@@ -115,14 +115,17 @@ impl Config {
 pub fn parse_duration(text: &str) -> Result<Duration, String> {
     let text = text.trim();
     let invalid = || format!("`{text}` is not a duration: use <n><unit> with s, m, h or d");
-    let (digits, unit) = text.split_at(text.len().checked_sub(1).ok_or_else(invalid)?);
+    // The unit is a `char`, not a trailing byte: slicing off one byte panics
+    // on a multi-byte tail, and malformed input is an error, never a panic.
+    let unit = text.chars().next_back().ok_or_else(invalid)?;
     let multiplier = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 60 * 60,
-        "d" => 24 * 60 * 60,
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
         _ => return Err(invalid()),
     };
+    let digits = &text[..text.len() - unit.len_utf8()];
     let seconds = digits
         .parse::<u64>()
         .ok()
@@ -166,7 +169,11 @@ mod tests {
 
     #[test]
     fn durations_reject_everything_else() {
-        for bad in ["", "14", "d", "1.5h", "-3d", "1w", "ten d", "10x"] {
+        for bad in [
+            "", "14", "d", "1.5h", "-3d", "1w", "ten d", "10x",
+            // A multi-byte tail used to panic on a non-char-boundary slice.
+            "14€", "€", "10ü",
+        ] {
             assert!(parse_duration(bad).is_err(), "{bad} parsed");
         }
         // Overflows report as invalid rather than wrapping.
