@@ -35,19 +35,19 @@ pub struct Loaded {
 
 impl Config {
     /// `$XDG_CONFIG_HOME/agent-sessions/config.toml`, falling back to
-    /// `~/.config/agent-sessions/config.toml` when XDG is unset. `None` when
-    /// neither variable can place it.
+    /// `~/.config/agent-sessions/config.toml` when XDG is unset or invalid.
+    /// `None` when neither variable can place it.
     pub fn path(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-        let base = xdg_dir(env, "XDG_CONFIG_HOME")
-            .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+        let base = env_dir(env, "XDG_CONFIG_HOME")
+            .or_else(|| env_dir(env, "HOME").map(|home| home.join(".config")))?;
         Some(base.join("agent-sessions").join("config.toml"))
     }
 
     /// `$XDG_STATE_HOME/agent-sessions/`, falling back to
     /// `~/.local/state/agent-sessions/`.
     pub fn state_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-        let base = xdg_dir(env, "XDG_STATE_HOME")
-            .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".local").join("state")))?;
+        let base = env_dir(env, "XDG_STATE_HOME")
+            .or_else(|| env_dir(env, "HOME").map(|home| home.join(".local").join("state")))?;
         Some(base.join("agent-sessions"))
     }
 
@@ -108,11 +108,12 @@ impl Config {
     }
 }
 
-/// An XDG base directory's value, or `None` when the variable is unset,
-/// empty or relative. The XDG Base Directory specification declares relative
-/// values invalid; an invalid value falls back exactly like an unset one
-/// rather than resolving relative to whatever directory we run in.
-fn xdg_dir(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Option<PathBuf> {
+/// A directory-valued variable's value, or `None` when it is unset, empty or
+/// relative. The XDG Base Directory specification declares relative values
+/// invalid, and a relative `HOME` is no better; an invalid value falls back
+/// exactly like an unset one rather than resolving relative to whatever
+/// directory we run in.
+fn env_dir(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Option<PathBuf> {
     env(name)
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -253,6 +254,10 @@ mod tests {
         }
         // With no HOME to fall back to, an invalid XDG value resolves nothing.
         assert_eq!(Config::path(&env(&[("XDG_CONFIG_HOME", "relative")])), None);
+        // An empty or relative HOME is invalid the same way.
+        assert_eq!(Config::path(&env(&[("HOME", "")])), None);
+        assert_eq!(Config::path(&env(&[("HOME", "relative")])), None);
+        assert_eq!(Config::state_dir(&env(&[("HOME", "relative")])), None);
     }
 
     /// A throwaway directory, unique per call because tests run in threads.
