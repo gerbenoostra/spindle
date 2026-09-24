@@ -1,0 +1,21 @@
+[package]
+name = "agent-sessions"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "One dashboard for every agentic session and worktree"
+repository = "https://github.com/gerbenoostra/spindle"
+license = "MIT"
+readme = "README.md"
+keywords = ["agent", "session", "dashboard", "tmux", "worktree"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+# `eq-separator`: pico-args ships with no features at all, so `--key=value` is
+# not understood without it.
+pico-args = { version = "0.5.0", features = ["eq-separator"] }
+# The authored config file is TOML; only its table access is used here.
+toml = "0.9.8"
+
+[profile.release]
+strip = true
