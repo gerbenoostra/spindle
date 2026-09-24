@@ -76,6 +76,17 @@ fn unshipped_subcommands_are_usage_errors() {
 }
 
 #[test]
+fn version_and_help_short_circuit_other_arguments() {
+    // Deliberate: a guessed word beside --version or --help still answers the
+    // flag. The usage-error contract is about silence, not about precedence.
+    for flag in ["--version", "--help"] {
+        let out = run(&["frobnicate", flag]);
+        assert!(out.status.success(), "{flag}: {out:?}");
+        assert!(stderr_of(&out).is_empty(), "{flag}: {out:?}");
+    }
+}
+
+#[test]
 fn an_unknown_flag_is_a_usage_error() {
     let out = run(&["--bogus"]);
     assert_eq!(out.status.code(), Some(2));
