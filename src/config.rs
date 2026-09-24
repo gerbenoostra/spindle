@@ -38,8 +38,7 @@ impl Config {
     /// `~/.config/agent-sessions/config.toml` when XDG is unset. `None` when
     /// neither variable can place it.
     pub fn path(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-        let base = env("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
+        let base = xdg_dir(env, "XDG_CONFIG_HOME")
             .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".config")))?;
         Some(base.join("agent-sessions").join("config.toml"))
     }
@@ -47,8 +46,7 @@ impl Config {
     /// `$XDG_STATE_HOME/agent-sessions/`, falling back to
     /// `~/.local/state/agent-sessions/`.
     pub fn state_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-        let base = env("XDG_STATE_HOME")
-            .map(PathBuf::from)
+        let base = xdg_dir(env, "XDG_STATE_HOME")
             .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".local").join("state")))?;
         Some(base.join("agent-sessions"))
     }
@@ -108,6 +106,16 @@ impl Config {
         }
         Ok(config)
     }
+}
+
+/// An XDG base directory's value, or `None` when the variable is unset,
+/// empty or relative. The XDG Base Directory specification declares relative
+/// values invalid; an invalid value falls back exactly like an unset one
+/// rather than resolving relative to whatever directory we run in.
+fn xdg_dir(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Option<PathBuf> {
+    env(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
 }
 
 /// `<n><unit>` with `s`, `m`, `h` or `d` - the one spelling the config file
@@ -227,6 +235,24 @@ mod tests {
             Some(PathBuf::from("/home/.local/state/agent-sessions"))
         );
         assert_eq!(Config::state_dir(&env(&[])), None);
+    }
+
+    #[test]
+    fn an_empty_or_relative_xdg_value_falls_back_to_home() {
+        for bad in ["", "relative", "./somewhere"] {
+            assert_eq!(
+                Config::path(&env(&[("XDG_CONFIG_HOME", bad), ("HOME", "/home")])),
+                Some(PathBuf::from("/home/.config/agent-sessions/config.toml")),
+                "XDG_CONFIG_HOME={bad:?} should fall back to HOME"
+            );
+            assert_eq!(
+                Config::state_dir(&env(&[("XDG_STATE_HOME", bad), ("HOME", "/home")])),
+                Some(PathBuf::from("/home/.local/state/agent-sessions")),
+                "XDG_STATE_HOME={bad:?} should fall back to HOME"
+            );
+        }
+        // With no HOME to fall back to, an invalid XDG value resolves nothing.
+        assert_eq!(Config::path(&env(&[("XDG_CONFIG_HOME", "relative")])), None);
     }
 
     /// A throwaway directory, unique per call because tests run in threads.
