@@ -56,6 +56,38 @@ filter excludes it by name).
 - **Subcommands ship with their behaviour.** An argument the binary cannot act
   on is a usage error, not a stub.
 
+## The read boundary
+
+Every external read is read-only and lives behind one audited spawn site
+per program - `git.rs`, `forge.rs`, `process.rs`, `tmux.rs` - which
+`tests/source_invariants.rs` enforces alongside the write ban. A record
+that does not parse fails closed: dropped to a warnings surface or
+degraded to `Unknown`, never guessed. The platform contracts behind the
+readers:
+
+- tmux: one `list-panes -a -F` per discovered server per refresh, and
+  nothing else. tmux does not promise control characters through `-F`
+  output across builds, so `|` is the record separator and a field value
+  containing `|` drops just that record to warnings. Sockets are
+  `<base>/tmux-<uid>` (`base` = `$TMUX_TMPDIR`, default `/tmp`) plus the
+  first component of `$TMUX`, deduplicated by canonical path - an aliased
+  socket must not return every pane twice. `tmux-agent-status`'s
+  `@agent_status`/`@agent_pane_status` options are never read: they are a
+  lossy projection of the primary evidence collected here.
+- `ps`: one `ps -A -o pid,ppid,etime,stat,tty,comm` snapshot per refresh.
+  `etime` is elapsed time, so a start is `snapshot - elapsed`, compared
+  within one second. macOS `ps` has no `etimes`, and `lstart` needs a
+  timezone database - which is why provider start times are normalized to
+  UTC epochs rather than the other way round. `comm` is not a
+  full-fidelity basename: Linux caps it at 15 bytes and macOS can emit a
+  16-byte argv0 prefix, so a cap-length prefix mismatch is unproven, not
+  dead. A row whose `etime` cannot be parsed is kept with an unavailable
+  start (pid-only evidence); a zombie is dead. Controlling ttys are
+  normalized to `/dev/...` on both platforms.
+- git: the optional `wt.*` worktree metadata is read via
+  `git config --worktree --get`; absence covers both an unset key and the
+  `extensions.worktreeConfig`-disabled refusal, and it is never written.
+
 ## The `register` write contract
 
 `register` is the only code that edits user files, and only when a human types
