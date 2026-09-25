@@ -135,7 +135,7 @@ pub fn parse_duration(text: &str) -> Result<Duration, String> {
 fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     for (unit, name) in [(86400, "d"), (3600, "h"), (60, "m")] {
-        if seconds >= unit && seconds % unit == 0 {
+        if seconds >= unit && seconds.is_multiple_of(unit) {
             return format!("{}{}", seconds / unit, name);
         }
     }
