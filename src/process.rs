@@ -89,6 +89,9 @@ pub struct ProcessRow {
     pub ppid: u32,
     /// Start time derived from `etime`: the snapshot time minus elapsed.
     /// Sub-second error stays inside the one-second comparison window.
+    /// `Unavailable` when `ps` reported no parseable elapsed - the pid is
+    /// observably live, so the row is kept as pid-only evidence rather
+    /// than dropped and reaped as dead.
     pub start: ProcessStart,
     /// The executable basename: `comm`'s path stripped, and the `-` login
     /// shell marker (`-zsh`) removed. `None` where the platform gave nothing.
@@ -250,7 +253,9 @@ fn parse_row(line: &str, taken: SystemTime) -> Option<ProcessRow> {
     };
     let pid = pid.parse().ok()?;
     let ppid = ppid.parse().ok()?;
-    let elapsed = parse_etime(etime)?;
+    let start = parse_etime(etime)
+        .map(|elapsed| start_from_elapsed(taken, elapsed))
+        .unwrap_or(ProcessStart::Unavailable);
     let state = stat.chars().next()?; // coverage: off - split_whitespace yields no empty fields
     let tty = normalize_tty(tty);
     let comm = comm.join(" ");
@@ -258,7 +263,7 @@ fn parse_row(line: &str, taken: SystemTime) -> Option<ProcessRow> {
     Some(ProcessRow {
         pid,
         ppid,
-        start: start_from_elapsed(taken, elapsed),
+        start,
         exe: normalize_exe(comm),
         tty,
         state,
@@ -430,14 +435,24 @@ mod tests {
         assert_eq!(bare.tty, None);
         assert!(parse_row("not a process row", taken).is_none());
         assert!(parse_row("", taken).is_none());
-        // Rows whose scalar fields do not parse fail the same way.
+        // A row whose pid or ppid does not parse is not a process row.
         for bad in [
             "  x     1 00:01 S    ttys0  zsh",
             "  9     x 00:01 S    ttys0  zsh",
-            "  9     1 xx:xx S    ttys0  zsh",
         ] {
             assert!(parse_row(bad, taken).is_none(), "{bad}");
         }
+        // An unparseable etime keeps the row with an unavailable start:
+        // the pid is observably live, so it is pid-only evidence, not
+        // a dead one.
+        let undated = parse_row("  9     1 xx:xx S    ttys0  zsh", taken).unwrap();
+        assert_eq!(undated.start, ProcessStart::Unavailable);
+        let table = ProcessTable::from_rows(vec![undated]);
+        let claim = ProcessInstance {
+            pid: 9,
+            pid_start: ProcessStart::At(1_000_000),
+        };
+        assert!(matches!(table.is_live(&claim, None), Liveness::PidOnly(_)));
     }
 
     #[test]
