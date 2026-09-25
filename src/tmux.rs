@@ -652,8 +652,7 @@ mod tests {
         assert_eq!(pane.wt_handle.as_deref(), Some("handle-x"));
 
         // Empty option and cwd fields read as absent.
-        let sparse =
-            parse_pane(socket, "%0|1|ttys001|sh||0|1|@2|0|0|$1|s|1||").unwrap();
+        let sparse = parse_pane(socket, "%0|1|ttys001|sh||0|1|@2|0|0|$1|s|1||").unwrap();
         assert_eq!(sparse.tty.as_deref(), Some("/dev/ttys001"));
         assert_eq!(sparse.cwd, None);
         assert_eq!(sparse.window_activity, None);
@@ -662,42 +661,12 @@ mod tests {
 
         // Wrong field count and bad ids are records we cannot use.
         assert!(parse_pane(socket, "%0|1").is_err());
-        assert!(
-            parse_pane(
-                socket,
-                "x|1|/dev/ttys1|sh|/p|0|0|@0|0|0|$0|s|0||"
-            )
-            .is_err()
-        );
-        assert!(
-            parse_pane(
-                socket,
-                "%0|x|/dev/ttys1|sh|/p|0|0|@0|0|0|$0|s|0||"
-            )
-            .is_err()
-        );
+        assert!(parse_pane(socket, "x|1|/dev/ttys1|sh|/p|0|0|@0|0|0|$0|s|0||").is_err());
+        assert!(parse_pane(socket, "%0|x|/dev/ttys1|sh|/p|0|0|@0|0|0|$0|s|0||").is_err());
         // A bad window id, session id or attachment count is the same.
-        assert!(
-            parse_pane(
-                socket,
-                "%0|1|/dev/ttys1|sh|/p|0|0|w0|0|0|$0|s|0||"
-            )
-            .is_err()
-        );
-        assert!(
-            parse_pane(
-                socket,
-                "%0|1|/dev/ttys1|sh|/p|0|0|@0|0|0|s0|s|0||"
-            )
-            .is_err()
-        );
-        assert!(
-            parse_pane(
-                socket,
-                "%0|1|/dev/ttys1|sh|/p|0|0|@0|0|0|$0|s|x||"
-            )
-            .is_err()
-        );
+        assert!(parse_pane(socket, "%0|1|/dev/ttys1|sh|/p|0|0|w0|0|0|$0|s|0||").is_err());
+        assert!(parse_pane(socket, "%0|1|/dev/ttys1|sh|/p|0|0|@0|0|0|s0|s|0||").is_err());
+        assert!(parse_pane(socket, "%0|1|/dev/ttys1|sh|/p|0|0|@0|0|0|$0|s|x||").is_err());
     }
 
     #[test]
