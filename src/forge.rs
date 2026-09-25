@@ -120,7 +120,7 @@ impl Forge {
         };
         match cli {
             Cli::Gh => self.gh(&exe, &host, &path, branch),
-            Cli::Glab => self.glab(&exe, remote_url, branch),
+            Cli::Glab => self.glab(&exe, &host, &path, branch),
         }
     }
 
@@ -163,39 +163,43 @@ impl Forge {
     }
 
     /// `gh pr list --head` answers both existence and state, without the
-    /// exit-code ambiguity `gh pr view` has for branches with no PR.
+    /// exit-code ambiguity `gh pr view` has for branches with no PR. Open
+    /// items are asked for first: anything the open filter returns is a
+    /// blocker candidate, so a page can never hide an open PR behind closed
+    /// predecessors - and an empty answer sends one more page to
+    /// distinguish `closed` from `not_existing`.
     fn gh(&self, exe: &PathBuf, host: &str, path: &str, branch: &str) -> ForgeStatus {
-        let args = vec![
-            "pr".to_owned(),
-            "list".to_owned(),
-            "--repo".to_owned(),
-            format!("{host}/{path}"),
-            "--head".to_owned(),
-            branch.to_owned(),
-            "--state".to_owned(),
-            "all".to_owned(),
-            "--json".to_owned(),
-            "number,state,url,statusCheckRollup".to_owned(),
-            "--limit".to_owned(),
-            "20".to_owned(),
-        ];
-        let text = match self.run(exe, &args) {
-            Ok(text) => text,
-            Err(reason) => return ForgeStatus::unknown(reason),
+        let args = |state: &str| {
+            vec![
+                "pr".to_owned(),
+                "list".to_owned(),
+                "--repo".to_owned(),
+                format!("{host}/{path}"),
+                "--head".to_owned(),
+                branch.to_owned(),
+                "--state".to_owned(),
+                state.to_owned(),
+                "--json".to_owned(),
+                "number,state,url,statusCheckRollup".to_owned(),
+                "--limit".to_owned(),
+                "20".to_owned(),
+            ]
         };
-        let items: serde_json::Value = match serde_json::from_str(&text) {
+        let items = match self.list(exe, &args("open"), "gh") {
+            Ok(items) if items.is_empty() => match self.list(exe, &args("all"), "gh") {
+                Ok(items) => items,
+                Err(status) => return status,
+            },
             Ok(items) => items,
-            Err(e) => return ForgeStatus::unknown(format!("unparseable gh output: {e}")),
+            Err(status) => return status,
         };
-        let Some(items) = items.as_array() else {
-            return ForgeStatus::unknown("gh output is not a list".to_owned());
-        };
-        // An open item wins over any number of closed predecessors.
-        let item = items
+        // An open item wins over any number of closed predecessors - still
+        // filtered client-side, in case the state flag was ignored.
+        let Some(item) = items
             .iter()
             .find(|pr| pr["state"] == "OPEN")
-            .or_else(|| items.first());
-        let Some(item) = item else {
+            .or_else(|| items.first())
+        else {
             return ForgeStatus::not_existing();
         };
         let state = item["state"].as_str().unwrap_or_default();
@@ -217,38 +221,44 @@ impl Forge {
         status
     }
 
-    /// `glab mr list --source-branch --all -F json` answers existence and
-    /// state; `head_pipeline.status` carries the pipeline.
-    fn glab(&self, exe: &PathBuf, remote_url: &str, branch: &str) -> ForgeStatus {
-        let args = vec![
-            "mr".to_owned(),
-            "list".to_owned(),
-            "--repo".to_owned(),
-            remote_url.to_owned(),
-            "--source-branch".to_owned(),
-            branch.to_owned(),
-            "--all".to_owned(),
-            "--output".to_owned(),
-            "json".to_owned(),
-            "--per-page".to_owned(),
-            "20".to_owned(),
-        ];
-        let text = match self.run(exe, &args) {
-            Ok(text) => text,
-            Err(reason) => return ForgeStatus::unknown(reason),
+    /// `glab mr list --source-branch -F json` answers existence and state;
+    /// `head_pipeline.status` carries the pipeline. Open items are asked
+    /// for first (the default listing) for the same reason as `gh`, with an
+    /// `--all` existence query behind an empty answer. `-R` accepts
+    /// `[HOST/]OWNER/[NAMESPACE/]REPO` - glab's own usage error names that
+    /// format - so it takes the parsed `host/path` exactly like `gh`.
+    fn glab(&self, exe: &PathBuf, host: &str, path: &str, branch: &str) -> ForgeStatus {
+        let args = |all: bool| {
+            let mut args = vec![
+                "mr".to_owned(),
+                "list".to_owned(),
+                "--repo".to_owned(),
+                format!("{host}/{path}"),
+                "--source-branch".to_owned(),
+                branch.to_owned(),
+                "--output".to_owned(),
+                "json".to_owned(),
+                "--per-page".to_owned(),
+                "20".to_owned(),
+            ];
+            if all {
+                args.push("--all".to_owned());
+            }
+            args
         };
-        let items: serde_json::Value = match serde_json::from_str(&text) {
+        let items = match self.list(exe, &args(false), "glab") {
+            Ok(items) if items.is_empty() => match self.list(exe, &args(true), "glab") {
+                Ok(items) => items,
+                Err(status) => return status,
+            },
             Ok(items) => items,
-            Err(e) => return ForgeStatus::unknown(format!("unparseable glab output: {e}")),
+            Err(status) => return status,
         };
-        let Some(items) = items.as_array() else {
-            return ForgeStatus::unknown("glab output is not a list".to_owned());
-        };
-        let item = items
+        let Some(item) = items
             .iter()
             .find(|mr| mr["state"] == "opened")
-            .or_else(|| items.first());
-        let Some(item) = item else {
+            .or_else(|| items.first())
+        else {
             return ForgeStatus::not_existing();
         };
         let state = item["state"].as_str().unwrap_or_default();
@@ -268,6 +278,23 @@ impl Forge {
             status.pipeline = glab_pipeline(&item["head_pipeline"]);
         }
         status
+    }
+
+    /// One list query against a forge CLI: a parsed JSON array, or the
+    /// `Unknown` status its failure mode maps to.
+    fn list(
+        &self,
+        exe: &PathBuf,
+        args: &[String],
+        program: &str,
+    ) -> Result<Vec<serde_json::Value>, ForgeStatus> {
+        let text = self.run(exe, args).map_err(ForgeStatus::unknown)?;
+        let items: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| ForgeStatus::unknown(format!("unparseable {program} output: {e}")))?;
+        items
+            .as_array()
+            .cloned()
+            .ok_or_else(|| ForgeStatus::unknown(format!("{program} output is not a list")))
     }
 }
 

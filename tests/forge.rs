@@ -27,6 +27,26 @@ fn stub(dir: &TempDir, name: &str, body: &str, code: u8) {
     std::fs::set_permissions(&path, perms).unwrap();
 }
 
+/// A stub that answers `body` only when the query asks for items of every
+/// state (`--state all` for `gh`, `--all` for `glab`) and an empty list to
+/// the open-only query - which is what exercises the second, existence,
+/// step of the two-query design.
+fn stub_all(dir: &TempDir, name: &str, flag: &str, body: &str) {
+    let log = dir.join(format!("{name}.log"));
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$*\" in\n  *\"{flag}\"*) printf '%s' '{body}' ;;\n  *) printf '[]' ;;\nesac\nexit 0\n",
+        log = log.display(),
+        flag = flag,
+        body = body.replace('\'', "'\\''"),
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, script).expect("stub");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
 fn forge_at(dir: &TempDir) -> Forge {
     Forge::with_path(dir.path().as_os_str().to_owned())
 }
@@ -71,11 +91,13 @@ fn github_hosts_route_to_gh_and_map_every_state() {
     assert_eq!(status.item, WorkItem::Open);
     assert_eq!(status.pipeline, Pipeline::Succeeded);
     assert_eq!(status.label.as_deref(), Some("PR #191"));
-    // Routing: the repo argument carries host/owner/repo for `gh`.
+    // Routing: the repo argument carries host/owner/repo for `gh`, and the
+    // open items are asked for first.
     let argv = calls(&dir, "gh").join(" ").replace('\n', " ");
     assert!(argv.contains("pr list"), "{argv}");
     assert!(argv.contains("--repo github.com/o/r"), "{argv}");
     assert!(argv.contains("--head feat"), "{argv}");
+    assert!(argv.contains("--state open"), "{argv}");
 
     // The scp-style remote spelling routes identically.
     let status = forge.status("git@github.com:o/r.git", "feat");
@@ -190,6 +212,7 @@ fn gitlab_hosts_route_to_glab_and_map_every_state() {
         }
         let argv = calls(&dir, "glab").join(" ").replace('\n', " ");
         assert!(argv.contains("mr list"), "{argv}");
+        assert!(argv.contains("--repo gitlab.com/o/r"), "{argv}");
         assert!(argv.contains("--source-branch feat"), "{argv}");
     }
     // Pipeline states from head_pipeline.status.
@@ -270,6 +293,43 @@ fn every_failure_mode_is_unknown_and_nonfatal() {
     stub(&dir, "glab", "{}", 0);
     let status = forge_at(&dir).status("https://gitlab.com/o/r", "b");
     assert_eq!(status.item, WorkItem::Unknown);
+}
+
+#[test]
+fn an_empty_open_page_sends_a_second_existence_query() {
+    // gh: the open page answers empty, the all-state page holds the item.
+    let dir = TempDir::new("forge-gh-exists");
+    stub_all(&dir, "gh", "--state all", &gh_pr(2, "CLOSED", "[]"));
+    let status = forge_at(&dir).status("https://github.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Closed);
+    assert_eq!(calls(&dir, "gh").len(), 2, "open query, then all states");
+
+    // An open item on the all-state page still wins - the client-side
+    // filter keeps a misbehaving filter from hiding it.
+    let dir = TempDir::new("forge-gh-exists-open");
+    stub_all(&dir, "gh", "--state all", &gh_pr(3, "OPEN", "[]"));
+    let status = forge_at(&dir).status("https://github.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Open);
+    assert_eq!(status.label.as_deref(), Some("PR #3"));
+
+    // Empty on both pages is not_existing, and costs the second call.
+    let dir = TempDir::new("forge-gh-exists-none");
+    stub_all(&dir, "gh", "--state all", "[]");
+    let status = forge_at(&dir).status("https://github.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::NotExisting);
+    assert_eq!(calls(&dir, "gh").len(), 2);
+
+    // glab: same shape, with `--all` as the existence flag.
+    let dir = TempDir::new("forge-glab-exists");
+    stub_all(&dir, "glab", "--all", &glab_mr(7, "merged", "null"));
+    let status = forge_at(&dir).status("https://gitlab.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Closed);
+    assert_eq!(calls(&dir, "glab").len(), 2, "open query, then all states");
+
+    let dir = TempDir::new("forge-glab-exists-none");
+    stub_all(&dir, "glab", "--all", "[]");
+    let status = forge_at(&dir).status("https://gitlab.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::NotExisting);
 }
 
 #[test]
