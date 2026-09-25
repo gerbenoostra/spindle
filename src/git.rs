@@ -151,11 +151,7 @@ fn check_argv(args: &[&str]) -> Result<(), Error> {
         "rev-parse" | "status" | "rev-list" | "merge-base" | "diff" | "ls-remote"
         | "for-each-ref" | "log" | "show" | "show-ref" | "cat-file" | "ls-tree" | "ls-files"
         | "name-rev" | "describe" => true,
-        "worktree" => {
-            rest == ["list"]
-                || rest == ["list", "--porcelain"]
-                || rest == ["list", "--porcelain", "-z"]
-        }
+        "worktree" => rest == ["list", "--porcelain", "-z"],
         "remote" => matches!(rest, [] | ["-v"] | ["--verbose"] | ["get-url", _]),
         "config" => is_read_only_config(rest),
         "symbolic-ref" => is_read_only_symbolic_ref(rest),
@@ -773,8 +769,6 @@ mod tests {
             vec!["ls-remote", "--symref", "origin", "HEAD"],
             vec!["for-each-ref", "--format=%(refname)", "refs/heads/"],
             vec!["show-ref", "--verify", "refs/heads/main"],
-            vec!["worktree", "list"],
-            vec!["worktree", "list", "--porcelain"],
             vec!["worktree", "list", "--porcelain", "-z"],
             vec!["remote"],
             vec!["remote", "-v"],
