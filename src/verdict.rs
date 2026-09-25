@@ -162,10 +162,7 @@ pub fn worktree_removal(state: &WorkState, forge: &ForgeStatus) -> ActionVerdict
                     reasons,
                 }
             }
-            Evidence::Unknown(_) => ActionVerdict {
-                verdict: Verdict::Blocked,
-                reasons,
-            }, // coverage: off - an unknown count is a blocker above
+            Evidence::Unknown(_) => blocked_count(reasons), // coverage: off - an unknown count is a blocker above
         },
         Evidence::Unknown(reason) => blocked_landing(reason), // coverage: off - needs a proven count with unproven ancestry
     }
@@ -173,6 +170,9 @@ pub fn worktree_removal(state: &WorkState, forge: &ForgeStatus) -> ActionVerdict
 
 #[rustfmt::skip]
 fn blocked_landing(reason: &str) -> ActionVerdict { ActionVerdict { verdict: Verdict::Blocked, reasons: vec![format!("cannot prove landing ({reason})")] } } // coverage: off - needs a proven count with unproven ancestry
+
+#[rustfmt::skip]
+fn blocked_count(reasons: Vec<String>) -> ActionVerdict { ActionVerdict { verdict: Verdict::Blocked, reasons } } // coverage: off - an unknown count is a blocker above
 
 /// Would `git branch -d` be a provably lossless act?
 ///
