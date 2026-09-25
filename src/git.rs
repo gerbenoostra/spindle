@@ -684,10 +684,7 @@ mod tests {
 
     #[test]
     fn the_runner_strips_ambient_git_environment() {
-        let cmd = git_command(
-            &[OsString::from("-C"), OsString::from("/tmp")],
-            &["status"],
-        );
+        let cmd = git_command(&[OsString::from("-C"), OsString::from("/tmp")], &["status"]);
         let envs: std::collections::HashMap<&std::ffi::OsStr, Option<&std::ffi::OsStr>> =
             cmd.get_envs().collect();
         // An ambient GIT_DIR would override -C discovery and attribute every

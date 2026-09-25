@@ -123,7 +123,13 @@ fn standard() -> FixtureRepo {
     let shared = f.dir.join("wt-detached-shared");
     f.git(
         f.main.as_path(),
-        &["worktree", "add", "--detach", shared.to_str().unwrap(), "kept"],
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            shared.to_str().unwrap(),
+            "kept",
+        ],
     );
 
     // Landed but the worktree is locked: the user marked it hands-off.
@@ -198,7 +204,10 @@ fn collect_all(f: &FixtureRepo) -> BTreeMap<String, WorkState> {
                     }
                 },
             };
-            (key, vector::collect_cached(&repo, &mut cache, &anchor, quiet()))
+            (
+                key,
+                vector::collect_cached(&repo, &mut cache, &anchor, quiet()),
+            )
         })
         .collect()
 }
@@ -901,10 +910,7 @@ fn remote_evidence_is_memoized_within_a_collection_pass() {
     let two = anchors.iter().find(|a| a.branch() == Some("two")).unwrap();
     let state = vector::collect_cached(&repo, &mut cache, two, quiet());
     assert!(
-        matches!(
-            state.vector.upstream_state,
-            UpstreamState::Tracked { .. }
-        ),
+        matches!(state.vector.upstream_state, UpstreamState::Tracked { .. }),
         "{:?}",
         state.vector.upstream_state
     );
@@ -920,7 +926,10 @@ fn a_self_referential_remote_resolves_against_the_repo_not_the_cwd() {
     f.branch_with_commits("stacked", 1, false);
     f.add_worktree("stacked", Some("stacked"));
     f.git(&f.main, &["config", "branch.stacked.remote", "."]);
-    f.git(&f.main, &["config", "branch.stacked.merge", "refs/heads/main"]);
+    f.git(
+        &f.main,
+        &["config", "branch.stacked.merge", "refs/heads/main"],
+    );
 
     let repo = git::Repo::discover(f.main.as_path()).unwrap().unwrap();
     let anchor = vector::anchors(&repo)
@@ -930,10 +939,7 @@ fn a_self_referential_remote_resolves_against_the_repo_not_the_cwd() {
         .unwrap();
     let state = vector::collect(&repo, &anchor, quiet());
     assert!(
-        matches!(
-            state.vector.upstream_state,
-            UpstreamState::Tracked { .. }
-        ),
+        matches!(state.vector.upstream_state, UpstreamState::Tracked { .. }),
         "{:?}",
         state.vector.upstream_state
     );

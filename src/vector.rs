@@ -356,7 +356,11 @@ fn remote_head(repo: &Repo, remote: &str, cache: &mut RemoteCache) -> RemoteHead
 /// `ls-remote --symref` is authoritative; a local `refs/remotes/<r>/HEAD`
 /// symref may corroborate it or stand in when the remote is unreachable, but
 /// the two disagreeing is a conflict, and a conflict is `Unknown`.
-fn resolve_base(repo: &Repo, upstream_remote: Option<&str>, cache: &mut RemoteCache) -> Evidence<Base> {
+fn resolve_base(
+    repo: &Repo,
+    upstream_remote: Option<&str>,
+    cache: &mut RemoteCache,
+) -> Evidence<Base> {
     let remote = match upstream_remote {
         Some(remote) => remote.to_owned(),
         None => match repo.remotes() {
