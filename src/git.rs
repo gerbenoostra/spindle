@@ -116,6 +116,13 @@ pub(crate) fn git_command(global: &[OsString], args: &[&str]) -> Command {
 /// `GIT_OPTIONAL_LOCKS=0` keeps reads from creating or waiting on lock files:
 /// without it even `git status` can try to refresh the index under a lock.
 fn git(global: &[OsString], args: &[&str]) -> Result<String, Error> {
+    git_bytes(global, args).map(|out| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// As [`git`], keeping the output bytes: a `-z` porcelain path is data that
+/// must not be lossy-decoded - a worktree directory that is not UTF-8 would
+/// round-trip mangled and attribute a different directory's state.
+fn git_bytes(global: &[OsString], args: &[&str]) -> Result<Vec<u8>, Error> {
     check_argv(args)?;
     let argv = global
         .iter()
@@ -127,7 +134,7 @@ fn git(global: &[OsString], args: &[&str]) -> Result<String, Error> {
         .output()
         .map_err(|e| Error::spawn(&argv, e))?; // coverage: off - needs a PATH without git
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(out.stdout)
     } else {
         Err(Error {
             argv,
@@ -212,6 +219,72 @@ fn in_repo(repo: &Repo, args: &[&str]) -> Result<String, Error> {
         ],
         args,
     )
+}
+
+/// [`in_repo`], keeping the output bytes for the callers parsing paths.
+fn in_repo_bytes(repo: &Repo, args: &[&str]) -> Result<Vec<u8>, Error> {
+    git_bytes(
+        &[
+            OsString::from("-C"),
+            repo.repo_dir().as_os_str().to_owned(),
+            OsString::from(format!("--git-dir={}", repo.common_dir.display())),
+        ],
+        args,
+    )
+}
+
+/// The records of `worktree list --porcelain -z`: every field is
+/// NUL-terminated, an empty field separates records, and the main worktree
+/// comes first. Paths arrive raw and are kept as bytes - a path holding a
+/// newline or non-UTF8 bytes would otherwise truncate or mangle onto a
+/// sibling directory and attribute that sibling's state.
+fn parse_worktrees(bytes: &[u8], common_dir: &Path) -> Vec<Worktree> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut found = Vec::new();
+    let mut current: Option<Worktree> = None;
+    for field in bytes.split(|b| *b == 0) {
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            if let Some(wt) = current.take() {
+                found.push(wt);
+            }
+            let path = PathBuf::from(OsString::from_vec(path.to_vec()));
+            let path = path.canonicalize().unwrap_or(path);
+            current = Some(Worktree {
+                admin_id: admin_id(&path, common_dir),
+                path,
+                head: Head::Detached(String::new()),
+                main: found.is_empty(),
+                bare: false,
+                locked: false,
+            });
+        } else if let Some(wt) = current.as_mut() {
+            let line = String::from_utf8_lossy(field);
+            if let Some(sha) = line.strip_prefix("HEAD ") {
+                wt.head = Head::Detached(sha.to_owned());
+            } else if let Some(reference) = line.strip_prefix("branch ") {
+                let name = reference.strip_prefix("refs/heads/").unwrap_or(reference);
+                let sha = match &wt.head {
+                    Head::Detached(sha) => sha.clone(),
+                    _ => String::new(), // coverage: off - porcelain never emits this shape
+                };
+                wt.head = if sha.chars().all(|c| c == '0') && !sha.is_empty() {
+                    Head::Unborn(name.to_owned())
+                } else {
+                    Head::Branch(name.to_owned())
+                };
+            } else if line == "detached" {
+                // The `HEAD` line already carried the sha; `detached`
+                // only confirms no branch owns it.
+            } else if line == "bare" {
+                wt.bare = true;
+            } else if line.starts_with("locked") {
+                wt.locked = true;
+            }
+        } // coverage: off - porcelain fields only follow a worktree record
+    }
+    found.extend(current.take());
+    found
 }
 
 /// What a worktree's HEAD points at.
@@ -335,57 +408,14 @@ impl Repo {
 
     /// Every worktree of the repository, main first, as reported by
     /// `git worktree list --porcelain -z`. Paths are canonicalized. `-z`
-    /// NUL-terminates every field: without it the path is emitted raw, so a
-    /// newline in a worktree directory name would split the `worktree`
-    /// record across two lines and silently truncate the path - possibly
-    /// onto a sibling that exists and reads as a different worktree.
+    /// NUL-terminates every field, and the output is parsed on bytes: the
+    /// path is emitted raw, so a newline would otherwise split the record
+    /// across two lines and a non-UTF8 name would otherwise be mangled by
+    /// a lossy decode - in both cases truncating onto a sibling that could
+    /// exist and read as a different worktree.
     pub fn worktrees(&self) -> Result<Vec<Worktree>, Error> {
-        let text = in_repo(self, &["worktree", "list", "--porcelain", "-z"])?;
-        let mut found = Vec::new();
-        let mut current: Option<Worktree> = None;
-        for line in text.split('\0') {
-            if let Some(path) = line.strip_prefix("worktree ") {
-                if let Some(wt) = current.take() {
-                    found.push(wt);
-                }
-                let path = PathBuf::from(path)
-                    .canonicalize()
-                    .unwrap_or_else(|_| PathBuf::from(path));
-                current = Some(Worktree {
-                    admin_id: admin_id(&path, &self.common_dir),
-                    path,
-                    head: Head::Detached(String::new()),
-                    // The porcelain output lists the main worktree first.
-                    main: found.is_empty(),
-                    bare: false,
-                    locked: false,
-                });
-            } else if let Some(wt) = current.as_mut() {
-                if let Some(sha) = line.strip_prefix("HEAD ") {
-                    wt.head = Head::Detached(sha.to_owned());
-                } else if let Some(reference) = line.strip_prefix("branch ") {
-                    let name = reference.strip_prefix("refs/heads/").unwrap_or(reference);
-                    let sha = match &wt.head {
-                        Head::Detached(sha) => sha.clone(),
-                        _ => String::new(), // coverage: off - porcelain never emits this shape
-                    };
-                    wt.head = if sha.chars().all(|c| c == '0') && !sha.is_empty() {
-                        Head::Unborn(name.to_owned())
-                    } else {
-                        Head::Branch(name.to_owned())
-                    };
-                } else if line == "detached" {
-                    // The `HEAD` line already carried the sha; `detached`
-                    // only confirms no branch owns it.
-                } else if line == "bare" {
-                    wt.bare = true;
-                } else if line.starts_with("locked") {
-                    wt.locked = true;
-                }
-            } // coverage: off - porcelain fields only follow a worktree record
-        }
-        found.extend(current.take());
-        Ok(found)
+        let bytes = in_repo_bytes(self, &["worktree", "list", "--porcelain", "-z"])?;
+        Ok(parse_worktrees(&bytes, &self.common_dir))
     }
 
     /// Local branch names, sorted.
@@ -756,6 +786,29 @@ mod tests {
                 Some(&Some(std::ffi::OsStr::new("ssh -oBatchMode=yes")))
             );
         } // coverage: off - the ambient-set arm needs a shell exporting GIT_SSH_COMMAND
+    }
+
+    #[test]
+    fn porcelain_parses_worktree_paths_byte_exact() {
+        // Newlines and non-UTF8 bytes are legal directory names in the
+        // filesystems git runs on; a line or lossy decode would truncate or
+        // mangle the path, possibly onto a sibling that exists.
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            b"worktree /tmp/main\nrepo\0HEAD deadbeef\0branch refs/heads/main\0\0",
+        );
+        bytes.extend_from_slice(b"worktree /tmp/wt-\xff x\0HEAD cafef00d\0detached\0\0");
+        let found = parse_worktrees(&bytes, Path::new("/tmp/.git"));
+
+        assert_eq!(found.len(), 2);
+        assert!(found[0].main);
+        assert_eq!(found[0].path.as_os_str().as_bytes(), b"/tmp/main\nrepo");
+        assert_eq!(found[0].head, Head::Branch("main".to_owned()));
+        assert!(!found[1].main);
+        assert_eq!(found[1].path.as_os_str().as_bytes(), b"/tmp/wt-\xff x");
+        assert_eq!(found[1].head, Head::Detached("cafef00d".to_owned()));
     }
 
     #[test]
