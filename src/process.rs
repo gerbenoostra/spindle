@@ -211,8 +211,10 @@ impl ProcessTable {
     ///
     /// `expected_exe` is what the claim implies about the executable - a
     /// provider's lock or session file names its own kind of process. When
-    /// it is given and the running basename differs, the pid was reused or
-    /// the process exec'd elsewhere; either way not the claimed instance.
+    /// it is given and the running basename provably differs, the pid was
+    /// reused or the process exec'd elsewhere; either way not the claimed
+    /// instance. A difference that could be the platform's `comm`
+    /// truncation is unproven rather than a mismatch.
     pub fn is_live(&self, claim: &ProcessInstance, expected_exe: Option<&str>) -> Liveness {
         let Some(row) = self.rows.get(&claim.pid) else {
             return Liveness::Dead(format!("pid {} has no process", claim.pid));
