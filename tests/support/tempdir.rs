@@ -14,8 +14,14 @@ pub struct TempDir {
 
 impl TempDir {
     pub fn new(label: &str) -> TempDir {
+        Self::new_in(&std::env::temp_dir(), label)
+    }
+
+    /// As [`new`], under a chosen root: unix socket paths cap out near a
+    /// hundred bytes, which the default temp root mostly spends by itself.
+    pub fn new_in(root: &Path, label: &str) -> TempDir {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
+        let path = root.join(format!(
             "agent-sessions-{label}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
