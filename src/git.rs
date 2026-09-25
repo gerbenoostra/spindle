@@ -62,7 +62,11 @@ impl std::error::Error for Error {}
 /// error instead of a collector that hangs on a prompt nobody answers; the
 /// ssh transport gets the same treatment through `SSH_ASKPASS_REQUIRE` and
 /// a default `ssh -oBatchMode=yes`.
-fn git_command(global: &[OsString], args: &[&str]) -> Command {
+///
+/// `pub(crate)` so the crate's own test fixtures spawn Git through the same
+/// isolation - an ambient `GIT_DIR` would defeat `-C` there exactly as it
+/// does here.
+pub(crate) fn git_command(global: &[OsString], args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.args(global).args(args);
     for var in [
@@ -854,8 +858,7 @@ mod tests {
         // A bare repository is a repo with no checkout.
         let bare = temp.0.join("bare.git");
         assert!(
-            Command::new("git")
-                .args(["init", "--bare", bare.to_str().unwrap()])
+            git_command(&[], &["init", "--bare", bare.to_str().unwrap()])
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .output()
@@ -875,8 +878,7 @@ mod tests {
         let temp = Temp::new();
         let dir = temp.0.join("repo");
         assert!(
-            Command::new("git")
-                .args(["init", dir.to_str().unwrap()])
+            git_command(&[], &["init", dir.to_str().unwrap()])
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .output()
@@ -889,10 +891,7 @@ mod tests {
     }
 
     fn git_ok(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
+        let out = git_command(&[OsString::from("-C"), dir.as_os_str().to_owned()], args)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_AUTHOR_NAME", "fixture")

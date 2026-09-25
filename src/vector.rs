@@ -597,8 +597,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agent-sessions-bare-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
-            std::process::Command::new("git")
-                .args(["init", "--bare", dir.to_str().unwrap()])
+            git::git_command(&[], &["init", "--bare", dir.to_str().unwrap()])
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .output()

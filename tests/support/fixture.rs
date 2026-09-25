@@ -180,13 +180,34 @@ pub enum Landing {
     CherryPick,
 }
 
-fn run(dir: Option<&Path>, args: &[&str]) -> String {
+/// The command a fixture operation runs: ambient Git environment removed
+/// (an exported `GIT_DIR` or `GIT_WORK_TREE` defeats `-C` discovery, so the
+/// fixture's mutations would land in the live repository they name), and a
+/// hermetic identity and config pinned so nothing touches the developer's
+/// real Git setup. Mirrors the isolation `src/git.rs` applies to its own
+/// subprocesses; keep the variable lists in sync.
+pub fn command(dir: Option<&Path>, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     if let Some(dir) = dir {
         cmd.arg("-C").arg(dir);
     }
-    let out = cmd
-        .args(args)
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_QUARANTINE_PATH",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.args(args)
         // Fixture paths are literal filenames: `x[0].txt` and `:(exclude)x`
         // are data the tests create on purpose, not pathspec patterns.
         .env("GIT_LITERAL_PATHSPECS", "1")
@@ -196,9 +217,12 @@ fn run(dir: Option<&Path>, args: &[&str]) -> String {
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("git runs");
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
+    cmd
+}
+
+fn run(dir: Option<&Path>, args: &[&str]) -> String {
+    let out = command(dir, args).output().expect("git runs");
     assert!(
         out.status.success(),
         "git {:?} in {:?} failed: {}",
@@ -208,3 +232,5 @@ fn run(dir: Option<&Path>, args: &[&str]) -> String {
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
+
+

@@ -1039,6 +1039,33 @@ fn a_self_referential_remote_resolves_against_the_repo_not_the_cwd() {
 }
 
 #[test]
+fn fixture_commands_are_isolated_from_the_ambient_git_environment() {
+    // An ambient GIT_DIR or GIT_WORK_TREE overrides `-C` discovery: without
+    // an explicit removal the fixture's mutations would land in whatever
+    // live repository the environment names.
+    let dir = TempDir::new("env-isolation");
+    let cmd = support::fixture::command(Some(dir.path()), &["status"]);
+    let envs: std::collections::HashMap<&std::ffi::OsStr, Option<&std::ffi::OsStr>> =
+        cmd.get_envs().collect();
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_QUARANTINE_PATH",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ] {
+        assert_eq!(envs.get(std::ffi::OsStr::new(var)), Some(&None), "{var}");
+    }
+}
+
+#[test]
 fn the_reads_leave_the_repository_untouched() {
     let f = standard();
     let refs_before = f.git(f.main.as_path(), &["for-each-ref"]);
