@@ -1039,6 +1039,45 @@ fn a_self_referential_remote_resolves_against_the_repo_not_the_cwd() {
 }
 
 #[test]
+fn a_url_valued_remote_still_feeds_forge_routing() {
+    // `branch.<name>.remote` may be the URL itself rather than a named
+    // remote: there is no `remote.<name>.url` to look up, but the URL is
+    // right there for the forge to route on. Port 1 on localhost refuses
+    // the ls-remote instantly, so nothing network-bound runs.
+    let f = FixtureRepo::new("origin");
+    f.branch_with_commits("feat", 1, true);
+    f.add_worktree("feat", Some("feat"));
+    f.git(
+        f.main.as_path(),
+        &[
+            "config",
+            "branch.feat.remote",
+            "https://127.0.0.1:1/o/r.git",
+        ],
+    );
+    f.git(
+        f.main.as_path(),
+        &["config", "branch.feat.merge", "refs/heads/feat"],
+    );
+    let repo = git::Repo::discover(f.main.as_path()).unwrap().unwrap();
+    let anchor = vector::anchors(&repo)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.branch() == Some("feat"))
+        .unwrap();
+    let state = vector::collect(&repo, &anchor, quiet());
+    assert_eq!(
+        state.remote_url.as_deref(),
+        Some("https://127.0.0.1:1/o/r.git")
+    );
+    // The remote itself is unreachable: upstream evidence stays Unknown.
+    assert!(matches!(
+        state.vector.upstream_state,
+        UpstreamState::Unknown(_)
+    ));
+}
+
+#[test]
 fn fixture_commands_are_isolated_from_the_ambient_git_environment() {
     // An ambient GIT_DIR or GIT_WORK_TREE overrides `-C` discovery: without
     // an explicit removal the fixture's mutations would land in whatever

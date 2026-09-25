@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::evidence::Evidence;
+use crate::forge;
 use crate::git::{self, Head, RemoteHead, Repo, UpstreamConfig};
 
 /// What a Work row is anchored on. Branch incarnations and detached
@@ -217,9 +218,14 @@ pub fn collect_cached(
         Some(Ok(UpstreamConfig::Full { remote, .. })) => Some(remote),
         _ => None,
     };
-    let remote_url = configured_remote
-        .as_deref()
-        .and_then(|remote| repo.remote_url(remote).ok().flatten());
+    let remote_url = configured_remote.as_deref().and_then(|remote| {
+        repo.remote_url(remote).ok().flatten().or_else(|| {
+            // `branch.<name>.remote` may be the URL itself rather than a
+            // configured remote name; there is no `remote.<name>.url` to
+            // look up then, but a forge can still be asked.
+            forge::parse_remote(remote).map(|_| remote.to_owned())
+        })
+    });
     let base = resolve_base(repo, configured_remote.as_deref(), cache);
 
     // A ref spec for the anchor's tip that resolves from the common dir:

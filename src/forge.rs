@@ -314,8 +314,9 @@ fn cli_for(host: &str) -> Option<Cli> {
 
 /// `(host, owner/repo-path)` from a remote URL, or `None` for a local path:
 /// ssh (`git@host:path`), `ssh://` and `https://` are remotes a forge can
-/// serve; a bare path is not.
-fn parse_remote(url: &str) -> Option<(String, String)> {
+/// serve; a bare path is not. `pub(crate)` so the vector can tell a
+/// URL-valued `branch.<name>.remote` from a remote name.
+pub(crate) fn parse_remote(url: &str) -> Option<(String, String)> {
     let strip = |path: &str| {
         path.trim_end_matches('/')
             .trim_end_matches(".git")
