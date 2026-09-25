@@ -7,6 +7,7 @@
 //! guessed, so an unproven base leaves `landed` and `commits_ahead_of_base`
 //! `Unknown` rather than compared against `origin/main` by convention.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -173,13 +174,35 @@ pub struct StateVector {
     pub last_git_activity: Option<SystemTime>,
 }
 
+/// Remote evidence reused across anchors of one collection pass. Each
+/// `ls-remote` is a network round-trip; a repository with twenty branches
+/// would otherwise ask the same remote twenty times for identical facts.
+/// Fresh per call if `collect` is used, shared across a batch with
+/// [`collect_cached`].
+#[derive(Default)]
+pub struct RemoteCache {
+    heads: HashMap<String, RemoteHead>,
+    refs: HashMap<String, Evidence<Vec<String>>>,
+}
+
 /// Collect the vector for one anchor. Reads only; all runtime fields come
 /// from `runtime`.
 pub fn collect(repo: &Repo, anchor: &Anchor, runtime: RuntimeFacts) -> WorkState {
+    collect_cached(repo, &mut RemoteCache::default(), anchor, runtime)
+}
+
+/// [`collect`] with a caller-owned [`RemoteCache`], so a batch over a
+/// repository's anchors asks the network once per remote, not once per row.
+pub fn collect_cached(
+    repo: &Repo,
+    cache: &mut RemoteCache,
+    anchor: &Anchor,
+    runtime: RuntimeFacts,
+) -> WorkState {
     let config = anchor.branch().map(|branch| repo.upstream_config(branch));
     let upstream = match &config {
         None => UpstreamState::NotApplicable,
-        Some(Ok(config)) => upstream_state(repo, config),
+        Some(Ok(config)) => upstream_state(repo, config, cache),
         Some(Err(e)) => UpstreamState::Unknown(format!("upstream config: {e}")),
     };
     // The configured remote names itself even when it cannot be reached, so
@@ -191,7 +214,7 @@ pub fn collect(repo: &Repo, anchor: &Anchor, runtime: RuntimeFacts) -> WorkState
     let remote_url = configured_remote
         .as_deref()
         .and_then(|remote| repo.remote_url(remote).ok().flatten());
-    let base = resolve_base(repo, configured_remote.as_deref());
+    let base = resolve_base(repo, configured_remote.as_deref(), cache);
 
     // A ref spec for the anchor's tip that resolves from the common dir:
     // `HEAD` alone would name the main worktree's HEAD.
@@ -265,22 +288,42 @@ fn worktree_head_log(admin_id: Option<&str>) -> PathBuf {
 /// A read-only `ls-remote` decides whether the remote still advertises the
 /// configured merge ref. An unreachable remote is `Unknown`, not `remote_gone`:
 /// gone is only claimed when the remote answered and did not have the ref.
-fn upstream_state(repo: &Repo, config: &UpstreamConfig) -> UpstreamState {
+fn upstream_state(repo: &Repo, config: &UpstreamConfig, cache: &mut RemoteCache) -> UpstreamState {
     match config {
         UpstreamConfig::None => UpstreamState::NeverPushed,
         UpstreamConfig::Partial => UpstreamState::Unknown("incomplete upstream config".to_owned()),
-        UpstreamConfig::Full { remote, merge } => match repo.remote_advertises(remote, merge) {
-            Evidence::Known(true) => UpstreamState::Tracked {
-                remote: remote.clone(),
-                merge_ref: merge.clone(),
-            },
-            Evidence::Known(false) => UpstreamState::RemoteGone {
-                remote: remote.clone(),
-                merge_ref: merge.clone(),
-            },
-            Evidence::Unknown(reason) => UpstreamState::Unknown(reason),
-        },
+        UpstreamConfig::Full { remote, merge } => {
+            match remote_refs(repo, remote, cache).map(|refs| refs.iter().any(|r| r == merge)) {
+                Evidence::Known(true) => UpstreamState::Tracked {
+                    remote: remote.clone(),
+                    merge_ref: merge.clone(),
+                },
+                Evidence::Known(false) => UpstreamState::RemoteGone {
+                    remote: remote.clone(),
+                    merge_ref: merge.clone(),
+                },
+                Evidence::Unknown(reason) => UpstreamState::Unknown(reason),
+            }
+        }
     }
+}
+
+/// The remote's advertised ref listing, once per remote per pass.
+fn remote_refs(repo: &Repo, remote: &str, cache: &mut RemoteCache) -> Evidence<Vec<String>> {
+    cache
+        .refs
+        .entry(remote.to_owned())
+        .or_insert_with(|| repo.remote_refs(remote))
+        .clone()
+}
+
+/// The remote's advertised HEAD, once per remote per pass.
+fn remote_head(repo: &Repo, remote: &str, cache: &mut RemoteCache) -> RemoteHead {
+    cache
+        .heads
+        .entry(remote.to_owned())
+        .or_insert_with(|| repo.remote_head(remote))
+        .clone()
 }
 
 /// The base branch: the symbolic HEAD of the upstream remote, or of the
@@ -289,7 +332,7 @@ fn upstream_state(repo: &Repo, config: &UpstreamConfig) -> UpstreamState {
 /// `ls-remote --symref` is authoritative; a local `refs/remotes/<r>/HEAD`
 /// symref may corroborate it or stand in when the remote is unreachable, but
 /// the two disagreeing is a conflict, and a conflict is `Unknown`.
-fn resolve_base(repo: &Repo, upstream_remote: Option<&str>) -> Evidence<Base> {
+fn resolve_base(repo: &Repo, upstream_remote: Option<&str>, cache: &mut RemoteCache) -> Evidence<Base> {
     let remote = match upstream_remote {
         Some(remote) => remote.to_owned(),
         None => match repo.remotes() {
@@ -314,7 +357,7 @@ fn resolve_base(repo: &Repo, upstream_remote: Option<&str>) -> Evidence<Base> {
             Err(e) => return Evidence::Unknown(format!("local remote HEAD: {e}")), // coverage: off - `remotes()` already failed on a repo this broken
         }
     };
-    let branch = match repo.remote_head(&remote) {
+    let branch = match remote_head(repo, &remote, cache) {
         RemoteHead::Advertised(advertised) => match &local {
             Some(local) if *local != advertised => {
                 return Evidence::Unknown(format!(

@@ -165,10 +165,12 @@ fn standard() -> FixtureRepo {
 }
 
 /// All anchors of the fixture, keyed by a name the table can assert against.
+/// One `RemoteCache` for the batch, as the collectors will share one pass.
 fn collect_all(f: &FixtureRepo) -> BTreeMap<String, WorkState> {
     let repo = git::Repo::discover(f.main.as_path())
         .expect("discover")
         .expect("the clone is a repo");
+    let mut cache = vector::RemoteCache::default();
     vector::anchors(&repo)
         .expect("anchors")
         .into_iter()
@@ -187,7 +189,7 @@ fn collect_all(f: &FixtureRepo) -> BTreeMap<String, WorkState> {
                     }
                 },
             };
-            (key, vector::collect(&repo, &anchor, quiet()))
+            (key, vector::collect_cached(&repo, &mut cache, &anchor, quiet()))
         })
         .collect()
 }
@@ -856,6 +858,40 @@ fn a_remote_named_other_than_origin_resolves() {
         state.base.known().map(|b| b.label()).as_deref(),
         Some("upstream/main")
     );
+}
+
+#[test]
+fn remote_evidence_is_memoized_within_a_collection_pass() {
+    // Two branches on one remote: collecting the second asks nothing the
+    // first already answered. Removing the remote between the two collects
+    // proves it - a fresh ls-remote would be Unreachable, the cache still
+    // answers Tracked and a proven base.
+    let f = FixtureRepo::new("origin");
+    f.branch_with_commits("one", 1, true);
+    f.branch_with_commits("two", 1, true);
+    let repo = git::Repo::discover(f.main.as_path()).unwrap().unwrap();
+    let anchors = vector::anchors(&repo).unwrap();
+    let mut cache = vector::RemoteCache::default();
+
+    let one = anchors.iter().find(|a| a.branch() == Some("one")).unwrap();
+    let state = vector::collect_cached(&repo, &mut cache, one, quiet());
+    assert!(matches!(
+        state.vector.upstream_state,
+        UpstreamState::Tracked { .. }
+    ));
+
+    std::fs::remove_dir_all(&f.remote).expect("the remote goes away");
+    let two = anchors.iter().find(|a| a.branch() == Some("two")).unwrap();
+    let state = vector::collect_cached(&repo, &mut cache, two, quiet());
+    assert!(
+        matches!(
+            state.vector.upstream_state,
+            UpstreamState::Tracked { .. }
+        ),
+        "{:?}",
+        state.vector.upstream_state
+    );
+    assert!(state.base.is_known(), "{:?}", state.base);
 }
 
 #[test]

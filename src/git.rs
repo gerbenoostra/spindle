@@ -252,7 +252,7 @@ pub enum UpstreamConfig {
 }
 
 /// Where the remote's default branch evidence landed.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteHead {
     /// `ls-remote --symref` advertised `refs/heads/<0>` as the remote HEAD.
     Advertised(String),
@@ -441,14 +441,17 @@ impl Repo {
         }
     }
 
-    /// Whether the remote still advertises `refname`, proven by `ls-remote`
-    /// (no fetch, no local mutation). `Unknown` when the remote could not be
-    /// asked.
-    pub fn remote_advertises(&self, remote: &str, refname: &str) -> Evidence<bool> {
-        match in_repo(self, &["ls-remote", remote, refname]) {
+    /// Every refname the remote advertises, proven by one `ls-remote`
+    /// listing (no fetch, no local mutation). Membership checks against the
+    /// listing answer any per-ref question without asking again. `Unknown`
+    /// when the remote could not be asked.
+    pub fn remote_refs(&self, remote: &str) -> Evidence<Vec<String>> {
+        match in_repo(self, &["ls-remote", remote]) {
             Ok(text) => Evidence::Known(
                 text.lines()
-                    .any(|line| line.rsplit('\t').next() == Some(refname)),
+                    .filter_map(|line| line.rsplit('\t').next())
+                    .map(str::to_owned)
+                    .collect(),
             ),
             Err(e) => Evidence::Unknown(format!("ls-remote {remote}: {e}")),
         }
@@ -775,7 +778,7 @@ mod tests {
         assert!(repo.local_remote_head("origin").is_err());
         assert!(is_unreachable(&repo.remote_head("origin")));
         assert!(!is_unreachable(&RemoteHead::Advertised("x".to_owned())));
-        assert!(!repo.remote_advertises("origin", "refs/heads/x").is_known());
+        assert!(!repo.remote_refs("origin").is_known());
         assert!(!repo.has_ref("refs/heads/main"));
         assert!(repo.rev_list_count("a", "b").is_err());
         assert!(!repo.is_ancestor("a", "b").is_known());
