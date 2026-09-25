@@ -25,6 +25,8 @@ pub enum Anchor {
         admin_id: Option<String>,
         head: Head,
         locked: bool,
+        /// The repository's own checkout; `git worktree remove` refuses it.
+        main: bool,
     },
     /// A local branch with no worktree anywhere.
     Branch { name: String },
@@ -61,6 +63,7 @@ pub fn anchors(repo: &Repo) -> Result<Vec<Anchor>, git::Error> {
             admin_id: wt.admin_id,
             head: wt.head,
             locked: wt.locked,
+            main: wt.main,
         });
     }
     let names = repo.local_branches()?; // coverage: off - needs refs broken where worktree list succeeded

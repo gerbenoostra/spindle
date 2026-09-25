@@ -216,6 +216,9 @@ pub struct Worktree {
     /// Basename of `$GIT_COMMON_DIR/worktrees/<id>`; `None` on the main
     /// worktree, which has no admin directory.
     pub admin_id: Option<String>,
+    /// The repository's own checkout - the first porcelain entry - which
+    /// `git worktree remove` can never remove.
+    pub main: bool,
     pub bare: bool,
     pub locked: bool,
 }
@@ -321,6 +324,8 @@ impl Repo {
                     admin_id: admin_id(&path, &self.common_dir),
                     path,
                     head: Head::Detached(String::new()),
+                    // The porcelain output lists the main worktree first.
+                    main: found.is_empty(),
                     bare: false,
                     locked: false,
                 });

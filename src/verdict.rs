@@ -53,11 +53,19 @@ impl ActionVerdict {
 /// commits are `review`: the branch keeps them, but removing the workspace
 /// of unfinished work is a human's call.
 pub fn worktree_removal(state: &WorkState, forge: &ForgeStatus) -> ActionVerdict {
-    let Anchor::Worktree { head, locked, .. } = &state.anchor else {
+    let Anchor::Worktree {
+        head, locked, main, ..
+    } = &state.anchor
+    else {
         return ActionVerdict::new(Verdict::NotApplicable, vec!["no worktree".to_owned()]);
     };
     let v = &state.vector;
     let mut blockers = Vec::new();
+
+    // `git worktree remove` refuses the main working tree outright.
+    if *main {
+        blockers.push("main worktree".to_owned());
+    }
 
     match &v.dirty {
         Evidence::Known(true) => blockers.push("uncommitted changes".to_owned()),

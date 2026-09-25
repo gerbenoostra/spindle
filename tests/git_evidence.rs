@@ -244,24 +244,18 @@ fn the_fixture_table() {
     let f = standard();
     let states = collect_all(&f);
 
-    // The main checkout itself is a row: landed, clean, checked out.
+    // The main checkout itself is a row, but `git worktree remove` always
+    // refuses it, so its removal can never be safe.
     expect(
         &states,
         "wt:main@main",
+        (Verdict::Blocked, &["main worktree"]),
         (
-            Verdict::Safe,
-            &["clean", "nothing live", "landed on origin/main (ancestor)"],
-        ),
-        (
-            Verdict::SafeAfterWorktreeRemoval,
-            &[
-                "merged into origin/main",
-                "nothing unpushed",
-                &format!(
-                    "checked out in {}; deleted after the worktree is removed",
-                    f.main.display()
-                ),
-            ],
+            Verdict::Blocked,
+            &[&format!(
+                "checked out in {}, and its removal is blocked",
+                f.main.display()
+            )],
         ),
     );
 
