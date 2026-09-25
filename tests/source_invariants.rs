@@ -59,6 +59,73 @@ fn production_sources_never_name_a_tmux_write() {
     }
 }
 
+/// The only modules allowed to spawn a subprocess: each external program's
+/// argv lives behind one audited boundary, and adding a spawn surface means
+/// editing this list where a reviewer will see it.
+const SPAWN_MODULES: [&str; 2] = ["git.rs", "forge.rs"];
+
+#[test]
+fn external_programs_are_spawned_in_their_own_module() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    for path in rust_sources(&src) {
+        let text = fs::read_to_string(&path).expect("a source file this crate owns");
+        let production = production_part(&text, &path);
+        if production.contains("Command::new") {
+            let module = path.file_name().and_then(|n| n.to_str());
+            assert!(
+                SPAWN_MODULES.contains(&module.unwrap_or_default()),
+                "{}: spawns a subprocess outside {SPAWN_MODULES:?}",
+                path.display()
+            );
+        }
+    }
+    // `GIT_OPTIONAL_LOCKS=0` is pinned exactly where the Git subprocess
+    // lives, so a background read never contends for index locks.
+    let git_rs = src.join("git.rs");
+    let text = fs::read_to_string(&git_rs).expect("src/git.rs exists");
+    assert!(
+        production_part(&text, &git_rs).contains("GIT_OPTIONAL_LOCKS"),
+        "src/git.rs: the Git runner must pin GIT_OPTIONAL_LOCKS=0"
+    );
+}
+
+/// Git argv that mutate a repository, as the quoted argv words that would do
+/// them. `git worktree remove`/`git branch -d` arrive only with confirmed
+/// cleanup execution; this scan is what keeps them confined to it.
+const FORBIDDEN_GIT_ARGV: [&str; 15] = [
+    "\"push\"",
+    "\"fetch\"",
+    "\"commit\"",
+    "\"merge\"",
+    "\"rebase\"",
+    "\"reset\"",
+    "\"checkout\"",
+    "\"switch\"",
+    "\"restore\"",
+    "\"update-ref\"",
+    "\"gc\"",
+    "\"prune\"",
+    "\"init\"",
+    "\"clone\"",
+    "\"am\"",
+];
+
+#[test]
+fn production_sources_never_name_a_git_write() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    for path in rust_sources(&src) {
+        let text = fs::read_to_string(&path).expect("a source file this crate owns");
+        let production = production_part(&text, &path);
+        for argv in FORBIDDEN_GIT_ARGV {
+            assert!(
+                !production.contains(argv),
+                "{}: names the Git write {argv}, which the read substrate never runs",
+                path.display()
+            );
+        }
+    }
+}
+
 /// The text of `file` up to its unit-test module, after asserting the
 /// `#[cfg(test)]` convention that makes that cut safe.
 fn production_part<'a>(text: &'a str, path: &Path) -> &'a str {

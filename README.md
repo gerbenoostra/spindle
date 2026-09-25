@@ -103,6 +103,27 @@ directories. `agent-sessions` does not read `tmux-agent-status`'s pane or
 window options at all: the two agree by applying the same event vocabulary and
 attention projection to independent observations, not by reading each other.
 
+### The shared worktree state vector
+
+Cleanup verdicts and section placement read one derived vector per work
+anchor. Runtime fields come from the tmux/process inventory; everything else
+is read from Git with `GIT_OPTIONAL_LOCKS=0`. Facts that cannot be proven are
+`Unknown` and fail closed - the tool never guesses a remote or branch name.
+
+| Field | Source | Notes |
+| --- | --- | --- |
+| `worktree` | `git worktree list --porcelain` | a path, or `none` for a branch with no workspace |
+| `windows` | tmux window options + derived cwd | total, and how many are orphaned |
+| `live_pids` | pid-cwd scan, worktree root or below | catches agents, servers, watchers alike |
+| `live_agent_sessions` | agent session stores, filtered by `(pid, pid_start)` liveness | |
+| `past_agent_sessions` | per-agent history for that path | "no live session" never means "nothing ever ran here" |
+| `dirty` | `git status --porcelain --untracked-files=all` | the primary removal blocker |
+| `commits_ahead_of_base` | `git rev-list --count <base>..HEAD` | zero plus no sessions means the worktree was never used |
+| `upstream_state` | `never_pushed` / `tracked` / `remote_gone` | proven by `ls-remote`; no fetch, no local mutation |
+| `unpushed_commits` | `git rev-list --count @{u}..HEAD`; vs the proven base when never pushed; commits no `refs/*` reaches when detached | the real data-loss risk on removal |
+| `landed` | `no` / `ancestor-merged` / `content-merged` | ancestry first, then path-scoped tree comparison |
+| `last_git_activity` | worktree HEAD reflog; branch reflog when there is no worktree | the reflog is per worktree, a real recency signal |
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development shell, the checks CI
