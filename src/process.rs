@@ -462,7 +462,7 @@ mod tests {
             pid: 9,
             pid_start: ProcessStart::At(1_000_000),
         };
-        assert!(matches!(table.is_live(&claim, None), Liveness::PidOnly(_)));
+        assert!(matches!(table.is_live(&claim, None), Liveness::PidOnly(_))); // coverage: off - miss edge is the assert failing
     }
 
     #[test]
@@ -630,10 +630,8 @@ mod tests {
         );
         // A same-cap basename that is not a prefix is still a proven
         // mismatch.
-        assert!(matches!(
-            truncated.is_live(&claim, Some("provider-with-x")),
-            Liveness::Dead(_)
-        )); // coverage: off - miss edge is the assert failing
+        let live = truncated.is_live(&claim, Some("provider-with-x"));
+        assert!(matches!(live, Liveness::Dead(_))); // coverage: off - miss edge is the assert failing
         // A dead pid is dead.
         let gone = ProcessInstance {
             pid: 4_000_000,

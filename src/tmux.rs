@@ -549,16 +549,15 @@ mod tests {
         p.cwd = Some(PathBuf::from("/no/such/dir/here"));
         assert!(!p.binds_worktree(None, &worktree));
         // The same for a worktree that does not exist, and for a
-        // worktree passed under a symlinked spelling of its real path.
+        // worktree passed under a symlinked spelling of its real path
+        // (where temp_dir has no symlink the two are one path and the
+        // check still runs).
         p.cwd = Some(worktree.join("inside"));
         assert!(!p.binds_worktree(None, Path::new("/no/such/worktree/here")));
         let raw = std::env::temp_dir();
-        if let Ok(canon) = raw.canonicalize()
-            && canon != raw
-        {
-            p.cwd = Some(canon.join("inside"));
-            assert!(p.binds_worktree(None, &raw));
-        }
+        let canon = raw.canonicalize().unwrap();
+        p.cwd = Some(canon.join("inside"));
+        assert!(p.binds_worktree(None, &raw));
     }
 
     #[test]

@@ -683,6 +683,13 @@ fn no_server_is_an_empty_inventory_and_unknown_panes() {
     assert_eq!(inventory.servers.len(), 1);
     assert!(inventory.servers[0].error.is_some());
 
+    // A socket path that does not exist at all cannot even canonicalize;
+    // it is still asked once and recorded as unanswered.
+    let missing = dir.join("never-existed");
+    let inventory = PaneInventory::collect(std::slice::from_ref(&missing));
+    assert_eq!(inventory.servers.len(), 1);
+    assert!(inventory.servers[0].error.is_some());
+
     // No sockets at all: still a valid empty inventory, and git evidence
     // is untouched by the missing tmux.
     let rt = Runtime::observe_over(&[]);
