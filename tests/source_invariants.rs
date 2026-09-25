@@ -38,6 +38,30 @@ const FORBIDDEN_TMUX_ARGV: [&str; 8] = [
     "\"kill-server\"",
 ];
 
+/// tmux options owned by the agent-status tool, as bare substrings. The
+/// dashboard must never read them: they are a lossy projection of the
+/// primary evidence this tool collects itself, and depending on them would
+/// couple the tools. Unlike the argv words above, an option name appears
+/// inside a `#{...}` format string, so the scan is on the name itself -
+/// production sources may not mention them at all.
+const FORBIDDEN_STATUS_OPTIONS: [&str; 2] = ["@agent_status", "@agent_pane_status"];
+
+#[test]
+fn production_sources_never_read_an_agent_status_option() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    for path in rust_sources(&src) {
+        let text = fs::read_to_string(&path).expect("a source file this crate owns");
+        let production = production_part(&text, &path);
+        for option in FORBIDDEN_STATUS_OPTIONS {
+            assert!(
+                !production.contains(option),
+                "{}: names the agent-status option {option}, which this tool never reads",
+                path.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn production_sources_never_name_a_tmux_write() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -62,7 +86,7 @@ fn production_sources_never_name_a_tmux_write() {
 /// The only modules allowed to spawn a subprocess: each external program's
 /// argv lives behind one audited boundary, and adding a spawn surface means
 /// editing this list where a reviewer will see it.
-const SPAWN_MODULES: [&str; 2] = ["git.rs", "forge.rs"];
+const SPAWN_MODULES: [&str; 4] = ["git.rs", "forge.rs", "process.rs", "tmux.rs"];
 
 #[test]
 fn external_programs_are_spawned_in_their_own_module() {

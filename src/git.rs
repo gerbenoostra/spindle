@@ -474,6 +474,25 @@ impl Repo {
         }
     }
 
+    /// `git -C <checkout> config --worktree --get wt.<key>`: optional
+    /// worktree metadata another tool may publish under the `wt.*` prefix
+    /// (`wt.handle`, `wt.wtid`, `wt.created-by`). Absence is `Ok(None)` in
+    /// every form it takes: an unset key (exit 1) and the
+    /// `extensions.worktreeConfig`-disabled refusal (exit 128), since
+    /// `wt.*` values only ever exist where that extension is enabled. This
+    /// tool never writes them.
+    pub fn wt_config(&self, checkout: &Path, key: &str) -> Result<Option<String>, Error> {
+        match in_dir(
+            checkout,
+            &["config", "--worktree", "--get", &format!("wt.{key}")],
+        ) {
+            Ok(value) => Ok(Some(value.trim().to_owned())),
+            Err(e) if e.code == Some(1) => Ok(None),
+            Err(e) if e.code == Some(128) && e.detail.contains("worktreeConfig") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The local `refs/remotes/<remote>/HEAD` symref target's branch name, if
     /// the symref exists. This is what the last fetch recorded; it can be
     /// stale but it is never a guess.
@@ -963,6 +982,39 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "{args:?}: {:?}", out.stderr);
+    }
+
+    #[test]
+    fn wt_config_reads_optional_worktree_metadata() {
+        let temp = Temp::new();
+        let dir = temp.0.join("repo");
+        git_ok(&temp.0, &["init", dir.to_str().unwrap()]);
+        let repo = Repo::discover(&dir).unwrap().expect("a repo");
+
+        // No extension enabled: nothing published, everywhere absent.
+        assert_eq!(repo.wt_config(&dir, "handle").unwrap(), None);
+
+        // Enabled and set: the value reads back.
+        git_ok(&dir, &["config", "extensions.worktreeConfig", "true"]);
+        git_ok(&dir, &["config", "--worktree", "wt.handle", "test-handle"]);
+        assert_eq!(
+            repo.wt_config(&dir, "handle").unwrap().as_deref(),
+            Some("test-handle")
+        );
+        assert_eq!(repo.wt_config(&dir, "wtid").unwrap(), None);
+
+        // Without the extension, a multi-worktree repo makes `--worktree`
+        // refuse outright - which also reads as absent, since `wt.*` only
+        // exists where the extension is on.
+        let linked = temp.0.join("linked");
+        git_ok(&dir, &["worktree", "add", linked.to_str().unwrap()]);
+        git_ok(&dir, &["config", "--unset", "extensions.worktreeConfig"]);
+        assert_eq!(repo.wt_config(&dir, "handle").unwrap(), None);
+        assert_eq!(repo.wt_config(&linked, "handle").unwrap(), None);
+
+        // A path that is not a checkout errors rather than reading as
+        // absent.
+        assert!(repo.wt_config(&temp.0.join("missing"), "handle").is_err());
     }
 
     #[test]
