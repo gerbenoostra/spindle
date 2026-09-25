@@ -181,12 +181,14 @@ pub struct StateVector {
 /// Remote evidence reused across anchors of one collection pass. Each
 /// `ls-remote` is a network round-trip; a repository with twenty branches
 /// would otherwise ask the same remote twenty times for identical facts.
-/// Fresh per call if `collect` is used, shared across a batch with
-/// [`collect_cached`].
+/// Entries are keyed by repository *and* remote name, so one shared cache
+/// stays correct across a multi-repo pass: two repos whose remotes share a
+/// name advertise different facts. Fresh per call if `collect` is used,
+/// shared across a batch with [`collect_cached`].
 #[derive(Default)]
 pub struct RemoteCache {
-    heads: HashMap<String, RemoteHead>,
-    refs: HashMap<String, Evidence<Vec<String>>>,
+    heads: HashMap<(PathBuf, String), RemoteHead>,
+    refs: HashMap<(PathBuf, String), Evidence<Vec<String>>>,
 }
 
 /// Collect the vector for one anchor. Reads only; all runtime fields come
@@ -332,20 +334,20 @@ fn upstream_state(repo: &Repo, config: &UpstreamConfig, cache: &mut RemoteCache)
     }
 }
 
-/// The remote's advertised ref listing, once per remote per pass.
+/// The remote's advertised ref listing, once per repo+remote per pass.
 fn remote_refs(repo: &Repo, remote: &str, cache: &mut RemoteCache) -> Evidence<Vec<String>> {
     cache
         .refs
-        .entry(remote.to_owned())
+        .entry((repo.common_dir().to_owned(), remote.to_owned()))
         .or_insert_with(|| repo.remote_refs(remote))
         .clone()
 }
 
-/// The remote's advertised HEAD, once per remote per pass.
+/// The remote's advertised HEAD, once per repo+remote per pass.
 fn remote_head(repo: &Repo, remote: &str, cache: &mut RemoteCache) -> RemoteHead {
     cache
         .heads
-        .entry(remote.to_owned())
+        .entry((repo.common_dir().to_owned(), remote.to_owned()))
         .or_insert_with(|| repo.remote_head(remote))
         .clone()
 }

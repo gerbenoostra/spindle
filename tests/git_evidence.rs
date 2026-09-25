@@ -949,6 +949,67 @@ fn remote_evidence_is_memoized_within_a_collection_pass() {
 }
 
 #[test]
+fn a_shared_remote_cache_scopes_evidence_per_repo() {
+    // Two repos whose remotes share the name `origin` but advertise
+    // different facts: a cache keyed by remote name alone would hand the
+    // second repo the first repo's HEAD and ref listing.
+    let a = FixtureRepo::new("origin");
+    a.branch_with_commits("feat", 1, true);
+    a.branch_with_commits("only-on-a", 1, true);
+
+    let b = FixtureRepo::new("origin");
+    b.branch_with_commits("feat", 1, true);
+    // Repoint B's remote HEAD at trunk, fetched and recorded locally so the
+    // evidence is non-conflicting.
+    b.git(&b.remote, &["branch", "trunk", "main"]);
+    b.git(&b.remote, &["symbolic-ref", "HEAD", "refs/heads/trunk"]);
+    b.git(b.main.as_path(), &["fetch", "origin"]);
+    b.git(b.main.as_path(), &["remote", "set-head", "origin", "-a"]);
+    // A branch tracking a ref only A's remote advertises: RemoteGone on B,
+    // Tracked only if B were handed A's ref listing.
+    b.git(b.main.as_path(), &["branch", "bfeat"]);
+    b.git(b.main.as_path(), &["config", "branch.bfeat.remote", "origin"]);
+    b.git(
+        b.main.as_path(),
+        &["config", "branch.bfeat.merge", "refs/heads/only-on-a"],
+    );
+
+    let mut cache = vector::RemoteCache::default();
+    let repo_a = git::Repo::discover(a.main.as_path()).unwrap().unwrap();
+    let anchor = vector::anchors(&repo_a)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.branch() == Some("feat"))
+        .unwrap();
+    let state = vector::collect_cached(&repo_a, &mut cache, &anchor, quiet());
+    assert_eq!(
+        state.base.known().map(|b| b.label()).as_deref(),
+        Some("origin/main")
+    );
+
+    let repo_b = git::Repo::discover(b.main.as_path()).unwrap().unwrap();
+    let anchors = vector::anchors(&repo_b).unwrap();
+    let feat = anchors.iter().find(|a| a.branch() == Some("feat")).unwrap();
+    let state = vector::collect_cached(&repo_b, &mut cache, feat, quiet());
+    assert_eq!(
+        state.base.known().map(|b| b.label()).as_deref(),
+        Some("origin/trunk"),
+        "{:?}",
+        state.base
+    );
+    let bfeat = anchors.iter().find(|a| a.branch() == Some("bfeat")).unwrap();
+    let state = vector::collect_cached(&repo_b, &mut cache, bfeat, quiet());
+    assert!(
+        matches!(
+            state.vector.upstream_state,
+            UpstreamState::RemoteGone { .. }
+        ),
+        "{:?}",
+        state.vector.upstream_state
+    );
+}
+
+#[test]
 fn a_self_referential_remote_resolves_against_the_repo_not_the_cwd() {
     // `branch.<name>.remote = .` means "this repository": the merge ref is a
     // local branch, and `ls-remote .` only answers when it runs from inside
