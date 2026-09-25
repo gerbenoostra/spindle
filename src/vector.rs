@@ -257,9 +257,15 @@ pub fn collect_cached(
     };
 
     let (dirty, last_git_activity) = match anchor {
-        Anchor::Worktree { path, admin_id, .. } => (
+        Anchor::Worktree {
+            path,
+            admin_id,
+            main,
+            ..
+        } => (
             repo.dirty(path),
-            repo.reflog_activity(&worktree_head_log(admin_id.as_deref())),
+            worktree_head_log(*main, admin_id.as_deref())
+                .and_then(|log| repo.reflog_activity(&log)),
         ),
         Anchor::Branch { name } => (
             Evidence::Known(false),
@@ -291,13 +297,16 @@ pub fn collect_cached(
     }
 }
 
-/// `$GIT_COMMON_DIR/worktrees/<id>/logs/HEAD` for a linked worktree,
-/// `$GIT_COMMON_DIR/logs/HEAD` for the main one: the reflog is per worktree.
-fn worktree_head_log(admin_id: Option<&str>) -> PathBuf {
-    match admin_id {
-        Some(id) => PathBuf::from(format!("worktrees/{id}/logs/HEAD")),
-        None => PathBuf::from("logs/HEAD"),
+/// `$GIT_COMMON_DIR/logs/HEAD` for the main worktree,
+/// `$GIT_COMMON_DIR/worktrees/<id>/logs/HEAD` for a linked one: the reflog
+/// is per worktree. A linked worktree whose admin id cannot be resolved
+/// gets `None` - its log is somewhere unknowable, and reading the main
+/// worktree's reflog instead would misattribute activity.
+fn worktree_head_log(main: bool, admin_id: Option<&str>) -> Option<PathBuf> {
+    if main {
+        return Some(PathBuf::from("logs/HEAD"));
     }
+    admin_id.map(|id| PathBuf::from(format!("worktrees/{id}/logs/HEAD")))
 }
 
 /// A read-only `ls-remote` decides whether the remote still advertises the
@@ -523,6 +532,19 @@ mod tests {
         assert!(!state.vector.landed.is_known());
         assert!(!state.vector.unpushed_commits.is_known());
         assert!(anchors(&repo).is_err());
+    }
+
+    #[test]
+    fn an_unresolvable_admin_id_reads_no_reflog() {
+        assert_eq!(
+            worktree_head_log(true, None),
+            Some(PathBuf::from("logs/HEAD"))
+        );
+        assert_eq!(
+            worktree_head_log(false, Some("wt1")),
+            Some(PathBuf::from("worktrees/wt1/logs/HEAD"))
+        );
+        assert_eq!(worktree_head_log(false, None), None);
     }
 
     #[test]
