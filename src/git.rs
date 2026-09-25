@@ -800,6 +800,7 @@ mod tests {
         assert!(!repo.remote_refs("origin").is_known());
         assert!(!repo.has_ref("refs/heads/main"));
         assert!(repo.rev_list_count("a", "b").is_err());
+        assert!(repo.unreachable_commits("a").is_err());
         assert!(!repo.is_ancestor("a", "b").is_known());
         assert!(repo.merge_base("a", "b").is_err());
         assert!(repo.changed_paths("a", "b").is_err());

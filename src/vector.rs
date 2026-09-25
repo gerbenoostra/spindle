@@ -539,6 +539,43 @@ mod tests {
     }
 
     #[test]
+    fn a_detached_anchor_on_a_broken_repo_collects_unknowns() {
+        // The unreachable-commit count needs no upstream and no base, but
+        // it still needs git to answer - on a broken repo it is Unknown,
+        // and the verdict's detached arm blocks on that unknown.
+        let repo = broken_repo();
+        let state = collect(
+            &repo,
+            &Anchor::Worktree {
+                path: PathBuf::from("/nonexistent"),
+                admin_id: Some("x".to_owned()),
+                head: Head::Detached("deadbeef".to_owned()),
+                locked: false,
+                main: false,
+            },
+            RuntimeFacts::default(),
+        );
+        assert!(!state.vector.unpushed_commits.is_known());
+        let forge = crate::forge::ForgeStatus {
+            item: crate::forge::WorkItem::Unknown,
+            pipeline: crate::forge::Pipeline::Unknown,
+            label: None,
+            url: None,
+            reason: None,
+        };
+        let (removal, _) = crate::verdict::cleanup(&state, &forge);
+        assert!(matches!(removal.verdict, crate::verdict::Verdict::Blocked)); // coverage: off - miss edge is the assert failing
+        assert!(
+            removal
+                .reasons
+                .iter()
+                .any(|r| r.contains("cannot prove commits are reachable from a ref")),
+            "{:?}",
+            removal.reasons
+        );
+    }
+
+    #[test]
     fn an_unresolvable_admin_id_reads_no_reflog() {
         assert_eq!(
             worktree_head_log(true, None),
