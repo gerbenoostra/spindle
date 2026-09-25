@@ -2,9 +2,10 @@
 //! and the low-level facts the state vector is built from.
 //!
 //! Every subprocess goes through [`git`], which pins `GIT_OPTIONAL_LOCKS=0`
-//! so a background read can never contend for `.git/index.lock`, and refuses
-//! argv outside a read-only allowlist. This module observes repositories; it
-//! never mutates them - no fetch, no prune, no config write.
+//! so a background read can never contend for `.git/index.lock`, refuses
+//! argv outside a read-only allowlist, and is isolated from the ambient git
+//! environment and locale (see [`git_command`]). This module observes
+//! repositories; it never mutates them - no fetch, no prune, no config write.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -58,7 +59,9 @@ impl std::error::Error for Error {}
 /// wrong repository. `LC_ALL=C` keeps diagnostics in one language because
 /// `Repo::discover` recognizes "not a git repository" by message.
 /// `GIT_TERMINAL_PROMPT=0` turns a remote that wants credentials into an
-/// error instead of a collector that hangs on a prompt nobody answers.
+/// error instead of a collector that hangs on a prompt nobody answers; the
+/// ssh transport gets the same treatment through `SSH_ASKPASS_REQUIRE` and
+/// a default `ssh -oBatchMode=yes`.
 fn git_command(global: &[OsString], args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.args(global).args(args);
@@ -81,6 +84,15 @@ fn git_command(global: &[OsString], args: &[&str]) -> Command {
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
     cmd.env("LC_ALL", "C");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // GIT_TERMINAL_PROMPT covers git's own credential prompt; ssh has its
+    // own - a passphrase or host-key question on an ls-remote would stall a
+    // whole collection behind a prompt nobody answers. BatchMode fails
+    // instead; key and agent auth still work. A caller's own
+    // GIT_SSH_COMMAND (custom ports, proxies, keys) is respected.
+    cmd.env("SSH_ASKPASS_REQUIRE", "never");
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    }
     cmd
 }
 
@@ -709,11 +721,19 @@ mod tests {
             ("GIT_OPTIONAL_LOCKS", "0"),
             ("LC_ALL", "C"),
             ("GIT_TERMINAL_PROMPT", "0"),
+            ("SSH_ASKPASS_REQUIRE", "never"),
         ] {
             assert_eq!(
                 envs.get(std::ffi::OsStr::new(var)),
                 Some(&Some(std::ffi::OsStr::new(value))),
                 "{var}"
+            );
+        }
+        // BatchMode is the default only; a caller-set GIT_SSH_COMMAND wins.
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new("GIT_SSH_COMMAND")),
+                Some(&Some(std::ffi::OsStr::new("ssh -oBatchMode=yes")))
             );
         }
     }
