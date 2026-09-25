@@ -145,7 +145,9 @@ fn check_argv(args: &[&str]) -> Result<(), Error> {
         "rev-parse" | "status" | "rev-list" | "merge-base" | "diff" | "ls-remote"
         | "for-each-ref" | "log" | "show" | "show-ref" | "cat-file" | "ls-tree" | "ls-files"
         | "name-rev" | "describe" => true,
-        "worktree" => rest == ["list"] || rest == ["list", "--porcelain"],
+        "worktree" => {
+            rest == ["list"] || rest == ["list", "--porcelain"] || rest == ["list", "--porcelain", "-z"]
+        }
         "remote" => matches!(rest, [] | ["-v"] | ["--verbose"] | ["get-url", _]),
         "config" => is_read_only_config(rest),
         "symbolic-ref" => is_read_only_symbolic_ref(rest),
@@ -328,12 +330,16 @@ impl Repo {
     }
 
     /// Every worktree of the repository, main first, as reported by
-    /// `git worktree list --porcelain`. Paths are canonicalized.
+    /// `git worktree list --porcelain -z`. Paths are canonicalized. `-z`
+    /// NUL-terminates every field: without it the path is emitted raw, so a
+    /// newline in a worktree directory name would split the `worktree`
+    /// record across two lines and silently truncate the path - possibly
+    /// onto a sibling that exists and reads as a different worktree.
     pub fn worktrees(&self) -> Result<Vec<Worktree>, Error> {
-        let text = in_repo(self, &["worktree", "list", "--porcelain"])?;
+        let text = in_repo(self, &["worktree", "list", "--porcelain", "-z"])?;
         let mut found = Vec::new();
         let mut current: Option<Worktree> = None;
-        for line in text.lines() {
+        for line in text.split('\0') {
             if let Some(path) = line.strip_prefix("worktree ") {
                 if let Some(wt) = current.take() {
                     found.push(wt);
@@ -761,6 +767,7 @@ mod tests {
             vec!["show-ref", "--verify", "refs/heads/main"],
             vec!["worktree", "list"],
             vec!["worktree", "list", "--porcelain"],
+            vec!["worktree", "list", "--porcelain", "-z"],
             vec!["remote"],
             vec!["remote", "-v"],
             vec!["remote", "--verbose"],

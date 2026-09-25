@@ -1039,6 +1039,30 @@ fn a_self_referential_remote_resolves_against_the_repo_not_the_cwd() {
 }
 
 #[test]
+fn a_worktree_path_with_a_newline_resolves_in_full() {
+    // `worktree list --porcelain` emits paths raw: a newline in the
+    // directory name splits the record's `worktree` line in two, which is
+    // why the listing is read with -z. Asserted through the anchor itself:
+    // a truncated path would either not match here or, worse, point at a
+    // sibling directory and attribute its state.
+    let f = FixtureRepo::new("origin");
+    let weird = f.dir.join("wt-with\nnewline");
+    f.git(
+        f.main.as_path(),
+        &["worktree", "add", weird.to_str().unwrap(), "--detach"],
+    );
+    let repo = git::Repo::discover(f.main.as_path()).unwrap().unwrap();
+    let weird = weird.canonicalize().expect("the worktree exists");
+    let anchor = vector::anchors(&repo)
+        .unwrap()
+        .into_iter()
+        .find(|a| matches!(a, Anchor::Worktree { path, .. } if path == &weird))
+        .expect("the newline worktree resolves by its full path");
+    let state = vector::collect(&repo, &anchor, quiet());
+    assert_eq!(state.vector.dirty, Evidence::Known(false));
+}
+
+#[test]
 fn a_url_valued_remote_still_feeds_forge_routing() {
     // `branch.<name>.remote` may be the URL itself rather than a named
     // remote: there is no `remote.<name>.url` to look up, but the URL is
