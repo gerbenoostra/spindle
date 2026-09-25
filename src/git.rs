@@ -52,6 +52,38 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Environment that must never leak into a Git read. `GIT_DIR` and friends
+/// override directory discovery (`-C` loses to `GIT_DIR`), so a caller
+/// running inside a hook or an exported-GIT_DIR shell would silently read the
+/// wrong repository. `LC_ALL=C` keeps diagnostics in one language because
+/// `Repo::discover` recognizes "not a git repository" by message.
+/// `GIT_TERMINAL_PROMPT=0` turns a remote that wants credentials into an
+/// error instead of a collector that hangs on a prompt nobody answers.
+fn git_command(global: &[OsString], args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(global).args(args);
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_QUARANTINE_PATH",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    cmd.env("LC_ALL", "C");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
 /// Reject argv that would mutate a repository, run the read, return stdout.
 ///
 /// `GIT_OPTIONAL_LOCKS=0` keeps reads from creating or waiting on lock files:
@@ -64,10 +96,7 @@ fn git(global: &[OsString], args: &[&str]) -> Result<String, Error> {
         .chain(args.iter().map(|s| s.to_string()))
         .collect::<Vec<_>>()
         .join(" ");
-    let out = Command::new("git")
-        .args(global)
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
+    let out = git_command(global, args)
         .output()
         .map_err(|e| Error::spawn(&argv, e))?; // coverage: off - needs a PATH without git
     if out.status.success() {
@@ -610,6 +639,45 @@ mod tests {
         let file = temp.0.join("not-a-repo");
         fs::write(&file, "x").unwrap();
         Repo { common_dir: file }
+    }
+
+    #[test]
+    fn the_runner_strips_ambient_git_environment() {
+        let cmd = git_command(
+            &[OsString::from("-C"), OsString::from("/tmp")],
+            &["status"],
+        );
+        let envs: std::collections::HashMap<&std::ffi::OsStr, Option<&std::ffi::OsStr>> =
+            cmd.get_envs().collect();
+        // An ambient GIT_DIR would override -C discovery and attribute every
+        // path to the wrong repository; these must be explicit removals.
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_NAMESPACE",
+            "GIT_QUARANTINE_PATH",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        ] {
+            assert_eq!(envs.get(std::ffi::OsStr::new(var)), Some(&None), "{var}");
+        }
+        for (var, value) in [
+            ("GIT_OPTIONAL_LOCKS", "0"),
+            ("LC_ALL", "C"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+        ] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(var)),
+                Some(&Some(std::ffi::OsStr::new(value))),
+                "{var}"
+            );
+        }
     }
 
     #[test]
