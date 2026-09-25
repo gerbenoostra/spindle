@@ -84,6 +84,10 @@ fn git_command(global: &[OsString], args: &[&str]) -> Command {
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
     cmd.env("LC_ALL", "C");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Filenames this tool feeds back as pathspecs are data, not patterns:
+    // `:(glob)`-style magic can match nothing and fake an identical diff,
+    // and glob characters widen it. Every caller passes literal paths only.
+    cmd.env("GIT_LITERAL_PATHSPECS", "1");
     // GIT_TERMINAL_PROMPT covers git's own credential prompt; ssh has its
     // own - a passphrase or host-key question on an ls-remote would stall a
     // whole collection behind a prompt nobody answers. BatchMode fails
@@ -722,6 +726,7 @@ mod tests {
             ("LC_ALL", "C"),
             ("GIT_TERMINAL_PROMPT", "0"),
             ("SSH_ASKPASS_REQUIRE", "never"),
+            ("GIT_LITERAL_PATHSPECS", "1"),
         ] {
             assert_eq!(
                 envs.get(std::ffi::OsStr::new(var)),

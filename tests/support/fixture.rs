@@ -187,6 +187,9 @@ fn run(dir: Option<&Path>, args: &[&str]) -> String {
     }
     let out = cmd
         .args(args)
+        // Fixture paths are literal filenames: `x[0].txt` and `:(exclude)x`
+        // are data the tests create on purpose, not pathspec patterns.
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .env("GIT_AUTHOR_NAME", "fixture")
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "fixture")

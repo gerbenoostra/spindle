@@ -171,6 +171,12 @@ fn standard() -> FixtureRepo {
     );
     f.add_worktree("reverted", Some("reverted"));
 
+    // A pathspec-magic filename: `:(glob)zzz-no-match` is glob magic
+    // matching nothing, so a naive diff sees no delta where the file
+    // differs - an empty match would fake "content merged".
+    f.branch_with_files("magicpath", &[(":(glob)zzz-no-match", Some("m"))], true);
+    f.add_worktree("magicpath", Some("magicpath"));
+
     // Branch-only rows: pushed and unmerged, and landed.
     f.branch_with_commits("shelved", 1, true);
     f.branch_with_commits("shipped", 1, true);
@@ -595,6 +601,31 @@ fn the_fixture_table() {
                 &format!(
                     "checked out in {}; deleted after the worktree is removed",
                     f.dir.join("wt-unrelated").display()
+                ),
+            ],
+        ),
+    );
+
+    // A pathspec-magic-named file that differs: not landed, not "content
+    // match" - the filename must reach diff as data, not as a pattern.
+    expect(
+        &states,
+        "wt:magicpath@wt-magicpath",
+        (
+            Verdict::Review,
+            &[
+                "1 commit ahead of origin/main and not landed",
+                "removal keeps branch magicpath and its commits",
+            ],
+        ),
+        (
+            Verdict::Review,
+            &[
+                "requires `git branch -D`",
+                "not landed on origin/main",
+                &format!(
+                    "checked out in {}; deleted after the worktree is removed",
+                    f.dir.join("wt-magicpath").display()
                 ),
             ],
         ),
