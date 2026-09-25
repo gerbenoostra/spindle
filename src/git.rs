@@ -53,10 +53,29 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Environment that must never leak into a Git read. `GIT_DIR` and friends
-/// override directory discovery (`-C` loses to `GIT_DIR`), so a caller
-/// running inside a hook or an exported-GIT_DIR shell would silently read the
-/// wrong repository. `LC_ALL=C` keeps diagnostics in one language because
+/// Environment that must never leak into a Git invocation. `GIT_DIR` and
+/// friends override directory discovery (`-C` loses to `GIT_DIR`), so a
+/// caller running inside a hook or an exported-GIT_DIR shell would silently
+/// read - or a test fixture would silently *write* - the wrong repository.
+/// `#[doc(hidden)]` because the integration-test fixtures strip this same
+/// list from their own spawns; one list, not a copy kept in sync by comment.
+#[doc(hidden)]
+pub const AMBIENT_ENV_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_QUARANTINE_PATH",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
+
+/// `LC_ALL=C` keeps diagnostics in one language because
 /// `Repo::discover` recognizes "not a git repository" by message.
 /// `GIT_TERMINAL_PROMPT=0` turns a remote that wants credentials into an
 /// error instead of a collector that hangs on a prompt nobody answers; the
@@ -69,20 +88,7 @@ impl std::error::Error for Error {}
 pub(crate) fn git_command(global: &[OsString], args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.args(global).args(args);
-    for var in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_COMMON_DIR",
-        "GIT_NAMESPACE",
-        "GIT_QUARANTINE_PATH",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-    ] {
+    for &var in AMBIENT_ENV_VARS {
         cmd.env_remove(var);
     }
     cmd.env("GIT_OPTIONAL_LOCKS", "0");

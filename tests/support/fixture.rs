@@ -184,27 +184,14 @@ pub enum Landing {
 /// (an exported `GIT_DIR` or `GIT_WORK_TREE` defeats `-C` discovery, so the
 /// fixture's mutations would land in the live repository they name), and a
 /// hermetic identity and config pinned so nothing touches the developer's
-/// real Git setup. Mirrors the isolation `src/git.rs` applies to its own
-/// subprocesses; keep the variable lists in sync.
+/// real Git setup. The variable list is shared with `src/git.rs`'s
+/// production runner, not a copy that could drift.
 pub fn command(dir: Option<&Path>, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     if let Some(dir) = dir {
         cmd.arg("-C").arg(dir);
     }
-    for var in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_COMMON_DIR",
-        "GIT_NAMESPACE",
-        "GIT_QUARANTINE_PATH",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-    ] {
+    for &var in agent_sessions::git::AMBIENT_ENV_VARS {
         cmd.env_remove(var);
     }
     cmd.args(args)
