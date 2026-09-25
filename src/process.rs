@@ -221,7 +221,7 @@ impl ProcessTable {
             return Liveness::Dead(format!("pid {} is a zombie", claim.pid));
         }
         if let (Some(expected), Some(observed)) = (expected_exe, row.exe.as_deref())
-            && expected != observed
+            && exe_mismatch(expected, observed)
         {
             return Liveness::Dead(format!(
                 "pid {} runs `{observed}`, not `{expected}`",
@@ -242,6 +242,16 @@ impl ProcessTable {
             )),
         }
     }
+}
+
+/// Whether the observed basename proves the process is not the claimed
+/// executable. `comm` can be a truncation - Linux caps it at 15 bytes and
+/// macOS can emit a 16-byte argv0 prefix - so a mismatch where the
+/// observed name is a cap-length prefix of the expected one may be the
+/// same executable cut short, and proves nothing. A shorter `observed`
+/// cannot be a truncation, so the mismatch stands.
+fn exe_mismatch(expected: &str, observed: &str) -> bool {
+    expected != observed && !(observed.len() >= 15 && expected.starts_with(observed))
 }
 
 /// One `ps` output row: `pid ppid etime stat tty comm...`. `comm` is the
@@ -599,6 +609,31 @@ mod tests {
             pid_start: ProcessStart::At(1_700_000_000),
         };
         assert_eq!(table.is_live(&unseen, Some("other")), Liveness::Instance);
+        // A basename that is only a platform-truncated prefix of the
+        // expected name proves nothing: the check falls through to the
+        // start time rather than reaping the live instance.
+        let truncated = ProcessTable::from_rows(vec![ProcessRow {
+            pid: 13,
+            ppid: 1,
+            start: ProcessStart::At(1_700_000_000),
+            exe: Some("provider-with-l".to_owned()),
+            tty: None,
+            state: 'S',
+        }]);
+        let claim = ProcessInstance {
+            pid: 13,
+            pid_start: ProcessStart::At(1_700_000_000),
+        };
+        assert_eq!(
+            truncated.is_live(&claim, Some("provider-with-long-name")),
+            Liveness::Instance
+        );
+        // A same-cap basename that is not a prefix is still a proven
+        // mismatch.
+        assert!(matches!(
+            truncated.is_live(&claim, Some("provider-with-x")),
+            Liveness::Dead(_)
+        )); // coverage: off - miss edge is the assert failing
         // A dead pid is dead.
         let gone = ProcessInstance {
             pid: 4_000_000,

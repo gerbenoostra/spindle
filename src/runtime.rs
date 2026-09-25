@@ -60,8 +60,9 @@ pub struct ProcessClaim {
     /// to pid-only evidence.
     pub pid_start: ProcessStart,
     /// The basename the claimed process should run, when the provider's
-    /// identity implies one. A live process with another basename is not
-    /// this instance.
+    /// identity implies one. A live process with a provably different
+    /// basename is not this instance; a name the platform truncated is
+    /// unproven rather than wrong.
     pub expected_exe: Option<String>,
     /// The provider-published pane handle (`session:@window.%pane` or a
     /// suffix of it), when the provider publishes one.
