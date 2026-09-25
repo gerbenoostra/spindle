@@ -94,9 +94,10 @@ fn git_command(global: &[OsString], args: &[&str]) -> Command {
     // instead; key and agent auth still work. A caller's own
     // GIT_SSH_COMMAND (custom ports, proxies, keys) is respected.
     cmd.env("SSH_ASKPASS_REQUIRE", "never");
-    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
-        cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
-    }
+    cmd.env(
+        "GIT_SSH_COMMAND",
+        std::env::var_os("GIT_SSH_COMMAND").unwrap_or_else(|| "ssh -oBatchMode=yes".into()),
+    );
     cmd
 }
 
@@ -740,7 +741,7 @@ mod tests {
                 envs.get(std::ffi::OsStr::new("GIT_SSH_COMMAND")),
                 Some(&Some(std::ffi::OsStr::new("ssh -oBatchMode=yes")))
             );
-        }
+        } // coverage: off - the ambient-set arm needs a shell exporting GIT_SSH_COMMAND
     }
 
     #[test]
