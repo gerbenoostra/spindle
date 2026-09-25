@@ -106,10 +106,11 @@ pub struct Pane {
 impl Pane {
     /// Whether this pane's evidence binds it to `worktree`: the stored
     /// admin-id edge when the window publishes one, else the derived edge -
-    /// a pane cwd at or below the worktree root. The stored edge decides
-    /// outright when present: a window whose stored id names another
-    /// worktree belongs to that worktree even if a pane has since `cd`-ed
-    /// into this one.
+    /// a pane cwd at or below the worktree root. Both sides are
+    /// canonicalized first, so a symlinked spelling of the worktree binds
+    /// the same. The stored edge decides outright when present: a window
+    /// whose stored id names another worktree belongs to that worktree
+    /// even if a pane has since `cd`-ed into this one.
     pub fn binds_worktree(&self, admin_id: Option<&str>, worktree: &Path) -> bool {
         match (&self.wt_adminid, admin_id) {
             (Some(stored), Some(id)) => return stored == id,
@@ -118,7 +119,10 @@ impl Pane {
         }
         self.cwd.as_deref().is_some_and(|cwd| {
             let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
-            cwd.starts_with(worktree)
+            let root = worktree
+                .canonicalize()
+                .unwrap_or_else(|_| worktree.to_owned());
+            cwd.starts_with(root)
         })
     }
 }
@@ -544,6 +548,17 @@ mod tests {
         assert!(p.binds_worktree(None, &worktree));
         p.cwd = Some(PathBuf::from("/no/such/dir/here"));
         assert!(!p.binds_worktree(None, &worktree));
+        // The same for a worktree that does not exist, and for a
+        // worktree passed under a symlinked spelling of its real path.
+        p.cwd = Some(worktree.join("inside"));
+        assert!(!p.binds_worktree(None, Path::new("/no/such/worktree/here")));
+        let raw = std::env::temp_dir();
+        if let Ok(canon) = raw.canonicalize()
+            && canon != raw
+        {
+            p.cwd = Some(canon.join("inside"));
+            assert!(p.binds_worktree(None, &raw));
+        }
     }
 
     #[test]
