@@ -700,6 +700,27 @@ fn no_server_is_an_empty_inventory_and_unknown_panes() {
     server.new_session("t", "sleep 300");
     let inventory = PaneInventory::collect(&[server.socket.clone(), server.socket.clone()]);
     assert_eq!(inventory.servers.len(), 1);
+
+    // A second path to the same socket - a symlink here - is also one
+    // server: its panes must not arrive twice.
+    let linkdir = TempDir::new("sock-alias");
+    let link = linkdir.join("alias");
+    std::os::unix::fs::symlink(&server.socket, &link).unwrap();
+    let inventory = PaneInventory::collect(&[server.socket.clone(), link]);
+    assert_eq!(
+        inventory.servers.len(),
+        1,
+        "an aliased socket is one server"
+    );
+    assert_eq!(
+        inventory
+            .panes
+            .iter()
+            .filter(|p| p.session_name == "t")
+            .count(),
+        1,
+        "an aliased socket must not duplicate panes"
+    );
 }
 
 #[test]

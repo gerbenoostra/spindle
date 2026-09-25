@@ -187,7 +187,12 @@ impl PaneInventory {
         let mut inventory = PaneInventory::default();
         let mut seen = HashSet::new();
         for socket in sockets {
-            if !seen.insert(socket.clone()) {
+            // Two spellings can name one server - a symlink in the socket
+            // dir, or a `$TMUX` path that resolves differently - and
+            // querying both would return every pane twice. Dedup on the
+            // canonical path while keeping the spelling that was given.
+            let identity = socket.canonicalize().unwrap_or_else(|_| socket.clone());
+            if !seen.insert(identity) {
                 continue;
             }
             match list_panes(socket) {
