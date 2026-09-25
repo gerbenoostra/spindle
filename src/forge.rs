@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -130,11 +131,24 @@ impl Forge {
     }
 
     fn run(&self, exe: &PathBuf, args: &[String]) -> Result<String, String> {
-        let out = Command::new(exe)
-            .args(args)
-            .env("PATH", &self.path)
-            .output()
-            .map_err(|e| format!("{}: {e}", exe.display()))?;
+        // execve refuses a file still open for writing with ETXTBSY; the
+        // hold lasts microseconds. Tests script a CLI and run it from
+        // sibling threads, and a real `gh` could be mid-upgrade, so a
+        // bounded retry beats reporting a transient Unknown.
+        let mut retries = 5;
+        let out = loop {
+            let result = Command::new(exe)
+                .args(args)
+                .env("PATH", &self.path)
+                .output();
+            let busy = matches!(&result, Err(e) if e.kind() == ErrorKind::ExecutableFileBusy); // coverage: off - the true arm needs ETXTBSY
+            if retries == 0 || !busy {
+                break result;
+            } // coverage: off - the fallthrough is the unreachable ETXTBSY retry
+            retries -= 1; // coverage: off - ETXTBSY needs a writer racing the exec
+            std::thread::sleep(Duration::from_millis(2)); // coverage: off - same retry arm
+        }
+        .map_err(|e| format!("{}: {e}", exe.display()))?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
