@@ -120,9 +120,9 @@ is read from Git with `GIT_OPTIONAL_LOCKS=0`. Facts that cannot be proven are
 | `dirty` | `git status --porcelain --untracked-files=all` | the primary removal blocker |
 | `commits_ahead_of_base` | `git rev-list --count <base>..HEAD` | zero plus no sessions means the worktree was never used |
 | `upstream_state` | `never_pushed` / `tracked` / `remote_gone` | proven by `ls-remote`; no fetch, no local mutation |
-| `unpushed_commits` | `git rev-list --count @{u}..HEAD` | the real data-loss risk on removal |
+| `unpushed_commits` | `git rev-list --count @{u}..HEAD`; vs the proven base when never pushed; commits no `refs/*` reaches when detached | the real data-loss risk on removal |
 | `landed` | `no` / `ancestor-merged` / `content-merged` | ancestry first, then path-scoped tree comparison |
-| `last_git_activity` | worktree HEAD reflog | the reflog is per worktree, a real recency signal |
+| `last_git_activity` | worktree HEAD reflog; branch reflog when there is no worktree | the reflog is per worktree, a real recency signal |
 
 ## Development
 
