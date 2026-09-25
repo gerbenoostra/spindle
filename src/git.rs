@@ -173,12 +173,16 @@ fn in_dir(dir: &Path, args: &[&str]) -> Result<String, Error> {
     git(&[OsString::from("-C"), dir.as_os_str().to_owned()], args)
 }
 
+/// `-C <repo_dir>` makes repo reads behave as if launched inside the
+/// repository: remote names, `.` remotes and relative-path remote URLs
+/// resolve against it, not against whatever directory launched the tool.
 fn in_repo(repo: &Repo, args: &[&str]) -> Result<String, Error> {
     git(
-        &[OsString::from(format!(
-            "--git-dir={}",
-            repo.common_dir.display()
-        ))],
+        &[
+            OsString::from("-C"),
+            repo.repo_dir().as_os_str().to_owned(),
+            OsString::from(format!("--git-dir={}", repo.common_dir.display())),
+        ],
         args,
     )
 }
@@ -285,6 +289,18 @@ impl Repo {
     /// The canonical `$GIT_COMMON_DIR`; the repository's identity.
     pub fn common_dir(&self) -> &Path {
         &self.common_dir
+    }
+
+    /// The directory repo-scoped reads run from: the worktree root for a
+    /// non-bare repo (the parent of its `.git` dir), the repository dir
+    /// itself for a bare one. Remote URLs spelled `.` or relative to the
+    /// repository resolve against this directory, not the caller's cwd.
+    fn repo_dir(&self) -> &Path {
+        if self.common_dir.file_name() == Some(std::ffi::OsStr::new(".git")) {
+            self.common_dir.parent().unwrap_or(&self.common_dir)
+        } else {
+            &self.common_dir
+        }
     }
 
     /// Every worktree of the repository, main first, as reported by

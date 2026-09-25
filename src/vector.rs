@@ -304,9 +304,15 @@ fn resolve_base(repo: &Repo, upstream_remote: Option<&str>) -> Evidence<Base> {
         },
     };
 
-    let local = match repo.local_remote_head(&remote) {
-        Ok(local) => local,
-        Err(e) => return Evidence::Unknown(format!("local remote HEAD: {e}")), // coverage: off - `remotes()` already failed on a repo this broken
+    // A `.` remote is the repository itself and has no remote-tracking
+    // symref to consult.
+    let local = if remote == "." {
+        None
+    } else {
+        match repo.local_remote_head(&remote) {
+            Ok(local) => local,
+            Err(e) => return Evidence::Unknown(format!("local remote HEAD: {e}")), // coverage: off - `remotes()` already failed on a repo this broken
+        }
     };
     let branch = match repo.remote_head(&remote) {
         RemoteHead::Advertised(advertised) => match &local {
@@ -333,7 +339,13 @@ fn resolve_base(repo: &Repo, upstream_remote: Option<&str>) -> Evidence<Base> {
         },
     };
 
-    let local_ref = format!("refs/remotes/{remote}/{branch}");
+    // A `.` remote is the repository itself, so its "tracking ref" is the
+    // advertised branch under refs/heads, not a remote-tracking ref.
+    let local_ref = if remote == "." {
+        format!("refs/heads/{branch}")
+    } else {
+        format!("refs/remotes/{remote}/{branch}")
+    };
     if repo.has_ref(&local_ref) {
         Evidence::Known(Base {
             remote,

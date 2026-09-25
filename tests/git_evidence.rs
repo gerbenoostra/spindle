@@ -859,6 +859,35 @@ fn a_remote_named_other_than_origin_resolves() {
 }
 
 #[test]
+fn a_self_referential_remote_resolves_against_the_repo_not_the_cwd() {
+    // `branch.<name>.remote = .` means "this repository": the merge ref is a
+    // local branch, and `ls-remote .` only answers when it runs from inside
+    // the repo - from the caller's cwd it would fail or read another repo.
+    let f = FixtureRepo::new("origin");
+    f.branch_with_commits("stacked", 1, false);
+    f.add_worktree("stacked", Some("stacked"));
+    f.git(&f.main, &["config", "branch.stacked.remote", "."]);
+    f.git(&f.main, &["config", "branch.stacked.merge", "refs/heads/main"]);
+
+    let repo = git::Repo::discover(f.main.as_path()).unwrap().unwrap();
+    let anchor = vector::anchors(&repo)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.branch() == Some("stacked"))
+        .unwrap();
+    let state = vector::collect(&repo, &anchor, quiet());
+    assert!(
+        matches!(
+            state.vector.upstream_state,
+            UpstreamState::Tracked { .. }
+        ),
+        "{:?}",
+        state.vector.upstream_state
+    );
+    assert!(state.base.is_known(), "{:?}", state.base);
+}
+
+#[test]
 fn the_reads_leave_the_repository_untouched() {
     let f = standard();
     let refs_before = f.git(f.main.as_path(), &["for-each-ref"]);
