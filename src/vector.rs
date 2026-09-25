@@ -165,8 +165,9 @@ pub struct StateVector {
     pub commits_ahead_of_base: Evidence<u64>,
     pub upstream_state: UpstreamState,
     /// Commits not reachable from the configured upstream. For a
-    /// never-pushed branch or detached HEAD every commit past the base is
-    /// unpushed by definition.
+    /// never-pushed branch every commit past the base is unpushed by
+    /// definition; for a detached HEAD it is the commits no ref reaches at
+    /// all - the ones removal actually loses.
     pub unpushed_commits: Evidence<u64>,
     pub landed: Evidence<Landed>,
     /// Newest of the worktree HEAD (or branch) reflog's last entry and its
@@ -236,7 +237,18 @@ pub fn collect_cached(
         Some(head) => {
             let commits = commits_ahead(repo, head, &base);
             let landed = landed(repo, head, &base);
-            let unpushed = unpushed_commits(repo, anchor.branch(), &upstream, &commits);
+            let unpushed = match anchor {
+                // A detached HEAD has no upstream; what removal loses is
+                // what no ref reaches.
+                Anchor::Worktree {
+                    head: Head::Detached(_),
+                    ..
+                } => match repo.unreachable_commits(head) {
+                    Ok(count) => Evidence::Known(count),
+                    Err(e) => Evidence::Unknown(format!("unreachable count: {e}")),
+                },
+                _ => unpushed_commits(repo, anchor.branch(), &upstream, &commits),
+            };
             (landed, commits, unpushed)
         }
     };

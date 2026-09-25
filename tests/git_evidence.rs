@@ -117,6 +117,15 @@ fn standard() -> FixtureRepo {
     // Detached HEAD at the base tip: nothing unique, nothing lost.
     f.add_worktree("detached-clean", None);
 
+    // Detached HEAD at another branch's tip: the commits are kept by that
+    // branch, so nothing is unreachable even though they are ahead of base.
+    f.branch_with_commits("kept", 1, true);
+    let shared = f.dir.join("wt-detached-shared");
+    f.git(
+        f.main.as_path(),
+        &["worktree", "add", "--detach", shared.to_str().unwrap(), "kept"],
+    );
+
     // Landed but the worktree is locked: the user marked it hands-off.
     f.branch_with_commits("locked", 1, true);
     f.land("locked", Landing::Merge);
@@ -472,6 +481,18 @@ fn the_fixture_table() {
         (Verdict::NotApplicable, &["no branch"]),
     );
 
+    // Detached at a branch tip: `kept` reaches the commits, so removal
+    // reviews the not-landed facts rather than blocking on phantom loss.
+    expect(
+        &states,
+        "wt:detached@wt-detached-shared",
+        (
+            Verdict::Review,
+            &["1 commit ahead of origin/main and not landed"],
+        ),
+        (Verdict::NotApplicable, &["no branch"]),
+    );
+
     expect(
         &states,
         "wt:locked@wt-locked",
@@ -764,7 +785,9 @@ fn missing_and_conflicting_remote_head_leave_the_base_unproven() {
             .any(|r| r.contains("cannot prove commits relative to base"))
     );
 
-    // The detached worktree: unique commits against an unproven base.
+    // The detached worktree: unique commits need no base to be counted -
+    // the unreachable check is ref-local, so the verdict still blocks but
+    // now names the true count.
     let anchor = vector::anchors(&repo)
         .unwrap()
         .into_iter()
@@ -785,7 +808,7 @@ fn missing_and_conflicting_remote_head_leave_the_base_unproven() {
         removal
             .reasons
             .iter()
-            .any(|r| r.contains("cannot prove commits are reachable from a ref")),
+            .any(|r| r.contains("unique commit reachable from no ref")),
         "{:?}",
         removal.reasons
     );

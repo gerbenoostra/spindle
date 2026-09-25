@@ -473,6 +473,23 @@ impl Repo {
             .map_err(|e| Error::parse(&range, e)) // coverage: off - rev-list prints a number
     }
 
+    /// `rev-list --count <head> --not --glob=refs/*`: commits reachable
+    /// from `head` that no ref reaches - branch, tag, remote-tracking,
+    /// stash, anything under `refs/`. `--not --all` does not work here:
+    /// `--all` includes every worktree's per-worktree HEAD, so a detached
+    /// worktree's own commits would always read as reachable. Commits a
+    /// *different* worktree's HEAD alone keeps pinned therefore count as
+    /// unique - literally reachable from no ref - and fail closed.
+    pub fn unreachable_commits(&self, head: &str) -> Result<u64, Error> {
+        let text = in_repo(
+            self,
+            &["rev-list", "--count", head, "--not", "--glob=refs/*"],
+        )?;
+        text.trim()
+            .parse::<u64>()
+            .map_err(|e| Error::parse(&format!("{head} --not --glob=refs/*"), e)) // coverage: off - rev-list prints a number
+    }
+
     /// `merge-base --is-ancestor`: three-valued because the comparison itself
     /// can fail, and a failed comparison is not "no".
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Evidence<bool> {

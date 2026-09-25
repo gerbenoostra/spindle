@@ -82,14 +82,15 @@ pub fn worktree_removal(state: &WorkState, forge: &ForgeStatus) -> ActionVerdict
         ));
     }
     match head {
-        Head::Detached(_) => match &v.commits_ahead_of_base {
+        Head::Detached(_) => match &v.unpushed_commits {
             Evidence::Known(0) => {}
             Evidence::Known(n) => blockers.push(format!(
                 "detached HEAD: {} reachable from no ref",
                 plural(*n as usize, "unique commit")
             )),
-            Evidence::Unknown(_) => blockers
-                .push("detached HEAD: cannot prove commits are reachable from a ref".to_owned()),
+            Evidence::Unknown(reason) => blockers.push(format!(
+                "detached HEAD: cannot prove commits are reachable from a ref ({reason})"
+            )),
         },
         _ => {
             match &v.unpushed_commits {
