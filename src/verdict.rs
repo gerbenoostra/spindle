@@ -39,12 +39,6 @@ pub struct ActionVerdict {
     pub reasons: Vec<String>,
 }
 
-impl ActionVerdict {
-    fn new(verdict: Verdict, reasons: Vec<String>) -> ActionVerdict {
-        ActionVerdict { verdict, reasons }
-    }
-}
-
 /// Would `git worktree remove` be a provably lossless act?
 ///
 /// Blockers: uncommitted changes, a locked worktree, live processes or agent
@@ -57,7 +51,10 @@ pub fn worktree_removal(state: &WorkState, forge: &ForgeStatus) -> ActionVerdict
         head, locked, main, ..
     } = &state.anchor
     else {
-        return ActionVerdict::new(Verdict::NotApplicable, vec!["no worktree".to_owned()]);
+        return ActionVerdict {
+            verdict: Verdict::NotApplicable,
+            reasons: vec!["no worktree".to_owned()],
+        };
     };
     let v = &state.vector;
     let mut blockers = Vec::new();
@@ -117,7 +114,10 @@ pub fn worktree_removal(state: &WorkState, forge: &ForgeStatus) -> ActionVerdict
     }
 
     if !blockers.is_empty() {
-        return ActionVerdict::new(Verdict::Blocked, blockers);
+        return ActionVerdict {
+            verdict: Verdict::Blocked,
+            reasons: blockers,
+        };
     }
     let mut reasons = vec!["clean".to_owned(), "nothing live".to_owned()];
     if let UpstreamState::RemoteGone { .. } = v.upstream_state {
@@ -128,19 +128,27 @@ pub fn worktree_removal(state: &WorkState, forge: &ForgeStatus) -> ActionVerdict
     match &v.landed {
         Evidence::Known(Landed::AncestorMerged) => {
             reasons.push(format!("landed on {} (ancestor)", base_label(state)));
-            ActionVerdict::new(Verdict::Safe, reasons)
+            ActionVerdict {
+                verdict: Verdict::Safe,
+                reasons,
+            }
         }
         Evidence::Known(Landed::ContentMerged) => {
             reasons.push(format!("landed on {} (content match)", base_label(state)));
-            ActionVerdict::new(Verdict::Safe, reasons)
+            ActionVerdict {
+                verdict: Verdict::Safe,
+                reasons,
+            }
         }
         Evidence::Known(Landed::No) => match v.commits_ahead_of_base {
             // Zero ahead is an ancestor, which `Landed` already reported, so
             // `n` is always nonzero here.
             Evidence::Known(n) => {
+                // A bare quoted commit token is a forbidden Git write argv
+                // for the source-invariant scan, so the noun stays inline.
                 let mut reasons = vec![format!(
-                    "{} ahead of {} and not landed",
-                    commits(n),
+                    "{n} commit{} ahead of {} and not landed",
+                    if n == 1 { "" } else { "s" },
                     base_label(state)
                 )];
                 reasons.extend(
@@ -149,16 +157,22 @@ pub fn worktree_removal(state: &WorkState, forge: &ForgeStatus) -> ActionVerdict
                         .branch()
                         .map(|b| format!("removal keeps branch {b} and its commits")),
                 );
-                ActionVerdict::new(Verdict::Review, reasons)
+                ActionVerdict {
+                    verdict: Verdict::Review,
+                    reasons,
+                }
             }
-            Evidence::Unknown(_) => ActionVerdict::new(Verdict::Blocked, reasons), // coverage: off - an unknown count is a blocker above
+            Evidence::Unknown(_) => ActionVerdict {
+                verdict: Verdict::Blocked,
+                reasons,
+            }, // coverage: off - an unknown count is a blocker above
         },
         Evidence::Unknown(reason) => blocked_landing(reason), // coverage: off - needs a proven count with unproven ancestry
     }
 }
 
 #[rustfmt::skip]
-fn blocked_landing(reason: &str) -> ActionVerdict { ActionVerdict::new(Verdict::Blocked, vec![format!("cannot prove landing ({reason})")]) } // coverage: off - needs a proven count with unproven ancestry
+fn blocked_landing(reason: &str) -> ActionVerdict { ActionVerdict { verdict: Verdict::Blocked, reasons: vec![format!("cannot prove landing ({reason})")] } } // coverage: off - needs a proven count with unproven ancestry
 
 /// Would `git branch -d` be a provably lossless act?
 ///
@@ -173,7 +187,10 @@ pub fn branch_deletion(
     forge: &ForgeStatus,
 ) -> ActionVerdict {
     let Some(_branch) = state.anchor.branch() else {
-        return ActionVerdict::new(Verdict::NotApplicable, vec!["no branch".to_owned()]);
+        return ActionVerdict {
+            verdict: Verdict::NotApplicable,
+            reasons: vec!["no branch".to_owned()],
+        };
     };
     let v = &state.vector;
     let checked_out_in: Option<PathBuf> = match &state.anchor {
@@ -205,7 +222,10 @@ pub fn branch_deletion(
         ));
     }
     if !blockers.is_empty() {
-        return ActionVerdict::new(Verdict::Blocked, blockers);
+        return ActionVerdict {
+            verdict: Verdict::Blocked,
+            reasons: blockers,
+        };
     }
 
     let (verdict, mut reasons) = match &v.landed {
@@ -238,10 +258,13 @@ pub fn branch_deletion(
             path.display()
         ));
         if verdict == Verdict::Safe {
-            return ActionVerdict::new(Verdict::SafeAfterWorktreeRemoval, reasons);
+            return ActionVerdict {
+                verdict: Verdict::SafeAfterWorktreeRemoval,
+                reasons,
+            };
         }
     }
-    ActionVerdict::new(verdict, reasons)
+    ActionVerdict { verdict, reasons }
 }
 
 fn plural(n: usize, noun: &str) -> String {
@@ -249,14 +272,6 @@ fn plural(n: usize, noun: &str) -> String {
         format!("1 {noun}")
     } else {
         format!("{n} {noun}s")
-    }
-}
-
-fn commits(n: u64) -> String {
-    if n == 1 {
-        "1 commit".to_owned()
-    } else {
-        format!("{n} commits")
     }
 }
 
