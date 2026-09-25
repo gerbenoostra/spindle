@@ -232,5 +232,3 @@ fn run(dir: Option<&Path>, args: &[&str]) -> String {
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
-
-

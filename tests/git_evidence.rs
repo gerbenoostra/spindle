@@ -968,7 +968,10 @@ fn a_shared_remote_cache_scopes_evidence_per_repo() {
     // A branch tracking a ref only A's remote advertises: RemoteGone on B,
     // Tracked only if B were handed A's ref listing.
     b.git(b.main.as_path(), &["branch", "bfeat"]);
-    b.git(b.main.as_path(), &["config", "branch.bfeat.remote", "origin"]);
+    b.git(
+        b.main.as_path(),
+        &["config", "branch.bfeat.remote", "origin"],
+    );
     b.git(
         b.main.as_path(),
         &["config", "branch.bfeat.merge", "refs/heads/only-on-a"],
@@ -997,7 +1000,10 @@ fn a_shared_remote_cache_scopes_evidence_per_repo() {
         "{:?}",
         state.base
     );
-    let bfeat = anchors.iter().find(|a| a.branch() == Some("bfeat")).unwrap();
+    let bfeat = anchors
+        .iter()
+        .find(|a| a.branch() == Some("bfeat"))
+        .unwrap();
     let state = vector::collect_cached(&repo_b, &mut cache, bfeat, quiet());
     assert!(
         matches!(

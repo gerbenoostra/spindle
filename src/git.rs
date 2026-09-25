@@ -146,7 +146,9 @@ fn check_argv(args: &[&str]) -> Result<(), Error> {
         | "for-each-ref" | "log" | "show" | "show-ref" | "cat-file" | "ls-tree" | "ls-files"
         | "name-rev" | "describe" => true,
         "worktree" => {
-            rest == ["list"] || rest == ["list", "--porcelain"] || rest == ["list", "--porcelain", "-z"]
+            rest == ["list"]
+                || rest == ["list", "--porcelain"]
+                || rest == ["list", "--porcelain", "-z"]
         }
         "remote" => matches!(rest, [] | ["-v"] | ["--verbose"] | ["get-url", _]),
         "config" => is_read_only_config(rest),
