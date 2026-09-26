@@ -164,6 +164,18 @@ pub struct ConversationRow {
     pub branch: Option<String>,
 }
 
+impl ConversationRow {
+    /// Whether a live process is bound right now: the claim resolved to an
+    /// attachment whose instance verdict is not `Dead`. Distinct from
+    /// `live`, which only says a live session record exists - a crashed
+    /// agent's stale file is a record, not a process.
+    pub fn running(&self) -> bool {
+        self.attachment
+            .as_ref()
+            .is_some_and(|a| a.liveness != "dead")
+    }
+}
+
 /// The collector: owns the plugins (and so their incremental indexes) and the
 /// caches one pass reuses. A collect is reads only - everything writes-averse
 /// in the boundary stays averse here.
@@ -206,6 +218,16 @@ impl Collector {
         for (slot, conv_index) in claim_of.iter().enumerate() {
             attachment_of.insert(*conv_index, slot);
         }
+        // Which conversations are actually running: a claim was resolved and
+        // the instance verdict is not `Dead`. A live file left behind by a
+        // crashed agent is stale evidence, not a live process.
+        let running: Vec<bool> = (0..inventory.conversations.len())
+            .map(|i| {
+                attachment_of
+                    .get(&i)
+                    .is_some_and(|slot| !matches!(resolved[*slot].liveness, Liveness::Dead(_)))
+            })
+            .collect();
 
         // Work identity per conversation: the cwd resolves to a checkout, a
         // bare repo, a project space, or nothing still on disk.
@@ -249,6 +271,7 @@ impl Collector {
                     runtime_facts(
                         runtime,
                         &inventory.conversations,
+                        &running,
                         &placements,
                         anchor,
                         repo_id,
@@ -333,7 +356,7 @@ impl Collector {
             row.work = work.iter().filter(|w| w.repo == row.id).count();
             row.live = conversations
                 .iter()
-                .filter(|c| c.live && c.repo.as_deref() == Some(row.id.as_str()))
+                .filter(|c| c.running() && c.repo.as_deref() == Some(row.id.as_str()))
                 .count();
             row.last_activity = work
                 .iter()
@@ -447,6 +470,7 @@ fn display_name(path: &Path) -> String {
 fn runtime_facts(
     runtime: &Runtime,
     conversations: &[Conversation],
+    running: &[bool],
     placements: &[Option<CwdPlacement>],
     anchor: &Anchor,
     repo_id: &str,
@@ -472,7 +496,7 @@ fn runtime_facts(
             }
         }
         facts.windows.orphaned = orphaned.len();
-        for (conv, place) in conversations.iter().zip(placements.iter()) {
+        for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() {
             let Some(CwdPlacement::Checkout { root, .. }) = place else {
                 continue;
             };
@@ -481,17 +505,17 @@ fn runtime_facts(
                 continue;
             }
             facts.past_agent_sessions += 1;
-            if conv.live.is_some() {
+            if running[i] {
                 facts.live_agent_sessions += 1;
                 facts.live_pids += 1;
             }
         }
     } else {
         // A branch-only row still counts conversations in its repository.
-        for (conv, place) in conversations.iter().zip(placements.iter()) {
+        for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() {
             if matches!(place, Some(CwdPlacement::Checkout { repo_id: id, .. }) if id == repo_id) {
                 facts.past_agent_sessions += 1;
-                if conv.live.is_some() {
+                if running[i] {
                     facts.live_agent_sessions += 1;
                     facts.live_pids += 1;
                 }

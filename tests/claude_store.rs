@@ -543,6 +543,22 @@ fn a_dead_pid_cannot_raise_a_transcript() {
     let attachment = merged.attachment.as_ref().expect("the claim resolved");
     assert_eq!(attachment.liveness, "dead");
     assert!(attachment.pane.is_none());
+
+    // A stale file on a dead pid feeds no live rollup: the worktree row
+    // counts only the genuinely running session, and the repo agrees.
+    let login = snapshot
+        .work
+        .iter()
+        .find(|w| w.name == "feat-login")
+        .expect("the worktree row");
+    assert_eq!(login.live_sessions, 1);
+    assert_eq!(login.live_pids, 1);
+    let repo = snapshot
+        .repos
+        .iter()
+        .find(|r| r.id == login.repo)
+        .expect("the repo row");
+    assert_eq!(repo.live, 1);
 }
 
 #[test]

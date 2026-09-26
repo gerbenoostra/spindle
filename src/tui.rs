@@ -437,7 +437,7 @@ impl App {
             List::Conversations => {
                 let live = rows
                     .iter()
-                    .filter(|r| matches!(r, Row::Conversation(c) if c.live))
+                    .filter(|r| matches!(r, Row::Conversation(c) if c.running()))
                     .count();
                 format!("{live} live · {} shown", rows.len())
             }
@@ -827,8 +827,13 @@ fn work_name(_snapshot: &Snapshot, w: &WorkRow) -> String {
     format!("{}{}", w.name, wt)
 }
 
-/// A conversation row's glyph from its published state.
+/// A conversation row's glyph from its published state. A claim the runtime
+/// proved dead carries no attention glyph: the published state the stale
+/// file still reports is history, not a live signal.
 fn conversation_glyph(c: &ConversationRow) -> &'static str {
+    if c.live && !c.running() {
+        return "";
+    }
     match c.state {
         "waiting" => "!",
         "busy" => "●",
@@ -1637,6 +1642,15 @@ mod tests {
         assert_eq!(detail_state(&conv), "waiting");
         conv.state = "busy";
         assert_eq!(detail_state(&conv), "busy");
+        // A live file whose claimed pid is dead is a record, not a process:
+        // it is not `running`, and its published `busy` earns no glyph.
+        let mut dead = fixture().conversations[0].clone();
+        dead.attachment = dead.attachment.map(|a| AttachmentRow {
+            liveness: "dead",
+            ..a
+        });
+        assert!(!dead.running());
+        assert_eq!(conversation_glyph(&dead), "");
         // Glyph colours by meaning; the empty glyph colours nothing.
         assert_eq!(glyph_style("✗").fg, Some(Color::LightRed));
         assert_eq!(glyph_style("✓").fg, Some(Color::LightGreen));
