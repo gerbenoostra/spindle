@@ -384,7 +384,7 @@ impl App {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(40), Constraint::Min(0)]).areas(main);
         let [repos, work, conversations] = Layout::vertical([
-            Constraint::Length(list_height(&self.snapshot.repos, left.height)),
+            Constraint::Length(list_height(self.rows(List::Repos).len(), left.height)),
             Constraint::Percentage(55),
             Constraint::Min(0),
         ])
@@ -737,10 +737,10 @@ fn list_index(list: List) -> usize {
     }
 }
 
-/// A panel's height: its rows plus borders, capped to a third of the screen
-/// so [1] cannot starve the others.
-fn list_height(rows: &[RepoRow], height: u16) -> u16 {
-    ((rows.len() as u16 + 3).max(3)).min(height / 3)
+/// A panel's height: its filtered rows plus borders, capped to a third of
+/// the screen so [1] cannot starve the others.
+fn list_height(rows: usize, height: u16) -> u16 {
+    ((rows as u16 + 3).max(3)).min(height / 3)
 }
 
 /// What the age column shows: `2m`, `1h`, `9d`, or `?` when unknown.
@@ -964,7 +964,8 @@ fn collect_worker(
 fn poll_event() -> io::Result<Option<Event>> {
     match event::poll(Duration::from_millis(200)) {
         Ok(true) => event::read().map(Some),
-        _ => Ok(None), // coverage: off - the pty test feeds stdin EOF instantly so the empty tick never wins, and an Err needs a broken stdin
+        Ok(false) => Ok(None), // coverage: off - the pty test feeds stdin EOF instantly, so the empty tick never wins
+        Err(e) => Err(e),      // coverage: off - needs a broken stdin
     }
 }
 
@@ -1298,6 +1299,30 @@ mod tests {
         let text = render_to(&app, 90, 24);
         assert!(text.contains("↑3 ~dirty"), "{text}");
         assert!(text.contains("2m"), "{text}");
+    }
+
+    #[test]
+    fn a_filtered_list_does_not_reserve_height_for_hidden_rows() {
+        let mut app = App::new(fixture());
+        press(
+            &mut app,
+            &[
+                Key::Char('1'),
+                Key::Char('/'),
+                Key::Char('n'),
+                Key::Char('o'),
+                Key::Char('t'),
+                Key::Enter,
+            ],
+        );
+        let text = render_to(&app, 90, 24);
+        // `all` plus one repo plus two borders: the filtered-down panel is
+        // four rows, so [2] starts on row 4 rather than row 5.
+        let y = text
+            .lines()
+            .position(|l| l.contains("[2] Work"))
+            .expect("the work panel");
+        assert_eq!(y, 4, "{text}");
     }
 
     #[test]
