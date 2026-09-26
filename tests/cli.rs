@@ -61,23 +61,54 @@ fn help_lists_only_what_is_shipped() {
     }
 }
 
+/// The `script` invocation that runs `bin` under a pty on this platform.
+/// Two dialects exist: BSD takes the command as trailing positional
+/// arguments, while util-linux wants `-c` and rejects extra positionals.
+/// Probing a trivial command picks the local dialect; neither working means
+/// there is no usable `script` here.
+fn script_pty(bin: &std::ffi::OsStr) -> Option<Vec<std::ffi::OsString>> {
+    let dialects: [&[&str]; 2] = [
+        // BSD: the command is trailing positional arguments.
+        &["-q", "/dev/null", "/usr/bin/true"],
+        // util-linux: the command is `-c`'s argument; extra positionals are
+        // a usage error.
+        &["-q", "-c", "/usr/bin/true", "/dev/null"],
+    ];
+    for probe in dialects {
+        let ok = Command::new("script")
+            .args(probe)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            return Some(
+                probe
+                    .iter()
+                    .map(|a| {
+                        if *a == "/usr/bin/true" {
+                            bin.to_os_string()
+                        } else {
+                            std::ffi::OsString::from(a)
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
 #[test]
 fn a_bare_invocation_under_a_terminal_quits_on_q() {
     // `script` runs the binary behind a pty, so the TUI path - terminal
     // setup, event poll, draw loop - executes for real. One `q` ends it.
-    if Command::new("script")
-        .arg("-q")
-        .arg("/dev/null")
-        .arg("/usr/bin/true")
-        .output()
-        .is_err()
-    {
-        return; // no script(1) on this platform
-    }
+    let Some(argv) = script_pty(std::ffi::OsStr::new(BIN)) else {
+        return; // no usable script(1) on this platform
+    };
     let home = TempDir::new("cli");
     let mut child = Command::new("script")
-        .args(["-q", "/dev/null"])
-        .arg(BIN)
+        .args(&argv)
         .env("HOME", home.path())
         .env("TMUX_TMPDIR", home.join("tmux"))
         .env_remove("CLAUDE_CONFIG_DIR")
