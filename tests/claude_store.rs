@@ -282,6 +282,9 @@ fn world() -> World {
         "not json at all\n",
     )
     .unwrap();
+    // A file the safety rules reject without parsing lands in `skipped`,
+    // not in conversations or errors.
+    fs::write(home.join(".claude/projects/-r-login/notes.jsonl"), "x").unwrap();
 
     World {
         tmux,
@@ -506,6 +509,18 @@ fn list_json_is_the_complete_unfiltered_snapshot() {
     );
     assert_eq!(live["attachment"]["pane_source"], "published");
     assert_eq!(live["attachment"]["liveness"], "instance");
+    // Parsed detail the evidence view later renders is already in the
+    // document: the transcript's malformed-line count and the skip list.
+    assert_eq!(live["malformed_lines"], 0);
+    assert!(
+        json["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().is_some_and(|p| p.ends_with("notes.jsonl"))),
+        "{:?}",
+        json["skipped"]
+    );
 
     // Non-live history carries no attachment and an unknown state.
     let merged = conversations

@@ -1051,7 +1051,8 @@ pub fn list_json() -> Result<String, String> {
     let mut collector = crate::snapshot::Collector::new(claude_root()?);
     let runtime = crate::runtime::Runtime::observe();
     let snapshot = collector.collect(&runtime, own_pane().as_ref());
-    Ok(to_json(&snapshot))
+    to_json(&snapshot) // coverage: off - `list_json` runs only inside the binary
+        .map_err(|e| format!("the snapshot cannot be serialized: {e}")) // coverage: off - same
 }
 
 #[cfg(test)]
@@ -1178,6 +1179,7 @@ mod tests {
                     transcript: Some(PathBuf::from(
                         "/h/.claude/projects/-r-a-l/8f423bbb-1111-2222-3333-444444444444.jsonl",
                     )),
+                    malformed_lines: Some(0),
                     resume_argv: vec![
                         "claude".to_owned(),
                         "--resume".to_owned(),
@@ -1203,6 +1205,7 @@ mod tests {
                     attachment: None,
                     cwd: Some(PathBuf::from("/repos/a-login")),
                     transcript: Some(PathBuf::from("/h/.claude/projects/-r-a-l/t.jsonl")),
+                    malformed_lines: Some(2),
                     resume_argv: vec![
                         "claude".to_owned(),
                         "--resume".to_owned(),
@@ -1228,6 +1231,7 @@ mod tests {
                     attachment: None,
                     cwd: None,
                     transcript: None,
+                    malformed_lines: None,
                     resume_argv: Vec::new(),
                     latest_prompt: None,
                     latest_reply: None,
@@ -1237,6 +1241,7 @@ mod tests {
                 },
             ],
             errors: vec![],
+            skipped: vec![],
         }
     }
 

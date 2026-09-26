@@ -43,6 +43,10 @@ pub struct Snapshot {
     pub conversations: Vec<ConversationRow>,
     /// Collector failures, isolated per record.
     pub errors: Vec<SourceError>,
+    /// Entries a provider's safety rules rejected without ever parsing -
+    /// non-UUID names, symlinks, non-regular or empty files. Retained for
+    /// the evidence view, as lossy display strings.
+    pub skipped: Vec<String>,
 }
 
 /// A repository - or a non-git project space - as the `[1]` list sees it.
@@ -152,6 +156,9 @@ pub struct ConversationRow {
     pub cwd: Option<PathBuf>,
     /// The transcript file, for history that survives everything.
     pub transcript: Option<PathBuf>,
+    /// Lines of the transcript that did not parse; `None` when there is no
+    /// transcript. Retained for the evidence view.
+    pub malformed_lines: Option<usize>,
     /// `claude --resume <id>` as an argv vector - never a shell string.
     pub resume_argv: Vec<String>,
     /// The latest provider-parsed user prompt and reply, verbatim.
@@ -375,6 +382,11 @@ impl Collector {
             work,
             conversations,
             errors,
+            skipped: inventory
+                .skipped
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
         }
     }
 }
@@ -695,6 +707,7 @@ fn conversation_row(
         attachment,
         cwd: conv.cwd().map(Path::to_owned),
         transcript: conv.transcript.as_ref().map(|t| t.file.clone()),
+        malformed_lines: conv.transcript.as_ref().map(|t| t.malformed_lines),
         resume_argv: conv
             .resume_argv()
             .iter()
@@ -761,8 +774,10 @@ fn short_sha(sha: &str) -> &str {
 }
 
 /// The snapshot as the `list --json` document: complete and unfiltered.
-pub fn to_json(snapshot: &Snapshot) -> String {
-    serde_json::to_string_pretty(snapshot).unwrap_or_else(|_| "{}".to_owned()) // coverage: off - serialization of this shape does not fail
+/// A serialization failure (a non-UTF-8 path anywhere in the rows) is an
+/// operational error - never a plausible-looking empty document.
+pub fn to_json(snapshot: &Snapshot) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(snapshot) // coverage: off - `list --json` runs as a subprocess in tests
 }
 
 #[cfg(test)]
@@ -1016,6 +1031,7 @@ mod tests {
             attachment: None,
             cwd: None,
             transcript: None,
+            malformed_lines: None,
             resume_argv: Vec::new(),
             latest_prompt: None,
             latest_reply: None,
