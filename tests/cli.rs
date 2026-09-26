@@ -65,7 +65,9 @@ fn help_lists_only_what_is_shipped() {
 /// Two dialects exist: BSD takes the command as trailing positional
 /// arguments, while util-linux wants `-c` and rejects extra positionals.
 /// Probing a trivial command picks the local dialect; neither working means
-/// there is no usable `script` here.
+/// there is no usable `script` here. Note the util-linux `-c` form runs
+/// `bin` through `sh -c`, so a binary path containing spaces would not
+/// survive it - the workspace target path never has one.
 fn script_pty(bin: &std::ffi::OsStr) -> Option<Vec<std::ffi::OsString>> {
     let dialects: [&[&str]; 2] = [
         // BSD: the command is trailing positional arguments.
@@ -79,6 +81,7 @@ fn script_pty(bin: &std::ffi::OsStr) -> Option<Vec<std::ffi::OsString>> {
             .args(probe)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|s| s.success());
         if ok {
