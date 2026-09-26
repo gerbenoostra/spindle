@@ -625,9 +625,8 @@ fn work_summary(v: &vector::StateVector) -> String {
 fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
     let (liveness, liveness_detail) = match &r.liveness {
         Liveness::Instance => ("instance", None),
-        Liveness::PidOnly(reason) | Liveness::Unverifiable(reason) => {
-            ("pid_only", Some(reason.clone()))
-        }
+        Liveness::PidOnly(reason) => ("pid_only", Some(reason.clone())),
+        Liveness::Unverifiable(reason) => ("unverifiable", Some(reason.clone())),
         Liveness::Dead(reason) => ("dead", Some(reason.clone())),
     };
     let (pane_source, placement_detail) = match &r.placement {
@@ -865,7 +864,7 @@ mod tests {
             (
                 Liveness::Unverifiable("no table".to_owned()),
                 Placement::Bound(PaneSource::Tty),
-                "pid_only",
+                "unverifiable",
                 Some("tty"),
             ),
             (
