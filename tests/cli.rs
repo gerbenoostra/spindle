@@ -1,16 +1,32 @@
-//! The command surface that exists today: `--version`, `--help`, and a usage
-//! error for everything else. Subcommands arrive together with the behaviour
-//! behind them; a guessed name exits 2 rather than doing nothing quietly.
+//! The command surface that exists today: the TUI on a bare invocation,
+//! `list --json`, `--version`, `--help`, and a usage error for everything
+//! else. Subcommands arrive together with the behaviour behind them; a
+//! guessed name exits 2 rather than doing nothing quietly.
 
 mod support;
 
 use std::process::Command;
 
+use support::tempdir::TempDir;
 use support::{BIN, stderr_of};
 
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(BIN)
         .args(args)
+        .output()
+        .expect("the binary runs")
+}
+
+/// The binary over an empty machine: a temp HOME and tmux socket dir, so a
+/// scan finds no providers and no panes rather than the host's real state.
+fn run_isolated(args: &[&str], home: &TempDir) -> std::process::Output {
+    Command::new(BIN)
+        .args(args)
+        .env("HOME", home.path())
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("TMUX_TMPDIR", home.join("tmux"))
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
         .output()
         .expect("the binary runs")
 }
@@ -36,7 +52,7 @@ fn help_lists_only_what_is_shipped() {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("--version"), "{stdout}");
         // No stubbed subcommands: help names nothing the binary cannot do.
-        for future in ["list", "hook", "register", "doctor"] {
+        for future in ["hook", "register", "doctor"] {
             assert!(
                 !stdout.contains(&format!("agent-sessions {future}")),
                 "help promises `{future}`, which has not shipped: {stdout}"
@@ -46,18 +62,109 @@ fn help_lists_only_what_is_shipped() {
 }
 
 #[test]
-fn a_bare_invocation_is_a_usage_error() {
-    let out = run(&[]);
-    assert_eq!(out.status.code(), Some(2));
+fn a_bare_invocation_under_a_terminal_quits_on_q() {
+    // `script` runs the binary behind a pty, so the TUI path - terminal
+    // setup, event poll, draw loop - executes for real. One `q` ends it.
+    if Command::new("script")
+        .arg("-q")
+        .arg("/dev/null")
+        .arg("/usr/bin/true")
+        .output()
+        .is_err()
+    {
+        return; // no script(1) on this platform
+    }
+    let home = TempDir::new("cli");
+    let mut child = Command::new("script")
+        .args(["-q", "/dev/null"])
+        .arg(BIN)
+        .env("HOME", home.path())
+        .env("TMUX_TMPDIR", home.join("tmux"))
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("script spawns");
+    use std::io::Write;
+    // Give the event loop one idle tick first: an expired poll returns no
+    // event, so the quiet path runs too.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"q")
+        .expect("q writes to the pty");
+    let out = child.wait_with_output().expect("the TUI exits");
+    assert!(
+        out.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn a_bare_invocation_without_a_terminal_is_an_operational_error() {
+    // `agent-sessions` is the dashboard; a piped stdout is not a terminal, so
+    // it declines rather than drawing escape codes into a file.
+    let home = TempDir::new("cli");
+    let out = run_isolated(&[], &home);
+    assert_eq!(out.status.code(), Some(1));
     let stderr = stderr_of(&out);
-    assert!(stderr.contains("no command given"), "{stderr}");
-    assert!(stderr.contains("usage:"), "{stderr}");
+    assert!(stderr.contains("needs a terminal"), "{stderr}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+}
+
+#[test]
+fn list_json_prints_the_complete_snapshot() {
+    let home = TempDir::new("cli");
+    // No CLAUDE_CONFIG_DIR here: the default `$HOME/.claude` resolves.
+    let out = Command::new(BIN)
+        .args(["list", "--json"])
+        .env("HOME", home.path())
+        .env("TMUX_TMPDIR", home.join("tmux"))
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("the binary runs");
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
+    assert_eq!(json["schema_version"], 1, "{stdout}");
+    assert!(json["observed_at"].as_u64().unwrap_or(0) > 0);
+    assert!(json["repos"].is_array() && json["work"].is_array());
+    assert!(json["conversations"].is_array() && json["errors"].is_array());
+    assert!(stderr_of(&out).is_empty(), "{out:?}");
+}
+
+#[test]
+fn list_json_without_a_home_is_an_operational_error() {
+    let home = TempDir::new("cli");
+    let out = Command::new(BIN)
+        .args(["list", "--json"])
+        .env_remove("HOME")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env("TMUX_TMPDIR", home.join("tmux"))
+        .output()
+        .expect("the binary runs");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr_of(&out).contains("HOME is not set"), "{out:?}");
+}
+
+#[test]
+fn list_without_json_is_a_usage_error() {
+    let home = TempDir::new("cli");
+    let out = run_isolated(&["list"], &home);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("list"), "{out:?}");
 }
 
 #[test]
 fn unshipped_subcommands_are_usage_errors() {
     for args in [
-        vec!["list", "--json"],
         vec!["hook", "claude", "stop"],
         vec!["register"],
         vec!["doctor"],

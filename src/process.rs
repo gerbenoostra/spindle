@@ -377,7 +377,7 @@ pub fn parse_utc_ctime(text: &str) -> Option<u64> {
 
 /// Days since the Unix epoch for a civil date (Howard Hinnant's
 /// `days_from_civil`), so a UTC timestamp needs no timezone database.
-fn days_from_civil(y: i64, m: i64, d: u64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: u64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
