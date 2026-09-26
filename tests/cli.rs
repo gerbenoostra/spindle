@@ -194,6 +194,16 @@ fn list_without_json_is_a_usage_error() {
 }
 
 #[test]
+fn json_without_list_is_a_usage_error() {
+    // `--json` is the list document's flag; alone it must not quietly open
+    // the dashboard.
+    let home = TempDir::new("cli");
+    let out = run_isolated(&["--json"], &home);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("--json"), "{out:?}");
+}
+
+#[test]
 fn unshipped_subcommands_are_usage_errors() {
     for args in [
         vec!["hook", "claude", "stop"],

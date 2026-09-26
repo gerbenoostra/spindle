@@ -51,7 +51,7 @@ fn run() -> Result<ExitCode, String> {
     // yet - `hook`, `register`, `doctor` - is a usage error, never a silent
     // no-op.
     match free.as_slice() {
-        [] => match agent_sessions::tui::tui() {
+        [] if !json => match agent_sessions::tui::tui() {
             Ok(()) => Ok(ExitCode::SUCCESS), // coverage: off - tui() only succeeds with a real terminal
             Err(e) => {
                 eprintln!("agent-sessions: {e}");
@@ -68,7 +68,16 @@ fn run() -> Result<ExitCode, String> {
                 Ok(ExitCode::FAILURE)
             }
         },
-        _ => Err(format!("unexpected arguments: {}", free.join(" "))),
+        // `--json` was already consumed out of `free`; put it back in the
+        // complaint when it is the argument being rejected.
+        _ => Err(format!(
+            "unexpected arguments: {}",
+            free.iter()
+                .cloned()
+                .chain(json.then(|| "--json".to_owned()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )),
     }
 }
 
