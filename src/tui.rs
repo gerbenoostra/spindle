@@ -901,13 +901,16 @@ fn map_key(code: crossterm::event::KeyCode) -> Option<Key> {
     })
 }
 
-/// The driver: crossterm event loop around an `App`, refreshed on a tick.
-/// Subprocess work stays in the collector, never on the input or render
-/// paths - the loop only swaps in snapshots a channel already collected.
+/// The driver: crossterm event loop around an `App`, with collection on a
+/// worker thread and finished snapshots swapped in through a bounded
+/// channel. Subprocess work stays in the collector, never on the input or
+/// render paths - the loop only swaps in snapshots the channel already
+/// collected.
 ///
-/// Only the terminal setup lives here; the loop itself is `run_loop`,
-/// which any backend can drive - the tests drive it on `TestBackend`.
-pub fn run(mut app: App, mut refresh: impl FnMut() -> Snapshot) -> io::Result<()> {
+/// Only the terminal setup and the worker spawn live here; the loop itself
+/// is `run_loop`, which any backend can drive - the tests drive it on
+/// `TestBackend` with a scripted snapshot source.
+pub fn run(mut app: App, refresh: impl FnMut() -> Snapshot + Send + 'static) -> io::Result<()> {
     use crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     };
@@ -917,16 +920,39 @@ pub fn run(mut app: App, mut refresh: impl FnMut() -> Snapshot) -> io::Result<()
     crossterm::execute!(stdout, EnterAlternateScreen)?; // coverage: off - `?` needs a broken terminal
     let backend = ratatui::backend::CrosstermBackend::new(stdout); // coverage: off - same
     let mut terminal = Terminal::new(backend)?; // coverage: off - `?` needs a broken terminal
+
+    // One pending snapshot at most: the worker computes the next pass only
+    // once the loop has taken the previous one, so a slow collect can delay
+    // the next swap but never a redraw or a key press.
+    let pace = Duration::from_secs(1); // coverage: off - the worker only runs under a real terminal
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Snapshot>(1); // coverage: off - same
+    std::thread::spawn(move || collect_worker(tx, refresh, pace)); // coverage: off - same
+
     let result = run_loop(
         &mut terminal,
         &mut app,
-        &mut refresh,
+        || rx.try_recv().ok(), // coverage: off - `run` itself needs a real terminal
         poll_event,
-        Duration::from_secs(1),
     );
     disable_raw_mode()?; // coverage: off - `?` needs a broken terminal
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?; // coverage: off - same
     result // coverage: off - same
+}
+
+/// The collector's own loop, on its own thread: produce a snapshot, hand it
+/// over once the previous one was taken (the bounded channel paces the
+/// worker), rest `interval`, repeat. A dropped receiver ends the worker.
+fn collect_worker(
+    tx: std::sync::mpsc::SyncSender<Snapshot>,
+    mut refresh: impl FnMut() -> Snapshot,
+    interval: Duration,
+) {
+    loop {
+        if tx.send(refresh()).is_err() {
+            return;
+        }
+        std::thread::sleep(interval);
+    }
 }
 
 /// The real input path: one event per tick, or `None` when the tick expires.
@@ -937,39 +963,36 @@ fn poll_event() -> io::Result<Option<Event>> {
     }
 }
 
-/// Draw, consume one event, refresh on the tick - until `q` quits. The event
-/// source is injected so the loop itself needs no terminal: tests hand it a
-/// script. Anything the user presses is mapped to a `Key` and applied;
-/// release events and unmapped codes are ignored; an idle tick refreshes
-/// the snapshot once `refresh_after` has passed.
+/// Draw, consume one event, swap in whatever the collector already
+/// produced - until `q` quits. Both sources are injected so the loop needs
+/// no terminal and no worker: tests hand it a key script and a scripted
+/// snapshot source. Anything the user presses is mapped to a `Key` and
+/// applied; release events and unmapped codes are ignored.
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    refresh: &mut impl FnMut() -> Snapshot,
+    mut next_snapshot: impl FnMut() -> Option<Snapshot>,
     mut poll: impl FnMut() -> io::Result<Option<Event>>,
-    refresh_after: Duration,
 ) -> io::Result<()>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let mut last_refresh = std::time::Instant::now();
     loop {
+        // Snapshots the worker finished since the last draw swap in first;
+        // when several queued up, the newest wins.
+        while let Some(snapshot) = next_snapshot() {
+            app.refresh(snapshot);
+        }
         terminal.draw(|f| app.render(f)).map_err(io::Error::other)?; // coverage: off - `?` needs a backend that can fail
         if app.quit() {
             break;
         }
         let event = poll()?; // coverage: off - `?` needs a broken stdin
-        if let Some(Event::Key(key)) = event {
-            if key.kind != KeyEventKind::Release
-                && let Some(mapped) = map_key(key.code)
-            {
-                app.key(mapped);
-            }
-            continue;
-        }
-        if last_refresh.elapsed() >= refresh_after {
-            app.refresh(refresh());
-            last_refresh = std::time::Instant::now();
+        if let Some(Event::Key(key)) = event
+            && key.kind != KeyEventKind::Release
+            && let Some(mapped) = map_key(key.code)
+        {
+            app.key(mapped);
         }
     }
     Ok(())
@@ -1557,13 +1580,14 @@ mod tests {
     }
 
     #[test]
-    fn the_loop_reads_keys_ignores_noise_and_refreshes_on_idle() {
+    fn the_loop_reads_keys_ignores_noise_and_swaps_in_pending_snapshots() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use ratatui::backend::TestBackend;
 
         let mut app = App::new(fixture());
         // A script: a mapped key, an unmapped key, a key release, an idle
-        // tick that should refresh, and `q` to leave the loop.
+        // tick, and `q` to leave the loop. Two queued snapshots swap in on
+        // the first pass - the newest wins.
         let mut events = std::collections::VecDeque::from([
             Some(Event::Key(KeyEvent::new(
                 KeyCode::Char('j'),
@@ -1583,29 +1607,29 @@ mod tests {
             ))),
         ]);
         let mut poll = move || Ok(events.pop_front().unwrap_or(None));
-        let mut refreshed = 0usize;
-        let mut refresh = || {
-            refreshed += 1;
-            fixture()
-        };
+        let mut pending = std::collections::VecDeque::from([
+            {
+                let mut s = fixture();
+                s.observed_at = 11;
+                s
+            },
+            {
+                let mut s = fixture();
+                s.observed_at = 42;
+                s
+            },
+        ]);
+        let mut next_snapshot = move || pending.pop_front();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        run_loop(
-            &mut terminal,
-            &mut app,
-            &mut refresh,
-            &mut poll,
-            Duration::ZERO,
-        )
-        .unwrap();
+        run_loop(&mut terminal, &mut app, &mut next_snapshot, &mut poll).unwrap();
         assert!(app.quit());
         // `j` moved the focused (Conversations) cursor one row; release and
-        // unmapped keys did not. Idle ticks - `None` and non-key events -
-        // each refreshed because the interval was zero.
+        // unmapped keys did not. The worker's finished snapshots swapped in
+        // - the newer of the two queued won.
         assert_eq!(app.cursor[list_index(List::Conversations)], 1);
-        assert_eq!(refreshed, 2);
+        assert_eq!(app.snapshot.observed_at, 42);
 
-        // With a refresh interval that never passes, an idle tick changes
-        // nothing at all.
+        // With no snapshot pending, an idle tick changes nothing at all.
         let mut app = App::new(fixture());
         let mut events = std::collections::VecDeque::from([
             None,
@@ -1615,16 +1639,34 @@ mod tests {
             ))),
         ]);
         let mut poll = move || Ok(events.pop_front().unwrap_or(None));
-        let mut refresh = || fixture(); // coverage: off - refresh_after never fires in this scenario
-        run_loop(
-            &mut terminal,
-            &mut app,
-            &mut refresh,
-            &mut poll,
-            Duration::MAX,
-        )
-        .unwrap();
+        let mut next_snapshot = || None;
+        run_loop(&mut terminal, &mut app, &mut next_snapshot, &mut poll).unwrap();
         assert!(app.quit());
+        assert_eq!(app.snapshot.observed_at, 1_800_000_000);
+    }
+
+    #[test]
+    fn the_worker_produces_until_the_receiver_drops() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Snapshot>(1);
+        let mut calls = 0u64;
+        let worker = std::thread::spawn(move || {
+            collect_worker(
+                tx,
+                move || {
+                    calls += 1;
+                    let mut s = fixture();
+                    s.observed_at = calls;
+                    s
+                },
+                Duration::ZERO,
+            )
+        });
+        // One pass after another lands on the channel; dropping the
+        // receiver ends the worker instead of leaving it parked.
+        assert_eq!(rx.recv().unwrap().observed_at, 1);
+        assert_eq!(rx.recv().unwrap().observed_at, 2);
+        drop(rx);
+        worker.join().unwrap();
     }
 
     #[test]
