@@ -494,9 +494,8 @@ impl App {
 
     /// A row assembled from fixed cells: glyph, label, right-aligned middle
     /// field and right-edge age. Width tiers, not clipping: a narrow pane
-    /// gets glyph and label, medium adds the age column, wide adds the
-    /// middle summary. Nothing scrolls horizontally; the label is what
-    /// shrinks.
+    /// gets glyph and label, a medium one adds the age and the compact
+    /// summary. Nothing scrolls horizontally; the label is what shrinks.
     fn render_row(&self, width: u16, cells: &RowCells<'_>) -> Line<'static> {
         let width = width as usize;
         let glyph_w = glyph_width(cells.glyph);
@@ -511,11 +510,17 @@ impl App {
             base
         };
         let dim = base.fg(Color::DarkGray);
-        // narrow: glyph + label. medium: + age. wide: + the middle summary.
-        let (show_middle, show_age) = (width >= 44, width >= 24);
-        let middle = if show_middle { cells.middle } else { "" };
-        let age = if show_age { cells.age } else { "" };
+        // narrow: glyph + label. medium adds the age and the compact
+        // summary - which is capped so it never starves the label below a
+        // readable minimum.
+        let show_fields = width >= 24;
+        let age = if show_fields { cells.age } else { "" };
         let age_w = age.chars().count();
+        let middle = if show_fields {
+            fit(cells.middle, width.saturating_sub(glyph_w + age_w + 12))
+        } else {
+            String::new()
+        };
         let middle_w = middle.chars().count();
         let label_w = width.saturating_sub(glyph_w + middle_w + age_w + 4);
         let label = fit(cells.label, label_w);
@@ -1283,6 +1288,11 @@ mod tests {
         }
         let app = App::new(fixture());
         assert!(render_to(&app, 200, 24).contains("? keys | q quit"));
+        // The medium tier carries the compact summary and the age too, not
+        // just the label: at 90 columns the left lists are ~34 cells wide.
+        let text = render_to(&app, 90, 24);
+        assert!(text.contains("↑3 ~dirty"), "{text}");
+        assert!(text.contains("2m"), "{text}");
     }
 
     #[test]
