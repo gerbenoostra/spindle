@@ -1,7 +1,7 @@
 //! The provider capability contract: what a plugin can prove about its own
-//! sessions, and the normalized observations it hands the core.
+//! sessions, and the normalized evidence it hands the core.
 //!
-//! A plugin returns observations, never final state. The core resolves
+//! A plugin returns evidence, never final state. The core resolves
 //! process, pane, cwd, worktree and branch identity, rejects stale or
 //! inapplicable evidence, and derives the snapshot's effective values. A
 //! capability a provider does not have is simply absent from its
@@ -9,11 +9,6 @@
 //! corresponding cells as `Unknown` rather than as a plausible guess.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
-use std::time::SystemTime;
-
-use crate::process::ProcessStart;
-use crate::runtime::{AgentSessionKey, EvidenceSource};
 
 /// What a provider can deliver. Absent capabilities stay absent: a plugin
 /// without a published state source emits records whose state is `Unknown`,
@@ -141,39 +136,4 @@ pub enum PublishedStatus {
     Busy,
     Idle,
     Waiting,
-}
-
-/// One normalized observation of a conversation, as a plugin emits it.
-/// Unknown fields stay absent rather than filled with defaults.
-#[derive(Debug)]
-pub struct Observation {
-    /// The conversation's durable identity, when the record carries one.
-    pub session: Option<AgentSessionKey>,
-    /// The claimed process instance, when the record is bound to one.
-    pub process: Option<ClaimedProcess>,
-    /// A provider-published pane handle (`session:@window.%pane` or a suffix).
-    pub published_pane: Option<String>,
-    /// The provider-published working directory - from record start, so it
-    /// binds Work but is never fresh enough to resolve a pane.
-    pub cwd: Option<PathBuf>,
-    /// When the producing record's evidence was written.
-    pub observed_at: SystemTime,
-    /// The provider's own sequence, when it publishes one; used to reject
-    /// events arriving out of order.
-    pub source_sequence: Option<u64>,
-    pub state: StateEvidence,
-    /// Which evidence source emitted the observation.
-    pub provenance: EvidenceSource,
-}
-
-/// A provider's claim that a conversation runs as a particular process.
-#[derive(Debug, Clone, Copy)]
-pub struct ClaimedProcess {
-    pub pid: u32,
-    /// The provider-published start, normalized to epoch; `Unavailable`
-    /// demotes the claim to lower-authority pid-only evidence.
-    pub pid_start: ProcessStart,
-    /// The basename the claimed process should run, when the provider's
-    /// identity implies one.
-    pub expected_exe: Option<&'static str>,
 }

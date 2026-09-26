@@ -27,9 +27,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::process::{self, ProcessStart};
 use crate::provider::{
-    Capabilities, ClaimedProcess, HookDispatch, InventorySource, Observation, OwnershipSource,
-    ProcessBindingSource, PublishedState, PublishedStatus, ResumeCommand, SourceError,
-    StateEvidence, StateSource,
+    Capabilities, HookDispatch, InventorySource, OwnershipSource, ProcessBindingSource,
+    PublishedState, PublishedStatus, ResumeCommand, SourceError, StateEvidence, StateSource,
 };
 use crate::runtime::{AgentSessionKey, EvidenceSource, ProcessClaim, Provider};
 
@@ -211,29 +210,6 @@ impl Conversation {
             source: EvidenceSource::Published,
             observed_at: live.updated_at.unwrap_or(observed_at),
         })
-    }
-
-    /// The normalized observation the capability contract emits.
-    pub fn observation(&self, observed_at: SystemTime) -> Observation {
-        Observation {
-            session: Some(self.key()),
-            process: self.live.as_ref().map(|l| ClaimedProcess {
-                pid: l.pid,
-                pid_start: l.pid_start,
-                expected_exe: Some(EXE),
-            }),
-            published_pane: self.live.as_ref().and_then(|l| l.tmux.clone()),
-            cwd: self.cwd().map(Path::to_owned),
-            observed_at,
-            source_sequence: self
-                .live
-                .as_ref()
-                .and_then(|l| l.updated_at)
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64),
-            state: self.state(),
-            provenance: EvidenceSource::Published,
-        }
     }
 
     /// Claude's verified resume argv: `claude --resume <session_id>` as an
@@ -1116,10 +1092,6 @@ mod tests {
         assert_eq!(claim.published_pane.as_deref(), Some("s:@1.%2"));
         assert_eq!(claim.source, EvidenceSource::Published);
         assert_eq!(claim.session.as_ref().unwrap().session_id, ID_A);
-
-        let obs = conv.observation(now);
-        assert!(obs.process.is_some());
-        assert_eq!(obs.cwd.as_deref(), Some(Path::new("/work/repo")));
 
         let argv = conv.resume_argv();
         assert_eq!(argv[0], OsString::from("claude"));
