@@ -124,6 +124,9 @@ pub struct App {
     editing: Option<(List, String)>,
     help: bool,
     quit: bool,
+    /// The collector thread died: the last snapshot stays on screen and the
+    /// footer says so instead of letting the dashboard look live.
+    collector_dead: bool,
 }
 
 /// The row shapes one list can hold - views over the snapshot, never copies
@@ -158,6 +161,7 @@ impl App {
             editing: None,
             help: false,
             quit: false,
+            collector_dead: false,
         }
     }
 
@@ -177,6 +181,12 @@ impl App {
     /// Whether the run loop should exit.
     pub fn quit(&self) -> bool {
         self.quit
+    }
+
+    /// Mark the collector dead: no more snapshots will arrive, and the
+    /// footer says so rather than letting stale rows look live.
+    fn collector_stopped(&mut self) {
+        self.collector_dead = true;
     }
 
     /// Which list is focused.
@@ -627,7 +637,9 @@ impl App {
     /// The footer: hints for the focused view, always ending `? keys | q quit`.
     /// A narrow terminal gets the compact form rather than a clipped one.
     fn footer(&self, f: &mut Frame<'_>, area: Rect) {
-        let text = if self.editing.is_some() {
+        let text = if self.collector_dead {
+            "collector stopped - last snapshot | q quit".to_owned()
+        } else if self.editing.is_some() {
             "filter: enter apply | esc cancel".to_owned()
         } else if area.width < 60 {
             match self.focused_list() {
@@ -937,12 +949,13 @@ pub fn run(mut app: App, refresh: impl FnMut() -> Snapshot + Send + 'static) -> 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Snapshot>(1); // coverage: off - same
     std::thread::spawn(move || collect_worker(tx, refresh, pace)); // coverage: off - same
 
-    let result = run_loop(
-        &mut terminal,
-        &mut app,
-        || rx.try_recv().ok(), // coverage: off - `run` itself needs a real terminal
-        poll_event,
-    );
+    let feed = move || match rx.try_recv() {
+        // coverage: off - `run` itself needs a real terminal
+        Ok(snapshot) => Feed::Snapshot(snapshot),
+        Err(std::sync::mpsc::TryRecvError::Empty) => Feed::Idle,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Feed::Dead, // coverage: off - needs the worker to die while the loop runs
+    };
+    let result = run_loop(&mut terminal, &mut app, feed, poll_event);
     disable_raw_mode()?; // coverage: off - `?` needs a broken terminal
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?; // coverage: off - same
     result // coverage: off - same
@@ -964,6 +977,16 @@ fn collect_worker(
     }
 }
 
+/// What the collector channel produced since the last draw.
+enum Feed {
+    /// Nothing new.
+    Idle,
+    /// A finished snapshot, ready to swap in.
+    Snapshot(Snapshot),
+    /// The collector thread is gone; what is on screen is the last snapshot.
+    Dead,
+}
+
 /// The real input path: one event per tick, or `None` when the tick expires.
 fn poll_event() -> io::Result<Option<Event>> {
     match event::poll(Duration::from_millis(200)) {
@@ -981,7 +1004,7 @@ fn poll_event() -> io::Result<Option<Event>> {
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    mut next_snapshot: impl FnMut() -> Option<Snapshot>,
+    mut next_snapshot: impl FnMut() -> Feed,
     mut poll: impl FnMut() -> io::Result<Option<Event>>,
 ) -> io::Result<()>
 where
@@ -989,9 +1012,17 @@ where
 {
     loop {
         // Snapshots the worker finished since the last draw swap in first;
-        // when several queued up, the newest wins.
-        while let Some(snapshot) = next_snapshot() {
-            app.refresh(snapshot);
+        // when several queued up, the newest wins. A dead collector is
+        // surfaced on the footer - the last snapshot stays on screen.
+        loop {
+            match next_snapshot() {
+                Feed::Snapshot(snapshot) => app.refresh(snapshot),
+                Feed::Dead => {
+                    app.collector_stopped();
+                    break;
+                }
+                Feed::Idle => break,
+            }
         }
         terminal.draw(|f| app.render(f)).map_err(io::Error::other)?; // coverage: off - `?` needs a backend that can fail
         if app.quit() {
@@ -1663,7 +1694,12 @@ mod tests {
                 s
             },
         ]);
-        let mut next_snapshot = move || pending.pop_front();
+        let mut next_snapshot = move || {
+            pending
+                .pop_front()
+                .map(Feed::Snapshot)
+                .unwrap_or(Feed::Idle)
+        };
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         run_loop(&mut terminal, &mut app, &mut next_snapshot, &mut poll).unwrap();
         assert!(app.quit());
@@ -1683,10 +1719,35 @@ mod tests {
             ))),
         ]);
         let mut poll = move || Ok(events.pop_front().unwrap_or(None));
-        let mut next_snapshot = || None;
+        let mut next_snapshot = || Feed::Idle;
         run_loop(&mut terminal, &mut app, &mut next_snapshot, &mut poll).unwrap();
         assert!(app.quit());
         assert_eq!(app.snapshot.observed_at, 1_800_000_000);
+    }
+
+    #[test]
+    fn a_dead_collector_is_surfaced_not_silent() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new(fixture());
+        let mut events = std::collections::VecDeque::from([
+            None,
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+            ))),
+        ]);
+        let mut poll = move || Ok(events.pop_front().unwrap_or(None));
+        let mut feeds = std::collections::VecDeque::from([Feed::Dead]);
+        let mut next_snapshot = move || feeds.pop_front().unwrap_or(Feed::Idle);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        run_loop(&mut terminal, &mut app, &mut next_snapshot, &mut poll).unwrap();
+        assert!(app.quit());
+        // A dead collector does not leave stale rows looking live: the
+        // footer names it.
+        assert!(app.collector_dead);
+        assert!(render_to(&app, 80, 24).contains("collector stopped"));
     }
 
     #[test]
