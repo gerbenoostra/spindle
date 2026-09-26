@@ -473,7 +473,7 @@ impl App {
                 dim_label: false,
             },
             Row::Work(w) => RowCells {
-                glyph: work_glyph(&self.snapshot, w),
+                glyph: work_glyph(w),
                 label: &work_name(&self.snapshot, w),
                 middle: &w.summary,
                 age: &age(self.now(), w.last_activity),
@@ -587,7 +587,7 @@ impl App {
                 format!("[4] Work - {}", w.name),
                 Line::from(format!(
                     "{} {} - {} · {}",
-                    work_glyph(&self.snapshot, w),
+                    work_glyph(w),
                     w.name,
                     w.kind.replace('_', " "),
                     age(self.now(), w.last_activity)
@@ -808,11 +808,10 @@ fn repo_counts(repo: &RepoRow) -> String {
 
 /// A work row's glyph from its live evidence: `●` while a live agent or
 /// process is bound to it, blank otherwise.
-fn work_glyph(snapshot: &Snapshot, w: &WorkRow) -> &'static str {
+fn work_glyph(w: &WorkRow) -> &'static str {
     if w.live_sessions > 0 || w.live_pids > 0 {
         "●"
     } else {
-        let _ = snapshot;
         ""
     }
 }
@@ -848,8 +847,13 @@ fn conversation_glyph(c: &ConversationRow) -> &'static str {
 }
 
 /// The detail header's state text: `waiting on you`, `busy`, `idle`,
-/// `unknown` - whatever the evidence says, with its reason.
+/// `unknown` - whatever the evidence says, with its reason. A claim the
+/// runtime proved dead reads `dead`: the stale file's published state is
+/// history, not a live signal.
 fn detail_state(c: &ConversationRow) -> String {
+    if c.live && !c.running() {
+        return "dead".to_owned();
+    }
     match c.state {
         "waiting" => match &c.waiting_for {
             Some(reason) => format!("waiting: {reason}"),
@@ -1733,6 +1737,7 @@ mod tests {
         });
         assert!(!dead.running());
         assert_eq!(conversation_glyph(&dead), "");
+        assert_eq!(detail_state(&dead), "dead");
         // Glyph colours by meaning; the empty glyph colours nothing.
         assert_eq!(glyph_style("✗").fg, Some(Color::LightRed));
         assert_eq!(glyph_style("✓").fg, Some(Color::LightGreen));

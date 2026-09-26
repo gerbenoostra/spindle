@@ -232,7 +232,7 @@ impl Collector {
             .map(|i| {
                 attachment_of
                     .get(&i)
-                    .is_some_and(|slot| !matches!(resolved[*slot].liveness, Liveness::Dead(_)))
+                    .is_some_and(|slot| resolved[*slot].liveness.may_be_live())
             })
             .collect();
 
@@ -740,8 +740,13 @@ fn sort_rows(work: &mut [WorkRow], conversations: &mut [ConversationRow], at: Sy
     });
 }
 
-/// Lower sorts first: the attention glyph's inbox order.
+/// Lower sorts first: the attention glyph's inbox order. A claim the
+/// runtime proved dead ranks below everything - the published state its
+/// stale file still reports is not a live signal.
 fn attention_rank(c: &ConversationRow) -> u8 {
+    if c.live && !c.running() {
+        return 4;
+    }
     match c.state {
         "waiting" => 0,
         "busy" => 1,
