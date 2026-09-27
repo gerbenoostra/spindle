@@ -336,12 +336,9 @@ impl Claude {
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(e) => {
-                    errors.push(SourceError {
-                        // coverage: off - a mid-iteration entry failure needs a racing mutation
-                        source: "claude sessions".to_owned(),
-                        detail: format!("{}: {e}", dir.display()),
-                    });
+                Err(e) /* // coverage: off - a mid-iteration entry failure needs a racing mutation */ => {
+                    let detail = format!("{}: {e}", dir.display()); // coverage: off - same
+                    errors.push(SourceError { source: "claude sessions".to_owned(), detail }); // coverage: off - same
                     continue; // coverage: off - same
                 }
             };
@@ -489,12 +486,9 @@ fn collect_transcripts(
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(e) => {
-                errors.push(SourceError {
-                    // coverage: off - a mid-iteration entry failure needs a racing mutation
-                    source: "claude transcripts".to_owned(),
-                    detail: format!("{}: {e}", dir.display()),
-                });
+            Err(e) /* // coverage: off - a mid-iteration entry failure needs a racing mutation */ => {
+                let detail = format!("{}: {e}", dir.display()); // coverage: off - same
+                errors.push(SourceError { source: "claude transcripts".to_owned(), detail }); // coverage: off - same
                 continue; // coverage: off - same
             }
         };

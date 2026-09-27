@@ -1175,11 +1175,27 @@ mod tests {
         fn wire(v: &impl Serialize) -> serde_json::Value {
             serde_json::to_value(v).unwrap()
         }
+        // The display spelling is the wire spelling.
+        for (kind, want) in [
+            (WorkKind::Branch, "branch"),
+            (WorkKind::Detached, "detached"),
+            (WorkKind::Worktree, "worktree"),
+            (WorkKind::ProjectSpace, "project_space"),
+        ] {
+            assert_eq!(kind.as_str(), want);
+            assert_eq!(wire(&kind), serde_json::json!(want));
+        }
+        for (state, want) in [
+            (ConversationState::Busy, "busy"),
+            (ConversationState::Idle, "idle"),
+            (ConversationState::Waiting, "waiting"),
+            (ConversationState::Unknown, "unknown"),
+        ] {
+            assert_eq!(state.as_str(), want);
+            assert_eq!(wire(&state), serde_json::json!(want));
+        }
+        assert_eq!(Provider::Claude.as_str(), "claude");
         for (value, want) in [
-            (wire(&WorkKind::Branch), "branch"),
-            (wire(&WorkKind::Detached), "detached"),
-            (wire(&WorkKind::Worktree), "worktree"),
-            (wire(&WorkKind::ProjectSpace), "project_space"),
             (wire(&Upstream::Tracked), "tracked"),
             (wire(&Upstream::NeverPushed), "never_pushed"),
             (wire(&Upstream::RemoteGone), "remote_gone"),
