@@ -273,7 +273,7 @@ impl PaneInventory {
         let mut windows = HashSet::new();
         for pane in &self.panes {
             if pane.binds_worktree(admin_id, worktree) {
-                windows.insert((pane.socket.clone(), pane.window.clone()));
+                windows.insert((&pane.socket, &pane.window));
             }
         }
         windows.len()

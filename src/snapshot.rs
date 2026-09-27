@@ -225,27 +225,22 @@ impl Collector {
             }
         }
         let resolved = runtime.resolve_attachments(&claims);
-        let mut attachment_of: HashMap<usize, usize> = HashMap::new();
+        let mut attachment_of: Vec<Option<usize>> = vec![None; inventory.conversations.len()];
         for (slot, conv_index) in claim_of.iter().enumerate() {
-            attachment_of.insert(*conv_index, slot);
+            attachment_of[*conv_index] = Some(slot);
         }
         // Which conversations are actually running: a claim was resolved and
         // the instance verdict is not `Dead`. A live file left behind by a
         // crashed agent is stale evidence, not a live process.
         let running: Vec<bool> = (0..inventory.conversations.len())
-            .map(|i| {
-                attachment_of
-                    .get(&i)
-                    .is_some_and(|slot| resolved[*slot].liveness.may_be_live())
-            })
+            .map(|i| attachment_of[i].is_some_and(|slot| resolved[slot].liveness.may_be_live()))
             .collect();
 
         // Work identity per conversation: the cwd resolves to a checkout, a
-        // bare repo, a project space, or nothing still on disk.
-        let mut placements: Vec<Option<CwdPlacement>> = Vec::new();
-        for conv in &inventory.conversations {
-            placements.push(resolve_cwd(conv.cwd(), &mut errors));
-        }
+        // bare repo, a project space, or nothing still on disk. Distinct
+        // cwds are few while conversations are many, so each resolves once
+        // per pass - a failure is also one error, not one per conversation.
+        let placements = resolve_cwds(&inventory.conversations, &mut errors);
 
         // Repos: every distinct repository plus every non-git project space.
         let mut repos: BTreeMap<String, RepoRow> = BTreeMap::new();
@@ -344,9 +339,7 @@ impl Collector {
 
         let mut conversations: Vec<ConversationRow> = Vec::new();
         for (i, conv) in inventory.conversations.iter().enumerate() {
-            let attachment = attachment_of
-                .get(&i)
-                .map(|slot| attachment_row(&resolved[*slot]));
+            let attachment = attachment_of[i].map(|slot| attachment_row(&resolved[slot]));
             let (repo, worktree, branch) = match &placements[i] {
                 Some(CwdPlacement::Checkout {
                     repo_id,
@@ -397,7 +390,7 @@ impl Collector {
 }
 
 /// The internal spelling of a resolved cwd - repo identity plus where in it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CwdPlacement {
     Checkout {
         repo_id: String,
@@ -409,10 +402,29 @@ enum CwdPlacement {
     },
 }
 
+/// Every conversation's cwd resolved, one `git::resolve` per distinct path:
+/// conversations share cwds, and the same failure would otherwise emit an
+/// identical error per conversation sharing it.
+fn resolve_cwds(
+    conversations: &[Conversation],
+    errors: &mut Vec<SourceError>,
+) -> Vec<Option<CwdPlacement>> {
+    let mut memo: HashMap<PathBuf, Option<CwdPlacement>> = HashMap::new();
+    conversations
+        .iter()
+        .map(|conv| match conv.cwd() {
+            Some(cwd) => memo
+                .entry(cwd.to_owned())
+                .or_insert_with(|| resolve_cwd(cwd, errors))
+                .clone(),
+            None => None,
+        })
+        .collect()
+}
+
 /// `cwd` -> checkout / project space / nothing. An unreadable or vanished
 /// path is no anchor at all; the error is retained, the row gets no claim.
-fn resolve_cwd(cwd: Option<&Path>, errors: &mut Vec<SourceError>) -> Option<CwdPlacement> {
-    let cwd = cwd?;
+fn resolve_cwd(cwd: &Path, errors: &mut Vec<SourceError>) -> Option<CwdPlacement> {
     if !cwd.is_dir() {
         return None;
     }
@@ -509,15 +521,15 @@ fn runtime_facts(
         let mut orphaned = std::collections::HashSet::new();
         for pane in &runtime.panes.panes {
             if pane.wt_adminid.is_none() && pane.binds_worktree(admin_id, path) {
-                orphaned.insert((pane.socket.clone(), pane.window.clone()));
+                orphaned.insert((&pane.socket, &pane.window));
             }
         }
         facts.windows.orphaned = orphaned.len();
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned()); // coverage: off - a reported path canonicalizes
         for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() {
             let Some(CwdPlacement::Checkout { root, .. }) = place else {
                 continue;
             };
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned()); // coverage: off - a reported path canonicalizes
             if root != &canonical {
                 continue;
             }
@@ -1066,16 +1078,15 @@ mod tests {
 
     #[test]
     fn a_cwd_resolves_or_fails_closed() {
-        // No cwd, and a cwd that no longer exists: no anchor, no error.
+        // A cwd that no longer exists: no anchor, no error.
         let mut errors = Vec::new();
-        assert!(resolve_cwd(None, &mut errors).is_none());
-        assert!(resolve_cwd(Some(Path::new("/definitely/gone")), &mut errors).is_none());
+        assert!(resolve_cwd(Path::new("/definitely/gone"), &mut errors).is_none());
         assert!(errors.is_empty());
 
         // A plain directory is a project space.
         let dir = std::env::temp_dir().join(format!("asd-space-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let Some(CwdPlacement::ProjectSpace { path }) = resolve_cwd(Some(&dir), &mut errors) else {
+        let Some(CwdPlacement::ProjectSpace { path }) = resolve_cwd(&dir, &mut errors) else {
             panic!("a plain dir is a project space") // coverage: off - a passing test never panics
         };
         assert_eq!(path, dir.canonicalize().unwrap());
@@ -1084,7 +1095,7 @@ mod tests {
         let broken = std::env::temp_dir().join(format!("asd-broken-{}", std::process::id()));
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join(".git"), "gitdir: /definitely/not/a/dir").unwrap();
-        assert!(resolve_cwd(Some(&broken), &mut errors).is_some());
+        assert!(resolve_cwd(&broken, &mut errors).is_some());
         // An unreadable `.git` file: resolve fails, the error is retained,
         // the row gets no anchor.
         let dead_dir = std::env::temp_dir().join(format!("asd-dead-{}", std::process::id()));
@@ -1093,11 +1104,42 @@ mod tests {
         fs::write(&gitfile, "gitdir: /x").unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&gitfile, fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(resolve_cwd(Some(&dead_dir), &mut errors).is_none());
+        assert!(resolve_cwd(&dead_dir, &mut errors).is_none());
         assert!(errors.iter().any(|e| e.source == "git resolve"));
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::set_permissions(&gitfile, fs::Permissions::from_mode(0o644));
         let _ = fs::remove_dir_all(&broken);
+        let _ = fs::remove_dir_all(&dead_dir);
+    }
+
+    /// A conversation whose live record sits at `cwd`.
+    fn live_at(cwd: &Path) -> Live {
+        let mut live = live_with(None);
+        live.cwd = Some(cwd.to_owned());
+        live
+    }
+
+    #[test]
+    fn a_shared_cwd_resolves_once_and_fails_once() {
+        // Three conversations on one cwd: one resolve each pass, and a
+        // failure is one retained error, not one per conversation.
+        let dead_dir = std::env::temp_dir().join(format!("asd-shared-{}", std::process::id()));
+        fs::create_dir_all(&dead_dir).unwrap();
+        let gitfile = dead_dir.join(".git");
+        fs::write(&gitfile, "gitdir: /x").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&gitfile, fs::Permissions::from_mode(0o000)).unwrap();
+        let conversations = vec![
+            conversation(Some(live_at(&dead_dir)), None),
+            conversation(Some(live_at(&dead_dir)), None),
+            conversation(None, None),
+        ];
+        let mut errors = Vec::new();
+        let placements = resolve_cwds(&conversations, &mut errors);
+        assert_eq!(placements.len(), 3);
+        assert!(placements.iter().all(Option::is_none));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let _ = fs::set_permissions(&gitfile, fs::Permissions::from_mode(0o644));
         let _ = fs::remove_dir_all(&dead_dir);
     }
 }
