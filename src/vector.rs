@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use crate::evidence::Evidence;
 use crate::forge;
@@ -193,7 +193,7 @@ pub const REMOTE_DEADLINE: Duration = Duration::from_secs(5 * 60);
 /// `collect` is used, shared across a batch with [`collect_cached`].
 pub struct RemoteCache {
     deadline: Duration,
-    listings: HashMap<(PathBuf, String), (Instant, RemoteListing)>,
+    listings: HashMap<(PathBuf, String), (SystemTime, RemoteListing)>,
 }
 
 impl Default for RemoteCache {
@@ -216,17 +216,27 @@ impl RemoteCache {
     /// next ask, not a retry storm against an unreachable host.
     fn listing(&mut self, repo: &Repo, remote: &str) -> &RemoteListing {
         let key = (repo.common_dir().to_owned(), remote.to_owned());
-        let now = Instant::now();
+        let now = SystemTime::now();
         let fresh = self
             .listings
             .get(&key)
-            .is_some_and(|(asked, _)| now.duration_since(*asked) < self.deadline);
+            .is_some_and(|(asked, _)| still_fresh(*asked, now, self.deadline));
         if !fresh {
             self.listings
                 .insert(key.clone(), (now, repo.remote_listing(remote)));
         }
         &self.listings[&key].1
     }
+}
+
+/// Whether an answer asked at `asked` still stands at `now`. Wall-clock
+/// time, not `Instant`: on macOS a monotonic clock stops while the machine
+/// sleeps, and a dashboard left open overnight must not wake up trusting a
+/// pre-sleep answer. A clock that went backwards proves nothing, so the
+/// answer is treated as expired.
+fn still_fresh(asked: SystemTime, now: SystemTime, deadline: Duration) -> bool {
+    now.duration_since(asked)
+        .is_ok_and(|elapsed| elapsed < deadline)
 }
 
 /// Collect the vector for one anchor. Reads only; all runtime fields come
@@ -538,6 +548,21 @@ fn unpushed_commits(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_remote_answer_expires_by_wall_clock() {
+        let asked = std::time::UNIX_EPOCH + super::Duration::from_secs(1_000);
+        let deadline = super::REMOTE_DEADLINE;
+        assert!(super::still_fresh(asked, asked, deadline));
+        assert!(super::still_fresh(asked, asked + deadline / 2, deadline));
+        assert!(!super::still_fresh(asked, asked + deadline, deadline));
+        // Hours of sleep count: the wall clock kept moving.
+        let overnight = super::Duration::from_secs(8 * 3600);
+        assert!(!super::still_fresh(asked, asked + overnight, deadline));
+        // A clock set backwards is no proof of freshness.
+        let earlier = asked - super::Duration::from_secs(1);
+        assert!(!super::still_fresh(asked, earlier, deadline));
+    }
+
     use super::*;
 
     fn is_unknown(upstream: &UpstreamState) -> bool {
