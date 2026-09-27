@@ -1194,15 +1194,11 @@ mod tests {
         let root = Root::new();
         // No summary and no name: the first line of the latest prompt titles
         // the row; multi-line prompts collapse to their first line.
-        root.write(
-            &format!("projects/p/{ID_A}.jsonl"),
-            &format!(
-                "{}\n",
-                format!(
-                    r#"{{"type":"user","sessionId":"{ID_A}","cwd":"/x","message":{{"role":"user","content":"first line\nsecond line which is quite long and keeps going past forty characters"}},"timestamp":"2026-01-01T00:00:00Z"}}"#
-                )
-            ),
+        let mut line = format!(
+            r#"{{"type":"user","sessionId":"{ID_A}","cwd":"/x","message":{{"role":"user","content":"first line\nsecond line which is quite long and keeps going past forty characters"}},"timestamp":"2026-01-01T00:00:00Z"}}"#
         );
+        line.push('\n');
+        root.write(&format!("projects/p/{ID_A}.jsonl"), &line);
         let mut claude = Claude::new(root.0.clone());
         let inv = claude.scan();
         assert_eq!(inv.conversations[0].title().as_deref(), Some("first line"));
