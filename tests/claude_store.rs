@@ -13,8 +13,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use agent_sessions::provider::SourceError;
-use agent_sessions::runtime::Runtime;
-use agent_sessions::snapshot::{Collector, SCHEMA_VERSION};
+use agent_sessions::runtime::{PaneSource, Runtime};
+use agent_sessions::snapshot::{
+    AttachmentLiveness, Collector, ConversationState, Landed, SCHEMA_VERSION, Upstream, WorkKind,
+};
 use support::fixture::{FixtureRepo, Landing};
 use support::tempdir::TempDir;
 use support::tmux::TmuxServer;
@@ -360,7 +362,7 @@ fn the_snapshot_holds_live_transcript_and_merged_conversations() {
         .find(|c| c.session_id == LIVE_ID)
         .expect("the live conversation");
     assert!(live.live);
-    assert_eq!(live.state, "waiting");
+    assert_eq!(live.state, ConversationState::Waiting);
     assert_eq!(live.waiting_for.as_deref(), Some("permission prompt"));
     assert_eq!(live.title.as_deref(), Some("fix login"));
     assert_eq!(live.latest_prompt.as_deref(), Some("add the form"));
@@ -369,7 +371,11 @@ fn the_snapshot_holds_live_transcript_and_merged_conversations() {
     assert!(live.transcript.is_some());
     let attachment = live.attachment.as_ref().expect("a live claim resolves");
     assert_eq!(attachment.pid, world.live_pid);
-    assert_eq!(attachment.liveness, "instance", "{attachment:?}");
+    assert_eq!(
+        attachment.liveness,
+        AttachmentLiveness::Instance,
+        "{attachment:?}"
+    );
     // The published handle bound: `socket:%id`, ending in the agent's pane.
     assert!(
         attachment
@@ -379,7 +385,7 @@ fn the_snapshot_holds_live_transcript_and_merged_conversations() {
         "{attachment:?} vs {}",
         world.pane_id
     );
-    assert_eq!(attachment.pane_source, Some("published"));
+    assert_eq!(attachment.pane_source, Some(PaneSource::Published));
 
     // Work identity came through the cwd: the worktree and its branch.
     assert_eq!(live.worktree.as_deref(), Some(world.worktree.as_path()));
@@ -393,7 +399,7 @@ fn the_snapshot_holds_live_transcript_and_merged_conversations() {
         .find(|c| c.session_id == MERGED_ID)
         .expect("the merged conversation");
     assert!(!merged.live);
-    assert_eq!(merged.state, "unknown");
+    assert_eq!(merged.state, ConversationState::Unknown);
     assert!(merged.attachment.is_none());
     assert!(merged.transcript.is_some());
     let ancient = snapshot
@@ -442,11 +448,11 @@ fn the_snapshot_holds_live_transcript_and_merged_conversations() {
             .unwrap_or_else(|| panic!("a row named {name}: {names:?}"))
     };
     assert!(row("feat-login").dirty == Some(true));
-    assert_eq!(row("feat-gone").upstream, "remote_gone");
-    assert_eq!(row("feat-unknown").upstream, "unknown");
-    assert_eq!(row("feat-merged").landed, Some("ancestor"));
-    assert_eq!(row("feat-squashed").landed, Some("content"));
-    assert!(snapshot.work.iter().any(|w| w.kind == "detached"));
+    assert_eq!(row("feat-gone").upstream, Upstream::RemoteGone);
+    assert_eq!(row("feat-unknown").upstream, Upstream::Unknown);
+    assert_eq!(row("feat-merged").landed, Some(Landed::Ancestor));
+    assert_eq!(row("feat-squashed").landed, Some(Landed::Content));
+    assert!(snapshot.work.iter().any(|w| w.kind == WorkKind::Detached));
     assert!(
         snapshot
             .work
@@ -588,7 +594,7 @@ fn a_dead_pid_cannot_raise_a_transcript() {
         .unwrap();
     assert!(merged.live, "the file exists; liveness is separate");
     let attachment = merged.attachment.as_ref().expect("the claim resolved");
-    assert_eq!(attachment.liveness, "dead");
+    assert_eq!(attachment.liveness, AttachmentLiveness::Dead);
     assert!(attachment.pane.is_none());
 
     // A stale file on a dead pid feeds no live rollup: the worktree row

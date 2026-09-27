@@ -21,9 +21,11 @@ use crate::evidence::Evidence;
 use crate::git::{self, Head, Resolved};
 use crate::process::{Liveness, ProcessStart};
 use crate::provider::{PublishedStatus, SourceError, StateEvidence};
-use crate::runtime::{Placement, Runtime};
+use crate::runtime::{PaneSource, Placement, Provider, Runtime};
 use crate::tmux::{PaneId, PaneRef};
-use crate::vector::{self, Anchor, Landed, RemoteCache, RuntimeFacts, UpstreamState, WindowCount};
+use crate::vector::{
+    self, Anchor, Landed as LandedVerdict, RemoteCache, RuntimeFacts, UpstreamState, WindowCount,
+};
 
 /// The JSON contract version. Additive changes keep it; a field's removal,
 /// rename or change of meaning bumps it.
@@ -71,6 +73,99 @@ pub struct RepoRow {
     pub last_activity: Option<u64>,
 }
 
+/// `WorkRow.kind`: which anchor shape the row is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkKind {
+    /// A branch checkout, or a branch with no checkout at all.
+    Branch,
+    /// A detached-HEAD checkout.
+    Detached,
+    /// The repository's own checkout.
+    Worktree,
+    /// A non-git project space.
+    ProjectSpace,
+}
+
+impl WorkKind {
+    /// The wire spelling; the detail view renders `project_space` as
+    /// "project space".
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkKind::Branch => "branch",
+            WorkKind::Detached => "detached",
+            WorkKind::Worktree => "worktree",
+            WorkKind::ProjectSpace => "project_space",
+        }
+    }
+}
+
+/// `WorkRow.upstream`: what the branch's configured upstream proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Upstream {
+    /// The upstream ref exists on the remote.
+    Tracked,
+    /// No upstream configured.
+    NeverPushed,
+    /// Configured, and the remote provably no longer carries it.
+    RemoteGone,
+    /// No branch to track (detached HEAD, project space).
+    NotApplicable,
+    /// Configured partially, or the remote could not be asked.
+    Unknown,
+}
+
+/// `WorkRow.landed`: whether HEAD's content already lives on the base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Landed {
+    /// HEAD is an ancestor of the base ref.
+    Ancestor,
+    /// Every path HEAD changed is identical on the base - the squash- or
+    /// rebase-landed shape.
+    Content,
+    /// Proven not landed (including the no-delta case).
+    No,
+}
+
+/// `AttachmentRow.liveness`: the claim's proven process state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentLiveness {
+    /// The running process is the claimed instance.
+    Instance,
+    /// The pid is alive but the instance is unproven.
+    PidOnly,
+    /// The pid is gone or provably belongs to another instance.
+    Dead,
+    /// Nothing could be checked - the process table failed to read.
+    Unverifiable,
+}
+
+/// `ConversationRow.state`: the provider's published execution state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationState {
+    Busy,
+    Idle,
+    Waiting,
+    /// No published state, or one the mapping does not know.
+    Unknown,
+}
+
+impl ConversationState {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConversationState::Busy => "busy",
+            ConversationState::Idle => "idle",
+            ConversationState::Waiting => "waiting",
+            ConversationState::Unknown => "unknown",
+        }
+    }
+}
+
 /// One Work row: a checkout on a branch, a detached checkout, a local branch
 /// without one, or a non-git project space. Incarnation identity and
 /// lifecycle sections are not modelled yet - rows are the on-disk anchors.
@@ -80,8 +175,7 @@ pub struct WorkRow {
     pub repo: String,
     /// The repo's display name; rows under `all` carry it as a prefix.
     pub repo_name: String,
-    /// `branch`, `detached`, `worktree` or `project_space`.
-    pub kind: &'static str,
+    pub kind: WorkKind,
     /// The row's label: the branch name, `detached @sha`, or the path name.
     pub name: String,
     /// The checkout path when there is one (`None` -> `no wt`).
@@ -92,12 +186,11 @@ pub struct WorkRow {
     /// Commits on the row's tip not on the proven base; `None` is `?`.
     pub commits_ahead: Option<u64>,
     pub unpushed: Option<u64>,
-    /// `tracked`, `never_pushed`, `remote_gone`, `not_applicable` or
-    /// `unknown`; detail in `upstream_detail`.
-    pub upstream: &'static str,
+    /// Detail in `upstream_detail`.
+    pub upstream: Upstream,
     pub upstream_detail: Option<String>,
-    /// `ancestor`, `content`, `no`; `None` is unproven.
-    pub landed: Option<&'static str>,
+    /// `None` is unproven.
+    pub landed: Option<Landed>,
     /// The proven base's `remote/branch` label.
     pub base: Option<String>,
     pub windows: usize,
@@ -120,13 +213,12 @@ pub struct AttachmentRow {
     /// The claimed start, epoch seconds; `None` when the provider did not
     /// date its process.
     pub pid_start: Option<u64>,
-    /// `instance`, `pid_only`, `dead` or `unverifiable`.
-    pub liveness: &'static str,
+    pub liveness: AttachmentLiveness,
     pub liveness_detail: Option<String>,
     /// The bound pane as `session:window.pane`, when bound.
     pub pane: Option<String>,
-    /// `published`, `ancestry` or `tty`; `None` when unbound.
-    pub pane_source: Option<&'static str>,
+    /// How the pane was bound; `None` when unbound.
+    pub pane_source: Option<PaneSource>,
     /// Why the pane is unbound, when it is (`dead`, `superseded`, or the
     /// failed-closed reason).
     pub placement_detail: Option<String>,
@@ -135,16 +227,16 @@ pub struct AttachmentRow {
 /// One conversation in the snapshot - live, restorable or transcript-only.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConversationRow {
-    /// `claude`; other providers arrive with their own plugins.
-    pub provider: &'static str,
+    /// The provider plugin the conversation came from.
+    pub provider: Provider,
     pub session_id: String,
     /// First eight of the id - what list rows display.
     pub short_id: String,
     /// Provider title, or `None` -> `?`.
     pub title: Option<String>,
-    /// `busy`, `idle`, `waiting` or `unknown`; the provider's published
-    /// reading, not yet arbitrated against hooks (there are none yet).
-    pub state: &'static str,
+    /// The provider's published reading, not yet arbitrated against hooks
+    /// (there are none yet).
+    pub state: ConversationState,
     /// The provider's raw status string, kept for the evidence view.
     pub state_raw: Option<String>,
     /// The provider's own wait reason, verbatim.
@@ -183,7 +275,7 @@ impl ConversationRow {
     pub fn running(&self) -> bool {
         self.attachment
             .as_ref()
-            .is_some_and(|a| a.liveness != "dead")
+            .is_some_and(|a| a.liveness != AttachmentLiveness::Dead)
     }
 }
 
@@ -314,7 +406,7 @@ impl Collector {
                 work.push(WorkRow {
                     repo: id.clone(),
                     repo_name: display_name(path),
-                    kind: "project_space",
+                    kind: WorkKind::ProjectSpace,
                     name: display_name(path),
                     // The row's workspace is the space itself: no checkout,
                     // but the path is what its conversations anchor on.
@@ -323,7 +415,7 @@ impl Collector {
                     dirty: None,
                     commits_ahead: None,
                     unpushed: None,
-                    upstream: "not_applicable",
+                    upstream: Upstream::NotApplicable,
                     upstream_detail: None,
                     landed: None,
                     base: None,
@@ -575,20 +667,20 @@ fn work_row(
                 Head::Detached(sha) => format!("detached @{}", short_sha(sha)),
             };
             let kind = match (branch.is_some(), main) {
-                (_, true) => "worktree",
-                (true, false) => "branch",
-                (false, false) => "detached",
+                (_, true) => WorkKind::Worktree,
+                (true, false) => WorkKind::Branch,
+                (false, false) => WorkKind::Detached,
             };
             (kind, name, branch)
         }
-        Anchor::Branch { name } => ("branch", name.clone(), Some(name.clone())),
+        Anchor::Branch { name } => (WorkKind::Branch, name.clone(), Some(name.clone())),
     };
     let upstream = match &v.upstream_state {
-        UpstreamState::NeverPushed => "never_pushed",
-        UpstreamState::Tracked { .. } => "tracked",
-        UpstreamState::RemoteGone { .. } => "remote_gone",
-        UpstreamState::Unknown(_) => "unknown",
-        UpstreamState::NotApplicable => "not_applicable",
+        UpstreamState::NeverPushed => Upstream::NeverPushed,
+        UpstreamState::Tracked { .. } => Upstream::Tracked,
+        UpstreamState::RemoteGone { .. } => Upstream::RemoteGone,
+        UpstreamState::Unknown(_) => Upstream::Unknown,
+        UpstreamState::NotApplicable => Upstream::NotApplicable,
     };
     let upstream_detail = match &v.upstream_state {
         UpstreamState::Tracked { remote, merge_ref }
@@ -609,9 +701,9 @@ fn work_row(
         upstream,
         upstream_detail,
         landed: v.landed.known().map(|l| match l {
-            Landed::AncestorMerged => "ancestor",
-            Landed::ContentMerged => "content",
-            Landed::No => "no",
+            LandedVerdict::AncestorMerged => Landed::Ancestor,
+            LandedVerdict::ContentMerged => Landed::Content,
+            LandedVerdict::No => Landed::No,
         }),
         base: state.base.known().map(|b| b.label()),
         windows: v.windows.total,
@@ -653,20 +745,13 @@ fn work_summary(v: &vector::StateVector) -> String {
 /// `resolved` -> the row's attachment view.
 fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
     let (liveness, liveness_detail) = match &r.liveness {
-        Liveness::Instance => ("instance", None),
-        Liveness::PidOnly(reason) => ("pid_only", Some(reason.clone())),
-        Liveness::Unverifiable(reason) => ("unverifiable", Some(reason.clone())),
-        Liveness::Dead(reason) => ("dead", Some(reason.clone())),
+        Liveness::Instance => (AttachmentLiveness::Instance, None),
+        Liveness::PidOnly(reason) => (AttachmentLiveness::PidOnly, Some(reason.clone())),
+        Liveness::Unverifiable(reason) => (AttachmentLiveness::Unverifiable, Some(reason.clone())),
+        Liveness::Dead(reason) => (AttachmentLiveness::Dead, Some(reason.clone())),
     };
     let (pane_source, placement_detail) = match &r.placement {
-        Placement::Bound(source) => (
-            Some(match source {
-                crate::runtime::PaneSource::Published => "published",
-                crate::runtime::PaneSource::Ancestry => "ancestry",
-                crate::runtime::PaneSource::Tty => "tty",
-            }),
-            None,
-        ),
+        Placement::Bound(source) => (Some(*source), None),
         Placement::Unknown(reason) | Placement::Dead(reason) => (None, Some(reason.clone())),
         Placement::Superseded => (None, Some("superseded".to_owned())),
     };
@@ -700,18 +785,18 @@ fn conversation_row(
     let (state, state_raw, waiting_for) = match conv.state() {
         StateEvidence::Published(p) => (
             match p.status {
-                Some(PublishedStatus::Busy) => "busy",
-                Some(PublishedStatus::Idle) => "idle",
-                Some(PublishedStatus::Waiting) => "waiting",
-                None => "unknown",
+                Some(PublishedStatus::Busy) => ConversationState::Busy,
+                Some(PublishedStatus::Idle) => ConversationState::Idle,
+                Some(PublishedStatus::Waiting) => ConversationState::Waiting,
+                None => ConversationState::Unknown,
             },
             Some(p.raw),
             p.waiting_for,
         ),
-        StateEvidence::Absent => ("unknown", None, None),
+        StateEvidence::Absent => (ConversationState::Unknown, None, None),
     };
     ConversationRow {
-        provider: "claude",
+        provider: Provider::Claude,
         session_id: conv.session_id.clone(),
         short_id: conv.session_id.chars().take(8).collect(),
         title: conv.title(),
@@ -765,10 +850,10 @@ fn attention_rank(c: &ConversationRow) -> u8 {
         return 4;
     }
     match c.state {
-        "waiting" => 0,
-        "busy" => 1,
-        "idle" => 2,
-        _ => 3,
+        ConversationState::Waiting => 0,
+        ConversationState::Busy => 1,
+        ConversationState::Idle => 2,
+        ConversationState::Unknown => 3,
     }
 }
 
@@ -807,7 +892,7 @@ mod tests {
     use super::*;
     use crate::claude::{Live, Transcript};
     use crate::process::ProcessInstance;
-    use crate::runtime::{EvidenceSource, LiveAttachment, PaneSource, ResolvedAttachment};
+    use crate::runtime::{EvidenceSource, LiveAttachment, ResolvedAttachment};
     use std::fs;
 
     /// One conversation fabricated to order: `live` and `transcript` each
@@ -867,18 +952,18 @@ mod tests {
         // Live-only, transcript-only and merged each produce one row; the
         // state column is the published status, `unknown` otherwise.
         for (live, want) in [
-            (live_with(Some("busy")), "busy"),
-            (live_with(Some("idle")), "idle"),
-            (live_with(Some("waiting")), "waiting"),
-            (live_with(Some("strange")), "unknown"),
-            (live_with(None), "unknown"),
+            (live_with(Some("busy")), ConversationState::Busy),
+            (live_with(Some("idle")), ConversationState::Idle),
+            (live_with(Some("waiting")), ConversationState::Waiting),
+            (live_with(Some("strange")), ConversationState::Unknown),
+            (live_with(None), ConversationState::Unknown),
         ] {
             let row = conversation_row(&conversation(Some(live), None), None, None, None, None);
-            assert_eq!(row.state, want, "{:?}", want);
+            assert_eq!(row.state, want, "{want:?}");
             assert!(row.live);
         }
         let row = conversation_row(&conversation(None, None), None, None, None, None);
-        assert_eq!(row.state, "unknown");
+        assert_eq!(row.state, ConversationState::Unknown);
         assert!(!row.live);
         assert_eq!(row.short_id, "11111111");
     }
@@ -889,34 +974,39 @@ mod tests {
             (
                 Liveness::Instance,
                 Placement::Bound(PaneSource::Published),
-                "instance",
-                Some("published"),
+                AttachmentLiveness::Instance,
+                Some(PaneSource::Published),
             ),
             (
                 Liveness::PidOnly("no start".to_owned()),
                 Placement::Bound(PaneSource::Ancestry),
-                "pid_only",
-                Some("ancestry"),
+                AttachmentLiveness::PidOnly,
+                Some(PaneSource::Ancestry),
             ),
             (
                 Liveness::Unverifiable("no table".to_owned()),
                 Placement::Bound(PaneSource::Tty),
-                "unverifiable",
-                Some("tty"),
+                AttachmentLiveness::Unverifiable,
+                Some(PaneSource::Tty),
             ),
             (
                 Liveness::Dead("gone".to_owned()),
                 Placement::Dead("gone".to_owned()),
-                "dead",
+                AttachmentLiveness::Dead,
                 None,
             ),
             (
                 Liveness::Instance,
                 Placement::Unknown("contradicted".to_owned()),
-                "instance",
+                AttachmentLiveness::Instance,
                 None,
             ),
-            (Liveness::Instance, Placement::Superseded, "instance", None),
+            (
+                Liveness::Instance,
+                Placement::Superseded,
+                AttachmentLiveness::Instance,
+                None,
+            ),
         ] {
             let row = attachment_row(&attachment(liveness, placement, true));
             assert_eq!(row.liveness, want_state);
@@ -1039,8 +1129,8 @@ mod tests {
 
     #[test]
     fn attention_orders_waiting_then_busy_then_idle_then_unknown() {
-        let row = |state: &'static str, since: Option<u64>| ConversationRow {
-            provider: "claude",
+        let row = |state: ConversationState, since: Option<u64>| ConversationRow {
+            provider: Provider::Claude,
             session_id: String::new(),
             short_id: String::new(),
             title: None,
@@ -1062,18 +1152,57 @@ mod tests {
             branch: None,
         };
         let now = SystemTime::now();
-        assert_eq!(attention_rank(&row("waiting", None)), 0);
-        assert_eq!(attention_rank(&row("busy", None)), 1);
-        assert_eq!(attention_rank(&row("idle", None)), 2);
-        assert_eq!(attention_rank(&row("unknown", None)), 3);
-        assert_eq!(attention_rank(&row("other", None)), 3);
+        assert_eq!(attention_rank(&row(ConversationState::Waiting, None)), 0);
+        assert_eq!(attention_rank(&row(ConversationState::Busy, None)), 1);
+        assert_eq!(attention_rank(&row(ConversationState::Idle, None)), 2);
+        assert_eq!(attention_rank(&row(ConversationState::Unknown, None)), 3);
         // No state timestamp means infinite age: sorted last of its rank.
-        assert_eq!(age_of(&row("waiting", None), now), Duration::MAX);
         assert_eq!(
-            age_of(&row("waiting", Some(1)), now),
+            age_of(&row(ConversationState::Waiting, None), now),
+            Duration::MAX
+        );
+        assert_eq!(
+            age_of(&row(ConversationState::Waiting, Some(1)), now),
             now.duration_since(UNIX_EPOCH + Duration::from_secs(1))
                 .unwrap()
         );
+    }
+
+    /// The row enums are the JSON contract: every variant serializes to the
+    /// snake_case label the field documented as a string before.
+    #[test]
+    fn label_enums_keep_their_wire_spellings() {
+        fn wire(v: &impl Serialize) -> serde_json::Value {
+            serde_json::to_value(v).unwrap()
+        }
+        for (value, want) in [
+            (wire(&WorkKind::Branch), "branch"),
+            (wire(&WorkKind::Detached), "detached"),
+            (wire(&WorkKind::Worktree), "worktree"),
+            (wire(&WorkKind::ProjectSpace), "project_space"),
+            (wire(&Upstream::Tracked), "tracked"),
+            (wire(&Upstream::NeverPushed), "never_pushed"),
+            (wire(&Upstream::RemoteGone), "remote_gone"),
+            (wire(&Upstream::NotApplicable), "not_applicable"),
+            (wire(&Upstream::Unknown), "unknown"),
+            (wire(&Landed::Ancestor), "ancestor"),
+            (wire(&Landed::Content), "content"),
+            (wire(&Landed::No), "no"),
+            (wire(&AttachmentLiveness::Instance), "instance"),
+            (wire(&AttachmentLiveness::PidOnly), "pid_only"),
+            (wire(&AttachmentLiveness::Dead), "dead"),
+            (wire(&AttachmentLiveness::Unverifiable), "unverifiable"),
+            (wire(&ConversationState::Busy), "busy"),
+            (wire(&ConversationState::Idle), "idle"),
+            (wire(&ConversationState::Waiting), "waiting"),
+            (wire(&ConversationState::Unknown), "unknown"),
+            (wire(&Provider::Claude), "claude"),
+            (wire(&PaneSource::Published), "published"),
+            (wire(&PaneSource::Ancestry), "ancestry"),
+            (wire(&PaneSource::Tty), "tty"),
+        ] {
+            assert_eq!(value, serde_json::json!(want));
+        }
     }
 
     #[test]

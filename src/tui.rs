@@ -23,7 +23,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::config;
-use crate::snapshot::{ConversationRow, RepoRow, Snapshot, WorkRow, to_json};
+use crate::snapshot::{
+    ConversationRow, ConversationState, RepoRow, Snapshot, WorkKind, WorkRow, to_json,
+};
 use crate::tmux::PaneId;
 
 /// The four panes, in `Tab` order.
@@ -296,7 +298,7 @@ impl App {
         }
         self.rows(List::Work).get(cursor - 1).map(|row| match row {
             Row::Work(w) => match (w.kind, &w.worktree, &w.branch) {
-                ("project_space", Some(root), _) => WorkScope::Space { path: root.clone() },
+                (WorkKind::ProjectSpace, Some(root), _) => WorkScope::Space { path: root.clone() },
                 (_, Some(root), _) => WorkScope::Worktree {
                     repo: w.repo.clone(),
                     root: root.clone(),
@@ -493,7 +495,7 @@ impl App {
             Row::Conversation(c) => RowCells {
                 glyph: conversation_glyph(c),
                 label: &format!("{} {}", c.short_id, c.title.as_deref().unwrap_or("?")),
-                middle: c.provider,
+                middle: c.provider.as_str(),
                 age: &age(self.now(), c.state_since),
                 selected,
                 dim_label: c.title.is_none(),
@@ -599,7 +601,7 @@ impl App {
                     "{} {} - {} · {}",
                     work_glyph(w),
                     w.name,
-                    w.kind.replace('_', " "),
+                    w.kind.as_str().replace('_', " "),
                     age(self.now(), w.last_activity)
                 )),
             ),
@@ -614,7 +616,7 @@ impl App {
                         "{} {} - {}, {}",
                         c.short_id,
                         c.title.as_deref().unwrap_or("?"),
-                        c.provider,
+                        c.provider.as_str(),
                         detail_state(c)
                     )),
                 ]),
@@ -831,7 +833,7 @@ fn work_glyph(w: &WorkRow) -> &'static str {
 /// The work row's label: `name ⌂worktree`; a project space's workspace is
 /// its name already, so it carries no suffix.
 fn work_name(_snapshot: &Snapshot, w: &WorkRow) -> String {
-    if w.kind == "project_space" {
+    if w.kind == WorkKind::ProjectSpace {
         return w.name.clone();
     }
     let wt = w
@@ -851,10 +853,10 @@ fn conversation_glyph(c: &ConversationRow) -> &'static str {
         return "";
     }
     match c.state {
-        "waiting" => "!",
-        "busy" => "●",
-        "unknown" => "?",
-        _ => "",
+        ConversationState::Waiting => "!",
+        ConversationState::Busy => "●",
+        ConversationState::Unknown => "?",
+        ConversationState::Idle => "",
     }
 }
 
@@ -867,11 +869,11 @@ fn detail_state(c: &ConversationRow) -> String {
         return "dead".to_owned();
     }
     match c.state {
-        "waiting" => match &c.waiting_for {
+        ConversationState::Waiting => match &c.waiting_for {
             Some(reason) => format!("waiting: {reason}"),
             None => "waiting".to_owned(),
         },
-        state => state.to_owned(),
+        state => state.as_str().to_owned(),
     }
 }
 
@@ -887,7 +889,7 @@ fn conversation_label(c: &ConversationRow) -> String {
         "{} {} {}",
         c.short_id,
         c.title.as_deref().unwrap_or(""),
-        c.provider
+        c.provider.as_str()
     )
 }
 
@@ -1093,7 +1095,10 @@ pub fn list_json() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::{AttachmentRow, RepoRow, SCHEMA_VERSION, WorkRow};
+    use crate::runtime::{PaneSource, Provider};
+    use crate::snapshot::{
+        AttachmentLiveness, AttachmentRow, Landed, RepoRow, SCHEMA_VERSION, Upstream, WorkRow,
+    };
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
 
@@ -1128,16 +1133,16 @@ mod tests {
                 WorkRow {
                     repo: "/repos/a/.git".to_owned(),
                     repo_name: "a".to_owned(),
-                    kind: "branch",
+                    kind: WorkKind::Branch,
                     name: "feat/login".to_owned(),
                     worktree: Some(PathBuf::from("/repos/a-login")),
                     branch: Some("feat/login".to_owned()),
                     dirty: Some(true),
                     commits_ahead: Some(3),
                     unpushed: Some(3),
-                    upstream: "tracked",
+                    upstream: Upstream::Tracked,
                     upstream_detail: Some("origin/feat/login".to_owned()),
-                    landed: Some("no"),
+                    landed: Some(Landed::No),
                     base: Some("origin/main".to_owned()),
                     windows: 1,
                     live_pids: 1,
@@ -1149,14 +1154,14 @@ mod tests {
                 WorkRow {
                     repo: "/repos/a/.git".to_owned(),
                     repo_name: "a".to_owned(),
-                    kind: "branch",
+                    kind: WorkKind::Branch,
                     name: "feat/old".to_owned(),
                     worktree: None,
                     branch: Some("feat/old".to_owned()),
                     dirty: Some(false),
                     commits_ahead: Some(7),
                     unpushed: Some(7),
-                    upstream: "never_pushed",
+                    upstream: Upstream::NeverPushed,
                     upstream_detail: None,
                     landed: None,
                     base: None,
@@ -1170,14 +1175,14 @@ mod tests {
                 WorkRow {
                     repo: "/spaces/notes".to_owned(),
                     repo_name: "notes".to_owned(),
-                    kind: "project_space",
+                    kind: WorkKind::ProjectSpace,
                     name: "notes".to_owned(),
                     worktree: Some(PathBuf::from("/spaces/notes")),
                     branch: None,
                     dirty: None,
                     commits_ahead: None,
                     unpushed: None,
-                    upstream: "not_applicable",
+                    upstream: Upstream::NotApplicable,
                     upstream_detail: None,
                     landed: None,
                     base: None,
@@ -1191,11 +1196,11 @@ mod tests {
             ],
             conversations: vec![
                 ConversationRow {
-                    provider: "claude",
+                    provider: Provider::Claude,
                     session_id: "8f423bbb-1111-2222-3333-444444444444".to_owned(),
                     short_id: "8f423bbb".to_owned(),
                     title: Some("update pane labels".to_owned()),
-                    state: "waiting",
+                    state: ConversationState::Waiting,
                     state_raw: Some("waiting".to_owned()),
                     waiting_for: Some("permission prompt".to_owned()),
                     state_since: Some(1_800_000_000 - 120),
@@ -1204,10 +1209,10 @@ mod tests {
                     attachment: Some(AttachmentRow {
                         pid: 4200,
                         pid_start: Some(1_790_093_933),
-                        liveness: "instance",
+                        liveness: AttachmentLiveness::Instance,
                         liveness_detail: None,
                         pane: Some("workmux:@149.%162".to_owned()),
-                        pane_source: Some("published"),
+                        pane_source: Some(PaneSource::Published),
                         placement_detail: None,
                     }),
                     cwd: Some(PathBuf::from("/repos/a-login")),
@@ -1227,11 +1232,11 @@ mod tests {
                     branch: Some("feat/login".to_owned()),
                 },
                 ConversationRow {
-                    provider: "claude",
+                    provider: Provider::Claude,
                     session_id: "02aa0bbb-1111-2222-3333-444444444444".to_owned(),
                     short_id: "02aa0bbb".to_owned(),
                     title: None,
-                    state: "idle",
+                    state: ConversationState::Idle,
                     state_raw: Some("idle".to_owned()),
                     waiting_for: None,
                     state_since: Some(1_800_000_000 - 3600),
@@ -1253,11 +1258,11 @@ mod tests {
                     branch: Some("feat/login".to_owned()),
                 },
                 ConversationRow {
-                    provider: "claude",
+                    provider: Provider::Claude,
                     session_id: "33cc0bbb-1111-2222-3333-444444444444".to_owned(),
                     short_id: "33cc0bbb".to_owned(),
                     title: Some("untitled".to_owned()),
-                    state: "unknown",
+                    state: ConversationState::Unknown,
                     state_raw: None,
                     waiting_for: None,
                     state_since: None,
@@ -1779,21 +1784,21 @@ mod tests {
         let mut conv = ConversationRow {
             ..fixture().conversations[0].clone()
         };
-        conv.state = "busy";
+        conv.state = ConversationState::Busy;
         assert_eq!(conversation_glyph(&conv), "●");
-        conv.state = "idle";
+        conv.state = ConversationState::Idle;
         assert_eq!(conversation_glyph(&conv), "");
         // waiting without a reason still says waiting.
-        conv.state = "waiting";
+        conv.state = ConversationState::Waiting;
         conv.waiting_for = None;
         assert_eq!(detail_state(&conv), "waiting");
-        conv.state = "busy";
+        conv.state = ConversationState::Busy;
         assert_eq!(detail_state(&conv), "busy");
         // A live file whose claimed pid is dead is a record, not a process:
         // it is not `running`, and its published `busy` earns no glyph.
         let mut dead = fixture().conversations[0].clone();
         dead.attachment = dead.attachment.map(|a| AttachmentRow {
-            liveness: "dead",
+            liveness: AttachmentLiveness::Dead,
             ..a
         });
         assert!(!dead.running());
