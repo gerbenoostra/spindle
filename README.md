@@ -9,9 +9,12 @@ already on disk - agent session stores, transcripts, tmux, git and live
 processes - and presents the derived facts in one terminal UI, so deciding what
 needs you takes a glance instead of a window tour.
 
-> Status: scaffolding. The binary builds, packages and releases; the dashboard
-> itself lands piecemeal. Today `agent-sessions` answers `--version` and
-> `--help`, and any subcommand that has not shipped is a usage error.
+> Status: early. The binary builds, packages and releases; the dashboard
+> renders the four-pane shell - repos, work, the conversation inbox and a
+> header detail - over Claude's live sessions and durable transcripts, and
+> `list --json` prints the same complete snapshot. Attention events, detail
+> views, navigation actions and cleanup still land piecemeal; any subcommand
+> that has not shipped is a usage error.
 
 `agent-sessions` is the binary and the state directory; `spindle` is this
 repository.
