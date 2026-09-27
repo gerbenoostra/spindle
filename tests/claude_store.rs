@@ -31,7 +31,7 @@ fn transcript_no_cwd(root: &TempDir, slug: &str, id: &str) {
     fs::write(
         projects.join(format!("{id}.jsonl")),
         format!(
-            "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"message\":{{\"role\":\"user\",\"content\":\"no cwd\"}}}}"
+            "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"message\":{{\"role\":\"user\",\"content\":\"no cwd\"}}}}\n"
         ),
     )
     .expect("transcript writes");
@@ -131,7 +131,13 @@ fn transcript(root: &TempDir, slug: &str, id: &str, cwd: &Path, texts: &[(&str, 
             i + 1,
         ));
     }
-    fs::write(projects.join(format!("{id}.jsonl")), lines.join("\n")).expect("transcript writes");
+    // Records are newline-terminated, as the provider writes them - an
+    // unterminated tail is a write still in flight and is not consumed.
+    fs::write(
+        projects.join(format!("{id}.jsonl")),
+        format!("{}\n", lines.join("\n")),
+    )
+    .expect("transcript writes");
 }
 
 /// The store, process, server and repo of the whole scenario: one live

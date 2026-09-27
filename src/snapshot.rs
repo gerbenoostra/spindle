@@ -804,7 +804,7 @@ mod tests {
         Conversation {
             session_id: "11111111-2222-3333-4444-555555555555".to_owned(),
             live,
-            transcript,
+            transcript: transcript.map(std::sync::Arc::new),
         }
     }
 

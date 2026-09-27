@@ -13,16 +13,18 @@
 //! a missing field makes that field unknown rather than guessed, and one
 //! malformed record is excluded with a source error retained - it never fails
 //! the scan. Incremental scans revisit only transcripts whose identity
-//! (device, inode), size or mtime changed.
+//! (device, inode), size or mtime changed, and transcripts are append-only:
+//! a file that grew re-parses only the tail past the last newline consumed.
 //!
 //! The plugin only reads. It never writes anything under the provider's
 //! directories.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::process::{self, ProcessStart};
@@ -54,7 +56,9 @@ pub struct Conversation {
     /// Claude's own `sessionId`, the durable conversation identity.
     pub session_id: String,
     pub live: Option<Live>,
-    pub transcript: Option<Transcript>,
+    /// Shared with the plugin's index, so an unchanged transcript costs a
+    /// scan nothing but a refcount.
+    pub transcript: Option<Arc<Transcript>>,
 }
 
 /// A parsed live session file.
@@ -82,7 +86,7 @@ pub struct Live {
 }
 
 /// A parsed transcript plus the metadata that keeps it incremental.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Transcript {
     pub file: PathBuf,
     /// The `projects/<slug>` component the file sits under; evidence of the
@@ -118,15 +122,34 @@ pub struct Inventory {
     pub skipped: Vec<PathBuf>,
 }
 
-/// The transcript index entry: what the file was when last parsed, and what
-/// it parsed to. `Err` is retained too, so a malformed file is not reparsed -
-/// and not re-reported - on every scan.
+/// The transcript index entry: what the file was when last parsed, how far
+/// into it the parse reached, and the record it parsed to. `Err` is retained
+/// too, so a malformed file is not reparsed - and not re-reported - on every
+/// scan.
 struct Indexed {
-    dev: u64,
-    ino: u64,
-    len: u64,
-    mtime: Option<SystemTime>,
-    parsed: Result<ParsedTranscript, String>,
+    /// `(dev, ino, len, mtime)` at the last parse; `None` before it.
+    identity: Option<(u64, u64, u64, Option<SystemTime>)>,
+    /// The byte offset just past the last complete line consumed. A partial
+    /// tail is a write in flight - left for the next pass, not counted
+    /// malformed.
+    consumed: u64,
+    /// The record the scan emits, shared unchanged until the file changes.
+    record: Result<Arc<Transcript>, String>,
+    /// `sessionId`s seen that disagree with the record's: the conflict
+    /// check's running state, kept across incremental parses.
+    other_ids: HashSet<String>,
+}
+
+impl Indexed {
+    /// An entry for a file never parsed; the first sighting reparses whole.
+    fn blank(path: &Path, slug: &str) -> Indexed {
+        Indexed {
+            identity: None,
+            consumed: 0,
+            record: Ok(Arc::new(Transcript::blank(path, slug))),
+            other_ids: HashSet::new(),
+        }
+    }
 }
 
 impl Conversation {
@@ -338,12 +361,15 @@ impl Claude {
     }
 
     /// Every transcript under `<root>/projects/`, reparsing only files whose
-    /// identity, size or mtime changed since the index last saw them.
+    /// identity, size or mtime changed since the index last saw them. A file
+    /// that only grew re-reads from the last consumed offset - transcripts
+    /// are append-only, so an active session's transcript costs its tail,
+    /// not its whole history, per pass.
     fn scan_transcripts(
         &mut self,
         errors: &mut Vec<SourceError>,
         skipped: &mut Vec<PathBuf>,
-    ) -> Vec<Transcript> {
+    ) -> Vec<Arc<Transcript>> {
         let dir = self.root.join("projects");
         let mut candidates = Vec::new();
         match fs::read_dir(&dir) {
@@ -356,42 +382,65 @@ impl Claude {
         }
 
         // Anything the walk no longer sees drops out of the index with it.
-        let seen: std::collections::HashSet<PathBuf> =
-            candidates.iter().map(|(p, _, _)| p.clone()).collect();
-        self.index.retain(|path, _| seen.contains(path));
+        let seen: HashSet<&Path> = candidates.iter().map(|(p, _, _)| p.as_path()).collect();
+        self.index.retain(|path, _| seen.contains(path.as_path()));
 
         let mut found = Vec::new();
         for (path, slug, meta) in candidates {
             let identity = (meta.dev(), meta.ino(), meta.len(), meta.modified().ok());
-            let stale = self.index.get(&path).is_none_or(|i| {
-                i.dev != identity.0
-                    || i.ino != identity.1
-                    || i.len != identity.2
-                    || i.mtime != identity.3
-            });
-            if stale {
-                let parsed = parse_transcript(&path, &slug);
-                if let Err(detail) = &parsed {
+            let indexed = self
+                .index
+                .entry(path.clone())
+                .or_insert_with(|| Indexed::blank(&path, &slug));
+            if indexed.identity.as_ref() == Some(&identity) {
+                // Unchanged: the parsed record stands, shared not rebuilt.
+                if let Ok(record) = &indexed.record {
+                    found.push(Arc::clone(record));
+                }
+                continue;
+            }
+            // The same file with more bytes is an append: read only what
+            // arrived past the consumed offset. Anything else - a rewrite,
+            // a shrink or a remembered failure - parses whole.
+            let appended = indexed
+                .identity
+                .as_ref()
+                .is_some_and(|i| i.0 == identity.0 && i.1 == identity.1)
+                && identity.2 > indexed.consumed
+                && indexed.record.is_ok();
+            let parsed = if appended {
+                let mut record = indexed.record.as_ref().unwrap().as_ref().clone(); // coverage: off - `appended` requires the record to be `Ok`
+                read_transcript(&path, indexed.consumed, &mut record, &mut indexed.other_ids)
+                    .and_then(|consumed| {
+                        validate(&path, &slug, &record, &indexed.other_ids)
+                            .map(|()| (consumed, record))
+                    })
+            } else {
+                let mut record = Transcript::blank(&path, &slug);
+                indexed.other_ids.clear();
+                read_transcript(&path, 0, &mut record, &mut indexed.other_ids).and_then(
+                    |consumed| {
+                        validate(&path, &slug, &record, &indexed.other_ids)
+                            .map(|()| (consumed, record))
+                    },
+                )
+            };
+            match parsed {
+                Ok((consumed, record)) => {
+                    indexed.consumed = consumed;
+                    indexed.record = Ok(Arc::new(record));
+                }
+                Err(detail) => {
                     errors.push(SourceError {
                         source: "claude transcript".to_owned(),
                         detail: detail.clone(),
                     });
+                    indexed.record = Err(detail);
                 }
-                self.index.insert(
-                    path.clone(),
-                    Indexed {
-                        dev: identity.0,
-                        ino: identity.1,
-                        len: identity.2,
-                        mtime: identity.3,
-                        parsed,
-                    },
-                );
             }
-            if let Some(indexed) = self.index.get(&path)
-                && let Ok(parsed) = &indexed.parsed
-            {
-                found.push(parsed.clone_record_with(&path, &slug));
+            indexed.identity = Some(identity);
+            if let Ok(record) = &indexed.record {
+                found.push(Arc::clone(record));
             }
         }
         found
@@ -528,113 +577,127 @@ fn millis(value: Option<&serde_json::Value>) -> Option<SystemTime> {
         .map(|ms| UNIX_EPOCH + Duration::from_millis(ms))
 }
 
-/// A transcript's parse output - everything later merging and rows need,
-/// without the line-by-line structure.
-#[derive(Clone)]
-struct ParsedTranscript {
-    session_id: String,
-    project_cwd: Option<PathBuf>,
-    summary: Option<String>,
-    latest_prompt: Option<String>,
-    latest_reply: Option<String>,
-    first_at: Option<SystemTime>,
-    last_at: Option<SystemTime>,
-    malformed_lines: usize,
-}
-
-impl ParsedTranscript {
-    fn clone_record_with(&self, file: &Path, slug: &str) -> Transcript {
+impl Transcript {
+    /// An empty record for `file` before its first line lands.
+    fn blank(file: &Path, slug: &str) -> Transcript {
         Transcript {
             file: file.to_owned(),
             slug: slug.to_owned(),
-            session_id: self.session_id.clone(),
-            project_cwd: self.project_cwd.clone(),
-            summary: self.summary.clone(),
-            latest_prompt: self.latest_prompt.clone(),
-            latest_reply: self.latest_reply.clone(),
-            first_at: self.first_at,
-            last_at: self.last_at,
-            malformed_lines: self.malformed_lines,
+            session_id: String::new(),
+            project_cwd: None,
+            summary: None,
+            latest_prompt: None,
+            latest_reply: None,
+            first_at: None,
+            last_at: None,
+            malformed_lines: 0,
         }
     }
 }
 
-/// Parse one JSONL transcript line-by-line: each line is one record, and a
-/// line that fails to parse is counted, not fatal - a truncated tail is how
-/// an interrupted write actually looks.
-fn parse_transcript(path: &Path, slug: &str) -> Result<ParsedTranscript, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut parsed = ParsedTranscript {
-        session_id: String::new(),
-        project_cwd: None,
-        summary: None,
-        latest_prompt: None,
-        latest_reply: None,
-        first_at: None,
-        last_at: None,
-        malformed_lines: 0,
-    };
-    let mut session_ids = std::collections::HashSet::new();
-    for line in text.lines() {
+/// Read `path` from `offset` and absorb its complete lines into `record`,
+/// returning the new consumed offset - just past the last newline. A
+/// trailing partial line is a write still in flight: left unread until it
+/// completes, and never counted malformed.
+fn read_transcript(
+    path: &Path,
+    offset: u64,
+    record: &mut Transcript,
+    other_ids: &mut HashSet<String>,
+) -> Result<u64, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("{}: {e}", path.display()))?; // coverage: off - a seek fails only on a racing truncation
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(offset + absorb(&text, record, other_ids) as u64)
+}
+
+/// Fold each complete line of `text` into `record`, returning the bytes
+/// consumed - everything through the last newline. Each line is one record;
+/// a line that fails to parse is counted, not fatal.
+fn absorb(text: &str, record: &mut Transcript, other_ids: &mut HashSet<String>) -> usize {
+    let mut consumed = 0;
+    for piece in text.split_inclusive('\n') {
+        let Some(line) = piece.strip_suffix('\n') else {
+            break;
+        };
+        consumed += piece.len();
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            parsed.malformed_lines += 1;
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+            record.malformed_lines += 1;
             continue;
         };
-        if let Some(id) = record.get("sessionId").and_then(|v| v.as_str()) {
-            session_ids.insert(id.to_owned());
-            if parsed.session_id.is_empty() {
-                parsed.session_id = id.to_owned();
+        if let Some(id) = json.get("sessionId").and_then(|v| v.as_str()) {
+            if record.session_id.is_empty() {
+                record.session_id = id.to_owned();
+            } else if record.session_id != id {
+                other_ids.insert(id.to_owned());
             }
         }
-        if parsed.project_cwd.is_none()
-            && let Some(cwd) = record.get("cwd").and_then(|v| v.as_str())
+        if record.project_cwd.is_none()
+            && let Some(cwd) = json.get("cwd").and_then(|v| v.as_str())
         {
-            parsed.project_cwd = Some(PathBuf::from(cwd));
+            record.project_cwd = Some(PathBuf::from(cwd));
         }
-        if parsed.summary.is_none()
-            && record.get("type").and_then(|v| v.as_str()) == Some("summary")
+        if record.summary.is_none() && json.get("type").and_then(|v| v.as_str()) == Some("summary")
         {
-            parsed.summary = record
+            record.summary = json
                 .get("summary")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned);
         }
-        if let Some(ts) = record
+        if let Some(ts) = json
             .get("timestamp")
             .and_then(|v| v.as_str())
             .and_then(parse_iso8601)
         {
-            parsed.first_at = Some(parsed.first_at.map_or(ts, |f| f.min(ts)));
-            parsed.last_at = Some(parsed.last_at.map_or(ts, |l| l.max(ts)));
+            record.first_at = Some(record.first_at.map_or(ts, |f| f.min(ts)));
+            record.last_at = Some(record.last_at.map_or(ts, |l| l.max(ts)));
         }
-        match record.get("type").and_then(|v| v.as_str()) {
+        match json.get("type").and_then(|v| v.as_str()) {
             Some("user") => {
-                if let Some(text) = message_text(&record, "user") {
-                    parsed.latest_prompt = Some(text);
+                if let Some(text) = message_text(&json, "user") {
+                    record.latest_prompt = Some(text);
                 }
             }
             Some("assistant") => {
-                if let Some(text) = message_text(&record, "assistant") {
-                    parsed.latest_reply = Some(text);
+                if let Some(text) = message_text(&json, "assistant") {
+                    record.latest_reply = Some(text);
                 }
             }
             _ => {}
         }
     }
-    if parsed.session_id.is_empty() {
+    consumed
+}
+
+/// The whole-file verdicts a scan cannot give until the lines are read: a
+/// transcript that never names a session, or names several, is excluded
+/// wholesale.
+fn validate(
+    path: &Path,
+    slug: &str,
+    record: &Transcript,
+    other_ids: &HashSet<String>,
+) -> Result<(), String> {
+    if record.session_id.is_empty() {
         return Err(format!("{}: no sessionId in any record", path.display()));
     }
-    if session_ids.len() > 1 {
+    if !other_ids.is_empty() {
         return Err(format!(
             "{slug}: {} carries {} conflicting session ids",
             path.display(),
-            session_ids.len()
+            other_ids.len() + 1
         ));
     }
-    Ok(parsed)
+    Ok(())
 }
 
 /// The text a record's `message.content` carries: a bare string, or the last
@@ -1012,6 +1075,51 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_tail_waits_for_its_newline() {
+        let root = Root::new();
+        let path = root.write(&format!("projects/p/{ID_A}.jsonl"), &transcript_lines(ID_A));
+        // A torn write: the half-written last record is in flight - not
+        // parsed, not counted malformed.
+        let partial = r#"{"type":"user","sessionId":""#;
+        fs::write(&path, format!("{}{partial}", transcript_lines(ID_A))).unwrap();
+        let mut claude = Claude::new(root.0.clone());
+        let first = claude.scan();
+        let t = first.conversations[0].transcript.as_ref().unwrap();
+        assert_eq!(t.malformed_lines, 0);
+        assert_eq!(t.last_at, parse_iso8601("2026-09-22T16:19:53.500Z"));
+
+        // The rest of the record lands on the next append, and the
+        // completed line parses then - from the tail, not a full reparse.
+        fs::write(
+            &path,
+            format!(
+                "{}{}{}{}\n",
+                transcript_lines(ID_A),
+                partial,
+                ID_A,
+                r#"","timestamp":"2026-09-22T16:25:00Z"}"#
+            ),
+        )
+        .unwrap();
+        let second = claude.scan();
+        let t = second.conversations[0].transcript.as_ref().unwrap();
+        assert_eq!(t.malformed_lines, 0);
+        assert_eq!(t.last_at, parse_iso8601("2026-09-22T16:25:00Z"));
+    }
+
+    #[test]
+    fn a_transcript_that_is_not_utf8_is_one_error() {
+        let root = Root::new();
+        let path = root.0.join(format!("projects/p/{ID_A}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, [0x7b, 0x80]).unwrap();
+        let mut claude = Claude::new(root.0.clone());
+        let inv = claude.scan();
+        assert!(inv.conversations.is_empty());
+        assert_eq!(inv.errors.len(), 1, "{:?}", inv.errors);
+    }
+
+    #[test]
     fn a_reparse_failure_is_remembered_not_spammed() {
         let root = Root::new();
         root.write(
@@ -1059,7 +1167,10 @@ mod tests {
         root.write(
             &format!("projects/p/{ID_A}.jsonl"),
             &format!(
-                r#"{{"type":"user","sessionId":"{ID_A}","cwd":"/x","message":{{"role":"user","content":"first line\nsecond line which is quite long and keeps going past forty characters"}},"timestamp":"2026-01-01T00:00:00Z"}}"#
+                "{}\n",
+                format!(
+                    r#"{{"type":"user","sessionId":"{ID_A}","cwd":"/x","message":{{"role":"user","content":"first line\nsecond line which is quite long and keeps going past forty characters"}},"timestamp":"2026-01-01T00:00:00Z"}}"#
+                )
             ),
         );
         let mut claude = Claude::new(root.0.clone());
@@ -1272,7 +1383,7 @@ mod tests {
         root.write(
             &format!("projects/-x/{ID_A}.jsonl"),
             &format!(
-                "{{\"type\":\"user\",\"sessionId\":\"{ID_A}\",\"message\":{{\"role\":\"user\"}}}}\n{{\"type\":\"assistant\",\"sessionId\":\"{ID_A}\",\"message\":{{\"role\":\"assistant\",\"content\":42}}}}"
+                "{{\"type\":\"user\",\"sessionId\":\"{ID_A}\",\"message\":{{\"role\":\"user\"}}}}\n{{\"type\":\"assistant\",\"sessionId\":\"{ID_A}\",\"message\":{{\"role\":\"assistant\",\"content\":42}}}}\n"
             ),
         );
         let mut claude = Claude::new(root.0.clone());
