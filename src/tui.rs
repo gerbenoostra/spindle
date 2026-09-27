@@ -950,8 +950,7 @@ pub fn run(mut app: App, refresh: impl FnMut() -> Snapshot + Send + 'static) -> 
     std::thread::spawn(move || collect_worker(tx, refresh, pace)); // coverage: off - same
 
     let feed = move || match rx.try_recv() {
-        // coverage: off - `run` itself needs a real terminal
-        Ok(snapshot) => Feed::Snapshot(snapshot),
+        Ok(snapshot) => Feed::Snapshot(snapshot), // coverage: off - `run` itself needs a real terminal
         Err(std::sync::mpsc::TryRecvError::Empty) => Feed::Idle,
         Err(std::sync::mpsc::TryRecvError::Disconnected) => Feed::Dead, // coverage: off - needs the worker to die while the loop runs
     };
