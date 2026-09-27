@@ -333,7 +333,18 @@ impl Claude {
                 return found;
             }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    errors.push(SourceError {
+                        // coverage: off - a mid-iteration entry failure needs a racing mutation
+                        source: "claude sessions".to_owned(),
+                        detail: format!("{}: {e}", dir.display()),
+                    });
+                    continue; // coverage: off - same
+                }
+            };
             let path = entry.path();
             let Some(pid) = pid_name(&path) else {
                 continue;
@@ -373,7 +384,7 @@ impl Claude {
         let dir = self.root.join("projects");
         let mut candidates = Vec::new();
         match fs::read_dir(&dir) {
-            Ok(_) => collect_transcripts(&dir, &mut candidates, skipped),
+            Ok(_) => collect_transcripts(&dir, &mut candidates, skipped, errors),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => errors.push(SourceError {
                 source: "claude transcripts".to_owned(),
@@ -457,22 +468,42 @@ fn pid_name(path: &Path) -> Option<u32> {
 
 /// Recursively collect transcript candidates under `dir`. The rules are the
 /// provider's promise: a transcript is a UUID-named regular non-empty file.
-/// Anything else is skipped, never parsed.
+/// Anything else is skipped, never parsed; an unreadable directory or entry
+/// is a retained error, consistent with the rest of the scan.
 fn collect_transcripts(
     dir: &Path,
     out: &mut Vec<(PathBuf, String, fs::Metadata)>,
     skipped: &mut Vec<PathBuf>,
+    errors: &mut Vec<SourceError>,
 ) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return; // coverage: off - an unreadable projects subdir is not reachable in tests
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            errors.push(SourceError {
+                source: "claude transcripts".to_owned(),
+                detail: format!("{}: {e}", dir.display()),
+            });
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                errors.push(SourceError {
+                    // coverage: off - a mid-iteration entry failure needs a racing mutation
+                    source: "claude transcripts".to_owned(),
+                    detail: format!("{}: {e}", dir.display()),
+                });
+                continue; // coverage: off - same
+            }
+        };
         let path = entry.path();
         let Ok(meta) = entry.metadata() else {
             continue; // coverage: off - an entry that cannot be stat'd has no identity to judge
         };
         if meta.is_dir() {
-            collect_transcripts(&path, out, skipped);
+            collect_transcripts(&path, out, skipped, errors);
             continue;
         }
         if !meta.is_file() || meta.len() == 0 || !uuid_name(&path) {
@@ -779,11 +810,10 @@ fn one_line(text: &str) -> String {
 /// `text` cut to at most `max` chars on a char boundary, `…`-suffixed when
 /// it was cut.
 fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_owned();
+    match text.char_indices().nth(max) {
+        None => text.to_owned(),
+        Some((end, _)) => format!("{}…", &text[..end]),
     }
-    let cut: String = text.chars().take(max).collect();
-    format!("{cut}…")
 }
 
 #[cfg(test)]
@@ -1238,6 +1268,25 @@ mod tests {
         let resume = caps.resume.unwrap();
         assert_eq!(resume.executable, OsString::from("claude"));
         assert_eq!(resume.argv, vec![OsString::from("--resume")]);
+    }
+
+    #[test]
+    fn an_unreadable_projects_subdir_is_one_error() {
+        let root = Root::new();
+        let locked = root.0.join("projects/locked");
+        fs::create_dir_all(&locked).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut claude = Claude::new(root.0.clone());
+        let inv = claude.scan();
+        assert!(
+            inv.errors
+                .iter()
+                .any(|e| e.source == "claude transcripts" && e.detail.contains("locked")),
+            "{:?}",
+            inv.errors
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
