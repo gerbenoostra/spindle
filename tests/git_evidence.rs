@@ -953,7 +953,7 @@ fn remote_evidence_is_reprobed_after_its_deadline() {
     // The same shape as the memoization test, but with the deadline
     // already passed: the second collect asks the remote again and sees
     // it gone, so a long-lived collector cannot serve the first answer
-    // forever (AC32).
+    // forever.
     let f = FixtureRepo::new("origin");
     f.branch_with_commits("one", 1, true);
     f.branch_with_commits("two", 1, true);

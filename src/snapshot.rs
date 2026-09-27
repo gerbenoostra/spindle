@@ -188,7 +188,7 @@ impl ConversationRow {
 }
 
 /// The collector: owns the plugins (and so their incremental indexes) and the
-/// caches one pass reuses. A collect is reads only - everything writes-averse
+/// caches reused across passes until their freshness deadline. A collect is reads only - everything writes-averse
 /// in the boundary stays averse here.
 pub struct Collector {
     claude: Claude,

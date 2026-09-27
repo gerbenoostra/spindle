@@ -163,7 +163,7 @@ pub struct PaneInventory {
     pub servers: Vec<Server>,
     /// Sockets with no server behind them: tmux never unlinks its socket
     /// file, so a dead server leaves one that refuses every connection.
-    /// Counted, never asked (L29).
+    /// Counted, never asked.
     pub stale_sockets: usize,
     /// Records the server printed that this tool did not understand - kept
     /// as evidence rather than silently dropped, since an invisible pane

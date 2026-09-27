@@ -676,7 +676,7 @@ fn no_server_is_an_empty_inventory_and_unknown_panes() {
     }
     // A socket file whose server is gone - tmux never unlinks its own -
     // refuses a connection. It is counted as stale, never asked and never
-    // a server error (AC32, L29). A killed tmux server is the real shape;
+    // a server error. A killed tmux server is the real shape;
     // a listener bound here could leak into a child a parallel test forks.
     let gone = TmuxServer::new();
     gone.new_session("t", "sleep 300");
