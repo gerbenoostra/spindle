@@ -98,10 +98,16 @@ impl Filter {
 
     /// Whether a row survives: its label matches the text, and its timestamp
     /// is newer than `age`. An unknown age fails closed - filtering out what
-    /// cannot be proven is honest; guessing it young is not.
-    fn allows(&self, label: &str, timestamp: Option<u64>, now: u64) -> bool {
-        if !self.text.is_empty() && !label.to_lowercase().contains(&self.text) {
-            return false;
+    /// cannot be proven is honest; guessing it young is not. `lower` is the
+    /// caller's scratch buffer for the case-folded label - one allocation
+    /// per pass instead of one per row per frame.
+    fn allows(&self, label: &str, timestamp: Option<u64>, now: u64, lower: &mut String) -> bool {
+        if !self.text.is_empty() {
+            lower.clear();
+            lower.extend(label.chars().flat_map(char::to_lowercase));
+            if !lower.contains(&self.text) {
+                return false;
+            }
         }
         if let Some(age) = self.age {
             match timestamp {
@@ -213,15 +219,15 @@ impl App {
     /// top of that. Each list's own `all` row is always first and always
     /// visible - a filter narrows records, never the aggregate.
     fn rows(&self, list: List) -> Vec<Row<'_>> {
+        let filter = self.filter(list);
+        let now = self.now();
+        let mut lower = String::new();
         match list {
             List::Repos => self
                 .snapshot
                 .repos
                 .iter()
-                .filter(|r| {
-                    self.filter(list)
-                        .allows(&repo_label(r), r.last_activity, self.now())
-                })
+                .filter(|r| filter.allows(&repo_label(r), r.last_activity, now, &mut lower))
                 .map(Row::Repo)
                 .collect(),
             List::Work => {
@@ -230,10 +236,7 @@ impl App {
                     .work
                     .iter()
                     .filter(|w| scope.as_deref().is_none_or(|s| w.repo == *s))
-                    .filter(|w| {
-                        self.filter(list)
-                            .allows(&work_label(w), w.last_activity, self.now())
-                    })
+                    .filter(|w| filter.allows(&work_label(w), w.last_activity, now, &mut lower))
                     .map(Row::Work)
                     .collect()
             }
@@ -268,8 +271,7 @@ impl App {
                         }
                     })
                     .filter(|c| {
-                        self.filter(list)
-                            .allows(&conversation_label(c), c.state_since, self.now())
+                        filter.allows(&conversation_label(c), c.state_since, now, &mut lower)
                     })
                     .map(Row::Conversation)
                     .collect()
@@ -395,16 +397,22 @@ impl App {
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(40), Constraint::Min(0)]).areas(main);
+        let repo_rows = self.rows(List::Repos);
         let [repos, work, conversations] = Layout::vertical([
-            Constraint::Length(list_height(self.rows(List::Repos).len(), left.height)),
+            Constraint::Length(list_height(repo_rows.len(), left.height)),
             Constraint::Percentage(55),
             Constraint::Min(0),
         ])
         .areas(left);
 
-        self.list_panel(f, repos, Pane::Repos);
-        self.list_panel(f, work, Pane::Work);
-        self.list_panel(f, conversations, Pane::Conversations);
+        self.list_panel(f, repos, Pane::Repos, repo_rows);
+        self.list_panel(f, work, Pane::Work, self.rows(List::Work));
+        self.list_panel(
+            f,
+            conversations,
+            Pane::Conversations,
+            self.rows(List::Conversations),
+        );
         self.detail_panel(f, right);
         self.footer(f, footer);
         if self.help {
@@ -413,7 +421,7 @@ impl App {
     }
 
     /// One list panel: title, `all` row, then the filtered rows.
-    fn list_panel(&self, f: &mut Frame<'_>, area: Rect, pane: Pane) {
+    fn list_panel(&self, f: &mut Frame<'_>, area: Rect, pane: Pane, rows: Vec<Row<'_>>) {
         let list = pane.list().expect("a list pane"); // coverage: off - only list panes reach here
         let block = Block::default()
             .title(self.panel_title(pane))
@@ -426,18 +434,22 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let mut lines = Vec::new();
-        let cursor = self.cursor[list_index(list)];
-        let rows = self.rows(list);
-        lines.push(self.all_row(list, &rows, inner.width, cursor == 0));
-        for (i, row) in rows.iter().enumerate() {
-            lines.push(self.row(list, row, inner.width, cursor == i + 1));
-        }
         // Follow the cursor: when the list is taller than its pane, scroll so
-        // the selected line stays visible. No horizontal scroll anywhere.
+        // the selected line stays visible - and build only the lines that
+        // can render. No horizontal scroll anywhere.
+        let cursor = self.cursor[list_index(list)];
         let visible = inner.height as usize;
         let scroll = cursor.saturating_sub(visible.saturating_sub(1));
-        let lines: Vec<Line<'static>> = lines.into_iter().skip(scroll).collect();
+        let mut lines = Vec::with_capacity(visible.saturating_add(1));
+        if scroll == 0 {
+            lines.push(self.all_row(list, &rows, inner.width, cursor == 0));
+        }
+        for (i, row) in rows.iter().enumerate().skip(scroll.saturating_sub(1)) {
+            if lines.len() >= visible {
+                break;
+            }
+            lines.push(self.row(list, row, inner.width, cursor == i + 1));
+        }
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -1649,10 +1661,11 @@ mod tests {
         assert_eq!(f.text, "fix");
         assert_eq!(f.age, Some(Duration::from_secs(7200)));
         // Text narrows case-insensitively; age requires a known timestamp.
-        assert!(f.allows("FIX the thing", Some(100), 200));
-        assert!(!f.allows("other", Some(100), 200));
-        assert!(!f.allows("fix", None, 200));
-        assert!(!f.allows("fix", Some(1), 200_000));
+        let mut lower = String::new();
+        assert!(f.allows("FIX the thing", Some(100), 200, &mut lower));
+        assert!(!f.allows("other", Some(100), 200, &mut lower));
+        assert!(!f.allows("fix", None, 200, &mut lower));
+        assert!(!f.allows("fix", Some(1), 200_000, &mut lower));
         // A bogus age term is text, not a filter that lets nothing through.
         let f = Filter::parse("age:forever");
         assert_eq!(f.text, "age:forever");
