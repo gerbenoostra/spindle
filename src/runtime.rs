@@ -433,6 +433,7 @@ mod tests {
             panes,
             servers: Vec::new(),
             warnings: Vec::new(),
+            stale_sockets: 0,
         }
     }
 

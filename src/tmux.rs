@@ -161,6 +161,10 @@ pub struct PaneInventory {
     pub panes: Vec<Pane>,
     /// One entry per socket attempted, answering or not.
     pub servers: Vec<Server>,
+    /// Sockets with no server behind them: tmux never unlinks its socket
+    /// file, so a dead server leaves one that refuses every connection.
+    /// Counted, never asked (L29).
+    pub stale_sockets: usize,
     /// Records the server printed that this tool did not understand - kept
     /// as evidence rather than silently dropped, since an invisible pane
     /// cannot claim liveness.
@@ -185,8 +189,9 @@ const LIST_FORMAT: &str = concat!(
 const FIELD_COUNT: usize = 15;
 
 impl PaneInventory {
-    /// One snapshot per socket in `sockets`, merged. Each socket is asked
-    /// exactly once; unreachable ones are recorded and skipped.
+    /// One snapshot per socket in `sockets`, merged. Each live socket is
+    /// asked exactly once; unreachable ones are recorded and skipped, and
+    /// ones no server listens on are only counted.
     pub fn collect(sockets: &[PathBuf]) -> PaneInventory {
         let mut inventory = PaneInventory::default();
         let mut seen = HashSet::new();
@@ -197,6 +202,10 @@ impl PaneInventory {
             // canonical path while keeping the spelling that was given.
             let identity = socket.canonicalize().unwrap_or_else(|_| socket.clone());
             if !seen.insert(identity) {
+                continue;
+            }
+            if is_stale(socket) {
+                inventory.stale_sockets += 1;
                 continue;
             }
             match list_panes(socket) {
@@ -331,6 +340,20 @@ fn uid() -> Option<u32> {
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
         .flatten()
+}
+
+/// Whether no server listens on `socket`: the path is gone, or a connect
+/// is refused. A connect costs microseconds where a `tmux` spawn costs
+/// milliseconds, and a machine can hold tens of thousands of dead sockets.
+/// Any other failure is left for `tmux` itself to report.
+fn is_stale(socket: &Path) -> bool {
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(_) => false,
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+        ),
+    }
 }
 
 /// One `tmux -S <socket> list-panes -a` read. The socket is always a path,
@@ -514,6 +537,7 @@ mod tests {
             panes,
             servers: Vec::new(),
             warnings: Vec::new(),
+            stale_sockets: 0,
         }
     }
 

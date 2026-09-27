@@ -674,19 +674,54 @@ fn no_server_is_an_empty_inventory_and_unknown_panes() {
     if !support::tmux_or_skip() {
         return;
     }
-    // A socket that answers nothing: recorded, contributes nothing.
-    let dir = TempDir::new("tmux-empty");
-    let bogus = dir.join("dead-socket");
-    std::os::unix::net::UnixListener::bind(&bogus).unwrap();
-    let inventory = PaneInventory::collect(std::slice::from_ref(&bogus));
+    // A socket file whose server is gone - tmux never unlinks its own -
+    // refuses a connection. It is counted as stale, never asked and never
+    // a server error (AC32, L29). A killed tmux server is the real shape;
+    // a listener bound here could leak into a child a parallel test forks.
+    let gone = TmuxServer::new();
+    gone.new_session("t", "sleep 300");
+    gone.tmux(&["kill-server"]);
+    let dead = gone.socket.clone();
+    // `kill-server` returns before the server closes its listener.
+    until(|| {
+        std::os::unix::net::UnixStream::connect(&dead)
+            .is_err()
+            .then_some(())
+    });
+    assert!(dead.exists(), "tmux leaves its socket file behind");
+    let inventory = PaneInventory::collect(std::slice::from_ref(&dead));
     assert!(inventory.panes.is_empty());
+    assert!(
+        inventory.servers.is_empty(),
+        "a dead socket is not a server"
+    );
+    assert_eq!(inventory.stale_sockets, 1);
+
+    // A path that does not exist at all is no server either.
+    let missing = gone.socket_root().join("never-existed");
+    let inventory = PaneInventory::collect(std::slice::from_ref(&missing));
+    assert!(inventory.servers.is_empty());
+    assert_eq!(inventory.stale_sockets, 1);
+
+    // A socket that accepts and hangs up is a server that answered
+    // nothing: asked once, recorded as unanswered.
+    let rude = gone.socket_root().join("rude");
+    let listener = std::os::unix::net::UnixListener::bind(&rude).unwrap();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            drop(conn);
+        }
+    });
+    let inventory = PaneInventory::collect(std::slice::from_ref(&rude));
+    assert_eq!(inventory.stale_sockets, 0);
     assert_eq!(inventory.servers.len(), 1);
     assert!(inventory.servers[0].error.is_some());
 
-    // A socket path that does not exist at all cannot even canonicalize;
-    // it is still asked once and recorded as unanswered.
-    let missing = dir.join("never-existed");
-    let inventory = PaneInventory::collect(std::slice::from_ref(&missing));
+    // A path too long to connect to is not proven dead either: tmux is
+    // asked and reports why it could not answer.
+    let long = gone.socket_root().join("x".repeat(120));
+    let inventory = PaneInventory::collect(std::slice::from_ref(&long));
+    assert_eq!(inventory.stale_sockets, 0);
     assert_eq!(inventory.servers.len(), 1);
     assert!(inventory.servers[0].error.is_some());
 
@@ -707,6 +742,7 @@ fn no_server_is_an_empty_inventory_and_unknown_panes() {
     server.new_session("t", "sleep 300");
     let inventory = PaneInventory::collect(&[server.socket.clone(), server.socket.clone()]);
     assert_eq!(inventory.servers.len(), 1);
+    assert_eq!(inventory.stale_sockets, 0, "a live server passes the probe");
 
     // A second path to the same socket - a symlink here - is also one
     // server: its panes must not arrive twice.
