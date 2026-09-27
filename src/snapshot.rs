@@ -47,6 +47,10 @@ pub struct Snapshot {
     /// non-UUID names, symlinks, non-regular or empty files. Retained for
     /// the evidence view, as lossy display strings.
     pub skipped: Vec<String>,
+    /// tmux socket files no server listens on. tmux never unlinks its
+    /// socket, so these pile up; each is skipped without a `tmux` spawn,
+    /// and the count keeps a socket dir full of them visible.
+    pub stale_sockets: usize,
 }
 
 /// A repository - or a non-git project space - as the `[1]` list sees it.
@@ -387,6 +391,7 @@ impl Collector {
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
+            stale_sockets: runtime.panes.stale_sockets,
         }
     }
 }

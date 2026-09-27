@@ -475,6 +475,31 @@ fn list_json_is_the_complete_unfiltered_snapshot() {
         return;
     }
     let world = world();
+    // A socket left by a killed server beside the live one: counted, not
+    // queried.
+    let dead = world.tmux.socket.with_file_name("dead");
+    let started = Command::new("tmux")
+        .arg("-S")
+        .arg(&dead)
+        .args(["-f", "/dev/null", "new-session", "-d", "sleep 300"])
+        .status()
+        .expect("tmux runs");
+    assert!(started.success());
+    Command::new("tmux")
+        .arg("-S")
+        .arg(&dead)
+        .arg("kill-server")
+        .status()
+        .expect("tmux runs");
+    // `kill-server` returns before the server closes its listener.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::os::unix::net::UnixStream::connect(&dead).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the killed server lingers"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let out = Command::new(BIN)
         .args(["list", "--json"])
         .env("HOME", world.home.path())
@@ -489,6 +514,7 @@ fn list_json_is_the_complete_unfiltered_snapshot() {
         serde_json::from_slice(&out.stdout).expect("the snapshot is JSON");
 
     assert_eq!(json["schema_version"], SCHEMA_VERSION);
+    assert_eq!(json["stale_sockets"], 1, "the dead socket is counted");
     let conversations = json["conversations"].as_array().expect("conversations");
     assert_eq!(conversations.len(), 8);
     let ids: Vec<&str> = conversations

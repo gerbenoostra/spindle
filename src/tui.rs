@@ -1277,6 +1277,7 @@ mod tests {
             ],
             errors: vec![],
             skipped: vec![],
+            stale_sockets: 0,
         }
     }
 
