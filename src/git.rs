@@ -849,7 +849,7 @@ mod tests {
             vec!["rev-list", "--count", "a..b"],
             vec!["merge-base", "--is-ancestor", "a", "b"],
             vec!["diff", "--name-only", "-z", "a", "b"],
-            vec!["ls-remote", "--symref", "origin", "HEAD"],
+            vec!["ls-remote", "--symref", "origin"],
             vec!["for-each-ref", "--format=%(refname)", "refs/heads/"],
             vec!["show-ref", "--verify", "refs/heads/main"],
             vec!["worktree", "list", "--porcelain", "-z"],
