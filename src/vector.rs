@@ -9,11 +9,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::evidence::Evidence;
 use crate::forge;
-use crate::git::{self, Head, RemoteHead, Repo, UpstreamConfig};
+use crate::git::{self, Head, RemoteHead, RemoteListing, Repo, UpstreamConfig};
 
 /// What a Work row is anchored on. Branch incarnations and detached
 /// worktrees are the Git anchors; non-Git paths are project spaces and never
@@ -179,17 +179,54 @@ pub struct StateVector {
     pub last_git_activity: Option<SystemTime>,
 }
 
-/// Remote evidence reused across anchors of one collection pass. Each
-/// `ls-remote` is a network round-trip; a repository with twenty branches
-/// would otherwise ask the same remote twenty times for identical facts.
-/// Entries are keyed by repository *and* remote name, so one shared cache
-/// stays correct across a multi-repo pass: two repos whose remotes share a
-/// name advertise different facts. Fresh per call if `collect` is used,
-/// shared across a batch with [`collect_cached`].
-#[derive(Default)]
+/// How long one remote's `ls-remote` answer stands before it is asked
+/// again: the remote-evidence row of the freshness table.
+pub const REMOTE_DEADLINE: Duration = Duration::from_secs(5 * 60);
+
+/// Remote evidence reused across anchors and passes until its deadline.
+/// Each `ls-remote` is a network round-trip; a repository with twenty
+/// branches would otherwise ask the same remote twenty times for identical
+/// facts, and a dashboard refreshing every few seconds would ask it every
+/// refresh. Entries are keyed by repository *and* remote name, so one
+/// shared cache stays correct across a multi-repo pass: two repos whose
+/// remotes share a name advertise different facts. Fresh per call if
+/// `collect` is used, shared across a batch with [`collect_cached`].
 pub struct RemoteCache {
-    heads: HashMap<(PathBuf, String), RemoteHead>,
-    refs: HashMap<(PathBuf, String), Evidence<Vec<String>>>,
+    deadline: Duration,
+    listings: HashMap<(PathBuf, String), (Instant, RemoteListing)>,
+}
+
+impl Default for RemoteCache {
+    fn default() -> Self {
+        RemoteCache::with_deadline(REMOTE_DEADLINE)
+    }
+}
+
+impl RemoteCache {
+    /// A cache whose answers expire `deadline` after they were asked.
+    pub fn with_deadline(deadline: Duration) -> RemoteCache {
+        RemoteCache {
+            deadline,
+            listings: HashMap::new(),
+        }
+    }
+
+    /// The remote's listing, asked again once the stored one is older
+    /// than the deadline. A failed ask is stored too: `Unknown` until the
+    /// next ask, not a retry storm against an unreachable host.
+    fn listing(&mut self, repo: &Repo, remote: &str) -> &RemoteListing {
+        let key = (repo.common_dir().to_owned(), remote.to_owned());
+        let now = Instant::now();
+        let fresh = self
+            .listings
+            .get(&key)
+            .is_some_and(|(asked, _)| now.duration_since(*asked) < self.deadline);
+        if !fresh {
+            self.listings
+                .insert(key.clone(), (now, repo.remote_listing(remote)));
+        }
+        &self.listings[&key].1
+    }
 }
 
 /// Collect the vector for one anchor. Reads only; all runtime fields come
@@ -340,22 +377,14 @@ fn upstream_state(repo: &Repo, config: &UpstreamConfig, cache: &mut RemoteCache)
     }
 }
 
-/// The remote's advertised ref listing, once per repo+remote per pass.
+/// The remote's advertised ref listing, once per repo+remote per deadline.
 fn remote_refs(repo: &Repo, remote: &str, cache: &mut RemoteCache) -> Evidence<Vec<String>> {
-    cache
-        .refs
-        .entry((repo.common_dir().to_owned(), remote.to_owned()))
-        .or_insert_with(|| repo.remote_refs(remote))
-        .clone()
+    cache.listing(repo, remote).refs.clone()
 }
 
-/// The remote's advertised HEAD, once per repo+remote per pass.
+/// The remote's advertised HEAD, once per repo+remote per deadline.
 fn remote_head(repo: &Repo, remote: &str, cache: &mut RemoteCache) -> RemoteHead {
-    cache
-        .heads
-        .entry((repo.common_dir().to_owned(), remote.to_owned()))
-        .or_insert_with(|| repo.remote_head(remote))
-        .clone()
+    cache.listing(repo, remote).head.clone()
 }
 
 /// The base branch: the symbolic HEAD of the upstream remote, or of the

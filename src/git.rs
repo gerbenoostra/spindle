@@ -354,6 +354,15 @@ pub enum UpstreamConfig {
     Full { remote: String, merge: String },
 }
 
+/// What one `ls-remote --symref` proved about a remote.
+#[derive(Debug, Clone)]
+pub struct RemoteListing {
+    pub head: RemoteHead,
+    /// Every advertised refname; `Unknown` when the remote could not be
+    /// asked.
+    pub refs: Evidence<Vec<String>>,
+}
+
 /// Where the remote's default branch evidence landed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteHead {
@@ -508,37 +517,39 @@ impl Repo {
         }
     }
 
-    /// `ls-remote --symref <remote> HEAD`: what the remote advertises as its
-    /// default branch, read-only and without fetching.
-    pub fn remote_head(&self, remote: &str) -> RemoteHead {
-        match in_repo(self, &["ls-remote", "--symref", remote, "HEAD"]) {
+    /// `ls-remote --symref <remote>`: the remote's advertised default branch
+    /// and every refname it advertises, from one network round-trip,
+    /// read-only and without fetching. Membership checks against the
+    /// listing answer any per-ref question without asking again.
+    pub fn remote_listing(&self, remote: &str) -> RemoteListing {
+        match in_repo(self, &["ls-remote", "--symref", remote]) {
             Ok(text) => {
+                let mut head = RemoteHead::NotAdvertised;
+                let mut refs = Vec::new();
                 for line in text.lines() {
-                    if let Some(rest) = line.strip_prefix("ref: refs/heads/")
-                        && let Some((branch, "HEAD")) = rest.split_once('\t')
-                    {
-                        return RemoteHead::Advertised(branch.to_owned());
+                    match line.strip_prefix("ref: ") {
+                        Some(symref) => {
+                            if let Some(rest) = symref.strip_prefix("refs/heads/")
+                                && let Some((branch, "HEAD")) = rest.split_once('\t')
+                            {
+                                head = RemoteHead::Advertised(branch.to_owned());
+                            }
+                        }
+                        None => refs.extend(line.split_once('\t').map(|(_, name)| name.to_owned())),
                     }
                 }
-                RemoteHead::NotAdvertised
+                RemoteListing {
+                    head,
+                    refs: Evidence::Known(refs),
+                }
             }
-            Err(e) => RemoteHead::Unreachable(format!("ls-remote {remote} HEAD: {e}")),
-        }
-    }
-
-    /// Every refname the remote advertises, proven by one `ls-remote`
-    /// listing (no fetch, no local mutation). Membership checks against the
-    /// listing answer any per-ref question without asking again. `Unknown`
-    /// when the remote could not be asked.
-    pub fn remote_refs(&self, remote: &str) -> Evidence<Vec<String>> {
-        match in_repo(self, &["ls-remote", remote]) {
-            Ok(text) => Evidence::Known(
-                text.lines()
-                    .filter_map(|line| line.rsplit('\t').next())
-                    .map(str::to_owned)
-                    .collect(),
-            ),
-            Err(e) => Evidence::Unknown(format!("ls-remote {remote}: {e}")),
+            Err(e) => {
+                let reason = format!("ls-remote {remote}: {e}");
+                RemoteListing {
+                    head: RemoteHead::Unreachable(reason.clone()),
+                    refs: Evidence::Unknown(reason),
+                }
+            }
         }
     }
 
@@ -906,9 +917,10 @@ mod tests {
         assert!(repo.remote_url("origin").is_err());
         assert!(repo.upstream_config("main").is_err());
         assert!(repo.local_remote_head("origin").is_err());
-        assert!(is_unreachable(&repo.remote_head("origin")));
+        let listing = repo.remote_listing("origin");
+        assert!(is_unreachable(&listing.head));
         assert!(!is_unreachable(&RemoteHead::Advertised("x".to_owned())));
-        assert!(!repo.remote_refs("origin").is_known());
+        assert!(!listing.refs.is_known());
         assert!(!repo.has_ref("refs/heads/main"));
         assert!(repo.rev_list_count("a", "b").is_err());
         assert!(repo.unreachable_commits("a").is_err());
