@@ -123,8 +123,9 @@ pub struct PublishedState {
     /// mapping knows, which is an `Unknown` with the raw value retained -
     /// never a guess at the nearest state.
     pub status: Option<PublishedStatus>,
-    /// The provider's raw status string, for the evidence view.
-    pub raw: String,
+    /// The provider's raw status string, for the evidence view; `None`
+    /// when the live record carried no status key at all.
+    pub raw: Option<String>,
     /// The provider's own reason for a wait ("permission prompt"), kept
     /// verbatim; only meaningful while `status` is `Waiting`.
     pub waiting_for: Option<String>,

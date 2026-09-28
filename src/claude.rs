@@ -198,7 +198,7 @@ impl Conversation {
         match &self.live {
             Some(live) => StateEvidence::Published(PublishedState {
                 status: live.status,
-                raw: live.status_raw.clone().unwrap_or_default(),
+                raw: live.status_raw.clone(),
                 waiting_for: live.waiting_for.clone(),
             }),
             None => StateEvidence::Absent,
@@ -924,7 +924,7 @@ mod tests {
     fn busy_state() -> StateEvidence {
         StateEvidence::Published(PublishedState {
             status: Some(PublishedStatus::Busy),
-            raw: "busy".to_owned(),
+            raw: Some("busy".to_owned()),
             waiting_for: None,
         })
     }
@@ -941,17 +941,21 @@ mod tests {
         match inv.conversations[0].state() {
             StateEvidence::Published(p) => {
                 assert_eq!(p.status, None);
-                assert_eq!(p.raw, "thinking");
+                assert_eq!(p.raw.as_deref(), Some("thinking"));
             }
             _ => panic!("published state keeps its raw value"), // coverage: off - failure path
         }
-        // And a session file with no status key reports absence the same way.
+        // And a session file with no status key keeps the absence.
         root.write(
             "sessions/2.json",
             &live_json(2, ID_B, "x").replace(r#""status":"x","#, ""),
         );
         let inv = claude.scan();
         assert_eq!(inv.conversations.len(), 2);
+        match inv.conversations[1].state() {
+            StateEvidence::Published(p) => assert_eq!(p.raw, None),
+            _ => panic!("a live record publishes state evidence"), // coverage: off - failure path
+        }
     }
 
     #[test]

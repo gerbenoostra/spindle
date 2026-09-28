@@ -790,7 +790,7 @@ fn conversation_row(
                 Some(PublishedStatus::Waiting) => ConversationState::Waiting,
                 None => ConversationState::Unknown,
             },
-            Some(p.raw),
+            p.raw,
             p.waiting_for,
         ),
         StateEvidence::Absent => (ConversationState::Unknown, None, None),
