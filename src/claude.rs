@@ -790,7 +790,16 @@ fn parse_iso8601(text: &str) -> Option<SystemTime> {
     let days_in_month = [
         31,
         if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ][(month - 1) as usize];
     if day == 0 || day > days_in_month {
         return None;
