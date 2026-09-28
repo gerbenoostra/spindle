@@ -1983,12 +1983,12 @@ mod tests {
     }
 
     #[test]
-    fn own_pane_and_terminal_detection_are_honest() {
+    fn own_pane_detection_is_honest() {
         // $TMUX_PANE parses or yields nothing; the dashboard never invents a pane.
+        // Terminal detection is covered by `tests/cli.rs`, which pipes stdout
+        // deterministically; a test binary inherits whatever stdout it is given.
         assert_eq!(parse_own_pane(Some("%12".to_owned())), PaneId::parse("%12"));
         assert_eq!(parse_own_pane(Some("nonsense".to_owned())), None);
         assert_eq!(parse_own_pane(None), None);
-        // Cargo test pipes stdout: never a terminal, so the TUI declines.
-        assert!(!terminal_present());
     }
 }
