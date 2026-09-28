@@ -645,6 +645,34 @@ fn a_project_space_and_no_cwd_stay_honest() {
         .unwrap();
     assert_eq!(conv.repo.as_deref(), Some(space_row.id.as_str()));
 
+    // A second conversation in the same space still makes one row - the
+    // space is an anchor, not a per-conversation record.
+    transcript(
+        &world.home,
+        "-p2",
+        "12121212-3434-5656-7878-909090909090",
+        &space,
+        &[("user", "more notes")],
+    );
+    let snapshot = collect(&world);
+    let space_rows = snapshot
+        .work
+        .iter()
+        .filter(|w| w.name == "plain-dir")
+        .count();
+    assert_eq!(
+        space_rows,
+        1,
+        "{:?}",
+        snapshot.work.iter().map(|w| &w.name).collect::<Vec<_>>()
+    );
+    let space_repo = snapshot
+        .repos
+        .iter()
+        .find(|r| r.name == "plain-dir")
+        .expect("the space's repo row");
+    assert_eq!(space_repo.work, 1);
+
     // A conversation whose cwd is gone keeps its record with no anchor.
     transcript(
         &world.home,

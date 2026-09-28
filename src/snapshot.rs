@@ -390,9 +390,14 @@ impl Collector {
             );
         }
 
-        // Non-git project spaces become rows on their own pseudo-repo.
+        // Non-git project spaces become rows on their own pseudo-repo -
+        // one per distinct space, not one per conversation sitting in it.
+        let mut spaces = std::collections::HashSet::new();
         for place in placements.iter().flatten() {
             if let CwdPlacement::ProjectSpace { path } = place {
+                if !spaces.insert(path) {
+                    continue;
+                }
                 let id = path.display().to_string();
                 repos.entry(id.clone()).or_insert_with(|| RepoRow {
                     id: id.clone(),
