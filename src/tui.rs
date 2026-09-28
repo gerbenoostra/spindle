@@ -260,8 +260,8 @@ impl App {
                                     c.repo.as_deref() == Some(repo.as_str())
                                         && c.branch.as_deref() == Some(branch.as_str())
                                 }
-                                WorkScope::Space { path } => {
-                                    c.cwd.as_deref() == Some(path.as_path())
+                                WorkScope::Space { id, .. } => {
+                                    c.repo.as_deref() == Some(id.as_str())
                                 }
                             }
                         } else if let Some(repo) = &repo_scope {
@@ -300,7 +300,10 @@ impl App {
         }
         self.rows(List::Work).get(cursor - 1).map(|row| match row {
             Row::Work(w) => match (w.kind, &w.worktree, &w.branch) {
-                (WorkKind::ProjectSpace, Some(root), _) => WorkScope::Space { path: root.clone() },
+                (WorkKind::ProjectSpace, Some(root), _) => WorkScope::Space {
+                    id: w.repo.clone(),
+                    path: root.clone(),
+                },
                 (_, Some(root), _) => WorkScope::Worktree {
                     repo: w.repo.clone(),
                     root: root.clone(),
@@ -310,10 +313,12 @@ impl App {
                     branch: branch.clone(),
                 },
                 _ /* // coverage: off - an anchor always names one of these */ => WorkScope::Space {
+                    id: String::new(),           // coverage: off - same
                     path: Path::new("").to_path_buf(), // coverage: off - same
                 },
             },
             _ /* // coverage: off - rows(List::Work) is Work rows only */ => WorkScope::Space {
+                id: String::new(),           // coverage: off - same
                 path: Path::new("").to_path_buf(), // coverage: off - same
             },
         })
@@ -732,7 +737,7 @@ impl App {
                 Some(WorkScope::Branch { branch, .. }) => {
                     format!("[3] Conversations  {branch}")
                 }
-                Some(WorkScope::Space { path }) => {
+                Some(WorkScope::Space { path, .. }) => {
                     format!("[3] Conversations  {}", path.display())
                 }
                 None => "[3] Conversations  all · by attention".to_owned(),
@@ -751,8 +756,12 @@ enum WorkScope {
     },
     /// A branch with no checkout of its own; conversations on that branch.
     Branch { repo: String, branch: String },
-    /// A non-git project space; conversations reporting exactly that cwd.
-    Space { path: std::path::PathBuf },
+    /// A non-git project space; conversations anchored on its canonical id
+    /// (`repo`), whatever spelling their recorded cwd carries.
+    Space {
+        id: String,
+        path: std::path::PathBuf,
+    },
 }
 
 fn list_index(list: List) -> usize {
@@ -1577,10 +1586,15 @@ mod tests {
         let text = render_to(&app, 200, 24);
         assert!(!text.contains("8f423bbb"), "{text}");
         assert!(text.contains("Conversations  feat/old"), "{text}");
-        // [2] on the project space: only a conv in exactly that cwd shows.
+        // [2] on the project space: a conv anchored on the space's
+        // canonical id shows even when its recorded cwd is another
+        // spelling of the same directory.
+        app.snapshot.conversations[1].repo = Some("/spaces/notes".to_owned());
+        app.snapshot.conversations[1].cwd = Some(PathBuf::from("/spaces/./notes"));
         press(&mut app, &[Key::Char('j')]);
         let text = render_to(&app, 200, 24);
         assert!(!text.contains("8f423bbb"), "{text}");
+        assert!(text.contains("02aa0bbb"), "{text}");
     }
 
     #[test]
