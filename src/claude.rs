@@ -122,13 +122,24 @@ pub struct Inventory {
     pub skipped: Vec<PathBuf>,
 }
 
+/// What a transcript file was when last parsed: device, inode, length and
+/// mtime. Equal means unchanged; same device+inode with a greater length
+/// means appended; anything else means reparse whole.
+#[derive(Debug, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: Option<SystemTime>,
+}
+
 /// The transcript index entry: what the file was when last parsed, how far
 /// into it the parse reached, and the record it parsed to. `Err` is retained
 /// too, so a malformed file is not reparsed - and not re-reported - on every
 /// scan.
 struct Indexed {
-    /// `(dev, ino, len, mtime)` at the last parse; `None` before it.
-    identity: Option<(u64, u64, u64, Option<SystemTime>)>,
+    /// The file's identity at the last parse; `None` before it.
+    identity: Option<FileIdentity>,
     /// The byte offset just past the last complete line consumed. A partial
     /// tail is a write in flight - left for the next pass, not counted
     /// malformed.
@@ -395,7 +406,12 @@ impl Claude {
 
         let mut found = Vec::new();
         for (path, slug, meta) in candidates {
-            let identity = (meta.dev(), meta.ino(), meta.len(), meta.modified().ok());
+            let identity = FileIdentity {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                len: meta.len(),
+                mtime: meta.modified().ok(),
+            };
             let indexed = self
                 .index
                 .entry(path.clone())
@@ -416,8 +432,8 @@ impl Claude {
             let appended = indexed
                 .identity
                 .as_ref()
-                .is_some_and(|i| i.0 == identity.0 && i.1 == identity.1)
-                && identity.2 > indexed.consumed
+                .is_some_and(|i| i.dev == identity.dev && i.ino == identity.ino)
+                && identity.len > indexed.consumed
                 && indexed.record.is_ok();
             let parsed = if appended {
                 let mut record = indexed.record.as_ref().unwrap().as_ref().clone();
