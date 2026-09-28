@@ -358,9 +358,11 @@ pub enum UpstreamConfig {
 #[derive(Debug, Clone)]
 pub struct RemoteListing {
     pub head: RemoteHead,
-    /// Every advertised refname; `Unknown` when the remote could not be
-    /// asked.
-    pub refs: Evidence<Vec<String>>,
+    /// Every advertised refname, shared: a repo asks the same remote for
+    /// each of its anchors, so the listing is refcounted rather than copied
+    /// per anchor (`Arc`, since the collector crosses threads). `Unknown`
+    /// when the remote could not be asked.
+    pub refs: Evidence<std::sync::Arc<Vec<String>>>,
 }
 
 /// Where the remote's default branch evidence landed.
@@ -540,7 +542,7 @@ impl Repo {
                 }
                 RemoteListing {
                     head,
-                    refs: Evidence::Known(refs),
+                    refs: Evidence::Known(std::sync::Arc::new(refs)),
                 }
             }
             Err(e) => {

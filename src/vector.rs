@@ -388,7 +388,12 @@ fn upstream_state(repo: &Repo, config: &UpstreamConfig, cache: &mut RemoteCache)
 }
 
 /// The remote's advertised ref listing, once per repo+remote per deadline.
-fn remote_refs(repo: &Repo, remote: &str, cache: &mut RemoteCache) -> Evidence<Vec<String>> {
+/// The `Arc` share is a refcount bump, not a copy of the whole listing.
+fn remote_refs(
+    repo: &Repo,
+    remote: &str,
+    cache: &mut RemoteCache,
+) -> Evidence<std::sync::Arc<Vec<String>>> {
     cache.listing(repo, remote).refs.clone()
 }
 
