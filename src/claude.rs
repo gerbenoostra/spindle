@@ -788,7 +788,16 @@ fn parse_iso8601(text: &str) -> Option<SystemTime> {
         d.next()?.parse::<i64>().ok()?,
         d.next()?.parse::<u64>().ok()?,
     );
-    if d.next().is_some() || !(1..=12).contains(&month) || day == 0 || day > 31 {
+    if d.next().is_some() || !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = [
+        31,
+        if leap { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ][(month - 1) as usize];
+    if day == 0 || day > days_in_month {
         return None;
     }
     let (hms, offset_secs) = match time.split_once('Z') {
@@ -1410,11 +1419,19 @@ mod tests {
             "2026-01-01T00:00:00+0:0:0",
             "2026-01-01T00:00:00+99:99",
             "2026-01-01T00:00:00x",
+            // impossible days are no timestamp either, per month
+            "2026-02-29T00:00:00Z",
+            "2026-02-31T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-11-31T00:00:00Z",
+            "1900-02-29T00:00:00Z",
             // before the epoch is no timestamp either
             "1969-12-31T00:00:00Z",
         ] {
             assert_eq!(parse_iso8601(bad), None, "{bad}");
         }
+        assert!(parse_iso8601("2024-02-29T00:00:00Z").is_some());
+        assert!(parse_iso8601("2000-02-29T00:00:00Z").is_some());
         // Fractional seconds, space separators and real offsets parse.
         assert!(parse_iso8601("2026-01-01T00:00:00.999Z").is_some());
         assert!(parse_iso8601("2026-01-01 00:00:00Z").is_some());
