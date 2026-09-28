@@ -488,13 +488,7 @@ impl App {
     fn row(&self, _list: List, row: &Row<'_>, width: u16, selected: bool) -> Line<'static> {
         let cells = match row {
             Row::Repo(r) => RowCells {
-                glyph: repo_glyph(
-                    self.snapshot
-                        .repos
-                        .iter()
-                        .find(|x| x.id == r.id)
-                        .unwrap_or(r),
-                ),
+                glyph: repo_glyph(r),
                 label: &r.name,
                 middle: &repo_counts(r),
                 age: &age(self.now(), r.last_activity),
@@ -503,7 +497,7 @@ impl App {
             },
             Row::Work(w) => RowCells {
                 glyph: work_glyph(w),
-                label: &work_name(&self.snapshot, w),
+                label: &work_name(w),
                 middle: &w.summary,
                 age: &age(self.now(), w.last_activity),
                 selected,
@@ -607,7 +601,7 @@ impl App {
                 format!("[4] Repo - {}", r.name),
                 Line::from(format!(
                     "{} {} - repo · {}",
-                    "",
+                    repo_glyph(r),
                     r.name,
                     age(self.now(), r.last_activity)
                 )),
@@ -853,7 +847,7 @@ fn work_glyph(w: &WorkRow) -> &'static str {
 
 /// The work row's label: `name ⌂worktree`; a project space's workspace is
 /// its name already, so it carries no suffix.
-fn work_name(_snapshot: &Snapshot, w: &WorkRow) -> String {
+fn work_name(w: &WorkRow) -> String {
     if w.kind == WorkKind::ProjectSpace {
         return w.name.clone();
     }
@@ -1848,7 +1842,7 @@ mod tests {
             worktree: None,
             ..fixture().work[1].clone()
         };
-        assert_eq!(work_name(&fixture(), &bare), "feat/old");
+        assert_eq!(work_name(&bare), "feat/old");
         // Key events map; unbound codes are None.
         use crossterm::event::KeyCode;
         assert_eq!(map_key(KeyCode::Tab), Some(Key::Tab));
