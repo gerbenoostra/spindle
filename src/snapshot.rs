@@ -618,7 +618,7 @@ fn runtime_facts(
         // carrying no stored worktree edge whose pane cwds land inside.
         let mut orphaned = std::collections::HashSet::new();
         for pane in &runtime.panes.panes {
-            if pane.wt_adminid.is_none() && pane.binds_worktree(admin_id, &canonical) {
+            if pane.wt_adminid.is_none() && pane.binds_worktree(admin_id, path) {
                 orphaned.insert((&pane.socket, &pane.window));
             }
         }
