@@ -407,9 +407,12 @@ impl Claude {
                 }
                 continue;
             }
-            // The same file with more bytes is an append: read only what
-            // arrived past the consumed offset. Anything else - a rewrite,
-            // a shrink or a remembered failure - parses whole.
+            // The same file grown past the consumed offset is an append:
+            // read only what arrived after it. A new inode, a shrink or a
+            // remembered failure parses whole. An in-place rewrite that
+            // grows the same inode is indistinguishable from an append on
+            // (dev, ino, len) alone - transcripts are append-only, so that
+            // is the contract, not a case to detect.
             let appended = indexed
                 .identity
                 .as_ref()
@@ -417,7 +420,7 @@ impl Claude {
                 && identity.2 > indexed.consumed
                 && indexed.record.is_ok();
             let parsed = if appended {
-                let mut record = indexed.record.as_ref().unwrap().as_ref().clone(); // coverage: off - `appended` requires the record to be `Ok`
+                let mut record = indexed.record.as_ref().unwrap().as_ref().clone();
                 read_transcript(&path, indexed.consumed, &mut record, &mut indexed.other_ids)
                     .and_then(|consumed| {
                         validate(&path, &slug, &record, &indexed.other_ids)
@@ -493,8 +496,13 @@ fn collect_transcripts(
             }
         };
         let path = entry.path();
-        let Ok(meta) = entry.metadata() else {
-            continue; // coverage: off - an entry that cannot be stat'd has no identity to judge
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(e) /* // coverage: off - a stat failure needs a racing delete */ => {
+                let detail = format!("{}: {e}", path.display()); // coverage: off - same
+                errors.push(SourceError { source: "claude transcripts".to_owned(), detail }); // coverage: off - same
+                continue; // coverage: off - same
+            }
         };
         if meta.is_dir() {
             collect_transcripts(&path, out, skipped, errors);
