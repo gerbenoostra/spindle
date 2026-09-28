@@ -1511,6 +1511,35 @@ mod tests {
     }
 
     #[test]
+    fn a_parsed_transcript_recovers_from_a_transient_read_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new();
+        let path = root.write(
+            &format!("projects/proj-a/{ID_A}.jsonl"),
+            &transcript_lines(ID_A),
+        );
+        let mut claude = Claude::new(root.0.clone());
+        assert_eq!(claude.scan().conversations.len(), 1);
+
+        // The file changes (a new line appended) and becomes unreadable:
+        // the new identity must not latch, or the error would be pinned
+        // even after the file reads cleanly again.
+        fs::write(
+            &path,
+            format!("{}{}", transcript_lines(ID_A), transcript_lines(ID_A)),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let inv = claude.scan();
+        assert!(inv.conversations.is_empty(), "{:?}", inv.conversations);
+        assert_eq!(inv.errors.len(), 1, "{:?}", inv.errors);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let inv = claude.scan();
+        assert_eq!(inv.conversations.len(), 1, "{:?}", inv.errors);
+    }
+
+    #[test]
     fn titles_truncate_over_forty_chars() {
         assert_eq!(
             truncate("a much longer single-line title that keeps going", 40),
