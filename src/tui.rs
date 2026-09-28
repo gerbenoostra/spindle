@@ -96,15 +96,26 @@ impl Filter {
         }
     }
 
-    /// Whether a row survives: its label matches the text, and its timestamp
-    /// is newer than `age`. An unknown age fails closed - filtering out what
-    /// cannot be proven is honest; guessing it young is not. `lower` is the
-    /// caller's scratch buffer for the case-folded label - one allocation
-    /// per pass instead of one per row per frame.
-    fn allows(&self, label: &str, timestamp: Option<u64>, now: u64, lower: &mut String) -> bool {
+    /// Whether a row survives: its fields, space-joined, match the text, and
+    /// its timestamp is newer than `age`. An unknown age fails closed -
+    /// filtering out what cannot be proven is honest; guessing it young is
+    /// not. `lower` is the caller's scratch buffer for the case-folded
+    /// fields - one allocation per pass instead of one per row per frame.
+    fn allows<'a>(
+        &self,
+        fields: impl IntoIterator<Item = &'a str>,
+        timestamp: Option<u64>,
+        now: u64,
+        lower: &mut String,
+    ) -> bool {
         if !self.text.is_empty() {
             lower.clear();
-            lower.extend(label.chars().flat_map(char::to_lowercase));
+            for (i, field) in fields.into_iter().enumerate() {
+                if i > 0 {
+                    lower.push(' ');
+                }
+                lower.extend(field.chars().flat_map(char::to_lowercase));
+            }
             if !lower.contains(&self.text) {
                 return false;
             }
@@ -178,7 +189,7 @@ impl App {
     pub fn refresh(&mut self, snapshot: Snapshot) {
         self.snapshot = snapshot;
         for list in [List::Repos, List::Work, List::Conversations] {
-            let len = self.rows(list).len();
+            let len = self.view().rows(list).len();
             let slot = &mut self.cursor[list_index(list)];
             if *slot > len {
                 *slot = len;
@@ -212,116 +223,109 @@ impl App {
         Filter::parse(&self.filter_raw[list_index(list)])
     }
 
-    /// The rows a list shows: the scope the cursor above it chose, filtered.
-    ///
-    /// `Repos` rows are the snapshot's repos; `Work` is scoped by the repo
-    /// cursor (index 0 is `all`), and `Conversations` by the work cursor on
-    /// top of that. Each list's own `all` row is always first and always
-    /// visible - a filter narrows records, never the aggregate.
-    fn rows(&self, list: List) -> Vec<Row<'_>> {
-        let filter = self.filter(list);
+    /// The view: the three lists' filtered rows plus the scopes the cursors
+    /// select, built once so panels, titles and the detail header all agree
+    /// on the same row sets. `Repos` rows are the snapshot's repos; `Work`
+    /// is scoped by the repo cursor (index 0 is `all`), and `Conversations`
+    /// by the work cursor on top of that. Each list's own `all` row is
+    /// always first and always visible - a filter narrows records, never
+    /// the aggregate.
+    fn view(&self) -> View<'_> {
         let now = self.now();
         let mut lower = String::new();
-        match list {
-            List::Repos => self
-                .snapshot
-                .repos
-                .iter()
-                .filter(|r| filter.allows(&repo_label(r), r.last_activity, now, &mut lower))
-                .map(Row::Repo)
-                .collect(),
-            List::Work => {
-                let scope = self.repo_scope();
-                self.snapshot
-                    .work
-                    .iter()
-                    .filter(|w| scope.as_deref().is_none_or(|s| w.repo == *s))
-                    .filter(|w| filter.allows(&work_label(w), w.last_activity, now, &mut lower))
-                    .map(Row::Work)
-                    .collect()
-            }
-            List::Conversations => {
-                let repo_scope = self.repo_scope();
-                let work_scope = self.work_scope();
-                self.snapshot
-                    .conversations
-                    .iter()
-                    .filter(|c| {
-                        if let Some(work) = &work_scope {
-                            // A conversation under one work row matches on
-                            // worktree path, or on branch for branch-only
-                            // rows; under `all` work, on the repo alone.
-                            match work {
-                                WorkScope::Worktree { repo, root } => {
-                                    c.repo.as_deref() == Some(repo.as_str())
-                                        && c.worktree.as_deref() == Some(root.as_path())
-                                }
-                                WorkScope::Branch { repo, branch } => {
-                                    c.repo.as_deref() == Some(repo.as_str())
-                                        && c.branch.as_deref() == Some(branch.as_str())
-                                }
-                                WorkScope::Space { id, .. } => {
-                                    c.repo.as_deref() == Some(id.as_str())
-                                }
-                            }
-                        } else if let Some(repo) = &repo_scope {
+        let repos = self
+            .snapshot
+            .repos
+            .iter()
+            .filter(|r| {
+                self.filter(List::Repos).allows(
+                    [r.name.as_str(), r.id.as_str()],
+                    r.last_activity,
+                    now,
+                    &mut lower,
+                )
+            })
+            .map(Row::Repo)
+            .collect::<Vec<_>>();
+        let repo_scope = match self.cursor[list_index(List::Repos)] {
+            0 => None,
+            cursor => repos.get(cursor - 1).map(|row| match row {
+                Row::Repo(r) => r.id.clone(),
+                _ => String::new(), // coverage: off - repos holds Repo rows only
+            }),
+        };
+        let work = self
+            .snapshot
+            .work
+            .iter()
+            .filter(|w| repo_scope.as_deref().is_none_or(|s| w.repo == *s))
+            .filter(|w| {
+                self.filter(List::Work).allows(
+                    [w.repo_name.as_str(), w.name.as_str(), w.summary.as_str()],
+                    w.last_activity,
+                    now,
+                    &mut lower,
+                )
+            })
+            .map(Row::Work)
+            .collect::<Vec<_>>();
+        let work_scope = match self.cursor[list_index(List::Work)] {
+            0 => None,
+            cursor => work.get(cursor - 1).map(|row| match row {
+                Row::Work(w) => scope_of(w),
+                _ /* // coverage: off - work holds Work rows only */ => WorkScope::Space {
+                    id: String::new(),                    // coverage: off - same
+                    path: Path::new("").to_path_buf(),    // coverage: off - same
+                },
+            }),
+        };
+        let conversations = self
+            .snapshot
+            .conversations
+            .iter()
+            .filter(|c| {
+                if let Some(work) = &work_scope {
+                    // A conversation under one work row matches on worktree
+                    // path, or on branch for branch-only rows; under `all`
+                    // work, on the repo alone.
+                    match work {
+                        WorkScope::Worktree { repo, root } => {
                             c.repo.as_deref() == Some(repo.as_str())
-                        } else {
-                            true
+                                && c.worktree.as_deref() == Some(root.as_path())
                         }
-                    })
-                    .filter(|c| {
-                        filter.allows(&conversation_label(c), c.state_since, now, &mut lower)
-                    })
-                    .map(Row::Conversation)
-                    .collect()
-            }
+                        WorkScope::Branch { repo, branch } => {
+                            c.repo.as_deref() == Some(repo.as_str())
+                                && c.branch.as_deref() == Some(branch.as_str())
+                        }
+                        WorkScope::Space { id, .. } => c.repo.as_deref() == Some(id.as_str()),
+                    }
+                } else if let Some(repo) = &repo_scope {
+                    c.repo.as_deref() == Some(repo.as_str())
+                } else {
+                    true
+                }
+            })
+            .filter(|c| {
+                self.filter(List::Conversations).allows(
+                    [
+                        c.short_id.as_str(),
+                        c.title.as_deref().unwrap_or(""),
+                        c.provider.as_str(),
+                    ],
+                    c.state_since,
+                    now,
+                    &mut lower,
+                )
+            })
+            .map(Row::Conversation)
+            .collect();
+        View {
+            repos,
+            work,
+            conversations,
+            repo_scope,
+            work_scope,
         }
-    }
-
-    /// The repo the [1] cursor names, or `None` on `all`. Index 0 is the
-    /// `all` row, so repo rows are offset by one.
-    fn repo_scope(&self) -> Option<String> {
-        let cursor = self.cursor[list_index(List::Repos)];
-        if cursor == 0 {
-            return None;
-        }
-        self.rows(List::Repos).get(cursor - 1).map(|row| match row {
-            Row::Repo(r) => r.id.clone(),
-            _ => String::new(), // coverage: off - rows(List::Repos) is Repo rows only
-        })
-    }
-
-    /// The work row the [2] cursor names, or `None` on `all`.
-    fn work_scope(&self) -> Option<WorkScope> {
-        let cursor = self.cursor[list_index(List::Work)];
-        if cursor == 0 {
-            return None;
-        }
-        self.rows(List::Work).get(cursor - 1).map(|row| match row {
-            Row::Work(w) => match (w.kind, &w.worktree, &w.branch) {
-                (WorkKind::ProjectSpace, Some(root), _) => WorkScope::Space {
-                    id: w.repo.clone(),
-                    path: root.clone(),
-                },
-                (_, Some(root), _) => WorkScope::Worktree {
-                    repo: w.repo.clone(),
-                    root: root.clone(),
-                },
-                (_, None, Some(branch)) => WorkScope::Branch {
-                    repo: w.repo.clone(),
-                    branch: branch.clone(),
-                },
-                _ /* // coverage: off - an anchor always names one of these */ => WorkScope::Space {
-                    id: String::new(),           // coverage: off - same
-                    path: Path::new("").to_path_buf(), // coverage: off - same
-                },
-            },
-            _ /* // coverage: off - rows(List::Work) is Work rows only */ => WorkScope::Space {
-                id: String::new(),           // coverage: off - same
-                path: Path::new("").to_path_buf(), // coverage: off - same
-            },
-        })
     }
 
     /// One key press.
@@ -381,7 +385,7 @@ impl App {
         let Some(list) = self.focused_list() else {
             return;
         };
-        let rows = self.rows(list).len();
+        let rows = self.view().rows(list).len();
         let cursor = &mut self.cursor[list_index(list)];
         // `all` plus rows: cursor range is 0..=rows.
         *cursor = (*cursor as i64 + delta).clamp(0, rows as i64) as usize;
@@ -402,23 +406,20 @@ impl App {
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(40), Constraint::Min(0)]).areas(main);
-        let repo_rows = self.rows(List::Repos);
+        // One view per frame: scoping, titles and the detail pane all read
+        // the same rows rather than recomputing them per panel.
+        let view = self.view();
         let [repos, work, conversations] = Layout::vertical([
-            Constraint::Length(list_height(repo_rows.len(), left.height)),
+            Constraint::Length(list_height(view.repos.len(), left.height)),
             Constraint::Percentage(55),
             Constraint::Min(0),
         ])
         .areas(left);
 
-        self.list_panel(f, repos, Pane::Repos, repo_rows);
-        self.list_panel(f, work, Pane::Work, self.rows(List::Work));
-        self.list_panel(
-            f,
-            conversations,
-            Pane::Conversations,
-            self.rows(List::Conversations),
-        );
-        self.detail_panel(f, right);
+        self.list_panel(f, repos, Pane::Repos, &view, &view.repos);
+        self.list_panel(f, work, Pane::Work, &view, &view.work);
+        self.list_panel(f, conversations, Pane::Conversations, &view, &view.conversations);
+        self.detail_panel(f, right, &view);
         self.footer(f, footer);
         if self.help {
             self.help_overlay(f, area);
@@ -426,10 +427,17 @@ impl App {
     }
 
     /// One list panel: title, `all` row, then the filtered rows.
-    fn list_panel(&self, f: &mut Frame<'_>, area: Rect, pane: Pane, rows: Vec<Row<'_>>) {
+    fn list_panel(
+        &self,
+        f: &mut Frame<'_>,
+        area: Rect,
+        pane: Pane,
+        view: &View<'_>,
+        rows: &[Row<'_>],
+    ) {
         let list = pane.list().expect("a list pane"); // coverage: off - only list panes reach here
         let block = Block::default()
-            .title(self.panel_title(pane))
+            .title(self.panel_title(pane, view))
             .borders(Borders::ALL)
             .border_style(if self.focus == pane {
                 Style::default().fg(Color::Cyan)
@@ -566,8 +574,8 @@ impl App {
     /// The detail pane: header-only for now - glyph, target, what it is and
     /// its state age. The full field set is the detail task's, not this
     /// one's; an honest `?` still renders where the header cannot be filled.
-    fn detail_panel(&self, f: &mut Frame<'_>, area: Rect) {
-        let (title, header) = self.detail_header();
+    fn detail_panel(&self, f: &mut Frame<'_>, area: Rect, view: &View<'_>) {
+        let (title, header) = self.detail_header(view);
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
@@ -583,14 +591,14 @@ impl App {
 
     /// `[4] <what>` plus the `glyph target - what · state age` header, taken
     /// from whatever the focused list's cursor sits on.
-    fn detail_header(&self) -> (String, Line<'static>) {
+    fn detail_header(&self, view: &View<'_>) -> (String, Line<'static>) {
         let (list, row) = match self.focused_list() {
             Some(list) => {
                 let cursor = self.cursor[list_index(list)];
                 let row = if cursor == 0 {
                     None
                 } else {
-                    self.rows(list).into_iter().nth(cursor - 1)
+                    view.rows(list).get(cursor - 1)
                 };
                 (Some(list), row)
             }
@@ -708,23 +716,23 @@ impl App {
     }
 
     /// The panel title: `[N] Name` plus the scope suffix the cursor above set.
-    fn panel_title(&self, pane: Pane) -> String {
+    fn panel_title(&self, pane: Pane, view: &View<'_>) -> String {
         match pane {
             Pane::Repos => "[1] Repos".to_owned(),
-            Pane::Work => match self.repo_scope() {
+            Pane::Work => match &view.repo_scope {
                 None => "[2] Work  all · by next action".to_owned(),
                 Some(repo) => {
                     let name = self
                         .snapshot
                         .repos
                         .iter()
-                        .find(|r| r.id == repo)
+                        .find(|r| &r.id == repo)
                         .map(|r| r.name.clone())
-                        .unwrap_or(repo);
+                        .unwrap_or_else(|| repo.clone());
                     format!("[2] Work  {name} · by next action")
                 }
             },
-            Pane::Conversations => match self.work_scope() {
+            Pane::Conversations => match &view.work_scope {
                 Some(WorkScope::Worktree { root, .. }) => {
                     format!("[3] Conversations  {}", root.display())
                 }
@@ -736,8 +744,53 @@ impl App {
                 }
                 None => "[3] Conversations  all · by attention".to_owned(),
             },
-            Pane::Detail => self.detail_header().0, // coverage: off - the detail pane renders its own header, never asks the title
+            Pane::Detail => self.detail_header(view).0, // coverage: off - the detail pane renders its own header, never asks the title
         }
+    }
+}
+
+/// The three lists' filtered rows plus the scopes the cursors select, built
+/// once per render or keypress. Views over the snapshot, never copies of it.
+struct View<'a> {
+    repos: Vec<Row<'a>>,
+    work: Vec<Row<'a>>,
+    conversations: Vec<Row<'a>>,
+    /// The repo the [1] cursor names; `None` on `all`.
+    repo_scope: Option<String>,
+    /// The work row the [2] cursor names; `None` on `all`.
+    work_scope: Option<WorkScope>,
+}
+
+impl View<'_> {
+    /// The rows of one list.
+    fn rows(&self, list: List) -> &[Row<'_>] {
+        match list {
+            List::Repos => &self.repos,
+            List::Work => &self.work,
+            List::Conversations => &self.conversations,
+        }
+    }
+}
+
+/// The scope a work row selects in [3].
+fn scope_of(w: &WorkRow) -> WorkScope {
+    match (w.kind, &w.worktree, &w.branch) {
+        (WorkKind::ProjectSpace, Some(root), _) => WorkScope::Space {
+            id: w.repo.clone(),
+            path: root.clone(),
+        },
+        (_, Some(root), _) => WorkScope::Worktree {
+            repo: w.repo.clone(),
+            root: root.clone(),
+        },
+        (_, None, Some(branch)) => WorkScope::Branch {
+            repo: w.repo.clone(),
+            branch: branch.clone(),
+        },
+        _ /* // coverage: off - an anchor always names one of these */ => WorkScope::Space {
+            id: String::new(),               // coverage: off - same
+            path: Path::new("").to_path_buf(), // coverage: off - same
+        },
     }
 }
 
@@ -890,22 +943,6 @@ fn detail_state(c: &ConversationRow) -> String {
         },
         state => state.as_str().to_owned(),
     }
-}
-
-/// The labels a list filter matches against.
-fn repo_label(r: &RepoRow) -> String {
-    format!("{} {}", r.name, r.id)
-}
-fn work_label(w: &WorkRow) -> String {
-    format!("{} {} {}", w.repo_name, w.name, w.summary)
-}
-fn conversation_label(c: &ConversationRow) -> String {
-    format!(
-        "{} {} {}",
-        c.short_id,
-        c.title.as_deref().unwrap_or(""),
-        c.provider.as_str()
-    )
 }
 
 /// The keys the input loop translates; `Tab`, `Esc`, `Enter`, `Backspace`
@@ -1670,10 +1707,10 @@ mod tests {
         assert_eq!(f.age, Some(Duration::from_secs(7200)));
         // Text narrows case-insensitively; age requires a known timestamp.
         let mut lower = String::new();
-        assert!(f.allows("FIX the thing", Some(100), 200, &mut lower));
-        assert!(!f.allows("other", Some(100), 200, &mut lower));
-        assert!(!f.allows("fix", None, 200, &mut lower));
-        assert!(!f.allows("fix", Some(1), 200_000, &mut lower));
+        assert!(f.allows(["FIX the thing"], Some(100), 200, &mut lower));
+        assert!(!f.allows(["other"], Some(100), 200, &mut lower));
+        assert!(!f.allows(["fix"], None, 200, &mut lower));
+        assert!(!f.allows(["fix"], Some(1), 200_000, &mut lower));
         // A bogus age term is text, not a filter that lets nothing through.
         let f = Filter::parse("age:forever");
         assert_eq!(f.text, "age:forever");
