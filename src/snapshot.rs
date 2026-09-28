@@ -612,17 +612,17 @@ fn runtime_facts(
         past_agent_sessions: 0,
     };
     if let Some(path) = path {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned()); // coverage: off - a reported path canonicalizes
         facts.windows.total = runtime.panes.windows_bound(admin_id, path);
         // Orphaned windows are bound by derived evidence alone: a window
         // carrying no stored worktree edge whose pane cwds land inside.
         let mut orphaned = std::collections::HashSet::new();
         for pane in &runtime.panes.panes {
-            if pane.wt_adminid.is_none() && pane.binds_worktree(admin_id, path) {
+            if pane.wt_adminid.is_none() && pane.binds_worktree(admin_id, &canonical) {
                 orphaned.insert((&pane.socket, &pane.window));
             }
         }
         facts.windows.orphaned = orphaned.len();
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned()); // coverage: off - a reported path canonicalizes
         for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() {
             let Some(CwdPlacement::Checkout { root, .. }) = place else {
                 continue;

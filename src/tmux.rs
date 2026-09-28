@@ -106,24 +106,22 @@ pub struct Pane {
 impl Pane {
     /// Whether this pane's evidence binds it to `worktree`: the stored
     /// admin-id edge when the window publishes one, else the derived edge -
-    /// a pane cwd at or below the worktree root. Both sides are
-    /// canonicalized first, so a symlinked spelling of the worktree binds
-    /// the same. The stored edge decides outright when present: a window
-    /// whose stored id names another worktree belongs to that worktree
-    /// even if a pane has since `cd`-ed into this one.
+    /// a pane cwd at or below the worktree root. Both sides are canonical:
+    /// the pane's cwd is normalized at inventory ingest and the caller
+    /// canonicalizes the worktree once per anchor, so the check itself is a
+    /// prefix compare, not two syscalls per (pane x anchor). The stored
+    /// edge decides outright when present: a window whose stored id names
+    /// another worktree belongs to that worktree even if a pane has since
+    /// `cd`-ed into this one.
     pub fn binds_worktree(&self, admin_id: Option<&str>, worktree: &Path) -> bool {
         match (&self.wt_adminid, admin_id) {
             (Some(stored), Some(id)) => return stored == id,
             (Some(_), None) => return false,
             _ => {}
         }
-        self.cwd.as_deref().is_some_and(|cwd| {
-            let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
-            let root = worktree
-                .canonicalize()
-                .unwrap_or_else(|_| worktree.to_owned());
-            cwd.starts_with(root)
-        })
+        self.cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd.starts_with(worktree))
     }
 }
 
@@ -212,7 +210,13 @@ impl PaneInventory {
                 Ok(panes) => {
                     for pane in panes {
                         match pane {
-                            Ok(pane) => inventory.panes.push(pane),
+                            Ok(mut pane) => {
+                                // Canonical once per pass, so a symlinked
+                                // cwd spelling binds by prefix compare; a
+                                // cwd that fails to resolve stays raw.
+                                pane.cwd = pane.cwd.map(|c| c.canonicalize().unwrap_or(c)); // coverage: off - tmux reports an existing path
+                                inventory.panes.push(pane);
+                            }
                             Err(line) => inventory
                                 .warnings
                                 .push(format!("{}: unparsed pane `{line}`", socket.display())),
@@ -270,9 +274,13 @@ impl PaneInventory {
     /// worktree. That is what keeps a hand-made window visible without
     /// ever claiming it.
     pub fn windows_bound(&self, admin_id: Option<&str>, worktree: &Path) -> usize {
+        // Once per anchor, not once per pane.
+        let canonical = worktree
+            .canonicalize()
+            .unwrap_or_else(|_| worktree.to_owned()); // coverage: off - a bound worktree exists
         let mut windows = HashSet::new();
         for pane in &self.panes {
-            if pane.binds_worktree(admin_id, worktree) {
+            if pane.binds_worktree(admin_id, &canonical) {
                 windows.insert((&pane.socket, &pane.window));
             }
         }
@@ -572,16 +580,23 @@ mod tests {
         assert!(p.binds_worktree(None, &worktree));
         p.cwd = Some(PathBuf::from("/no/such/dir/here"));
         assert!(!p.binds_worktree(None, &worktree));
-        // The same for a worktree that does not exist, and for a
-        // worktree passed under a symlinked spelling of its real path
-        // (where temp_dir has no symlink the two are one path and the
-        // check still runs).
+        // The same for a worktree that does not exist. A symlinked
+        // spelling of the worktree binds the same: windows_bound
+        // canonicalizes it once, per anchor rather than per pane (where
+        // temp_dir has no symlink the two are one path and the check
+        // still runs).
         p.cwd = Some(worktree.join("inside"));
         assert!(!p.binds_worktree(None, Path::new("/no/such/worktree/here")));
         let raw = std::env::temp_dir();
         let canon = raw.canonicalize().unwrap();
         p.cwd = Some(canon.join("inside"));
-        assert!(p.binds_worktree(None, &raw));
+        let inv = PaneInventory {
+            panes: vec![p],
+            servers: Vec::new(),
+            stale_sockets: 0,
+            warnings: Vec::new(),
+        };
+        assert_eq!(inv.windows_bound(None, &raw), 1);
     }
 
     #[test]
