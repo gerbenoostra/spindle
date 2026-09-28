@@ -201,24 +201,21 @@ impl App {
                 }
             });
         self.snapshot = snapshot;
-        self.cursor = {
-            let after = self.view();
-            let mut cursors = [0; 3];
-            for (list, key) in [List::Repos, List::Work, List::Conversations]
-                .into_iter()
-                .zip(keys)
-            {
-                cursors[list_index(list)] = key
-                    .and_then(|key| {
-                        after
-                            .rows(list)
-                            .iter()
-                            .position(|row| selection_key(row) == key)
-                    })
-                    .map_or(0, |position| position + 1);
-            }
-            cursors
-        };
+        // Resolve parent to child: a list's rows are scoped by the cursor
+        // above it, so each cursor update rebuilds the view before the next
+        // selection is searched - otherwise a re-sorted repo row would look
+        // up work and conversation keys under the stale parent scope.
+        for (list, key) in [List::Repos, List::Work, List::Conversations]
+            .into_iter()
+            .zip(keys)
+        {
+            let position = self
+                .view()
+                .rows(list)
+                .iter()
+                .position(|row| key.as_ref().is_some_and(|key| selection_key(row) == *key));
+            self.cursor[list_index(list)] = position.map_or(0, |p| p + 1);
+        }
     }
 
     /// Whether the run loop should exit.
@@ -758,7 +755,7 @@ impl App {
                         .iter()
                         .find(|r| &r.id == repo)
                         .map(|r| r.name.clone())
-                        .unwrap_or_else(|| repo.clone());
+                        .unwrap_or_else(|| repo.clone()); // coverage: off - the scope's id always names a repo row
                     format!("[2] Work  {name} · by next action")
                 }
             },
@@ -1406,15 +1403,40 @@ mod tests {
     fn a_refresh_keeps_the_selection_on_its_record_not_its_index() {
         const IDLE_ID: &str = "02aa0bbb-1111-2222-3333-444444444444";
         let mut app = App::new(fixture());
-        press(&mut app, &[Key::Char('j'), Key::Char('j')]);
-        assert_eq!(app.cursor[list_index(List::Conversations)], 2);
+        // Select a row on every list: repo "a", work "feat/login", and the
+        // idle conversation (feat/old is a branch-only row and scopes no
+        // conversations).
+        press(
+            &mut app,
+            &[
+                Key::Char('1'),
+                Key::Char('j'),
+                Key::Char('2'),
+                Key::Char('j'),
+            ],
+        );
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char('j')]);
+        assert_eq!(app.cursor, [1, 1, 2]);
 
-        // The next collect re-sorts: the unknown row jumps to the front,
-        // pushing the selected record back one position.
+        // The next collect re-sorts everything: the repo rows trade places,
+        // the unknown conversation jumps to the front.
         let mut next = fixture();
+        next.repos.swap(0, 1);
         next.conversations.swap(0, 2);
         app.refresh(next);
         let view = app.view();
+        // The repo cursor still names "a", under whose scope the work
+        // selection still names "feat/login".
+        let cursor = app.cursor[list_index(List::Repos)];
+        let Some(Row::Repo(r)) = view.repos.get(cursor - 1) else {
+            panic!("cursor lands on a repo row"); // coverage: off - failure path
+        };
+        assert_eq!(r.name, "a");
+        let cursor = app.cursor[list_index(List::Work)];
+        let Some(Row::Work(w)) = view.work.get(cursor - 1) else {
+            panic!("cursor lands on a work row"); // coverage: off - failure path
+        };
+        assert_eq!(w.name, "feat/login");
         let cursor = app.cursor[list_index(List::Conversations)];
         let Some(Row::Conversation(c)) = view.conversations.get(cursor - 1) else {
             panic!("cursor lands on a conversation row"); // coverage: off - failure path
