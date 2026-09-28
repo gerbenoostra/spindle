@@ -584,6 +584,9 @@ mod tests {
         let canon = raw.canonicalize().unwrap();
         p.cwd = Some(canon.join("inside"));
         assert!(p.binds_worktree(None, &raw));
+        // A pane tmux reports no cwd for binds by the stored edge alone.
+        p.cwd = None;
+        assert!(!p.binds_worktree(None, &worktree));
     }
 
     #[test]
