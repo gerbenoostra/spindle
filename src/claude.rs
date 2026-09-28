@@ -435,28 +435,22 @@ impl Claude {
                 .is_some_and(|i| i.dev == identity.dev && i.ino == identity.ino)
                 && identity.len > indexed.consumed
                 && indexed.record.is_ok();
-            let parsed = if appended {
+            // Read first, validate after. A read failure is transient - a
+            // racing rewrite or a permissions fix can make the same file
+            // readable again - so the identity is not latched and the next
+            // pass retries. A validation failure is the content's own
+            // verdict: it latches with the identity until the file changes.
+            let read = if appended {
                 let mut record = indexed.record.as_ref().unwrap().as_ref().clone();
                 read_transcript(&path, indexed.consumed, &mut record, &mut indexed.other_ids)
-                    .and_then(|consumed| {
-                        validate(&path, &slug, &record, &indexed.other_ids)
-                            .map(|()| (consumed, record))
-                    })
+                    .map(|consumed| (consumed, record))
             } else {
                 let mut record = Transcript::blank(&path, &slug);
                 indexed.other_ids.clear();
-                read_transcript(&path, 0, &mut record, &mut indexed.other_ids).and_then(
-                    |consumed| {
-                        validate(&path, &slug, &record, &indexed.other_ids)
-                            .map(|()| (consumed, record))
-                    },
-                )
+                read_transcript(&path, 0, &mut record, &mut indexed.other_ids)
+                    .map(|consumed| (consumed, record))
             };
-            match parsed {
-                Ok((consumed, record)) => {
-                    indexed.consumed = consumed;
-                    indexed.record = Ok(Arc::new(record));
-                }
+            match read {
                 Err(detail) => {
                     errors.push(SourceError {
                         source: "claude transcript".to_owned(),
@@ -464,8 +458,21 @@ impl Claude {
                     });
                     indexed.record = Err(detail);
                 }
+                Ok((consumed, record)) => {
+                    indexed.consumed = consumed;
+                    indexed.identity = Some(identity);
+                    match validate(&path, &slug, &record, &indexed.other_ids) {
+                        Ok(()) => indexed.record = Ok(Arc::new(record)),
+                        Err(detail) => {
+                            errors.push(SourceError {
+                                source: "claude transcript".to_owned(),
+                                detail: detail.clone(),
+                            });
+                            indexed.record = Err(detail);
+                        }
+                    }
+                }
             }
-            indexed.identity = Some(identity);
             if let Ok(record) = &indexed.record {
                 found.push(Arc::clone(record));
             }
@@ -1458,6 +1465,28 @@ mod tests {
         let t = &inv.conversations[0].transcript.as_ref().unwrap();
         assert_eq!(t.latest_prompt, None);
         assert_eq!(t.latest_reply, None);
+    }
+
+    #[test]
+    fn a_transiently_unreadable_transcript_is_retried_not_latched() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new();
+        let path = root.write(
+            &format!("projects/proj-a/{ID_A}.jsonl"),
+            &transcript_lines(ID_A),
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut claude = Claude::new(root.0.clone());
+        let inv = claude.scan();
+        assert!(inv.conversations.is_empty(), "{:?}", inv.conversations);
+        assert_eq!(inv.errors.len(), 1, "{:?}", inv.errors);
+
+        // The same file readable again - identical (dev, ino, len, mtime),
+        // so only a retry-on-read-error recovers it.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let inv = claude.scan();
+        assert_eq!(inv.conversations.len(), 1, "{:?}", inv.errors);
     }
 
     #[test]
