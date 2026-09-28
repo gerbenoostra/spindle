@@ -184,17 +184,41 @@ impl App {
         }
     }
 
-    /// Swap in a fresh snapshot, clamping cursors onto the rows that remain:
-    /// the range is `0..=rows` - the `all` row counts as a position.
+    /// Swap in a fresh snapshot. Rows are re-sorted on every collect, so a
+    /// kept cursor index would silently select a different record; each
+    /// cursor instead tracks its row's identity and falls back to `all`
+    /// when that record vanished - widening scope rather than retargeting
+    /// it to a different row.
     pub fn refresh(&mut self, snapshot: Snapshot) {
+        let before = self.view();
+        let keys: [Option<String>; 3] =
+            [List::Repos, List::Work, List::Conversations].map(|list| {
+                let cursor = self.cursor[list_index(list)];
+                if cursor == 0 {
+                    None
+                } else {
+                    before.rows(list).get(cursor - 1).map(selection_key)
+                }
+            });
         self.snapshot = snapshot;
-        for list in [List::Repos, List::Work, List::Conversations] {
-            let len = self.view().rows(list).len();
-            let slot = &mut self.cursor[list_index(list)];
-            if *slot > len {
-                *slot = len;
+        self.cursor = {
+            let after = self.view();
+            let mut cursors = [0; 3];
+            for (list, key) in [List::Repos, List::Work, List::Conversations]
+                .into_iter()
+                .zip(keys)
+            {
+                cursors[list_index(list)] = key
+                    .and_then(|key| {
+                        after
+                            .rows(list)
+                            .iter()
+                            .position(|row| selection_key(row) == key)
+                    })
+                    .map_or(0, |position| position + 1);
             }
-        }
+            cursors
+        };
     }
 
     /// Whether the run loop should exit.
@@ -418,7 +442,13 @@ impl App {
 
         self.list_panel(f, repos, Pane::Repos, &view, &view.repos);
         self.list_panel(f, work, Pane::Work, &view, &view.work);
-        self.list_panel(f, conversations, Pane::Conversations, &view, &view.conversations);
+        self.list_panel(
+            f,
+            conversations,
+            Pane::Conversations,
+            &view,
+            &view.conversations,
+        );
         self.detail_panel(f, right, &view);
         self.footer(f, footer);
         if self.help {
@@ -455,7 +485,7 @@ impl App {
         let scroll = cursor.saturating_sub(visible.saturating_sub(1));
         let mut lines = Vec::with_capacity(visible.saturating_add(1));
         if scroll == 0 {
-            lines.push(self.all_row(list, &rows, inner.width, cursor == 0));
+            lines.push(self.all_row(list, rows, inner.width, cursor == 0));
         }
         for (i, row) in rows.iter().enumerate().skip(scroll.saturating_sub(1)) {
             if lines.len() >= visible {
@@ -769,6 +799,15 @@ impl View<'_> {
             List::Work => &self.work,
             List::Conversations => &self.conversations,
         }
+    }
+}
+
+/// The identity a cursor selection tracks across refreshes.
+fn selection_key(row: &Row<'_>) -> String {
+    match row {
+        Row::Repo(r) => r.id.clone(),
+        Row::Work(w) => format!("{}\u{0}{}\u{0}{}", w.repo, w.kind.as_str(), w.name),
+        Row::Conversation(c) => format!("{}\u{0}{}", c.provider.as_str(), c.session_id),
     }
 }
 
@@ -1364,6 +1403,33 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_keeps_the_selection_on_its_record_not_its_index() {
+        const IDLE_ID: &str = "02aa0bbb-1111-2222-3333-444444444444";
+        let mut app = App::new(fixture());
+        press(&mut app, &[Key::Char('j'), Key::Char('j')]);
+        assert_eq!(app.cursor[list_index(List::Conversations)], 2);
+
+        // The next collect re-sorts: the unknown row jumps to the front,
+        // pushing the selected record back one position.
+        let mut next = fixture();
+        next.conversations.swap(0, 2);
+        app.refresh(next);
+        let view = app.view();
+        let cursor = app.cursor[list_index(List::Conversations)];
+        let Some(Row::Conversation(c)) = view.conversations.get(cursor - 1) else {
+            panic!("cursor lands on a conversation row"); // coverage: off - failure path
+        };
+        assert_eq!(c.session_id, IDLE_ID);
+
+        // A record that vanished drops the cursor to `all`, which widens
+        // the scope rather than silently retargeting a different row.
+        let mut next = fixture();
+        next.conversations.retain(|c| c.session_id != IDLE_ID);
+        app.refresh(next);
+        assert_eq!(app.cursor[list_index(List::Conversations)], 0);
+    }
+
+    #[test]
     fn the_shell_renders_at_55_and_200_columns() {
         for width in [55u16, 200] {
             let app = App::new(fixture());
@@ -1590,12 +1656,13 @@ mod tests {
         let mut app = App::new(fixture());
         press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char('j')]);
         assert_eq!(app.cursor[1], 2);
-        // A snapshot with one work row: the [2] cursor clamps, and the
-        // shrink survives a second refresh to an even smaller snapshot.
+        // A snapshot without the selected row: the [2] cursor falls back
+        // to `all`, and the shrink survives a second refresh to an even
+        // smaller snapshot.
         let mut next = fixture();
         next.work.truncate(1);
         app.refresh(next);
-        assert_eq!(app.cursor[1], 1);
+        assert_eq!(app.cursor[1], 0);
         next_refresh(&mut app);
         fn next_refresh(app: &mut App) {
             let mut empty = fixture();
