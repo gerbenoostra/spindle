@@ -164,14 +164,6 @@ impl Indexed {
 }
 
 impl Conversation {
-    /// The conversation key used across the snapshot.
-    pub fn key(&self) -> AgentSessionKey {
-        AgentSessionKey {
-            provider: Provider::Claude,
-            session_id: self.session_id.clone(),
-        }
-    }
-
     /// The display title: the live name wins, then the transcript summary,
     /// then a truncation of the latest user prompt. `None` renders `?`.
     pub fn title(&self) -> Option<String> {
@@ -236,7 +228,10 @@ impl Conversation {
     /// The process claim a live session makes, for runtime resolution.
     pub fn claim(&self, observed_at: SystemTime) -> Option<ProcessClaim> {
         self.live.as_ref().map(|live| ProcessClaim {
-            session: Some(self.key()),
+            session: Some(AgentSessionKey {
+                provider: Provider::Claude,
+                session_id: self.session_id.clone(),
+            }),
             pid: live.pid,
             pid_start: live.pid_start,
             expected_exe: Some(EXE.to_owned()),
