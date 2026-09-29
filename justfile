@@ -198,7 +198,7 @@ ci-linux:
     # other's tree. The cargo home is shared whole: cargo keeps its package
     # cache locks at its root, not in registry/, and they hold across
     # containers on one volume.
-    checkout="spindle-ci-linux-src-$(printf '%s' "$root" | shasum | cut -c1-12)"
+    checkout="spindle-ci-linux-src-$(printf '%s' "$root" | git hash-object --stdin | cut -c1-12)"
     tty=()
     [[ -t 1 ]] && tty=(--tty)
     # ${a[@]+...}: bash 3.2, macOS's /bin/bash, calls an empty array unset.
