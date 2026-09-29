@@ -54,8 +54,9 @@ impl TmuxServer {
         );
         // `-f /dev/null`: the user's tmux.conf must not decide what a test
         // sees. Nor its login shell: tmux runs pane commands through
-        // `$SHELL`, and bash execs a lone command where Debian's dash
-        // stays its parent, adding a hop the tests do not expect.
+        // `$SHELL`, and not every shell execs a lone command: bash does,
+        // while Debian's dash (0.5.12) stays its parent, adding a hop the
+        // tests do not expect.
         let out = Command::new("tmux")
             .env("TMUX_TMPDIR", &dir)
             .env("SHELL", super::on_path("bash"))
