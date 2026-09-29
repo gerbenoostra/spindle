@@ -4,14 +4,41 @@
 
 ```sh
 nix develop          # cargo, clippy, rustfmt, rust-analyzer, tmux, git, just
-just check           # fmt-check + lint + lint-sh + test, exactly what CI runs
+just check           # fmt-check + lint + lint-sh + test, the fast inner loop
 just coverage        # the test suite plus a full-region coverage gate on src/
+just ci              # every CI job, on this Mac and in a Linux container
 just link            # shadow the installed binary with this checkout's release build
 ```
 
-`just check` is what CI runs. `just coverage` runs the same suite and then
+`just check` is the fast subset of CI. `just coverage` runs the same suite and then
 fails on any region of `src/` nothing reached; a line that genuinely cannot
 be reached carries a trailing `// coverage: off` saying why.
+
+## Running CI locally
+
+Every CI job is a recipe, and `ci.yml` only installs tools and calls them.
+`just ci` runs them all before a push, as `just ci-macos` and `just ci-linux`:
+
+- `ci-macos` runs the jobs of the `macos-latest` matrix legs (test, nix)
+  natively, in the current shell's toolchain.
+- `ci-linux` runs every `ubuntu-latest` job in a Docker container built from
+  `ci/linux.Dockerfile`: rustup stable and the MSRV, apt's tmux, jq and
+  shellcheck, the pinned cargo-llvm-cov, and Determinate Nix, run by a
+  non-root user as on GitHub. It runs `--privileged` because the Nix build
+  sandbox needs namespaces; without it Nix would silently build unsandboxed,
+  and the image turns that fallback into an error.
+
+Both check the committed `HEAD`, not the working tree: each keeps a clean
+checkout of it under `target/ci/<os>/` (Linux: in a Docker volume), so an
+uncommitted or untracked file cannot make a local run pass that CI fails.
+Builds there stay incremental between runs.
+
+The container runs the host's architecture, so on Apple silicon it is
+aarch64 Linux while `ubuntu-latest` is x86_64. `just ci-linux-clean` drops
+the image and its cache volumes.
+
+The job lists in the justfile (`ci_linux_jobs`, `ci_macos_jobs`) mirror
+`ci.yml`'s jobs per runner OS; change them together.
 
 ## PR titles
 
@@ -170,7 +197,7 @@ CI runs and the push triggers the release workflow. That requires the
 Before merging a release PR, verify the release build end to end on a
 supported system without relying on the development symlink:
 
-1. Run `just check` and `just nix-build` on the release PR's branch.
+1. Run `just ci` on the release PR's branch.
 2. Install the resulting package or release binary using one of the documented
    installation routes.
 3. Confirm `agent-sessions --version` resolves to that installed binary.

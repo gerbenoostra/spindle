@@ -148,6 +148,77 @@ package-verify:
         exit 1
     fi
 
+# ci.yml's jobs per runner OS, as recipes. Keep in step with ci.yml.
+ci_linux_jobs := "fmt-check lint lint-sh test coverage msrv nix-verify package-verify"
+ci_macos_jobs := "test nix-verify"
+
+# Run ci.yml's macOS and Linux jobs locally, against the committed HEAD.
+ci: ci-macos ci-linux
+
+# Run ci.yml's macOS jobs on this Mac, against the committed HEAD.
+ci-macos:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ "$(uname -s)" == Darwin ]] || { echo "ci-macos runs on macOS." >&2; exit 1; }
+    just _ci-snapshot "{{justfile_directory()}}" "{{justfile_directory()}}/target/ci/macos" {{ci_macos_jobs}}
+
+# Run ci.yml's Linux jobs in a Docker container, against the committed HEAD.
+ci-linux:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The container runs the host's architecture, so on Apple silicon this is
+    # aarch64 Linux where CI's ubuntu-latest is x86_64. It runs privileged
+    # because the Nix build sandbox needs namespaces.
+    root="{{justfile_directory()}}"
+    msrv="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' "$root/Cargo.toml")"
+    llvm_cov="$(sed -n 's/.*tool: cargo-llvm-cov@//p' "$root/.github/workflows/ci.yml")"
+    docker build --quiet --tag spindle-ci-linux \
+        --build-arg "MSRV=$msrv" --build-arg "LLVM_COV_VERSION=$llvm_cov" \
+        --file "$root/ci/linux.Dockerfile" "$root/ci" >/dev/null
+    # Mounted at their host paths: a linked worktree's .git names its common
+    # git directory by absolute path, and that may lie outside the checkout.
+    mounts=(--volume "$root:$root:ro")
+    common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)"
+    [[ "$common" == "$root"/* ]] || mounts+=(--volume "$common:$common:ro")
+    tty=()
+    [[ -t 1 ]] && tty=(--tty)
+    docker run --rm --privileged "${tty[@]}" "${mounts[@]}" \
+        --volume spindle-ci-linux:/home/runner/ci \
+        --volume spindle-ci-linux-cargo:/home/runner/.cargo/registry \
+        --env CARGO_TERM_COLOR=always \
+        spindle-ci-linux \
+        bash -c 'set -euo pipefail
+            git config --global --add safe.directory "*"
+            # CI installs the stable of the day, not the one the image baked.
+            rustup update stable --no-self-update >/dev/null
+            root="$1"; shift
+            just --justfile "$root/justfile" _ci-snapshot "$root" /home/runner/ci "$@"' \
+        _ "$root" {{ci_linux_jobs}}
+
+# Drop the Linux CI image and the volumes that cache its builds.
+ci-linux-clean:
+    -docker volume rm spindle-ci-linux spindle-ci-linux-cargo
+    -docker image rm spindle-ci-linux
+
+# Run recipes in a clean checkout of the repo's HEAD, kept under `dir` so
+# builds stay incremental between runs.
+_ci-snapshot repo dir +recipes:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src="{{dir}}/src"
+    [[ -d "$src/.git" ]] || git init --quiet "$src"
+    git -C "$src" fetch --quiet --no-tags "{{repo}}" HEAD
+    git -C "$src" checkout --quiet --force --detach FETCH_HEAD
+    git -C "$src" clean --quiet -ffdx
+    echo "ci: $(git -C "$src" log -1 --format='%h %s') on $(uname -s)" >&2
+    export CARGO_TARGET_DIR="{{dir}}/target"
+    cd "$src"
+    # Coverage profiles from the previous run's HEAD pollute this one's.
+    if [[ " {{recipes}} " == *" coverage "* ]]; then
+        cargo llvm-cov clean --workspace
+    fi
+    just {{recipes}}
+
 # Build the release binary.
 build:
     cargo build --release
