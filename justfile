@@ -199,10 +199,11 @@ ci-linux:
     # cache locks at its root, not in registry/, and they hold across
     # containers on one volume.
     checkout="spindle-ci-linux-src-$(printf '%s' "$root" | git hash-object --stdin | cut -c1-12)"
-    tty=()
-    [[ -t 1 ]] && tty=(--tty)
-    # ${a[@]+...}: bash 3.2, macOS's /bin/bash, calls an empty array unset.
-    docker run --rm --privileged ${tty[@]+"${tty[@]}"} "${mounts[@]}" \
+    # No --tty: a GitHub runner has no terminal, and colour is forced below.
+    # Without a terminal, Ctrl-C reaches only the container's PID 1, which a
+    # bash there ignores; tini as PID 1, told to signal the whole process
+    # group, stops the jobs rather than leaving them running unseen.
+    docker run --rm --privileged --init --env TINI_KILL_PROCESS_GROUP=1 "${mounts[@]}" \
         --volume "$checkout:/home/runner/ci" \
         --volume spindle-ci-linux-cargo-home:/home/runner/cargo-home \
         --volume "$nix_volume:/nix" \
