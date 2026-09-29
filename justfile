@@ -86,7 +86,7 @@ coverage:
     fi
     echo "Every region of src/ was reached, across $files files."
 
-# What CI runs.
+# The fast subset of CI: format, lints and tests.
 check: fmt-check lint lint-sh test
 
 # Build with the minimum supported Rust version from Cargo.toml.
