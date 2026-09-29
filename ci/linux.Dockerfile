@@ -47,4 +47,4 @@ RUN curl -fsSL "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${L
 
 # Mount points for the volumes `just ci-linux` keeps between runs, created
 # here so a fresh volume inherits the runner's ownership.
-RUN mkdir -p /home/runner/ci /home/runner/.cargo/registry
+RUN mkdir -p /home/runner/ci /home/runner/cargo-home

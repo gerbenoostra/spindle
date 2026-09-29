@@ -192,14 +192,16 @@ ci-linux:
     common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)"
     [[ "$common" == "$root"/* ]] || mounts+=(--volume "$common:$common:ro")
     # One snapshot per checkout, so runs from two worktrees cannot reset each
-    # other's tree; the registry is shared, as cargo locks it.
+    # other's tree. The cargo home is shared whole: cargo keeps its package
+    # cache locks at its root, not in registry/, and they hold across
+    # containers on one volume.
     checkout="spindle-ci-linux-src-$(printf '%s' "$root" | shasum | cut -c1-12)"
     tty=()
     [[ -t 1 ]] && tty=(--tty)
     # ${a[@]+...}: bash 3.2, macOS's /bin/bash, calls an empty array unset.
     docker run --rm --privileged ${tty[@]+"${tty[@]}"} "${mounts[@]}" \
         --volume "$checkout:/home/runner/ci" \
-        --volume spindle-ci-linux-cargo:/home/runner/.cargo/registry \
+        --volume spindle-ci-linux-cargo-home:/home/runner/cargo-home \
         --volume "$nix_volume:/nix" \
         --env CARGO_TERM_COLOR=always \
         "$image" \
@@ -207,6 +209,8 @@ ci-linux:
             git config --global --add safe.directory "*"
             # CI installs the stable of the day, not the one the image baked.
             rustup update stable --no-self-update >/dev/null
+            # Set after rustup, whose proxies stay in ~/.cargo from the image.
+            export CARGO_HOME=/home/runner/cargo-home
             just --justfile "$1/justfile" _ci-snapshot "$1" /home/runner/ci linux' \
         _ "$root"
 
