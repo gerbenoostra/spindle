@@ -160,7 +160,7 @@ ci-macos:
     #!/usr/bin/env bash
     set -euo pipefail
     [[ "$(uname -s)" == Darwin ]] || { echo "ci-macos runs on macOS." >&2; exit 1; }
-    just _ci-snapshot "{{justfile_directory()}}" "{{justfile_directory()}}/target/ci/macos" {{ci_macos_jobs}}
+    just _ci-snapshot "{{justfile_directory()}}" "{{justfile_directory()}}/target/ci/macos" macos
 
 # Run ci.yml's Linux jobs in a Docker container, against the committed HEAD.
 ci-linux:
@@ -170,11 +170,12 @@ ci-linux:
     # aarch64 Linux where CI's ubuntu-latest is x86_64. It runs privileged
     # because the Nix build sandbox needs namespaces.
     root="{{justfile_directory()}}"
-    msrv="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' "$root/Cargo.toml")"
-    llvm_cov="$(sed -n 's/.*tool: cargo-llvm-cov@//p' "$root/.github/workflows/ci.yml")"
-    docker build --quiet --tag spindle-ci-linux \
-        --build-arg "MSRV=$msrv" --build-arg "LLVM_COV_VERSION=$llvm_cov" \
-        --file "$root/ci/linux.Dockerfile" "$root/ci" >/dev/null
+    # The image, like the jobs, comes from HEAD rather than the working tree.
+    at_head() { git -C "$root" show "HEAD:$1"; }
+    msrv="$(at_head Cargo.toml | sed -n 's/^rust-version = "\(.*\)"$/\1/p')"
+    llvm_cov="$(at_head .github/workflows/ci.yml | sed -n 's/.*tool: cargo-llvm-cov@//p')"
+    at_head ci/linux.Dockerfile | docker build --quiet --tag spindle-ci-linux \
+        --build-arg "MSRV=$msrv" --build-arg "LLVM_COV_VERSION=$llvm_cov" - >/dev/null
     # Mounted at their host paths: a linked worktree's .git names its common
     # git directory by absolute path, and that may lie outside the checkout.
     mounts=(--volume "$root:$root:ro")
@@ -195,9 +196,8 @@ ci-linux:
             git config --global --add safe.directory "*"
             # CI installs the stable of the day, not the one the image baked.
             rustup update stable --no-self-update >/dev/null
-            root="$1"; shift
-            just --justfile "$root/justfile" _ci-snapshot "$root" /home/runner/ci "$@"' \
-        _ "$root" {{ci_linux_jobs}}
+            just --justfile "$1/justfile" _ci-snapshot "$1" /home/runner/ci linux' \
+        _ "$root"
 
 # Drop the Linux CI image and the volumes that cache its builds, for every checkout.
 ci-linux-clean:
@@ -209,9 +209,10 @@ ci-linux-clean:
     (( ${#volumes[@]} == 0 )) || docker volume rm "${volumes[@]}"
     docker image rm --force spindle-ci-linux 2>/dev/null || true
 
-# Run recipes in a clean checkout of the repo's HEAD, kept under `dir` so
-# builds stay incremental between runs.
-_ci-snapshot repo dir +recipes:
+# Run CI's jobs for `os` in a clean checkout of the repo's HEAD, kept under
+# `dir` so builds stay incremental between runs. The job list, like the job
+# recipes, is read from that checkout; only this plumbing is the working tree's.
+_ci-snapshot repo dir os:
     #!/usr/bin/env bash
     set -euo pipefail
     src="{{dir}}/src"
@@ -222,11 +223,14 @@ _ci-snapshot repo dir +recipes:
     echo "ci: $(git -C "$src" log -1 --format='%h %s') on $(uname -s)" >&2
     export CARGO_TARGET_DIR="{{dir}}/target"
     cd "$src"
+    jobs="$(just --evaluate "ci_{{os}}_jobs")"
     # Coverage profiles from the previous run's HEAD pollute this one's.
-    if [[ " {{recipes}} " == *" coverage "* ]]; then
+    if [[ " $jobs " == *" coverage "* ]]; then
         cargo llvm-cov clean --workspace
     fi
-    just {{recipes}}
+    # Word-split on purpose: the list is recipe names.
+    # shellcheck disable=SC2086
+    just $jobs
 
 # Build the release binary.
 build:
