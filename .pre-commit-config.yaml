@@ -26,19 +26,20 @@ repos:
 
   - repo: local
     hooks:
+      # Also run when the manifest, lockfile or rustfmt config changes, not only on .rs files.
       - id: cargo-fmt
         name: Rust format check
         language: system
         entry: nix develop --command just fmt-check
         pass_filenames: false
-        types: [rust]
+        files: '\.rs$|^Cargo\.(toml|lock)$|^rustfmt\.toml$'
 
       - id: cargo-clippy
         name: Rust clippy
         language: system
         entry: nix develop --command just lint
         pass_filenames: false
-        types: [rust]
+        files: '\.rs$|^Cargo\.(toml|lock)$|^rustfmt\.toml$'
 
       - id: local-ci
         name: Local CI pipeline
