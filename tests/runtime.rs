@@ -634,7 +634,12 @@ fn a_worktree_binds_windows_by_stored_then_derived_evidence() {
         "24",
         "sleep 300",
     ]);
-    let rt = observe(&server);
+    // tmux reads the cwd off the pane's process, which may not have
+    // started yet on the first listing.
+    let rt = until(|| {
+        let rt = observe(&server);
+        pane_in(&rt, "t").cwd.is_some().then_some(rt)
+    });
     let pane = pane_in(&rt, "t");
     assert_eq!(pane.cwd.as_deref(), Some(worktree.path()));
 
