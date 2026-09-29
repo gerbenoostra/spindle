@@ -47,15 +47,8 @@ fn transcript_no_cwd(root: &TempDir, slug: &str, id: &str) {
 /// the argv0 `claude`. The trailing `exit` keeps bash from exec'ing `sleep`
 /// in its own place.
 fn fake_agent(dir: &TempDir) -> String {
-    let bash = std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|d| d.join("bash"))
-                .find(|p| p.is_file())
-        })
-        .expect("bash is on PATH");
     let exe = dir.join("claude");
-    std::os::unix::fs::symlink(bash, &exe).expect("bash links");
+    std::os::unix::fs::symlink(support::on_path("bash"), &exe).expect("bash links");
     format!("exec {} -c 'sleep 300; exit'", exe.display())
 }
 

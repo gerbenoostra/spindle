@@ -52,9 +52,12 @@ impl TmuxServer {
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
         // `-f /dev/null`: the user's tmux.conf must not decide what a test
-        // sees.
+        // sees. Nor its login shell: tmux runs pane commands through
+        // `$SHELL`, and bash execs a lone command where Debian's dash
+        // stays its parent, adding a hop the tests do not expect.
         let out = Command::new("tmux")
             .env("TMUX_TMPDIR", &dir)
+            .env("SHELL", super::on_path("bash"))
             .args([
                 "-f",
                 "/dev/null",
