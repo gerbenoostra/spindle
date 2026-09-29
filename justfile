@@ -213,6 +213,8 @@ ci-linux:
             # CI installs the stable of the day, not the one the image baked.
             rustup update stable --no-self-update >/dev/null
             # Set after rustup, whose proxies stay in ~/.cargo from the image.
+            # Only the cache moves: the tools stay on PATH in ~/.cargo/bin,
+            # and anything cargo installs here would land off PATH.
             export CARGO_HOME=/home/runner/cargo-home
             just --justfile "$1/justfile" _ci-snapshot "$1" /home/runner/ci linux' \
         _ "$root"
