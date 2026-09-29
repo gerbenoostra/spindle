@@ -181,11 +181,9 @@ ci-linux:
         --build-arg "MSRV=$msrv" --build-arg "LLVM_COV_VERSION=$llvm_cov" -)"
     # The Nix store is kept per image: a fresh volume starts as a copy of the
     # image's /nix, and a rebuilt image's Nix never meets an older store.
-    # Volumes of earlier images go, unless a running build still holds them.
+    # Earlier images' volumes stay until ci-linux-clean: checkouts whose HEADs
+    # build different images would otherwise delete each other's store.
     nix_volume="spindle-ci-linux-nix-$(printf '%s' "${image#sha256:}" | cut -c1-12)"
-    docker volume ls --quiet --filter name='^spindle-ci-linux-nix-' \
-        | { grep -vx "$nix_volume" || true; } \
-        | while IFS= read -r stale; do docker volume rm "$stale" >/dev/null 2>&1 || true; done
     # Mounted at their host paths: a linked worktree's .git names its common
     # git directory by absolute path, and that may lie outside the checkout.
     mounts=(--volume "$root:$root:ro")
