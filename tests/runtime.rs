@@ -50,24 +50,6 @@ fn until<T>(f: impl Fn() -> Option<T>) -> T {
     }
 }
 
-/// An observation in which `session`'s pane process runs `exe`, and that
-/// pid. tmux starts a pane command through its shell, which lists as the
-/// pane's process until it execs the command, so the name settles later
-/// than the pane appears.
-fn pane_running(server: &TmuxServer, session: &str, exe: &str) -> (Runtime, u32) {
-    until(|| {
-        let rt = observe(server);
-        let pid = rt
-            .panes
-            .panes
-            .iter()
-            .find(|pane| pane.session_name == session)?
-            .pid;
-        let row = rt.processes.as_ref()?.get(pid)?;
-        (row.exe.as_deref() == Some(exe)).then_some((rt, pid))
-    })
-}
-
 /// The pane in `session`, after the server has listed it.
 fn pane_in<'a>(rt: &'a Runtime, session: &str) -> &'a agent_sessions::tmux::Pane {
     rt.panes
@@ -321,7 +303,8 @@ fn claims_are_validated_by_start_time_and_executable() {
     }
     let server = TmuxServer::new();
     server.new_session("t", "sleep 300");
-    let (rt, pid) = pane_running(&server, "t", "sleep");
+    let (pid, _) = server.pane_running("t", "sleep");
+    let rt = observe(&server);
     let table = rt.processes.as_ref().unwrap();
     let ProcessStart::At(start) = table.get(pid).unwrap().start else {
         panic!("the pane's process has a start time")
