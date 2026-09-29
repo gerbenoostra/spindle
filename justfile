@@ -174,9 +174,18 @@ ci-linux:
     at_head() { git -C "$root" show "HEAD:$1"; }
     msrv="$(at_head Cargo.toml | sed -n 's/^rust-version = "\(.*\)"$/\1/p')"
     llvm_cov="$(at_head .github/workflows/ci.yml | sed -n 's/.*tool: cargo-llvm-cov@//p')"
-    at_head ci/linux.Dockerfile | docker build --quiet --pull --tag spindle-ci-linux \
-        --build-arg "IMAGE_WEEK=$(date +%G-W%V)" \
-        --build-arg "MSRV=$msrv" --build-arg "LLVM_COV_VERSION=$llvm_cov" - >/dev/null
+    # Without a provenance attestation, which carries a build timestamp, the
+    # image ID changes only when the image does.
+    image="$(at_head ci/linux.Dockerfile | docker build --quiet --pull --provenance=false \
+        --tag spindle-ci-linux --build-arg "IMAGE_WEEK=$(date +%G-W%V)" \
+        --build-arg "MSRV=$msrv" --build-arg "LLVM_COV_VERSION=$llvm_cov" -)"
+    # The Nix store is kept per image: a fresh volume starts as a copy of the
+    # image's /nix, and a rebuilt image's Nix never meets an older store.
+    # Volumes of earlier images go, unless a running build still holds them.
+    nix_volume="spindle-ci-linux-nix-$(printf '%s' "${image#sha256:}" | cut -c1-12)"
+    docker volume ls --quiet --filter name='^spindle-ci-linux-nix-' \
+        | { grep -vx "$nix_volume" || true; } \
+        | while IFS= read -r stale; do docker volume rm "$stale" >/dev/null 2>&1 || true; done
     # Mounted at their host paths: a linked worktree's .git names its common
     # git directory by absolute path, and that may lie outside the checkout.
     mounts=(--volume "$root:$root:ro")
@@ -191,8 +200,9 @@ ci-linux:
     docker run --rm --privileged ${tty[@]+"${tty[@]}"} "${mounts[@]}" \
         --volume "$checkout:/home/runner/ci" \
         --volume spindle-ci-linux-cargo:/home/runner/.cargo/registry \
+        --volume "$nix_volume:/nix" \
         --env CARGO_TERM_COLOR=always \
-        spindle-ci-linux \
+        "$image" \
         bash -c 'set -euo pipefail
             git config --global --add safe.directory "*"
             # CI installs the stable of the day, not the one the image baked.

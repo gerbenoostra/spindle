@@ -33,7 +33,8 @@ checkout of it under `target/ci/<os>/` (Linux: in a Docker volume per
 checkout), so an uncommitted or untracked file cannot make a local run pass
 that CI fails. The jobs, their recipes and the Linux image all come from
 `HEAD`; only the recipes that set up the checkout and the container are read
-from the working tree. Builds there stay incremental between runs.
+from the working tree. Builds there stay incremental between runs, and the
+container keeps its Nix store in a volume per image.
 
 The container runs the host's architecture, so on Apple silicon it is
 aarch64 Linux while `ubuntu-latest` is x86_64. The image is rebuilt the
