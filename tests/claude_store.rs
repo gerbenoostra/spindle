@@ -3,7 +3,7 @@
 //! git repository, fused into the snapshot and printed as `list --json`.
 //!
 //! Nothing here touches the user's real stores, processes or servers: the
-//! store is a tempdir, the agent a renamed `sleep`, the tmux a `-L` server.
+//! store is a tempdir, the agent a renamed `bash`, the tmux a `-L` server.
 
 mod support;
 
@@ -39,13 +39,24 @@ fn transcript_no_cwd(root: &TempDir, slug: &str, id: &str) {
     .expect("transcript writes");
 }
 
-/// A `claude` process that is really `sleep` - a symlink, not a copy, because
-/// macOS kills a relocated copy of a signed system binary, while `comm` still
-/// reports the invoked name: the basename is what liveness checks.
-fn fake_agent(dir: &TempDir) -> std::path::PathBuf {
+/// The pane command of a `claude` process that is really `bash` - a symlink,
+/// not a copy, because macOS kills a relocated copy of a signed system
+/// binary, while `comm` still reports the invoked name: the basename is what
+/// liveness checks. `bash` comes from `PATH`: the Linux nix sandbox has no
+/// `/bin/sleep`, and its `sleep` is multicall `coreutils`, which rejects
+/// the argv0 `claude`. The trailing `exit` keeps bash from exec'ing `sleep`
+/// in its own place.
+fn fake_agent(dir: &TempDir) -> String {
+    let bash = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join("bash"))
+                .find(|p| p.is_file())
+        })
+        .expect("bash is on PATH");
     let exe = dir.join("claude");
-    std::os::unix::fs::symlink("/bin/sleep", &exe).expect("sleep links");
-    exe
+    std::os::unix::fs::symlink(bash, &exe).expect("bash links");
+    format!("exec {} -c 'sleep 300; exit'", exe.display())
 }
 
 /// `<root>/sessions/<pid>.json`.
@@ -197,7 +208,7 @@ fn world() -> World {
     let keep = repo2.add_worktree("keep", Some("keep"));
 
     let home = TempDir::new("claude-store");
-    let exe = fake_agent(&home);
+    let agent = fake_agent(&home);
     // The agent runs in its own tmux session, cwd inside the worktree.
     tmux.tmux(&[
         "new-session",
@@ -210,7 +221,7 @@ fn world() -> World {
         "24",
         "-c",
         worktree.to_str().unwrap(),
-        &format!("exec {} 300", exe.display()),
+        &agent,
     ]);
     let (pid, handle) = wait_for_pane(&tmux, "agents");
 
