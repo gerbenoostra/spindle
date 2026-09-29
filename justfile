@@ -152,48 +152,57 @@ package-verify:
 ci_linux_jobs := "fmt-check lint lint-sh test coverage msrv nix-verify package-verify"
 ci_macos_jobs := "test nix-verify"
 
-# Run ci.yml's macOS and Linux jobs locally, against the committed HEAD.
-ci: ci-macos ci-linux
+# Run ci.yml's macOS and Linux jobs locally, against a commit (default HEAD).
+ci rev="HEAD":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Resolved once, so a commit made while the macOS jobs run cannot give the
+    # Linux jobs another one.
+    commit="$(just _ci-commit {{quote(rev)}})"
+    just ci-macos "$commit"
+    just ci-linux "$commit"
 
-# Run every CI job this host can, saying so when the macOS jobs could not run.
+# Run the CI jobs this host can against a commit (default HEAD), noting skipped macOS jobs.
 [macos]
-ci-gentle: ci
+ci-gentle rev="HEAD": (ci rev)
 
-# Run every CI job this host can, saying so when the macOS jobs could not run.
+# Run the CI jobs this host can against a commit (default HEAD), noting skipped macOS jobs.
 [linux]
-ci-gentle: ci-linux
+ci-gentle rev="HEAD": (ci-linux rev)
     @echo "ci-gentle: the macOS jobs did not run; they need a Mac." >&2
 
-# Run ci.yml's macOS jobs on this Mac, against the committed HEAD.
-ci-macos:
+# Run ci.yml's macOS jobs on this Mac, against a commit (default HEAD).
+ci-macos rev="HEAD":
     #!/usr/bin/env bash
     set -euo pipefail
     [[ "$(uname -s)" == Darwin ]] || { echo "ci-macos runs on macOS." >&2; exit 1; }
-    just _ci-snapshot "{{justfile_directory()}}" "{{justfile_directory()}}/target/ci/macos" macos
+    commit="$(just _ci-commit {{quote(rev)}})"
+    just _ci-snapshot "{{justfile_directory()}}" "$commit" "{{justfile_directory()}}/target/ci/macos" macos
 
-# Run ci.yml's Linux jobs in a Docker container, against the committed HEAD.
-ci-linux:
+# Run ci.yml's Linux jobs in a Docker container, against a commit (default HEAD).
+ci-linux rev="HEAD":
     #!/usr/bin/env bash
     set -euo pipefail
     # The container runs the host's architecture, so on Apple silicon this is
     # aarch64 Linux where CI's ubuntu-latest is x86_64. It runs privileged
     # because the Nix build sandbox needs namespaces.
     root="{{justfile_directory()}}"
-    # The image, like the jobs, comes from HEAD rather than the working tree.
-    at_head() { git -C "$root" show "HEAD:$1"; }
-    msrv="$(at_head Cargo.toml | sed -n 's/^rust-version = "\(.*\)"$/\1/p')"
-    llvm_cov="$(at_head .github/workflows/ci.yml | sed -n 's/.*tool: cargo-llvm-cov@//p')"
+    commit="$(just _ci-commit {{quote(rev)}})"
+    # The image, like the jobs, comes from the commit rather than the working tree.
+    at_commit() { git -C "$root" show "$commit:$1"; }
+    msrv="$(at_commit Cargo.toml | sed -n 's/^rust-version = "\(.*\)"$/\1/p')"
+    llvm_cov="$(at_commit .github/workflows/ci.yml | sed -n 's/.*tool: cargo-llvm-cov@//p')"
     week="$(date +%G-W%V)"
     # Without a provenance attestation, which carries a build timestamp, the
     # image ID changes only when the image does.
-    image="$(at_head ci/linux.Dockerfile | docker build --quiet --pull --provenance=false \
+    image="$(at_commit ci/linux.Dockerfile | docker build --quiet --pull --provenance=false \
         --tag spindle-ci-linux --build-arg "IMAGE_WEEK=$week" \
         --build-arg "MSRV=$msrv" --build-arg "LLVM_COV_VERSION=$llvm_cov" -)"
     # The Nix store is kept per image: a fresh volume starts as a copy of the
     # image's /nix, and a rebuilt image's Nix never meets an older store.
     # Every image is rebuilt weekly, so stores of earlier weeks are dead and
     # go (unless a running build still holds one); this week's stay, as
-    # checkouts whose HEADs build different images each need theirs.
+    # checkouts whose commits build different images each need theirs.
     nix_volume="spindle-ci-linux-nix-$week-$(printf '%s' "${image#sha256:}" | cut -c1-12)"
     docker volume ls --quiet --filter name='^spindle-ci-linux-nix-' \
         | { grep -v -- "^spindle-ci-linux-nix-$week-" || true; } \
@@ -235,8 +244,8 @@ ci-linux:
             # Only the cache moves: the tools stay on PATH in ~/.cargo/bin,
             # and anything cargo installs here would land off PATH.
             export CARGO_HOME=/home/runner/cargo-home
-            just --justfile "$1/justfile" _ci-snapshot "$1" /home/runner/ci linux' \
-        _ "$root"
+            just --justfile "$1/justfile" _ci-snapshot "$1" "$2" /home/runner/ci linux' \
+        _ "$root" "$commit"
 
 # Drop the Linux CI image and the volumes that cache its builds, for every checkout.
 ci-linux-clean:
@@ -248,22 +257,27 @@ ci-linux-clean:
     (( ${#volumes[@]} == 0 )) || docker volume rm "${volumes[@]}"
     docker image rm --force spindle-ci-linux 2>/dev/null || true
 
-# Run CI's jobs for `os` in a clean checkout of the repo's HEAD, kept under
-# `dir` so builds stay incremental between runs. The job list, like the job
-# recipes, is read from that checkout; only this plumbing is the working tree's.
-_ci-snapshot repo dir os:
+# The full hash of a commit of this repo, or an error naming what is not one.
+_ci-commit rev:
+    @git -C "{{justfile_directory()}}" rev-parse --verify --quiet {{quote(rev + "^{commit}")}} \
+        || { echo ci: {{quote(rev)}} names no commit. >&2; exit 1; }
+
+# Run CI's jobs for `os` in a clean checkout of `commit`, kept under `dir` so
+# builds stay incremental between runs. The job list, like the job recipes, is
+# read from that checkout; only this plumbing is the working tree's.
+_ci-snapshot repo commit dir os:
     #!/usr/bin/env bash
     set -euo pipefail
     src="{{dir}}/src"
     [[ -d "$src/.git" ]] || git init --quiet "$src"
-    git -C "$src" fetch --quiet --no-tags "{{repo}}" HEAD
+    git -C "$src" fetch --quiet --no-tags "{{repo}}" "{{commit}}"
     git -C "$src" checkout --quiet --force --detach FETCH_HEAD
     git -C "$src" clean --quiet -ffdx
     echo "ci: $(git -C "$src" log -1 --format='%h %s') on $(uname -s)" >&2
     export CARGO_TARGET_DIR="{{dir}}/target"
     cd "$src"
     jobs="$(just --evaluate "ci_{{os}}_jobs")"
-    # Coverage profiles from the previous run's HEAD pollute this one's.
+    # Coverage profiles from the previous run's commit pollute this one's.
     if [[ " $jobs " == *" coverage "* ]]; then
         cargo llvm-cov clean --workspace
     fi
