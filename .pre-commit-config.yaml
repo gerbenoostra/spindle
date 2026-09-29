@@ -45,7 +45,7 @@ repos:
       - id: local-ci
         name: Local CI pipeline
         language: system
-        entry: nix develop --command just ci
+        entry: nix develop --command just ci-gentle
         pass_filenames: false
         always_run: true
         stages: [pre-push]
