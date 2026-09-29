@@ -185,7 +185,8 @@ ci-linux:
     checkout="spindle-ci-linux-src-$(printf '%s' "$root" | shasum | cut -c1-12)"
     tty=()
     [[ -t 1 ]] && tty=(--tty)
-    docker run --rm --privileged "${tty[@]}" "${mounts[@]}" \
+    # ${a[@]+...}: bash 3.2, macOS's /bin/bash, calls an empty array unset.
+    docker run --rm --privileged ${tty[@]+"${tty[@]}"} "${mounts[@]}" \
         --volume "$checkout:/home/runner/ci" \
         --volume spindle-ci-linux-cargo:/home/runner/.cargo/registry \
         --env CARGO_TERM_COLOR=always \
