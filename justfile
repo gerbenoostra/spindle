@@ -89,6 +89,65 @@ coverage:
 # What CI runs.
 check: fmt-check lint lint-sh test
 
+# Build with the minimum supported Rust version from Cargo.toml.
+msrv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    msrv="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+    [[ -n "$msrv" ]] || { echo "Cargo.toml names no rust-version." >&2; exit 1; }
+    rustup toolchain install "$msrv" --profile minimal --no-self-update
+    rustup run "$msrv" cargo build --locked --all-targets
+
+# Check the flake, build the package and run what came out of it.
+nix-verify:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    nix flake check
+    nix build .#agent-sessions
+    # The packaging path is only proven by running what came out of it.
+    ./result/bin/agent-sessions --version
+    # share/ joins the package when it exists; today there is nothing to check.
+    [ -d share ] || exit 0
+    missing=0
+    while IFS= read -r f; do
+        rel="${f#share/}"
+        if [[ ! -e "result/share/$rel" ]]; then
+            echo "missing in Nix output: $rel" >&2
+            missing=1
+        fi
+    done < <(find share -type f -o -type l)
+    exit "$missing"
+
+# Build the release tarball and check its share tree.
+package-verify:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --locked
+    target="$(rustc -vV | sed -n 's|host: ||p')"
+    dist="$(mktemp -d)"
+    trap 'rm -rf "$dist"' EXIT
+    name="agent-sessions-ci-${target}"
+    mkdir -p "$dist/$name"
+    cp "${CARGO_TARGET_DIR:-target}/release/agent-sessions" "$dist/$name/"
+    cp README.md LICENSE "$dist/$name/"
+    # -L, not -R alone: share/ may carry symlinks into trees the
+    # tarball does not ship. share/ joins the tarball when it exists.
+    if [ -d share ]; then
+        cp -RL share "$dist/$name/"
+    fi
+    tar -C "$dist" -czf "$dist/$name.tar.gz" "$name"
+    [ -d share ] || exit 0
+    find share -type f -o -type l | sed 's|^share/||' | sort > "$dist/expected"
+    tar -tzf "$dist/$name.tar.gz" \
+        | grep '/share/.' \
+        | sed 's|^[^/]*/share/||' \
+        | grep -v '/$' \
+        | sort -u > "$dist/actual"
+    if ! diff -u "$dist/expected" "$dist/actual"; then
+        echo "release tarball share files do not match share/" >&2
+        exit 1
+    fi
+
 # Build the release binary.
 build:
     cargo build --release

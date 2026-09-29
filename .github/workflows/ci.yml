@@ -76,13 +76,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Read from Cargo.toml rather than repeated here, so the two cannot drift.
-      - id: msrv
-        run: echo "version=$(grep '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
-      - run: cargo build --locked --all-targets
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      # Reads the MSRV from Cargo.toml, so the two cannot drift, and installs it.
+      - run: just msrv
 
   nix:
     strategy:
@@ -93,24 +89,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
-      - run: nix flake check
-      - run: nix build .#agent-sessions
-      # The packaging path is only proven by running what came out of it.
-      - run: ./result/bin/agent-sessions --version
-      - name: Assert every shipped share file is in the Nix output
-        run: |
-          set -euo pipefail
-          # share/ joins the package when it exists; today there is nothing to check.
-          [ -d share ] || exit 0
-          missing=0
-          while IFS= read -r f; do
-            rel="${f#share/}"
-            if [[ ! -e "result/share/$rel" ]]; then
-              echo "missing in Nix output: $rel" >&2
-              missing=1
-            fi
-          done < <(find share -type f -o -type l)
-          exit "$missing"
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - run: just nix-verify
 
   packaging:
     runs-on: ubuntu-latest
@@ -119,36 +99,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: stable
-      - run: cargo build --release --locked
-      - name: Build the release tarball and check its share tree
-        run: |
-          set -euo pipefail
-          target="$(rustc -vV | sed -n 's|host: ||p')"
-          # Not GITHUB_REF_NAME: on a pull_request it is "<pr>/merge", and the
-          # slash turns the name into a path. The name is irrelevant here.
-          name="agent-sessions-ci-${target}"
-          mkdir -p "dist/$name"
-          cp "target/release/agent-sessions" "dist/$name/"
-          cp README.md LICENSE "dist/$name/"
-          # -L, not -R alone: share/ may carry symlinks into trees the
-          # tarball does not ship. share/ joins the tarball when it exists.
-          if [ -d share ]; then
-            cp -RL share "dist/$name/"
-          fi
-          tar -C dist -czf "$name.tar.gz" "$name"
-
-          if [ -d share ]; then
-            expected=$(mktemp)
-            actual=$(mktemp)
-            find share -type f -o -type l | sed 's|^share/||' | sort > "$expected"
-            tar -tzf "$name.tar.gz" \
-              | grep '/share/.' \
-              | sed 's|^[^/]*/share/||' \
-              | grep -v '/$' \
-              | sort -u > "$actual"
-
-            if ! diff -u "$expected" "$actual"; then
-              echo "release tarball share files do not match share/" >&2
-              exit 1
-            fi
-          fi
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - run: just package-verify
