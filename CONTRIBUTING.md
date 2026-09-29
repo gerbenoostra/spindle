@@ -36,6 +36,11 @@ that CI fails. The jobs, their recipes and the Linux image all come from
 from the working tree. Builds there stay incremental between runs, and the
 container keeps its Nix store in a volume per image.
 
+`just ci` fails on a host that is not a Mac. `just ci-gentle` runs every job
+the host can: all of them on macOS; elsewhere the Linux jobs, ending with a
+notice that the macOS jobs did not run. `prek install` also installs a pre-push
+hook that runs `just ci-gentle`, so a push waits for it.
+
 Unlike CI, which runs every job, a local run stops at the first failing job,
 and `just ci` skips the Linux jobs when a macOS job fails; run
 `just ci-linux` on its own to see them.

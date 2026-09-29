@@ -155,15 +155,15 @@ ci_macos_jobs := "test nix-verify"
 # Run ci.yml's macOS and Linux jobs locally, against the committed HEAD.
 ci: ci-macos ci-linux
 
-# Run every CI job locally, skipping macOS-only jobs on non-macOS hosts.
-# This is the recipe the pre-push hook uses.
-ci-gentle:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ "$(uname -s)" == Darwin ]]; then
-        just ci-macos
-    fi
-    just ci-linux
+# The pre-push hook runs this.
+# Run every CI job this host can, saying so when the macOS jobs could not run.
+[macos]
+ci-gentle: ci
+
+# Run every CI job this host can, saying so when the macOS jobs could not run.
+[linux]
+ci-gentle: ci-linux
+    @echo "ci-gentle: the macOS jobs did not run; they need a Mac." >&2
 
 # Run ci.yml's macOS jobs on this Mac, against the committed HEAD.
 ci-macos:
