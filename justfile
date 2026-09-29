@@ -180,10 +180,13 @@ ci-linux:
     mounts=(--volume "$root:$root:ro")
     common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)"
     [[ "$common" == "$root"/* ]] || mounts+=(--volume "$common:$common:ro")
+    # One snapshot per checkout, so runs from two worktrees cannot reset each
+    # other's tree; the registry is shared, as cargo locks it.
+    checkout="spindle-ci-linux-src-$(printf '%s' "$root" | shasum | cut -c1-12)"
     tty=()
     [[ -t 1 ]] && tty=(--tty)
     docker run --rm --privileged "${tty[@]}" "${mounts[@]}" \
-        --volume spindle-ci-linux:/home/runner/ci \
+        --volume "$checkout:/home/runner/ci" \
         --volume spindle-ci-linux-cargo:/home/runner/.cargo/registry \
         --env CARGO_TERM_COLOR=always \
         spindle-ci-linux \
@@ -195,10 +198,15 @@ ci-linux:
             just --justfile "$root/justfile" _ci-snapshot "$root" /home/runner/ci "$@"' \
         _ "$root" {{ci_linux_jobs}}
 
-# Drop the Linux CI image and the volumes that cache its builds.
+# Drop the Linux CI image and the volumes that cache its builds, for every checkout.
 ci-linux-clean:
-    -docker volume rm spindle-ci-linux spindle-ci-linux-cargo
-    -docker image rm spindle-ci-linux
+    #!/usr/bin/env bash
+    set -euo pipefail
+    volumes=()
+    while IFS= read -r v; do volumes+=("$v"); done \
+        < <(docker volume ls --quiet --filter name='^spindle-ci-linux-')
+    (( ${#volumes[@]} == 0 )) || docker volume rm "${volumes[@]}"
+    docker image rm --force spindle-ci-linux 2>/dev/null || true
 
 # Run recipes in a clean checkout of the repo's HEAD, kept under `dir` so
 # builds stay incremental between runs.
