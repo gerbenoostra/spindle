@@ -155,7 +155,6 @@ ci_macos_jobs := "test nix-verify"
 # Run ci.yml's macOS and Linux jobs locally, against the committed HEAD.
 ci: ci-macos ci-linux
 
-# The pre-push hook runs this.
 # Run every CI job this host can, saying so when the macOS jobs could not run.
 [macos]
 ci-gentle: ci
