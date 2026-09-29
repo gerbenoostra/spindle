@@ -171,6 +171,20 @@ ci-gentle rev="HEAD": (ci rev)
 ci-gentle rev="HEAD": (ci-linux rev)
     @echo "ci-gentle: the macOS jobs did not run; they need a Mac." >&2
 
+# Run ci-gentle against the commit a branch push sends; the pre-push hook runs this.
+pre-push:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Other pushes, such as a tag, need no check; prek itself skips deletions
+    # and pushes that send no new commits.
+    ref="${PRE_COMMIT_REMOTE_BRANCH:?pre-push runs from the prek pre-push hook}"
+    commit="${PRE_COMMIT_TO_REF:?pre-push runs from the prek pre-push hook}"
+    if [[ "$ref" != refs/heads/* ]] || [[ "$commit" =~ ^0+$ ]]; then
+        echo "pre-push: $ref is not a branch update; skipping local CI." >&2
+        exit 0
+    fi
+    just ci-gentle "$commit"
+
 # Run ci.yml's macOS jobs on this Mac, against a commit (default HEAD).
 ci-macos rev="HEAD":
     #!/usr/bin/env bash
