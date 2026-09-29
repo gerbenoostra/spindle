@@ -45,7 +45,8 @@ aarch64 Linux while `ubuntu-latest` is x86_64. The image is rebuilt the
 first time it is used in each ISO week, to track the latest tools CI installs.
 Each image keeps its own Nix store volume (about 3 GB), so a checkout whose
 `HEAD` builds a different image never evicts another's. A run drops the
-stores of earlier weeks, whose images the weekly rebuild replaced.
+stores of earlier weeks, whose images the weekly rebuild replaced, and the
+snapshots of checkouts that no longer exist, such as removed worktrees.
 `just ci-linux-clean` drops the image and every cache volume.
 
 The job lists in the justfile (`ci_linux_jobs`, `ci_macos_jobs`) mirror

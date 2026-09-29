@@ -199,6 +199,15 @@ ci-linux:
     # cache locks at its root, not in registry/, and they hold across
     # containers on one volume.
     checkout="spindle-ci-linux-src-$(printf '%s' "$root" | git hash-object --stdin | cut -c1-12)"
+    # Each snapshot is labelled with its checkout, so the snapshots of removed
+    # checkouts, such as deleted worktrees, go (unless a running build still
+    # holds one). Created before the run, as `docker run` cannot label one.
+    label=spindle-ci-linux.checkout
+    docker volume create --label "$label=$root" "$checkout" >/dev/null
+    docker volume ls --filter label="$label" --format "{{{{.Name}}\t{{{{.Label \"$label\"}}" \
+        | while IFS=$'\t' read -r volume path; do
+            [[ -e "$path" ]] || docker volume rm "$volume" >/dev/null 2>&1 || true
+        done
     # No --tty: a GitHub runner has no terminal, and colour is forced below.
     # Without a terminal, Ctrl-C reaches only the container's PID 1, which a
     # bash there ignores; tini as PID 1, told to signal the whole process
