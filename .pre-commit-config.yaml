@@ -1,18 +1,28 @@
+default_install_hook_types:
+  - pre-commit
+  - pre-push
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        stages: [pre-commit]
       - id: end-of-file-fixer
+        stages: [pre-commit]
       - id: check-toml
+        stages: [pre-commit]
       - id: check-yaml
+        stages: [pre-commit]
       - id: check-json
+        stages: [pre-commit]
 
   - repo: https://github.com/koalaman/shellcheck-precommit
     rev: v0.11.0
     hooks:
       - id: shellcheck
         args: ["-s", "sh"]
+        stages: [pre-commit]
 
   - repo: local
     hooks:
@@ -22,6 +32,7 @@ repos:
         entry: nix develop --command just fmt-check
         pass_filenames: false
         types: [rust]
+        stages: [pre-commit]
 
       - id: cargo-clippy
         name: Rust clippy
@@ -29,3 +40,12 @@ repos:
         entry: nix develop --command just lint
         pass_filenames: false
         types: [rust]
+        stages: [pre-commit]
+
+      - id: local-ci
+        name: Local CI pipeline
+        language: system
+        entry: nix develop --command just ci
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
