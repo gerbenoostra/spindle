@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use super::tempdir::TempDir;
 
@@ -52,9 +53,13 @@ impl TmuxServer {
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
         // `-f /dev/null`: the user's tmux.conf must not decide what a test
-        // sees.
+        // sees. Nor its login shell: tmux runs pane commands through
+        // `$SHELL`, and not every shell execs a lone command: bash does,
+        // while Debian's dash (0.5.12) stays its parent, adding a hop the
+        // tests do not expect.
         let out = Command::new("tmux")
             .env("TMUX_TMPDIR", &dir)
+            .env("SHELL", super::on_path("bash"))
             .args([
                 "-f",
                 "/dev/null",
@@ -129,6 +134,33 @@ impl TmuxServer {
         ]);
     }
 
+    /// The pid and `session:@window.%pane` handle of `session`'s pane once
+    /// its process runs `exe`: tmux lists the pane while its shell is still
+    /// starting the command, and only the exec renames it.
+    pub fn pane_running(&self, session: &str, exe: &str) -> (u32, String) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let out = self.tmux(&[
+                "list-panes",
+                "-t",
+                session,
+                "-F",
+                "#{pane_pid}|#{session_name}:#{window_id}.#{pane_id}",
+            ]);
+            if let Some((pid, handle)) = out.lines().next().and_then(|l| l.split_once('|'))
+                && let Ok(pid) = pid.parse::<u32>()
+                && comm(pid).rsplit('/').next() == Some(exe)
+            {
+                return (pid, handle.to_owned());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{session}'s pane never ran {exe}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// A control-mode client attached to `session`: tmux attaches a client
     /// without a pty in control mode, which is the only headless way to
     /// make `session_attached` non-zero. Hold the returned `Child` - its
@@ -159,6 +191,15 @@ impl Drop for TmuxServer {
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// `ps`'s `comm` for `pid`, trimmed; empty once it is gone.
+fn comm(pid: u32) -> String {
+    let out = Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
 /// The socket `<dir>/tmux-<uid>/<name>` tmux creates under `-L`.

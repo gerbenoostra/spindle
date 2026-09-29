@@ -11,7 +11,13 @@ just link            # shadow the installed binary with this checkout's release 
 
 `just check` is what CI runs. `just coverage` runs the same suite and then
 fails on any region of `src/` nothing reached; a line that genuinely cannot
-be reached carries a trailing `// coverage: off` saying why.
+be reached carries a trailing `// coverage: off` saying why. The marker
+exempts every region on its own line, and rustfmt moves a `//` comment that
+follows an opening `{` to its own line - positions like a catch-all match
+arm or a closure body carry `/* // coverage: off - reason */` instead. If
+the gate reports regions that should be covered, run
+`cargo llvm-cov clean --workspace` first: stale `.profraw` files from older
+builds pollute the merged view.
 
 ## PR titles
 

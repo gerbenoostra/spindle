@@ -272,22 +272,28 @@ fn a_dead_pane_is_dead_within_one_refresh() {
     server.tmux(&["kill-pane", "-t", pane.id.as_str()]);
 
     // One refresh is enough: a fresh observation carries no cache, so the
-    // pane is absent and the pid reports dead immediately.
+    // first one without the pane places the claim nowhere, even while the
+    // killed process is still exiting.
     let rt = until(|| {
         let rt = observe(&server);
         rt.panes.panes.iter().all(|p| p.id != pane.id).then_some(rt)
     });
-    let table = rt.processes.as_ref().unwrap();
-    let instance = ProcessInstance {
-        pid,
-        pid_start: start,
-    };
-    assert!(matches!(table.is_live(&instance, None), Liveness::Dead(_)));
     let resolved = rt.resolve_attachments(&[claim(pid)]);
     assert!(matches!(
         resolved[0].placement,
         Placement::Dead(_) | Placement::Unknown(_)
     ));
+    // The process itself dies on the OS's schedule, not tmux's: tmux lists
+    // the pane gone before the hangup has ended its process.
+    let instance = ProcessInstance {
+        pid,
+        pid_start: start,
+    };
+    until(|| {
+        let rt = observe(&server);
+        let table = rt.processes.as_ref().unwrap();
+        matches!(table.is_live(&instance, None), Liveness::Dead(_)).then_some(())
+    });
 }
 
 #[test]
@@ -297,9 +303,9 @@ fn claims_are_validated_by_start_time_and_executable() {
     }
     let server = TmuxServer::new();
     server.new_session("t", "sleep 300");
+    let (pid, _) = server.pane_running("t", "sleep");
     let rt = observe(&server);
     let table = rt.processes.as_ref().unwrap();
-    let pid = pane_in(&rt, "t").pid;
     let ProcessStart::At(start) = table.get(pid).unwrap().start else {
         panic!("the pane's process has a start time")
     };
@@ -628,7 +634,12 @@ fn a_worktree_binds_windows_by_stored_then_derived_evidence() {
         "24",
         "sleep 300",
     ]);
-    let rt = observe(&server);
+    // tmux reads the cwd off the pane's process, which may not have
+    // started yet on the first listing.
+    let rt = until(|| {
+        let rt = observe(&server);
+        pane_in(&rt, "t").cwd.is_some().then_some(rt)
+    });
     let pane = pane_in(&rt, "t");
     assert_eq!(pane.cwd.as_deref(), Some(worktree.path()));
 
@@ -674,19 +685,54 @@ fn no_server_is_an_empty_inventory_and_unknown_panes() {
     if !support::tmux_or_skip() {
         return;
     }
-    // A socket that answers nothing: recorded, contributes nothing.
-    let dir = TempDir::new("tmux-empty");
-    let bogus = dir.join("dead-socket");
-    std::os::unix::net::UnixListener::bind(&bogus).unwrap();
-    let inventory = PaneInventory::collect(std::slice::from_ref(&bogus));
+    // A socket file whose server is gone - tmux never unlinks its own -
+    // refuses a connection. It is counted as stale, never asked and never
+    // a server error. A killed tmux server is the real shape;
+    // a listener bound here could leak into a child a parallel test forks.
+    let gone = TmuxServer::new();
+    gone.new_session("t", "sleep 300");
+    gone.tmux(&["kill-server"]);
+    let dead = gone.socket.clone();
+    // `kill-server` returns before the server closes its listener.
+    until(|| {
+        std::os::unix::net::UnixStream::connect(&dead)
+            .is_err()
+            .then_some(())
+    });
+    assert!(dead.exists(), "tmux leaves its socket file behind");
+    let inventory = PaneInventory::collect(std::slice::from_ref(&dead));
     assert!(inventory.panes.is_empty());
+    assert!(
+        inventory.servers.is_empty(),
+        "a dead socket is not a server"
+    );
+    assert_eq!(inventory.stale_sockets, 1);
+
+    // A path that does not exist at all is no server either.
+    let missing = gone.socket_root().join("never-existed");
+    let inventory = PaneInventory::collect(std::slice::from_ref(&missing));
+    assert!(inventory.servers.is_empty());
+    assert_eq!(inventory.stale_sockets, 1);
+
+    // A socket that accepts and hangs up is a server that answered
+    // nothing: asked once, recorded as unanswered.
+    let rude = gone.socket_root().join("rude");
+    let listener = std::os::unix::net::UnixListener::bind(&rude).unwrap();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            drop(conn);
+        }
+    });
+    let inventory = PaneInventory::collect(std::slice::from_ref(&rude));
+    assert_eq!(inventory.stale_sockets, 0);
     assert_eq!(inventory.servers.len(), 1);
     assert!(inventory.servers[0].error.is_some());
 
-    // A socket path that does not exist at all cannot even canonicalize;
-    // it is still asked once and recorded as unanswered.
-    let missing = dir.join("never-existed");
-    let inventory = PaneInventory::collect(std::slice::from_ref(&missing));
+    // A path too long to connect to is not proven dead either: tmux is
+    // asked and reports why it could not answer.
+    let long = gone.socket_root().join("x".repeat(120));
+    let inventory = PaneInventory::collect(std::slice::from_ref(&long));
+    assert_eq!(inventory.stale_sockets, 0);
     assert_eq!(inventory.servers.len(), 1);
     assert!(inventory.servers[0].error.is_some());
 
@@ -707,6 +753,7 @@ fn no_server_is_an_empty_inventory_and_unknown_panes() {
     server.new_session("t", "sleep 300");
     let inventory = PaneInventory::collect(&[server.socket.clone(), server.socket.clone()]);
     assert_eq!(inventory.servers.len(), 1);
+    assert_eq!(inventory.stale_sockets, 0, "a live server passes the probe");
 
     // A second path to the same socket - a symlink here - is also one
     // server: its panes must not arrive twice.
@@ -752,12 +799,16 @@ fn a_recorded_warning_keeps_the_rest_of_the_inventory() {
         "24",
         "sleep 300",
     ]);
-    let rt = observe(&server);
-    assert!(
-        rt.panes.warnings.iter().any(|w| w.contains("weird")),
-        "{:?}",
-        rt.panes.warnings
-    );
+    // tmux reads the cwd off the pane's process, which may not have
+    // started yet on the first listing.
+    let rt = until(|| {
+        let rt = observe(&server);
+        rt.panes
+            .warnings
+            .iter()
+            .any(|w| w.contains("weird"))
+            .then_some(rt)
+    });
     // The well-formed panes still parsed.
     assert!(rt.panes.panes.iter().any(|p| p.session_name == "holder"));
     assert!(rt.panes.servers.iter().all(|s| s.error.is_none()));

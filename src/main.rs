@@ -12,6 +12,8 @@ const HELP: &str = "\
 agent-sessions - one dashboard for every agentic session and worktree
 
 usage:
+  agent-sessions              the dashboard (needs a terminal)
+  agent-sessions list --json  the complete snapshot, unfiltered
   agent-sessions --version    version, and the executable that is actually running
   agent-sessions --help       this text
 ";
@@ -35,9 +37,7 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Subcommands arrive together with the behaviour behind them; anything
-    // that has not shipped yet - `list`, `hook`, `register`, `doctor`, the
-    // dashboard itself - is a usage error here, never a silent no-op.
+    let json = pargs.contains("--json");
     let free = pargs
         .finish()
         .into_iter()
@@ -46,10 +46,39 @@ fn run() -> Result<ExitCode, String> {
                 .map_err(|_| "argument is not valid UTF-8".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Err(match free.as_slice() {
-        [] => "no command given".to_owned(),
-        _ => format!("unexpected arguments: {}", free.join(" ")),
-    })
+    // Bare `agent-sessions` is the dashboard itself. Subcommands arrive
+    // together with the behaviour behind them; anything that has not shipped
+    // yet - `hook`, `register`, `doctor` - is a usage error, never a silent
+    // no-op.
+    match free.as_slice() {
+        [] if !json => match agent_sessions::tui::tui() {
+            Ok(()) => Ok(ExitCode::SUCCESS), // coverage: off - tui() only succeeds with a real terminal
+            Err(e) => {
+                eprintln!("agent-sessions: {e}");
+                Ok(ExitCode::FAILURE)
+            }
+        },
+        [cmd] if cmd == "list" && json => match agent_sessions::tui::list_json() {
+            Ok(json) => {
+                println!("{json}");
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(e) => {
+                eprintln!("agent-sessions: {e}");
+                Ok(ExitCode::FAILURE)
+            }
+        },
+        // `--json` was already consumed out of `free`; put it back in the
+        // complaint when it is the argument being rejected.
+        _ => Err(format!(
+            "unexpected arguments: {}",
+            free.iter()
+                .cloned()
+                .chain(json.then(|| "--json".to_owned()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )),
+    }
 }
 
 fn version() -> String {

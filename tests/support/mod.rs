@@ -39,6 +39,18 @@ pub fn stderr_of(out: &std::process::Output) -> String {
     }
 }
 
+/// `name` resolved on `PATH`: fixtures must not assume `/bin`, which the
+/// Linux nix build sandbox reduces to `sh` alone.
+pub fn on_path(name: &str) -> std::path::PathBuf {
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(name))
+                .find(|candidate| candidate.is_file())
+        })
+        .unwrap_or_else(|| panic!("{name} is on PATH"))
+}
+
 /// Whether there is a tmux to test against.
 ///
 /// tmux is installed everywhere this suite runs and the CI job installs it

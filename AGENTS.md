@@ -12,4 +12,7 @@ adds a full-region coverage gate on `src/`.
 
 Tests run against disposable fixtures only: throwaway tmux servers
 (`tmux -L <socket>`), scratch git repositories and temp `$HOME`s. Never test
-against live state, a live agent or the user's real tmux server.
+against live state, a live agent or the user's real tmux server. The harness
+lives in `tests/support/` and `tests/claude_store.rs`; a fake agent process
+is a symlink to a system binary (a copied signed binary is killed on macOS,
+while `comm` still reports the invoked name).

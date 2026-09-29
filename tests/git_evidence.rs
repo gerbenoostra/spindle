@@ -949,6 +949,41 @@ fn remote_evidence_is_memoized_within_a_collection_pass() {
 }
 
 #[test]
+fn remote_evidence_is_reprobed_after_its_deadline() {
+    // The same shape as the memoization test, but with the deadline
+    // already passed: the second collect asks the remote again and sees
+    // it gone, so a long-lived collector cannot serve the first answer
+    // forever.
+    let f = FixtureRepo::new("origin");
+    f.branch_with_commits("one", 1, true);
+    f.branch_with_commits("two", 1, true);
+    let repo = git::Repo::discover(f.main.as_path()).unwrap().unwrap();
+    let anchors = vector::anchors(&repo).unwrap();
+    let mut cache = vector::RemoteCache::with_deadline(std::time::Duration::ZERO);
+
+    let one = anchors.iter().find(|a| a.branch() == Some("one")).unwrap();
+    let state = vector::collect_cached(&repo, &mut cache, one, quiet());
+    assert!(matches!(
+        state.vector.upstream_state,
+        UpstreamState::Tracked { .. }
+    ));
+
+    std::fs::remove_dir_all(&f.remote).expect("the remote goes away");
+    let two = anchors.iter().find(|a| a.branch() == Some("two")).unwrap();
+    let state = vector::collect_cached(&repo, &mut cache, two, quiet());
+    assert!(
+        matches!(state.vector.upstream_state, UpstreamState::Unknown(_)),
+        "{:?}",
+        state.vector.upstream_state
+    );
+}
+
+#[test]
+fn the_default_remote_deadline_is_five_minutes() {
+    assert_eq!(vector::REMOTE_DEADLINE, std::time::Duration::from_secs(300));
+}
+
+#[test]
 fn a_shared_remote_cache_scopes_evidence_per_repo() {
     // Two repos whose remotes share the name `origin` but advertise
     // different facts: a cache keyed by remote name alone would hand the

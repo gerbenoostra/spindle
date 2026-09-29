@@ -18,11 +18,23 @@ use crate::tmux::{PaneInventory, PaneRef, PublishedHandle};
 
 /// The v1 providers. Adding one is a capability decision, not a value a
 /// record can freely carry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Provider {
     Claude,
     Vibe,
     Devin,
+}
+
+impl Provider {
+    /// The provider's wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Claude => "claude",
+            Provider::Vibe => "vibe", // coverage: off - Vibe ships with its provider task
+            Provider::Devin => "devin", // coverage: off - Devin ships with its provider task
+        }
+    }
 }
 
 /// A conversation's durable identity: provider plus the provider's own
@@ -99,7 +111,8 @@ pub struct LiveAttachment {
 }
 
 /// How a pane was bound, in the order the evidence is asked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PaneSource {
     /// A provider-published `session:@window.%pane` handle.
     Published,
@@ -433,6 +446,7 @@ mod tests {
             panes,
             servers: Vec::new(),
             warnings: Vec::new(),
+            stale_sockets: 0,
         }
     }
 

@@ -106,24 +106,25 @@ pub struct Pane {
 impl Pane {
     /// Whether this pane's evidence binds it to `worktree`: the stored
     /// admin-id edge when the window publishes one, else the derived edge -
-    /// a pane cwd at or below the worktree root. Both sides are
-    /// canonicalized first, so a symlinked spelling of the worktree binds
-    /// the same. The stored edge decides outright when present: a window
-    /// whose stored id names another worktree belongs to that worktree
-    /// even if a pane has since `cd`-ed into this one.
+    /// a pane cwd at or below the worktree root. Both spellings are
+    /// canonicalized here, so a symlinked path binds the same no matter who
+    /// built the pane record. The stored edge decides outright when
+    /// present: a window whose stored id names another worktree belongs to
+    /// that worktree even if a pane has since `cd`-ed into this one.
     pub fn binds_worktree(&self, admin_id: Option<&str>, worktree: &Path) -> bool {
         match (&self.wt_adminid, admin_id) {
             (Some(stored), Some(id)) => return stored == id,
             (Some(_), None) => return false,
             _ => {}
         }
-        self.cwd.as_deref().is_some_and(|cwd| {
-            let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
-            let root = worktree
-                .canonicalize()
-                .unwrap_or_else(|_| worktree.to_owned());
-            cwd.starts_with(root)
-        })
+        let Some(cwd) = self.cwd.as_deref() else {
+            return false;
+        };
+        let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
+        let root = worktree
+            .canonicalize()
+            .unwrap_or_else(|_| worktree.to_owned());
+        cwd.starts_with(root)
     }
 }
 
@@ -161,6 +162,10 @@ pub struct PaneInventory {
     pub panes: Vec<Pane>,
     /// One entry per socket attempted, answering or not.
     pub servers: Vec<Server>,
+    /// Sockets with no server behind them: tmux never unlinks its socket
+    /// file, so a dead server leaves one that refuses every connection.
+    /// Counted, never asked.
+    pub stale_sockets: usize,
     /// Records the server printed that this tool did not understand - kept
     /// as evidence rather than silently dropped, since an invisible pane
     /// cannot claim liveness.
@@ -185,8 +190,9 @@ const LIST_FORMAT: &str = concat!(
 const FIELD_COUNT: usize = 15;
 
 impl PaneInventory {
-    /// One snapshot per socket in `sockets`, merged. Each socket is asked
-    /// exactly once; unreachable ones are recorded and skipped.
+    /// One snapshot per socket in `sockets`, merged. Each live socket is
+    /// asked exactly once; unreachable ones are recorded and skipped, and
+    /// ones no server listens on are only counted.
     pub fn collect(sockets: &[PathBuf]) -> PaneInventory {
         let mut inventory = PaneInventory::default();
         let mut seen = HashSet::new();
@@ -197,6 +203,10 @@ impl PaneInventory {
             // canonical path while keeping the spelling that was given.
             let identity = socket.canonicalize().unwrap_or_else(|_| socket.clone());
             if !seen.insert(identity) {
+                continue;
+            }
+            if is_stale(socket) {
+                inventory.stale_sockets += 1;
                 continue;
             }
             match list_panes(socket) {
@@ -264,7 +274,7 @@ impl PaneInventory {
         let mut windows = HashSet::new();
         for pane in &self.panes {
             if pane.binds_worktree(admin_id, worktree) {
-                windows.insert((pane.socket.clone(), pane.window.clone()));
+                windows.insert((&pane.socket, &pane.window));
             }
         }
         windows.len()
@@ -331,6 +341,20 @@ fn uid() -> Option<u32> {
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
         .flatten()
+}
+
+/// Whether no server listens on `socket`: the path is gone, or a connect
+/// is refused. A connect costs microseconds where a `tmux` spawn costs
+/// milliseconds, and a machine can hold tens of thousands of dead sockets.
+/// Any other failure is left for `tmux` itself to report.
+fn is_stale(socket: &Path) -> bool {
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(_) => false,
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+        ),
+    }
 }
 
 /// One `tmux -S <socket> list-panes -a` read. The socket is always a path,
@@ -514,6 +538,7 @@ mod tests {
             panes,
             servers: Vec::new(),
             warnings: Vec::new(),
+            stale_sockets: 0,
         }
     }
 
@@ -549,15 +574,19 @@ mod tests {
         p.cwd = Some(PathBuf::from("/no/such/dir/here"));
         assert!(!p.binds_worktree(None, &worktree));
         // The same for a worktree that does not exist, and for a
-        // worktree passed under a symlinked spelling of its real path
-        // (where temp_dir has no symlink the two are one path and the
-        // check still runs).
+        // worktree passed under a symlinked spelling of its real path:
+        // binds_worktree canonicalizes both spellings itself (where
+        // temp_dir has no symlink the two are one path and the check
+        // still runs).
         p.cwd = Some(worktree.join("inside"));
         assert!(!p.binds_worktree(None, Path::new("/no/such/worktree/here")));
         let raw = std::env::temp_dir();
         let canon = raw.canonicalize().unwrap();
         p.cwd = Some(canon.join("inside"));
         assert!(p.binds_worktree(None, &raw));
+        // A pane tmux reports no cwd for binds by the stored edge alone.
+        p.cwd = None;
+        assert!(!p.binds_worktree(None, &worktree));
     }
 
     #[test]

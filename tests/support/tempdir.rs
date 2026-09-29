@@ -86,10 +86,16 @@ fn restore_modes(path: &Path) {
         return;
     };
     for entry in entries.flatten() {
+        // The entry's own type: following a symlink would chmod, or recurse
+        // into, whatever it points at outside the tree - a fixture's system
+        // binary included.
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         let child = entry.path();
-        if child.is_dir() {
+        if kind.is_dir() {
             restore_modes(&child);
-        } else {
+        } else if !kind.is_symlink() {
             let _ = fs::set_permissions(&child, fs::Permissions::from_mode(0o644));
         }
     }
