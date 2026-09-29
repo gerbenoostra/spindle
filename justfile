@@ -174,7 +174,8 @@ ci-linux:
     at_head() { git -C "$root" show "HEAD:$1"; }
     msrv="$(at_head Cargo.toml | sed -n 's/^rust-version = "\(.*\)"$/\1/p')"
     llvm_cov="$(at_head .github/workflows/ci.yml | sed -n 's/.*tool: cargo-llvm-cov@//p')"
-    at_head ci/linux.Dockerfile | docker build --quiet --tag spindle-ci-linux \
+    at_head ci/linux.Dockerfile | docker build --quiet --pull --tag spindle-ci-linux \
+        --build-arg "IMAGE_WEEK=$(date +%G-W%V)" \
         --build-arg "MSRV=$msrv" --build-arg "LLVM_COV_VERSION=$llvm_cov" - >/dev/null
     # Mounted at their host paths: a linked worktree's .git names its common
     # git directory by absolute path, and that may lie outside the checkout.

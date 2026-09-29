@@ -2,6 +2,11 @@
 # installs. Built and run by `just ci-linux`; CI itself does not use it.
 FROM ubuntu:24.04
 
+# CI installs the latest of everything on every run. A new value, which
+# `just ci-linux` sets to the ISO week, rebuilds every layer below, so the
+# image trails CI by a week at most.
+ARG IMAGE_WEEK
+
 # Everything the jobs install with apt, plus what a GitHub runner ships with.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
