@@ -317,7 +317,8 @@ fn world() -> World {
 }
 
 /// The pid and `session:@window.%pane` handle of the `agents` session's
-/// pane, once the server has listed it.
+/// pane, once the server has listed it and its shell has exec'd the agent:
+/// until then the pane's process is tmux's shell, not `claude`.
 fn wait_for_pane(tmux: &TmuxServer, session: &str) -> (u32, String) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -330,13 +331,24 @@ fn wait_for_pane(tmux: &TmuxServer, session: &str) -> (u32, String) {
         ]);
         if let Some(line) = out.lines().next() {
             let (pid, handle) = line.split_once('|').expect("the format has a |");
-            if let Ok(pid) = pid.parse::<u32>() {
+            if let Ok(pid) = pid.parse::<u32>()
+                && comm(pid).rsplit('/').next() == Some("claude")
+            {
                 return (pid, handle.to_owned());
             }
         }
-        assert!(Instant::now() < deadline, "the pane never listed");
+        assert!(Instant::now() < deadline, "the agent never ran in the pane");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// `ps`'s `comm` for `pid`, trimmed; empty once it is gone.
+fn comm(pid: u32) -> String {
+    let out = Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
 fn collect(world: &World) -> agent_sessions::snapshot::Snapshot {

@@ -50,6 +50,24 @@ fn until<T>(f: impl Fn() -> Option<T>) -> T {
     }
 }
 
+/// An observation in which `session`'s pane process runs `exe`, and that
+/// pid. tmux starts a pane command through its shell, which lists as the
+/// pane's process until it execs the command, so the name settles later
+/// than the pane appears.
+fn pane_running(server: &TmuxServer, session: &str, exe: &str) -> (Runtime, u32) {
+    until(|| {
+        let rt = observe(server);
+        let pid = rt
+            .panes
+            .panes
+            .iter()
+            .find(|pane| pane.session_name == session)?
+            .pid;
+        let row = rt.processes.as_ref()?.get(pid)?;
+        (row.exe.as_deref() == Some(exe)).then_some((rt, pid))
+    })
+}
+
 /// The pane in `session`, after the server has listed it.
 fn pane_in<'a>(rt: &'a Runtime, session: &str) -> &'a agent_sessions::tmux::Pane {
     rt.panes
@@ -272,22 +290,28 @@ fn a_dead_pane_is_dead_within_one_refresh() {
     server.tmux(&["kill-pane", "-t", pane.id.as_str()]);
 
     // One refresh is enough: a fresh observation carries no cache, so the
-    // pane is absent and the pid reports dead immediately.
+    // first one without the pane places the claim nowhere, even while the
+    // killed process is still exiting.
     let rt = until(|| {
         let rt = observe(&server);
         rt.panes.panes.iter().all(|p| p.id != pane.id).then_some(rt)
     });
-    let table = rt.processes.as_ref().unwrap();
-    let instance = ProcessInstance {
-        pid,
-        pid_start: start,
-    };
-    assert!(matches!(table.is_live(&instance, None), Liveness::Dead(_)));
     let resolved = rt.resolve_attachments(&[claim(pid)]);
     assert!(matches!(
         resolved[0].placement,
         Placement::Dead(_) | Placement::Unknown(_)
     ));
+    // The process itself dies on the OS's schedule, not tmux's: tmux lists
+    // the pane gone before the hangup has ended its process.
+    let instance = ProcessInstance {
+        pid,
+        pid_start: start,
+    };
+    until(|| {
+        let rt = observe(&server);
+        let table = rt.processes.as_ref().unwrap();
+        matches!(table.is_live(&instance, None), Liveness::Dead(_)).then_some(())
+    });
 }
 
 #[test]
@@ -297,9 +321,8 @@ fn claims_are_validated_by_start_time_and_executable() {
     }
     let server = TmuxServer::new();
     server.new_session("t", "sleep 300");
-    let rt = observe(&server);
+    let (rt, pid) = pane_running(&server, "t", "sleep");
     let table = rt.processes.as_ref().unwrap();
-    let pid = pane_in(&rt, "t").pid;
     let ProcessStart::At(start) = table.get(pid).unwrap().start else {
         panic!("the pane's process has a start time")
     };
@@ -788,12 +811,16 @@ fn a_recorded_warning_keeps_the_rest_of_the_inventory() {
         "24",
         "sleep 300",
     ]);
-    let rt = observe(&server);
-    assert!(
-        rt.panes.warnings.iter().any(|w| w.contains("weird")),
-        "{:?}",
-        rt.panes.warnings
-    );
+    // tmux reads the cwd off the pane's process, which may not have
+    // started yet on the first listing.
+    let rt = until(|| {
+        let rt = observe(&server);
+        rt.panes
+            .warnings
+            .iter()
+            .any(|w| w.contains("weird"))
+            .then_some(rt)
+    });
     // The well-formed panes still parsed.
     assert!(rt.panes.panes.iter().any(|p| p.session_name == "holder"));
     assert!(rt.panes.servers.iter().all(|s| s.error.is_none()));
