@@ -197,7 +197,8 @@ CI runs and the push triggers the release workflow. That requires the
 Before merging a release PR, verify the release build end to end on a
 supported system without relying on the development symlink:
 
-1. Run `just ci` on the release PR's branch.
+1. Run `just ci` and `just nix-build` on the release PR's branch; the second
+   leaves the package to install at `./result`.
 2. Install the resulting package or release binary using one of the documented
    installation routes.
 3. Confirm `agent-sessions --version` resolves to that installed binary.
