@@ -174,16 +174,21 @@ ci-linux:
     at_head() { git -C "$root" show "HEAD:$1"; }
     msrv="$(at_head Cargo.toml | sed -n 's/^rust-version = "\(.*\)"$/\1/p')"
     llvm_cov="$(at_head .github/workflows/ci.yml | sed -n 's/.*tool: cargo-llvm-cov@//p')"
+    week="$(date +%G-W%V)"
     # Without a provenance attestation, which carries a build timestamp, the
     # image ID changes only when the image does.
     image="$(at_head ci/linux.Dockerfile | docker build --quiet --pull --provenance=false \
-        --tag spindle-ci-linux --build-arg "IMAGE_WEEK=$(date +%G-W%V)" \
+        --tag spindle-ci-linux --build-arg "IMAGE_WEEK=$week" \
         --build-arg "MSRV=$msrv" --build-arg "LLVM_COV_VERSION=$llvm_cov" -)"
     # The Nix store is kept per image: a fresh volume starts as a copy of the
     # image's /nix, and a rebuilt image's Nix never meets an older store.
-    # Earlier images' volumes stay until ci-linux-clean: checkouts whose HEADs
-    # build different images would otherwise delete each other's store.
-    nix_volume="spindle-ci-linux-nix-$(printf '%s' "${image#sha256:}" | cut -c1-12)"
+    # Every image is rebuilt weekly, so stores of earlier weeks are dead and
+    # go (unless a running build still holds one); this week's stay, as
+    # checkouts whose HEADs build different images each need theirs.
+    nix_volume="spindle-ci-linux-nix-$week-$(printf '%s' "${image#sha256:}" | cut -c1-12)"
+    docker volume ls --quiet --filter name='^spindle-ci-linux-nix-' \
+        | { grep -v -- "^spindle-ci-linux-nix-$week-" || true; } \
+        | while IFS= read -r stale; do docker volume rm "$stale" >/dev/null 2>&1 || true; done
     # Mounted at their host paths: a linked worktree's .git names its common
     # git directory by absolute path, and that may lie outside the checkout.
     mounts=(--volume "$root:$root:ro")

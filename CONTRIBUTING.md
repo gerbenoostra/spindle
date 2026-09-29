@@ -43,9 +43,10 @@ and `just ci` skips the Linux jobs when a macOS job fails; run
 The container runs the host's architecture, so on Apple silicon it is
 aarch64 Linux while `ubuntu-latest` is x86_64. The image is rebuilt the
 first time it is used in each ISO week, to track the latest tools CI installs.
-Each image keeps its own Nix store volume, so a checkout whose `HEAD` builds a
-different image never evicts another's; `just ci-linux-clean` drops the image
-and every cache volume, including the stores of earlier images.
+Each image keeps its own Nix store volume (about 3 GB), so a checkout whose
+`HEAD` builds a different image never evicts another's. A run drops the
+stores of earlier weeks, whose images the weekly rebuild replaced.
+`just ci-linux-clean` drops the image and every cache volume.
 
 The job lists in the justfile (`ci_linux_jobs`, `ci_macos_jobs`) mirror
 `ci.yml`'s jobs per runner OS; change them together.
