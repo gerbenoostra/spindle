@@ -148,7 +148,7 @@ package-verify:
         exit 1
     fi
 
-# ci.yml's jobs per runner OS, as recipes. Keep in step with ci.yml.
+# ci.yml's jobs per runner OS, as recipes; tests/ci_jobs.rs holds the two equal.
 ci_linux_jobs := "fmt-check lint lint-sh test coverage msrv nix-verify package-verify"
 ci_macos_jobs := "test nix-verify"
 
