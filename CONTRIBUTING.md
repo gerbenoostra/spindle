@@ -4,12 +4,13 @@
 
 ```sh
 nix develop          # cargo, clippy, rustfmt, rust-analyzer, tmux, git, just
-just check           # fmt-check + lint + lint-sh + test, exactly what CI runs
+just check           # fmt-check + lint + lint-sh + test, the fast inner loop
 just coverage        # the test suite plus a full-region coverage gate on src/
+just ci              # every CI job, on this Mac and in a Linux container
 just link            # shadow the installed binary with this checkout's release build
 ```
 
-`just check` is what CI runs. `just coverage` runs the same suite and then
+`just check` is the fast subset of CI. `just coverage` runs the same suite and then
 fails on any region of `src/` nothing reached; a line that genuinely cannot
 be reached carries a trailing `// coverage: off` saying why. The marker
 exempts every region on its own line, and rustfmt moves a `//` comment that
@@ -18,6 +19,57 @@ arm or a closure body carry `/* // coverage: off - reason */` instead. If
 the gate reports regions that should be covered, run
 `cargo llvm-cov clean --workspace` first: stale `.profraw` files from older
 builds pollute the merged view.
+
+## Running CI locally
+
+Every CI job is a recipe, and `ci.yml` only installs tools and calls them.
+`just ci` runs them all before a push, as `just ci-macos` and `just ci-linux`:
+
+- `ci-macos` runs the jobs of the `macos-latest` matrix legs (test, nix)
+  natively, in the current shell's toolchain.
+- `ci-linux` runs every `ubuntu-latest` job in a Docker container built from
+  `ci/linux.Dockerfile`: rustup stable and the MSRV, apt's tmux, jq and
+  shellcheck, the pinned cargo-llvm-cov, and Determinate Nix, run by a
+  non-root user as on GitHub. It runs `--privileged` because the Nix build
+  sandbox needs namespaces; without it Nix would silently build unsandboxed,
+  and the image turns that fallback into an error.
+
+Both check a commit, `HEAD` unless one is given (`just ci <commit>`), not the
+working tree: each keeps a clean checkout of it under `target/ci/<os>/`
+(Linux: in a Docker volume per checkout), so an uncommitted or untracked file
+cannot make a local run pass that CI fails. The jobs, their recipes and the
+Linux image all come from that commit; only the recipes that set up the
+checkout and the container are read from the working tree. Builds there stay
+incremental between runs, and the container keeps its Nix store in a volume per
+image.
+
+`just ci` fails on a host that is not a Mac. `just ci-gentle` runs every job
+the host can: all of them on macOS; elsewhere the Linux jobs, ending with a
+notice that the macOS jobs did not run.
+
+`prek install` also installs a pre-push hook: pushing a branch runs
+`just ci-gentle` against the commit pushed, which need not be `HEAD`. Pushing a
+tag, deleting a branch or pushing no new commits runs nothing. When one push
+updates several branches, prek checks only one of them, so push branches one at
+a time. `git push --no-verify` skips the hook.
+
+Unlike CI, which runs every job, a local run stops at the first failing job,
+and `just ci` skips the Linux jobs when a macOS job fails; run
+`just ci-linux` on its own to see them.
+
+The container runs the host's architecture, so on Apple silicon it is
+aarch64 Linux while `ubuntu-latest` is x86_64. The image is rebuilt the
+first time it is used in each ISO week, to track the latest tools CI installs.
+Each image keeps its own Nix store volume (about 3 GB), so a checkout whose
+commit builds a different image never evicts another's. A run drops the
+stores of earlier weeks, whose images the weekly rebuild replaced, and the
+snapshots of checkouts that no longer exist, such as removed worktrees.
+`just ci-linux-clean` drops the image and every cache volume.
+
+The job lists in the justfile (`ci_linux_jobs`, `ci_macos_jobs`) mirror
+`ci.yml`'s jobs per runner OS; change them together. `tests/ci_jobs.rs` fails
+when they differ, and when a `ci.yml` job calls no recipe, since `just ci`
+could not run it.
 
 ## PR titles
 
@@ -176,9 +228,11 @@ CI runs and the push triggers the release workflow. That requires the
 Before merging a release PR, verify the release build end to end on a
 supported system without relying on the development symlink:
 
-1. Run `just check` and `just nix-build` on the release PR's branch.
-2. Install the resulting package or release binary using one of the documented
-   installation routes.
+1. On a clean checkout of the release PR's branch, run `just ci`, then
+   `just nix-build`: `ci` checks the committed `HEAD`, and `nix-build` builds
+   the working tree, which is only the same thing when nothing is modified.
+   `nix-build` leaves the package to install at `./result`.
+2. Install that package using one of the documented installation routes.
 3. Confirm `agent-sessions --version` resolves to that installed binary.
 
 For Nix, the checkout itself can be tested without changing another

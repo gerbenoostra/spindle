@@ -86,8 +86,218 @@ coverage:
     fi
     echo "Every region of src/ was reached, across $files files."
 
-# What CI runs.
+# The fast subset of CI: format, lints and tests.
 check: fmt-check lint lint-sh test
+
+# Build with the minimum supported Rust version from Cargo.toml.
+msrv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    msrv="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+    [[ -n "$msrv" ]] || { echo "Cargo.toml names no rust-version." >&2; exit 1; }
+    rustup toolchain install "$msrv" --profile minimal --no-self-update
+    rustup run "$msrv" cargo build --locked --all-targets
+
+# Check the flake, build the package and run what came out of it.
+nix-verify:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    nix flake check
+    nix build .#agent-sessions
+    # The packaging path is only proven by running what came out of it.
+    ./result/bin/agent-sessions --version
+    # share/ joins the package when it exists; today there is nothing to check.
+    [ -d share ] || exit 0
+    missing=0
+    while IFS= read -r f; do
+        rel="${f#share/}"
+        if [[ ! -e "result/share/$rel" ]]; then
+            echo "missing in Nix output: $rel" >&2
+            missing=1
+        fi
+    done < <(find share -type f -o -type l)
+    exit "$missing"
+
+# Build the release tarball and check its share tree.
+package-verify:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --locked
+    target="$(rustc -vV | sed -n 's|host: ||p')"
+    dist="$(mktemp -d)"
+    trap 'rm -rf "$dist"' EXIT
+    name="agent-sessions-ci-${target}"
+    mkdir -p "$dist/$name"
+    cp "${CARGO_TARGET_DIR:-target}/release/agent-sessions" "$dist/$name/"
+    cp README.md LICENSE "$dist/$name/"
+    # -L, not -R alone: share/ may carry symlinks into trees the
+    # tarball does not ship. share/ joins the tarball when it exists.
+    if [ -d share ]; then
+        cp -RL share "$dist/$name/"
+    fi
+    tar -C "$dist" -czf "$dist/$name.tar.gz" "$name"
+    [ -d share ] || exit 0
+    find share -type f -o -type l | sed 's|^share/||' | sort > "$dist/expected"
+    tar -tzf "$dist/$name.tar.gz" \
+        | grep '/share/.' \
+        | sed 's|^[^/]*/share/||' \
+        | grep -v '/$' \
+        | sort -u > "$dist/actual"
+    if ! diff -u "$dist/expected" "$dist/actual"; then
+        echo "release tarball share files do not match share/" >&2
+        exit 1
+    fi
+
+# ci.yml's jobs per runner OS, as recipes; tests/ci_jobs.rs holds the two equal.
+ci_linux_jobs := "fmt-check lint lint-sh test coverage msrv nix-verify package-verify"
+ci_macos_jobs := "test nix-verify"
+
+# Run ci.yml's macOS and Linux jobs locally, against a commit (default HEAD).
+ci rev="HEAD":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Resolved once, so a commit made while the macOS jobs run cannot give the
+    # Linux jobs another one.
+    commit="$(just _ci-commit {{quote(rev)}})"
+    just ci-macos "$commit"
+    just ci-linux "$commit"
+
+# Run the CI jobs this host can against a commit (default HEAD), noting skipped macOS jobs.
+[macos]
+ci-gentle rev="HEAD": (ci rev)
+
+# Run the CI jobs this host can against a commit (default HEAD), noting skipped macOS jobs.
+[linux]
+ci-gentle rev="HEAD": (ci-linux rev)
+    @echo "ci-gentle: the macOS jobs did not run; they need a Mac." >&2
+
+# Run ci-gentle against the commit a branch push sends; the pre-push hook runs this.
+pre-push:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Other pushes, such as a tag, need no check; prek itself skips deletions
+    # and pushes that send no new commits.
+    ref="${PRE_COMMIT_REMOTE_BRANCH:?pre-push runs from the prek pre-push hook}"
+    commit="${PRE_COMMIT_TO_REF:?pre-push runs from the prek pre-push hook}"
+    if [[ "$ref" != refs/heads/* ]] || [[ "$commit" =~ ^0+$ ]]; then
+        echo "pre-push: $ref is not a branch update; skipping local CI." >&2
+        exit 0
+    fi
+    just ci-gentle "$commit"
+
+# Run ci.yml's macOS jobs on this Mac, against a commit (default HEAD).
+ci-macos rev="HEAD":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ "$(uname -s)" == Darwin ]] || { echo "ci-macos runs on macOS." >&2; exit 1; }
+    commit="$(just _ci-commit {{quote(rev)}})"
+    just _ci-snapshot "{{justfile_directory()}}" "$commit" "{{justfile_directory()}}/target/ci/macos" macos
+
+# Run ci.yml's Linux jobs in a Docker container, against a commit (default HEAD).
+ci-linux rev="HEAD":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The container runs the host's architecture, so on Apple silicon this is
+    # aarch64 Linux where CI's ubuntu-latest is x86_64. It runs privileged
+    # because the Nix build sandbox needs namespaces.
+    root="{{justfile_directory()}}"
+    commit="$(just _ci-commit {{quote(rev)}})"
+    # The image, like the jobs, comes from the commit rather than the working tree.
+    at_commit() { git -C "$root" show "$commit:$1"; }
+    msrv="$(at_commit Cargo.toml | sed -n 's/^rust-version = "\(.*\)"$/\1/p')"
+    llvm_cov="$(at_commit .github/workflows/ci.yml | sed -n 's/.*tool: cargo-llvm-cov@//p')"
+    week="$(date +%G-W%V)"
+    # Without a provenance attestation, which carries a build timestamp, the
+    # image ID changes only when the image does.
+    image="$(at_commit ci/linux.Dockerfile | docker build --quiet --pull --provenance=false \
+        --tag spindle-ci-linux --build-arg "IMAGE_WEEK=$week" \
+        --build-arg "MSRV=$msrv" --build-arg "LLVM_COV_VERSION=$llvm_cov" -)"
+    # The Nix store is kept per image: a fresh volume starts as a copy of the
+    # image's /nix, and a rebuilt image's Nix never meets an older store.
+    # Every image is rebuilt weekly, so stores of earlier weeks are dead and
+    # go (unless a running build still holds one); this week's stay, as
+    # checkouts whose commits build different images each need theirs.
+    nix_volume="spindle-ci-linux-nix-$week-$(printf '%s' "${image#sha256:}" | cut -c1-12)"
+    docker volume ls --quiet --filter name='^spindle-ci-linux-nix-' \
+        | { grep -v -- "^spindle-ci-linux-nix-$week-" || true; } \
+        | while IFS= read -r stale; do docker volume rm "$stale" >/dev/null 2>&1 || true; done
+    # Mounted at their host paths: a linked worktree's .git names its common
+    # git directory by absolute path, and that may lie outside the checkout.
+    mounts=(--volume "$root:$root:ro")
+    common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)"
+    [[ "$common" == "$root"/* ]] || mounts+=(--volume "$common:$common:ro")
+    # One snapshot per checkout, so runs from two worktrees cannot reset each
+    # other's tree. The cargo home is shared whole: cargo keeps its package
+    # cache locks at its root, not in registry/, and they hold across
+    # containers on one volume.
+    checkout="spindle-ci-linux-src-$(printf '%s' "$root" | git hash-object --stdin | cut -c1-12)"
+    # Each snapshot is labelled with its checkout, so the snapshots of removed
+    # checkouts, such as deleted worktrees, go (unless a running build still
+    # holds one). Created before the run, as `docker run` cannot label one.
+    label=spindle-ci-linux.checkout
+    docker volume create --label "$label=$root" "$checkout" >/dev/null
+    docker volume ls --filter label="$label" --format "{{{{.Name}}\t{{{{.Label \"$label\"}}" \
+        | while IFS=$'\t' read -r volume path; do
+            [[ -e "$path" ]] || docker volume rm "$volume" >/dev/null 2>&1 || true
+        done
+    # No --tty: a GitHub runner has no terminal, and colour is forced below.
+    # Without a terminal, Ctrl-C reaches only the container's PID 1, which a
+    # bash there ignores; tini as PID 1, told to signal the whole process
+    # group, stops the jobs rather than leaving them running unseen.
+    docker run --rm --privileged --init --env TINI_KILL_PROCESS_GROUP=1 "${mounts[@]}" \
+        --volume "$checkout:/home/runner/ci" \
+        --volume spindle-ci-linux-cargo-home:/home/runner/cargo-home \
+        --volume "$nix_volume:/nix" \
+        --env CARGO_TERM_COLOR=always \
+        "$image" \
+        bash -c 'set -euo pipefail
+            git config --global --add safe.directory "*"
+            # CI installs the stable of the day, not the one the image baked.
+            rustup update stable --no-self-update >/dev/null
+            # Set after rustup, whose proxies stay in ~/.cargo from the image.
+            # Only the cache moves: the tools stay on PATH in ~/.cargo/bin,
+            # and anything cargo installs here would land off PATH.
+            export CARGO_HOME=/home/runner/cargo-home
+            just --justfile "$1/justfile" _ci-snapshot "$1" "$2" /home/runner/ci linux' \
+        _ "$root" "$commit"
+
+# Drop the Linux CI image and the volumes that cache its builds, for every checkout.
+ci-linux-clean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    volumes=()
+    while IFS= read -r v; do volumes+=("$v"); done \
+        < <(docker volume ls --quiet --filter name='^spindle-ci-linux-')
+    (( ${#volumes[@]} == 0 )) || docker volume rm "${volumes[@]}"
+    docker image rm --force spindle-ci-linux 2>/dev/null || true
+
+# The full hash of a commit of this repo, or an error naming what is not one.
+_ci-commit rev:
+    @git -C "{{justfile_directory()}}" rev-parse --verify --quiet {{quote(rev + "^{commit}")}} \
+        || { echo ci: {{quote(rev)}} names no commit. >&2; exit 1; }
+
+# Run CI's jobs for `os` in a clean checkout of `commit`, kept under `dir` so
+# builds stay incremental between runs. The job list, like the job recipes, is
+# read from that checkout; only this plumbing is the working tree's.
+_ci-snapshot repo commit dir os:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src="{{dir}}/src"
+    [[ -d "$src/.git" ]] || git init --quiet "$src"
+    git -C "$src" fetch --quiet --no-tags "{{repo}}" "{{commit}}"
+    git -C "$src" checkout --quiet --force --detach FETCH_HEAD
+    git -C "$src" clean --quiet -ffdx
+    echo "ci: $(git -C "$src" log -1 --format='%h %s') on $(uname -s)" >&2
+    export CARGO_TARGET_DIR="{{dir}}/target"
+    cd "$src"
+    jobs="$(just --evaluate "ci_{{os}}_jobs")"
+    # Coverage profiles from the previous run's commit pollute this one's.
+    if [[ " $jobs " == *" coverage "* ]]; then
+        cargo llvm-cov clean --workspace
+    fi
+    # Word-split on purpose: the list is recipe names.
+    # shellcheck disable=SC2086
+    just $jobs
 
 # Build the release binary.
 build:

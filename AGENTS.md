@@ -7,8 +7,9 @@ not useful to a stranger who cloned it.
 ## Development
 
 Run development tools within the shell `nix develop` creates, or use
-`. "$HOME/.cargo/env" && [cmd]`. `just check` is what CI runs; `just coverage`
-adds a full-region coverage gate on `src/`.
+`. "$HOME/.cargo/env" && [cmd]`. `just check` is the fast subset of CI;
+`just coverage` adds a full-region coverage gate on `src/`; `just ci` runs
+every CI job against the committed `HEAD`, natively and in a Linux container.
 
 Tests run against disposable fixtures only: throwaway tmux servers
 (`tmux -L <socket>`), scratch git repositories and temp `$HOME`s. Never test
