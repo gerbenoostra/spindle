@@ -11,10 +11,12 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use agent_sessions::git;
 use agent_sessions::provider::SourceError;
 use agent_sessions::runtime::{PaneSource, Runtime};
 use agent_sessions::snapshot::{
-    AttachmentLiveness, Collector, ConversationState, Landed, SCHEMA_VERSION, Upstream, WorkKind,
+    AttachmentLiveness, Collector, ConversationState, Landed, SCHEMA_VERSION, Snapshot, Upstream,
+    WorkKind,
 };
 use support::fixture::{FixtureRepo, Landing};
 use support::tempdir::TempDir;
@@ -674,4 +676,226 @@ fn a_project_space_and_no_cwd_stay_honest() {
             .iter()
             .any(|e: &SourceError| { e.detail.contains("gone/path") && e.source == "git resolve" })
     );
+}
+
+/// Every publish a staged pass emits. `collect_staged` hands them through
+/// the callback; the sequence - not any single snapshot - is what the
+/// progressive contract is.
+fn staged(world: &World) -> Vec<Snapshot> {
+    let root = world.home.join(".claude");
+    // One worker keeps the repo order exactly the priority order, so the
+    // landing sequence the assertion reads is deterministic.
+    let mut collector = Collector::new(root).with_workers(1);
+    let runtime = Runtime::observe_over(std::slice::from_ref(&world.tmux.socket));
+    let mut published = Vec::new();
+    collector.collect_staged(&runtime, None, &mut |snapshot| {
+        published.push(snapshot);
+        true
+    });
+    published
+}
+
+#[test]
+fn a_staged_pass_streams_inventory_local_git_remote_then_completes() {
+    if !tmux_or_skip() {
+        return;
+    }
+    let world = world();
+    let published = staged(&world);
+    assert!(
+        published.len() >= 3,
+        "stages publish separately: {}",
+        published.len()
+    );
+
+    // The first publish is the stage-1 inventory: conversations and their
+    // runtime state with every Git-derived field still unknown - proof it
+    // landed before any Git read could have.
+    let first = &published[0];
+    assert!(!first.complete);
+    assert_eq!(first.conversations.len(), 8, "{:?}", first.conversations);
+    assert!(first.repos.is_empty() && first.work.is_empty());
+    assert!(
+        first
+            .conversations
+            .iter()
+            .all(|c| c.repo.is_none() && c.worktree.is_none() && c.branch.is_none()),
+        "stage 1 cannot hold resolved placement"
+    );
+    // But it is already a complete renderable view: the live conversation's
+    // published state is there.
+    let live = first
+        .conversations
+        .iter()
+        .find(|c| c.session_id == LIVE_ID)
+        .expect("the live conversation");
+    assert_eq!(live.state, ConversationState::Waiting);
+
+    // Every publish is a full snapshot - incomplete never means partial.
+    for snapshot in &published {
+        assert_eq!(snapshot.schema_version, SCHEMA_VERSION);
+        assert_eq!(snapshot.conversations.len(), 8);
+    }
+
+    // The repos land newest-activity first: the repo holding the live
+    // (recent) conversation's checkout before the second repo's, whose only
+    // conversation is an old transcript.
+    let repo_a = git::Repo::discover(&world.worktree)
+        .expect("discover")
+        .expect("a repo")
+        .common_dir()
+        .display()
+        .to_string();
+    let repo_b = git::Repo::discover(&world._repo2.main)
+        .expect("discover")
+        .expect("a repo")
+        .common_dir()
+        .display()
+        .to_string();
+    let lands = |id: &str| {
+        published
+            .iter()
+            .position(|s| s.repos.iter().any(|r| r.id == id && r.work > 0))
+            .unwrap_or_else(|| panic!("{id} never lands"))
+    };
+    assert!(
+        lands(&repo_a) < lands(&repo_b),
+        "newest-activity repo lands first"
+    );
+
+    // The final publish is complete and holds the same rows the
+    // single-shot collect produced - staged and unstaged classify alike.
+    let last = published.last().unwrap();
+    assert!(last.complete);
+    assert_eq!(last.conversations.len(), 8);
+    let login = last
+        .work
+        .iter()
+        .find(|w| w.name == "feat-login")
+        .expect("the worktree row");
+    assert_eq!(login.live_sessions, 1);
+    // Remote fields landed - no `?` placeholder survives the final publish.
+    assert_eq!(login.upstream, Upstream::NeverPushed);
+    let row = |name: &str| last.work.iter().find(|w| w.name == name).expect(name);
+    assert_eq!(row("feat-gone").upstream, Upstream::RemoteGone);
+    assert_eq!(row("feat-merged").landed, Some(Landed::Ancestor));
+    assert!(
+        last.work
+            .iter()
+            .all(|w| w.upstream_detail.as_deref() != Some("collection pending"))
+    );
+
+    // And it agrees with the direct one-pass collect field for field.
+    let direct = collect(&world);
+    assert_eq!(direct.complete, last.complete);
+    assert_eq!(direct.repos.len(), last.repos.len());
+    assert_eq!(direct.work.len(), last.work.len());
+    assert_eq!(direct.conversations.len(), last.conversations.len());
+    let direct_work = serde_json::to_value(&direct).unwrap()["work"].clone();
+    let staged_work = serde_json::to_value(last).unwrap()["work"].clone();
+    {
+        let d_order: Vec<_> = direct_work
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_owned())
+            .collect();
+        let s_order: Vec<_> = staged_work
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(d_order, s_order, "row order");
+    }
+    for (d, s) in direct_work
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(staged_work.as_array().unwrap())
+    {
+        assert_eq!(d, s, "row {}", s["name"]);
+    }
+    assert!(
+        serde_json::to_value(&direct).unwrap()["repos"]
+            == serde_json::to_value(last).unwrap()["repos"]
+    );
+    assert!(
+        serde_json::to_value(&direct).unwrap()["conversations"]
+            == serde_json::to_value(last).unwrap()["conversations"]
+    );
+}
+
+#[test]
+fn a_publish_that_returns_false_stops_the_pass() {
+    if !tmux_or_skip() {
+        return;
+    }
+    let world = world();
+    // Refusing at each publish boundary ends the pass there: stage 1, the
+    // stage-2 placements publish, mid-stage-2 (a repo merge), mid-stage-3
+    // (an apply). No refusal reaches the end - the pass is complete.
+    for stop_at in [1usize, 2, 4, 6] {
+        let root = world.home.join(".claude");
+        let mut collector = Collector::new(root).with_workers(1);
+        let runtime = Runtime::observe_over(std::slice::from_ref(&world.tmux.socket));
+        let mut count = 0;
+        let mut last = None;
+        collector.collect_staged(&runtime, None, &mut |s| {
+            count += 1;
+            last = Some(s);
+            count < stop_at
+        });
+        assert_eq!(
+            count, stop_at,
+            "the pass stops at the {stop_at}th refused publish"
+        );
+        assert!(
+            !last.unwrap().complete,
+            "a refused pass never publishes a complete snapshot"
+        );
+    }
+}
+
+#[test]
+fn a_second_pass_carries_remote_fields_until_they_are_replaced() {
+    if !tmux_or_skip() {
+        return;
+    }
+    let world = world();
+    let root = world.home.join(".claude");
+    let mut collector = Collector::new(root).with_workers(1);
+    let runtime = Runtime::observe_over(std::slice::from_ref(&world.tmux.socket));
+
+    let mut first = Vec::new();
+    collector.collect_staged(&runtime, None, &mut |s| {
+        first.push(s);
+        true
+    });
+    let mut second = Vec::new();
+    collector.collect_staged(&runtime, None, &mut |s| {
+        second.push(s);
+        true
+    });
+
+    // Remote evidence is deadline-cached across passes: the second pass
+    // proves nothing twice, but carries it forward - `feat-gone` shows
+    // remote_gone in the first stage-2 publish, before stage 3 ran at all.
+    let early = second
+        .iter()
+        .find(|s| s.work.iter().any(|w| w.name == "feat-gone"))
+        .expect("a publish with the work rows");
+    let gone = early.work.iter().find(|w| w.name == "feat-gone").unwrap();
+    assert_eq!(
+        gone.upstream,
+        Upstream::RemoteGone,
+        "carried from the last pass, not reset to ?"
+    );
+
+    // And the second pass's final snapshot agrees with the first's.
+    let last_a = serde_json::to_value(first.last().unwrap()).unwrap();
+    let last_b = serde_json::to_value(second.last().unwrap()).unwrap();
+    for key in ["repos", "work", "conversations"] {
+        assert_eq!(last_a[key], last_b[key], "{key} diverged across passes");
+    }
 }

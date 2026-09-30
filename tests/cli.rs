@@ -125,12 +125,22 @@ fn a_bare_invocation_under_a_terminal_quits_on_q() {
     // Give the event loop one idle tick first: an expired poll returns no
     // event, so the quiet path runs too.
     std::thread::sleep(std::time::Duration::from_millis(300));
+    // Exercise the key map for real: focus, movement, the detail pane, then
+    // `q` to leave. The lone escape needs its own write - sent together it
+    // would join `q` into an escape sequence.
     child
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(b"q")
-        .expect("q writes to the pty");
+        .write_all(b"12\tj\x1b[A\x1b[B\x7f\x0d")
+        .expect("keys write to the pty");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"\x1bq")
+        .expect("esc and q write to the pty");
     let out = child.wait_with_output().expect("the TUI exits");
     assert!(
         out.status.success(),
@@ -168,6 +178,9 @@ fn list_json_prints_the_complete_snapshot() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
     assert_eq!(json["schema_version"], 1, "{stdout}");
+    // The staged pipeline ran to completion: `list --json` prints only the
+    // final snapshot.
+    assert_eq!(json["complete"], true, "{stdout}");
     assert!(json["observed_at"].as_u64().unwrap_or(0) > 0);
     assert!(json["repos"].is_array() && json["work"].is_array());
     assert!(json["conversations"].is_array() && json["errors"].is_array());

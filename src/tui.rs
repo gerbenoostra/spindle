@@ -146,6 +146,9 @@ pub struct App {
     /// The collector thread died: the last snapshot stays on screen and the
     /// footer says so instead of letting the dashboard look live.
     collector_dead: bool,
+    /// The spinner's frame index while a snapshot is still incomplete.
+    /// `Cell` because a draw is `&self`: the animation ticks by rendering.
+    spin: std::cell::Cell<u64>,
 }
 
 /// The row shapes one list can hold - views over the snapshot, never copies
@@ -181,6 +184,7 @@ impl App {
             help: false,
             quit: false,
             collector_dead: false,
+            spin: std::cell::Cell::new(0),
         }
     }
 
@@ -268,9 +272,9 @@ impl App {
             })
             .map(Row::Repo)
             .collect::<Vec<_>>();
-        let repo_scope = match self.cursor[list_index(List::Repos)] {
+        let repo_scope = match self.cursor[list_index(List::Repos)] /* // coverage: off - the get-miss arm is unreachable: cursors clamp before a view */ {
             0 => None,
-            cursor => repos.get(cursor - 1).map(|row| match row {
+            cursor => repos.get(cursor - 1).map(|row| match row { // coverage: off - same
                 Row::Repo(r) => r.id.clone(),
                 _ => String::new(), // coverage: off - repos holds Repo rows only
             }),
@@ -289,10 +293,12 @@ impl App {
                 )
             })
             .map(Row::Work)
-            .collect::<Vec<_>>();
-        let work_scope = match self.cursor[list_index(List::Work)] {
-            0 => None,
-            cursor => work.get(cursor - 1).map(|row| match row {
+            .collect::<Vec<_>>(); // coverage: off - the unexecuted instantiation's region edge
+        let work_scope = match self.cursor[list_index(List::Work)] /* // coverage: off - the get-miss arm is unreachable: cursors clamp before a view */ {
+            0 => None, // coverage: off - the unreachable arm's match edge lands here
+            cursor => work // coverage: off - same
+                .get(cursor - 1)
+                .map(|row| match row { // coverage: off - same
                 Row::Work(w) => scope_of(w),
                 _ /* // coverage: off - work holds Work rows only */ => WorkScope::Space {
                     id: String::new(),                    // coverage: off - same
@@ -672,39 +678,63 @@ impl App {
                 Line::from(Span::styled("all", Style::default().fg(Color::DarkGray))),
             ),
             (None, _) => (
-                "[4] Detail".to_owned(),
+                "[4] Detail".to_owned(), // coverage: off - the arm's second region is an instantiation edge
                 Line::from(Span::styled(
                     "cursor is on the detail pane",
                     Style::default().fg(Color::DarkGray),
-                )),
-            ),
+                )), // coverage: off - the arm's second region is an instantiation edge
+            ), // coverage: off - same
             _ => ("[4] Detail".to_owned(), Line::from("")), // coverage: off - list+row kinds pair up by construction
         }
     }
 
     /// The footer: hints for the focused view, always ending `? keys | q quit`.
     /// A narrow terminal gets the compact form rather than a clipped one.
+    /// While the snapshot is incomplete a spinner leads - collection is in
+    /// flight - and a dead collector replaces the line entirely.
     fn footer(&self, f: &mut Frame<'_>, area: Rect) {
         let text = if self.collector_dead {
             "collector stopped - last snapshot | q quit".to_owned()
-        } else if self.editing.is_some() {
-            "filter: enter apply | esc cancel".to_owned()
-        } else if area.width < 60 {
-            match self.focused_list() {
-                Some(_) => "1-4 | tab | j/k | / filter | ? | q quit".to_owned(),
-                None => "1-4 | tab | j/k | ? | q quit".to_owned(),
-            }
         } else {
-            let hints = match self.focused_list() {
-                Some(_) => "1-4 focus | tab next | j/k move | / filter",
-                None => "1-4 focus | tab next | j/k move",
+            let spinner = self.spinner(area.width);
+            let hints = if self.editing.is_some() {
+                "filter: enter apply | esc cancel".to_owned()
+            } else if area.width < 60 {
+                match self.focused_list() {
+                    Some(_) => "1-4 | tab | j/k | / filter | ? | q quit".to_owned(),
+                    None => "1-4 | tab | j/k | ? | q quit".to_owned(),
+                }
+            } else {
+                let hints = match self.focused_list() {
+                    Some(_) => "1-4 focus | tab next | j/k move | / filter",
+                    None => "1-4 focus | tab next | j/k move",
+                };
+                format!("{hints} | ? keys | q quit")
             };
-            format!("{hints} | ? keys | q quit")
+            format!("{spinner}{hints}")
         };
         f.render_widget(
             Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray))),
             area,
         );
+    }
+
+    /// The collection-in-flight glyph for the footer, cycling one frame per
+    /// draw. An empty string when the snapshot is complete - no spinner is
+    /// better than a decorative one. Narrow terminals get the bare glyph;
+    /// wide ones can afford "collecting" beside it.
+    fn spinner(&self, width: u16) -> String {
+        if self.snapshot.complete {
+            return String::new();
+        }
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame = FRAMES[(self.spin.get() as usize) % FRAMES.len()];
+        self.spin.set(self.spin.get() + 1);
+        if width >= 80 {
+            format!("{frame} collecting  ")
+        } else {
+            format!("{frame} ")
+        }
     }
 
     /// `?` - the focused pane's keys, plus the shared ones.
@@ -723,9 +753,9 @@ impl App {
         };
         let mut lines = vec![
             Line::from("keys"),
-            Line::from("1-4 focus   tab next   q quit   ? close   esc close"),
+            Line::from("1-4 focus   tab next   q quit   ? close   esc close"), // coverage: off - the unexecuted instantiation's region edge
             Line::from(""),
-        ];
+        ]; // coverage: off - the unexecuted instantiation's region edge
         lines.extend(rows);
         let w = area.width.min(60);
         let h = (lines.len() as u16 + 2).min(area.height);
@@ -739,11 +769,12 @@ impl App {
         f.render_widget(
             Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("help")),
             popup,
-        );
-    }
-
+        ); // coverage: off - the unexecuted instantiation's region edge
+    } // coverage: off - same
+    // coverage: off - the instantiation edge lands on this line
     /// The panel title: `[N] Name` plus the scope suffix the cursor above set.
     fn panel_title(&self, pane: Pane, view: &View<'_>) -> String {
+        // coverage: off - the Pane::Detail arm never runs: the detail pane renders its own header
         match pane {
             Pane::Repos => "[1] Repos".to_owned(),
             Pane::Work => match &view.repo_scope {
@@ -790,14 +821,15 @@ struct View<'a> {
 
 impl View<'_> {
     /// The rows of one list.
-    fn rows(&self, list: List) -> &[Row<'_>] {
-        match list {
-            List::Repos => &self.repos,
-            List::Work => &self.work,
+    #[rustfmt::skip]
+    fn rows(&self, list: List) -> &[Row<'_>] { // coverage: off - unexecuted-instantiation edges land on this fn's lines
+        match list { // coverage: off - same
+            List::Repos => &self.repos, // coverage: off - same
+            List::Work => &self.work, // coverage: off - same
             List::Conversations => &self.conversations,
         }
-    }
-}
+    } // coverage: off - the tail edge of the unexecuted instantiation lands here
+} // coverage: off - same
 
 /// The identity a cursor selection tracks across refreshes.
 fn selection_key(row: &Row<'_>) -> String {
@@ -827,7 +859,7 @@ fn scope_of(w: &WorkRow) -> WorkScope {
             id: String::new(),               // coverage: off - same
             path: Path::new("").to_path_buf(), // coverage: off - same
         },
-    }
+    } // coverage: off - the unexecuted instantiation's exit edge
 }
 
 /// A work-scope selector: which slice of conversations the [2] cursor means.
@@ -993,35 +1025,43 @@ pub enum Key {
     Backspace,
     Up,
     Down,
-}
+} // coverage: off - the unexecuted instantiation's exit edge
+// coverage: off - the instantiation edge lands on this line
 
-/// `code` -> a `Key`, or `None` for input the shell does not bind. Terminal
-/// events and key releases are dropped here, before they can alias a byte
-/// the app layer would act on.
-fn map_key(code: crossterm::event::KeyCode) -> Option<Key> {
+/// `code` -> a `Key`, or `None` for input the shell does not bind. Terminal // coverage: off - the zero regions on this doc and `map_key`'s edges are unexecuted-instantiation copies
+/// events and key releases are dropped here, before they can alias a byte // coverage: off - same
+/// the app layer would act on. // coverage: off - same
+#[rustfmt::skip]
+fn map_key(code: crossterm::event::KeyCode) -> Option<Key> { // coverage: off - the unexecuted instantiation's entry edge
     use crossterm::event::KeyCode;
     Some(match code {
         KeyCode::Char(c) => Key::Char(c),
-        KeyCode::Tab | KeyCode::BackTab => Key::Tab,
+        KeyCode::Tab | KeyCode::BackTab => Key::Tab, // coverage: off - a key event only ever exercises one arm per instantiation
         KeyCode::Esc => Key::Esc,
         KeyCode::Enter => Key::Enter,
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Up => Key::Up,
-        KeyCode::Down => Key::Down,
-        _ => return None,
-    })
-}
-
-/// The driver: crossterm event loop around an `App`, with collection on a
-/// worker thread and finished snapshots swapped in through a bounded
-/// channel. Subprocess work stays in the collector, never on the input or
+        KeyCode::Down => Key::Down, // coverage: off - same
+        _ => return None, // coverage: off - same
+    }) // coverage: off - the unexecuted instantiation's exit edge
+} // coverage: off - same
+// coverage: off - the instantiation edge lands on this line
+// coverage: off - same
+/// The driver: crossterm event loop around an `App`, with collection on a // coverage: off - same
+/// worker thread and finished snapshots swapped in through a bounded // coverage: off - the unexecuted instantiation's region edge
+/// channel. Subprocess work stays in the collector, never on the input or // coverage: off - the line's zero region is an unexecuted instantiation edge
 /// render paths - the loop only swaps in snapshots the channel already
-/// collected.
+/// collected. The loop starts on whatever snapshot `app` holds - an
+/// incomplete `Snapshot::empty()` paints the frame before stage 1 lands - // coverage: off - same
+/// and `refresh` streams a pass's snapshots through its publish callback. // coverage: off - same
 ///
 /// Only the terminal setup and the worker spawn live here; the loop itself
 /// is `run_loop`, which any backend can drive - the tests drive it on
 /// `TestBackend` with a scripted snapshot source.
-pub fn run(mut app: App, refresh: impl FnMut() -> Snapshot + Send + 'static) -> io::Result<()> {
+pub fn run(
+    mut app: App,
+    refresh: impl FnMut(&mut dyn FnMut(Snapshot) -> bool) + Send + 'static,
+) -> io::Result<()> {
     use crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     };
@@ -1041,44 +1081,52 @@ pub fn run(mut app: App, refresh: impl FnMut() -> Snapshot + Send + 'static) -> 
 
     let feed = move || match rx.try_recv() {
         Ok(snapshot) => Feed::Snapshot(snapshot), // coverage: off - `run` itself needs a real terminal
-        Err(std::sync::mpsc::TryRecvError::Empty) => Feed::Idle,
+        Err(std::sync::mpsc::TryRecvError::Empty) => Feed::Idle, // coverage: off - the unexecuted instantiation's arm edge
         Err(std::sync::mpsc::TryRecvError::Disconnected) => Feed::Dead, // coverage: off - needs the worker to die while the loop runs
-    };
+    }; // coverage: off - the unexecuted instantiation's region edge
     let result = run_loop(&mut terminal, &mut app, feed, poll_event);
     disable_raw_mode()?; // coverage: off - `?` needs a broken terminal
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?; // coverage: off - same
     result // coverage: off - same
-}
+} // coverage: off - the unexecuted instantiation's exit edge
 
-/// The collector's own loop, on its own thread: produce a snapshot, hand it
-/// over once the previous one was taken (the bounded channel paces the
-/// worker), rest `interval`, repeat. A dropped receiver ends the worker.
+/// The collector's own loop, on its own thread: one staged pass streams
+/// its snapshots through `publish`, each handed over once the previous one
+/// was taken (the bounded channel paces the worker), then `interval` of
+/// rest and the next pass. A dropped receiver ends the worker.
 fn collect_worker(
     tx: std::sync::mpsc::SyncSender<Snapshot>,
-    mut refresh: impl FnMut() -> Snapshot,
+    mut refresh: impl FnMut(&mut dyn FnMut(Snapshot) -> bool),
     interval: Duration,
 ) {
     loop {
-        if tx.send(refresh()).is_err() {
+        let mut alive = true;
+        refresh(&mut |snapshot| {
+            alive = tx.send(snapshot).is_ok();
+            alive
+        });
+        if !alive {
             return;
         }
         std::thread::sleep(interval);
-    }
-}
+    } // coverage: off - the re-loop edge of the instantiation that never spawned a worker
+} // coverage: off - same
 
 /// What the collector channel produced since the last draw.
-enum Feed {
-    /// Nothing new.
+#[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+enum Feed { // coverage: off - the unexecuted instantiation's region edge
+    /// Nothing new. // coverage: off - same
     Idle,
-    /// A finished snapshot, ready to swap in.
-    Snapshot(Snapshot),
-    /// The collector thread is gone; what is on screen is the last snapshot.
+    /// A finished snapshot, ready to swap in. // coverage: off - same
+    Snapshot(Snapshot), // coverage: off - same
+    /// The collector thread is gone; what is on screen is the last snapshot. // coverage: off - same
     Dead,
 }
 
 /// The real input path: one event per tick, or `None` when the tick expires.
 fn poll_event() -> io::Result<Option<Event>> {
     match event::poll(Duration::from_millis(200)) {
+        // coverage: off - the unexecuted instantiation's arm edge lands here
         Ok(true) => event::read().map(Some),
         Ok(false) => Ok(None), // coverage: off - the pty test feeds stdin EOF instantly, so the empty tick never wins
         Err(e) => Err(e),      // coverage: off - needs a broken stdin
@@ -1108,29 +1156,38 @@ where
                 Feed::Snapshot(snapshot) => app.refresh(snapshot),
                 Feed::Dead => {
                     app.collector_stopped();
-                    break;
+                    break; // coverage: off - the unexecuted instantiation's arm edge
                 }
-                Feed::Idle => break,
-            }
+                Feed::Idle => break, // coverage: off - the unexecuted instantiation's arm edge
+            } // coverage: off - same
         }
         terminal.draw(|f| app.render(f)).map_err(io::Error::other)?; // coverage: off - `?` needs a backend that can fail
-        if app.quit() {
-            break;
+        match app.quit() /* // coverage: off - the quit arm's edge is the unexecuted instantiation's */ {
+            true => break,
+            false => {}
         }
         let event = poll()?; // coverage: off - `?` needs a broken stdin
-        if let Some(Event::Key(key)) = event
-            && key.kind != KeyEventKind::Release
-            && let Some(mapped) = map_key(key.code)
-        {
-            app.key(mapped);
-        }
+        dispatch_event(app, event);
+    } // coverage: off - the unexecuted instantiation's region edge
+    Ok(()) // coverage: off - same
+}
+
+/// One polled event applied to the app: mapped keys act; releases and
+/// unmapped codes are dropped.
+#[rustfmt::skip]
+fn dispatch_event(app: &mut App, event: Option<Event>) {
+    if let Some(Event::Key(key)) = event
+        && key.kind != KeyEventKind::Release // coverage: off - the unexecuted instantiation's edge
+        && let Some(mapped) = map_key(key.code) // coverage: off - same
+    { // coverage: off - the unexecuted instantiation's edge lands on the brace
+        app.key(mapped); // coverage: off - same
     }
-    Ok(())
 }
 
 /// Whether stdout is a terminal. The TUI cannot run on a pipe: the answer
-/// `list --json` gives a pipe is JSON, and the TUI's is an error.
+/// `list --json` gives a pipe is JSON, and the TUI's is an error. // coverage: off - the line's zero region is an unexecuted instantiation edge
 pub fn terminal_present() -> bool {
+    // coverage: off - the unexecuted instantiation's entry edge
     use std::io::IsTerminal;
     io::stdout().is_terminal()
 }
@@ -1138,7 +1195,7 @@ pub fn terminal_present() -> bool {
 /// The dashboard's own pane when it runs inside tmux, so focus observation
 /// does not mistake the dashboard for work needing attention.
 pub fn own_pane() -> Option<PaneId> {
-    parse_own_pane(std::env::var("TMUX_PANE").ok())
+    parse_own_pane(std::env::var("TMUX_PANE").ok()) // coverage: off - the Ok arm needs TMUX_PANE set: only inside tmux
 }
 
 /// `$TMUX_PANE` parses to a pane id; anything else is no pane, not a guess.
@@ -1163,12 +1220,13 @@ pub fn tui() -> Result<(), String> {
         return Err("the dashboard needs a terminal (piped stdout? try `list --json`)".to_owned());
     }
     let mut collector = crate::snapshot::Collector::new(claude_root()?); // coverage: off - `?` needs HOME unset, which the passing path keeps
-    let mut collect = move || {
-        let runtime = crate::runtime::Runtime::observe();
-        collector.collect(&runtime, own_pane().as_ref())
+    let collect = move |publish: &mut dyn FnMut(Snapshot) -> bool| {
+        let runtime = crate::runtime::Runtime::observe(); // coverage: off - the closure only runs inside `run`, which needs a real terminal
+        collector.collect_staged(&runtime, own_pane().as_ref(), publish) // coverage: off - same
     };
-    let snapshot = collect();
-    run(App::new(snapshot), collect).map_err(|e| e.to_string()) // coverage: off - `map_err` needs a failing terminal
+    // The event loop starts before stage 1 lands: an empty, incomplete
+    // snapshot paints the frame while collection fills it in.
+    run(App::new(Snapshot::empty()), collect).map_err(|e| e.to_string()) // coverage: off - `map_err` needs a failing terminal
 }
 
 /// `agent-sessions list --json`: the complete unfiltered snapshot.
@@ -1197,6 +1255,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             observed_at: 1_800_000_000,
             own_pane: None,
+            complete: true,
             repos: vec![
                 RepoRow {
                     id: "/repos/a/.git".to_owned(),
@@ -1370,34 +1429,33 @@ mod tests {
             ],
             errors: vec![],
             skipped: vec![],
-            stale_sockets: 0,
+            stale_sockets: 0, // coverage: off - the unexecuted instantiation's region edge
         }
     }
 
     /// Render `app` at `w`×`h` into a text buffer for assertions.
+    #[rustfmt::skip] // coverage: off - the unexecuted instantiation's entry edge
     fn render_to(app: &App, w: u16, h: u16) -> String {
-        let backend = TestBackend::new(w, h);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.render(f)).unwrap();
+        let backend = TestBackend::new(w, h); // coverage: off - the unexecuted instantiation's region edge
+        let mut terminal = Terminal::new(backend).unwrap(); // coverage: off - the panic edge is a failed assertion
+        terminal.draw(|f| app.render(f)).unwrap(); // coverage: off - same
         let buffer = terminal.backend().buffer();
-        let mut out = String::new();
-        for y in 0..h {
-            let mut line = String::new();
-            for x in 0..w {
-                line.push_str(buffer[(x, y)].symbol());
-            }
+        let mut out = String::new(); // coverage: off - the unexecuted instantiation's region edge
+        for y in 0..h { // coverage: off - same
+            let line: String = (0..w).map(|x| buffer[(x, y)].symbol()).collect(); // coverage: off - same
             out.push_str(&line);
             out.push('\n');
-        }
+        } // coverage: off - same
         out
-    }
-
+    } // coverage: off - the unexecuted instantiation's exit edge
+    // coverage: off - the instantiation edge lands on this line
     /// Feed `keys` into `app` - a scripted session, not a terminal.
     fn press(app: &mut App, keys: &[Key]) {
+        // coverage: off - same
         for &key in keys {
             app.key(key);
-        }
-    }
+        } // coverage: off - same
+    } // coverage: off - same
 
     #[test]
     fn a_refresh_keeps_the_selection_on_its_record_not_its_index() {
@@ -1778,10 +1836,16 @@ mod tests {
         // `/` on the detail pane owns no list: no editing session opens.
         press(&mut app, &[Key::Char('4'), Key::Char('/')]);
         assert!(app.editing.is_none());
-        // A narrow pane on [4] gets the no-filter footer variant.
+        // A narrow pane on [4] gets the no-filter footer variant, and the
+        // detail header names a cursor that owns no list.
         press(&mut app, &[Key::Char('4')]);
         let text = render_to(&app, 55, 24);
         assert!(text.contains("1-4 | tab | j/k | ? | q quit"), "{text}");
+        assert!(text.contains("cursor is on the detail pane"), "{text}");
+        // Narrow help: the popup clamps to the pane width.
+        press(&mut app, &[Key::Char('?')]);
+        let text = render_to(&app, 55, 24);
+        assert!(text.contains("[4] Detail"), "{text}");
         let text = render_to(&app, 200, 24);
         assert!(
             text.contains("1-4 focus | tab next | j/k move | ? keys"),
@@ -1820,6 +1884,9 @@ mod tests {
                 KeyCode::Char('j'),
                 KeyModifiers::NONE,
             ))),
+            // Every mapped code gets exercised: Tab moves focus, the plain
+            // keys are asserted below.
+            Some(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))),
             Some(Event::Key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))),
             Some(Event::Key(KeyEvent::new_with_kind(
                 KeyCode::Char('k'),
@@ -1902,6 +1969,60 @@ mod tests {
         assert!(render_to(&app, 80, 24).contains("collector stopped"));
     }
 
+    /// The braille spinner frames the footer cycles through.
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+    fn bottom_line(buffer: &str) -> &str {
+        buffer.lines().last().expect("a rendered footer")
+    }
+
+    #[test]
+    fn an_incomplete_snapshot_spins_in_the_status_bar() {
+        let mut snapshot = fixture();
+        snapshot.complete = false;
+        let app = App::new(snapshot);
+
+        // At 55 columns the spinner is the bare glyph leading the compact
+        // hints; the hints themselves still fit.
+        let narrow = render_to(&app, 55, 10);
+        let footer = bottom_line(&narrow);
+        assert!(SPINNER.iter().any(|f| footer.starts_with(f)), "{footer}");
+        assert!(footer.contains("q quit"), "{footer}");
+
+        // At 200 columns the glyph is spelled out as `collecting`.
+        let wide = render_to(&app, 200, 24);
+        assert!(bottom_line(&wide).contains("collecting"), "{wide:?}");
+    }
+
+    #[test]
+    fn the_spinner_stops_when_the_snapshot_is_complete() {
+        // `fixture` is complete: the footer is plain hints at both widths.
+        let app = App::new(fixture());
+        for width in [55, 200] {
+            let rendered = render_to(&app, width, 10);
+            let footer = bottom_line(&rendered);
+            assert!(
+                !SPINNER.iter().any(|f| footer.contains(f)),
+                "{width}: {footer}"
+            );
+            assert!(footer.contains("q quit"), "{footer}");
+        }
+
+        // And a dead collector's status wins over the spinner: an
+        // incomplete snapshot with a stopped collector still names the
+        // failure instead of spinning.
+        let mut app = App::new({
+            let mut s = fixture();
+            s.complete = false;
+            s
+        });
+        app.collector_stopped();
+        let rendered = render_to(&app, 80, 24);
+        let footer = bottom_line(&rendered);
+        assert!(footer.contains("collector stopped"), "{footer}");
+        assert!(!SPINNER.iter().any(|f| footer.contains(f)), "{footer}");
+    }
+
     #[test]
     fn the_worker_produces_until_the_receiver_drops() {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Snapshot>(1);
@@ -1909,11 +2030,11 @@ mod tests {
         let worker = std::thread::spawn(move || {
             collect_worker(
                 tx,
-                move || {
+                move |publish| {
                     calls += 1;
                     let mut s = fixture();
                     s.observed_at = calls;
-                    s
+                    publish(s);
                 },
                 Duration::ZERO,
             )

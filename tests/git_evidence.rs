@@ -185,6 +185,25 @@ fn standard() -> FixtureRepo {
     f
 }
 
+/// The anchor keying `collect_all` uses, shared so the batched and probed
+/// maps align.
+fn key_of(anchor: &Anchor) -> String {
+    match anchor {
+        Anchor::Branch { name } => format!("branch:{name}"),
+        Anchor::Worktree { path, head, .. } => match head {
+            Head::Branch(name) | Head::Unborn(name) => {
+                format!("wt:{name}@{}", path.file_name().unwrap().to_string_lossy())
+            }
+            Head::Detached(_) => {
+                format!(
+                    "wt:detached@{}",
+                    path.file_name().unwrap().to_string_lossy()
+                )
+            }
+        },
+    }
+}
+
 /// All anchors of the fixture, keyed by a name the table can assert against.
 /// One `RemoteCache` for the batch, as the collectors will share one pass.
 fn collect_all(f: &FixtureRepo) -> BTreeMap<String, WorkState> {
@@ -196,20 +215,7 @@ fn collect_all(f: &FixtureRepo) -> BTreeMap<String, WorkState> {
         .expect("anchors")
         .into_iter()
         .map(|anchor| {
-            let key = match &anchor {
-                Anchor::Branch { name } => format!("branch:{name}"),
-                Anchor::Worktree { path, head, .. } => match head {
-                    Head::Branch(name) | Head::Unborn(name) => {
-                        format!("wt:{name}@{}", path.file_name().unwrap().to_string_lossy())
-                    }
-                    Head::Detached(_) => {
-                        format!(
-                            "wt:detached@{}",
-                            path.file_name().unwrap().to_string_lossy()
-                        )
-                    }
-                },
-            };
+            let key = key_of(&anchor);
             (
                 key,
                 vector::collect_cached(&repo, &mut cache, &anchor, quiet()),
@@ -1299,4 +1305,110 @@ fn an_unfetched_remote_leaves_no_local_base_evidence() {
         "{:?}",
         state.base
     );
+}
+
+/// The staged collector reads each repo's branch facts from one
+/// `for-each-ref` and applies remote evidence afterwards. It must agree
+/// with the per-branch probes it replaces on every fixture row - verdicts,
+/// reasons and the evidence fields behind them alike.
+#[test]
+fn the_batched_read_agrees_with_the_per_branch_probes() {
+    let f = standard();
+    let probed = collect_all(&f);
+
+    let repo = git::Repo::discover(f.main.as_path())
+        .expect("discover")
+        .expect("the clone is a repo");
+    let mut local = vector::collect_local_repo(&repo, |_| quiet()).expect("local");
+    let applied = vector::apply_remote(&repo, &local, |r, name| r.remote_listing(name));
+    assert_eq!(applied.len(), local.anchors.len());
+    /// A row's evidence dump plus its removal/deletion verdict pair.
+    type RowFacts = (String, (Verdict, Vec<String>, Verdict, Vec<String>));
+    let mut batched: BTreeMap<String, RowFacts> = BTreeMap::new();
+    for (work, applied) in local.anchors.iter_mut().zip(applied) {
+        work.apply(applied);
+        batched.insert(
+            key_of(&work.state.anchor),
+            (
+                evidence_text(&work.state),
+                verdicts(&work.state, &no_item()),
+            ),
+        );
+    }
+
+    // The same anchors, keyed identically.
+    let probed_keys: Vec<&String> = probed.keys().collect();
+    let batched_keys: Vec<&String> = batched.keys().collect();
+    assert_eq!(probed_keys, batched_keys);
+
+    for (key, probed_state) in &probed {
+        let (batched_evidence, batched_verdicts) = &batched[key];
+        // The whole evidence surface, not just its verdicts.
+        assert_eq!(
+            evidence_text(probed_state),
+            *batched_evidence,
+            "{key}: evidence disagrees"
+        );
+        assert_eq!(
+            verdicts(probed_state, &no_item()),
+            *batched_verdicts,
+            "{key}: verdicts disagree"
+        );
+    }
+}
+
+/// Everything a verdict (and a row) can read except `last_git_activity`,
+/// which legitimately differs: the batch adds the tip's committerdate on
+/// branch anchors where the probe path has only the reflog.
+fn evidence_text(s: &WorkState) -> String {
+    format!(
+        "remote_url={:?} base={:?} worktree={:?} windows={:?} live_pids={} \
+         live_sessions={} past_sessions={} dirty={:?} commits_ahead={:?} \
+         upstream={:?} unpushed={:?} landed={:?}",
+        s.remote_url,
+        s.base,
+        s.vector.worktree,
+        s.vector.windows,
+        s.vector.live_pids,
+        s.vector.live_agent_sessions,
+        s.vector.past_agent_sessions,
+        s.vector.dirty,
+        s.vector.commits_ahead_of_base,
+        s.vector.upstream_state,
+        s.vector.unpushed_commits,
+        s.vector.landed,
+    )
+}
+
+/// `git worktree list` reports a locked checkout; the anchor must carry it,
+/// since removal of locked work is a different conversation entirely.
+#[test]
+fn a_locked_worktree_marks_its_anchor() {
+    let f = FixtureRepo::new("origin");
+    f.branch_with_commits("feat", 1, false);
+    let wt = f.add_worktree("feat", Some("feat"));
+    f.git(&f.main, &["worktree", "lock", wt.to_str().unwrap()]);
+    let repo = git::Repo::discover(f.main.as_path())
+        .expect("discover")
+        .expect("the clone is a repo");
+    let anchor = vector::anchors(&repo)
+        .expect("anchors")
+        .into_iter()
+        .find(|a| matches!(a, Anchor::Worktree { path, .. } if path == &wt))
+        .expect("the worktree anchor");
+    let Anchor::Worktree { locked, .. } = anchor else {
+        panic!("a worktree anchor") // coverage: off - the find above already matched
+    };
+    assert!(locked);
+    // The staged local read agrees: lock state is local evidence.
+    let local = vector::collect_local_repo(&repo, |_| quiet()).expect("local");
+    let work = local
+        .anchors
+        .iter()
+        .find(|w| w.state.anchor.branch() == Some("feat"))
+        .expect("the anchor");
+    assert!(matches!(
+        work.state.anchor,
+        Anchor::Worktree { locked: true, .. }
+    ));
 }
