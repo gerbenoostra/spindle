@@ -381,9 +381,11 @@ pub fn derive(inputs: Inputs<'_>) -> Derived {
         attention = Attention::Unknown;
         detail = None;
     }
-    if attention == Attention::None && inputs.live.is_some() && exec == Exec::Unknown {
+    if attention == Attention::None && inputs.live.is_some() && since_ms.is_none() {
         // Live but with no applicable evidence at all: `?`, not a guess.
-        // A live conversation that is simply idle carries no glyph.
+        // Evidence that proves no execution - an acknowledged `error` -
+        // still answers, as does a live conversation that is simply idle:
+        // neither carries a glyph.
         attention = Attention::Unknown;
     }
 
@@ -556,6 +558,13 @@ mod tests {
         in_.published = Some(published(95_000));
         in_.seen.wait_ms = Some(90_000);
         assert_eq!(derive(in_).attention, Attention::Waiting);
+        // An acknowledged `error` on a live process proves no execution,
+        // but it is evidence: no glyph, not `?`.
+        let fold = fold_with(&[(NormEvent::Start, 50_000), (NormEvent::Error, 60_000)]);
+        let mut in_ = inputs(&fold, Some((7, Some(90))), &mut idle);
+        in_.seen.seq = 2;
+        let d = derive(in_);
+        assert_eq!((d.exec, d.attention), (Exec::Unknown, Attention::None));
         // And with seen-state unreadable a live wait is `?`, not a guess.
         let mut in_ = inputs(&empty, Some((7, Some(90))), &mut idle);
         in_.published = Some(published(90_000));
