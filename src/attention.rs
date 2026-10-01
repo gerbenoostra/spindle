@@ -16,7 +16,7 @@
 use serde::Serialize;
 
 use crate::provider::PublishedStatus;
-use crate::store::{Exec, Fold, Mark, NormEvent};
+use crate::store::{Exec, Fold, Mark, NormEvent, Seen};
 
 /// What a row is asking of the user, or proving about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -107,9 +107,9 @@ pub struct Published {
 pub struct Inputs<'a> {
     /// The journal reduction; `None` (or empty) means no events arrived.
     pub fold: Option<&'a Fold>,
-    /// The acknowledgement high-water mark: retained events at or below
-    /// it are seen.
-    pub seen_through: u64,
+    /// What the user has acknowledged: retained events at or below its
+    /// sequence, and the live wait episode it names.
+    pub seen: Seen,
     /// The authored not-busy mark, when one exists.
     pub mark: Option<&'a Mark>,
     /// The provider-published state, present only when it is bound to a
@@ -144,6 +144,9 @@ pub struct Derived {
     /// The commit sequence an acknowledgement writes through: the highest
     /// unacknowledged retained event, `0` when nothing awaits.
     pub ack_through: u64,
+    /// The live wait episode an acknowledgement records: its `since`
+    /// while `exec` is a `Waiting` the user has not seen, else `None`.
+    pub wait_ms: Option<u64>,
     /// The newest event the conversation has - a not-busy mark written at
     /// this sequence is superseded by anything above it.
     pub journal_seq: u64,
@@ -239,7 +242,7 @@ pub fn derive(inputs: Inputs<'_>) -> Derived {
     let unacked: Vec<&crate::store::Retained> = fold
         .retained
         .iter()
-        .filter(|r| r.seq > inputs.seen_through)
+        .filter(|r| r.seq > inputs.seen.seq)
         .collect();
     let ack_through = unacked.iter().map(|r| r.seq).max().unwrap_or(0);
 
@@ -337,6 +340,18 @@ pub fn derive(inputs: Inputs<'_>) -> Derived {
         inputs.idle.reset();
     }
 
+    // A live wait is seen once its episode was acknowledged - by its
+    // `since`, or through the sequence of the event that opened it - and
+    // shows again only when a newer wait begins.
+    let wait_seen = exec == Exec::Waiting
+        && (since_ms.is_some() && inputs.seen.wait_ms == since_ms
+            || winner_seq > 0 && winner_seq <= inputs.seen.seq);
+    let wait_ms = if exec == Exec::Waiting && !wait_seen {
+        since_ms
+    } else {
+        None
+    };
+
     // Attention sources: every unacknowledged latch, plus the live claim.
     let mut attention = Attention::None;
     let mut detail = None;
@@ -356,13 +371,13 @@ pub fn derive(inputs: Inputs<'_>) -> Derived {
         consider(kind, r.reason.as_deref());
     }
     match exec {
-        Exec::Waiting => consider(Attention::Waiting, waiting_for.as_deref()),
+        Exec::Waiting if !wait_seen => consider(Attention::Waiting, waiting_for.as_deref()),
         Exec::Busy if !marked => consider(Attention::Working, None),
         _ => {}
     }
-    if !inputs.ack_ok && ack_through > 0 {
-        // The latches exist but their acknowledgement cannot be
-        // established: `?`, never a guessed glyph.
+    if !inputs.ack_ok && (ack_through > 0 || wait_ms.is_some()) {
+        // Attention exists but its acknowledgement cannot be established:
+        // `?`, never a guessed glyph.
         attention = Attention::Unknown;
         detail = None;
     }
@@ -379,6 +394,7 @@ pub fn derive(inputs: Inputs<'_>) -> Derived {
         attention,
         attention_detail: detail,
         ack_through,
+        wait_ms,
         journal_seq: fold.last_seq,
         marked,
     }
@@ -431,7 +447,7 @@ mod tests {
     ) -> Inputs<'a> {
         Inputs {
             fold: Some(fold),
-            seen_through: 0,
+            seen: Seen::default(),
             mark: None,
             published: None,
             live,
@@ -484,7 +500,7 @@ mod tests {
         let mut idle = WeakIdle::default();
         let fold = fold_with(&[(NormEvent::Start, 50_000), (NormEvent::End, 60_000)]);
         let mut in_ = inputs(&fold, Some((7, Some(90))), &mut idle);
-        in_.seen_through = 2;
+        in_.seen.seq = 2;
         let d = derive(in_);
         assert_eq!(d.attention, Attention::None);
         assert_eq!(d.ack_through, 0);
@@ -500,6 +516,54 @@ mod tests {
     }
 
     #[test]
+    fn an_acknowledged_wait_clears_until_a_newer_wait_begins() {
+        let mut idle = WeakIdle::default();
+        // A hook-driven wait, acknowledged through its event's sequence:
+        // the agent still waits, but nothing asks to be seen.
+        let fold = fold_with(&[(NormEvent::Start, 50_000), (NormEvent::Awaiting, 60_000)]);
+        let d = derive(inputs(&fold, Some((7, Some(90))), &mut idle));
+        assert_eq!(d.wait_ms, Some(60_000));
+        let mut in_ = inputs(&fold, Some((7, Some(90))), &mut idle);
+        in_.seen.seq = 2;
+        let d = derive(in_);
+        assert_eq!(d.exec, Exec::Waiting);
+        assert_eq!(d.attention, Attention::None);
+        assert_eq!((d.ack_through, d.wait_ms), (0, None));
+
+        // A wait only the provider published carries no sequence: its
+        // episode is acknowledged by its `since`.
+        let published = |since: u64| Published {
+            status: Some(PublishedStatus::Waiting),
+            waiting_for: Some("permission prompt".to_owned()),
+            observed_ms: since,
+            since_ms: Some(since),
+        };
+        let empty = Fold::default();
+        let mut in_ = inputs(&empty, Some((7, Some(90))), &mut idle);
+        in_.published = Some(published(90_000));
+        let d = derive(in_);
+        assert_eq!(d.attention, Attention::Waiting);
+        assert_eq!((d.ack_through, d.wait_ms), (0, Some(90_000)));
+        let mut in_ = inputs(&empty, Some((7, Some(90))), &mut idle);
+        in_.published = Some(published(90_000));
+        in_.seen.wait_ms = Some(90_000);
+        let d = derive(in_);
+        assert_eq!(d.exec, Exec::Waiting);
+        assert_eq!(d.attention, Attention::None);
+        assert_eq!(d.wait_ms, None);
+        // A newer wait episode is unseen again.
+        let mut in_ = inputs(&empty, Some((7, Some(90))), &mut idle);
+        in_.published = Some(published(95_000));
+        in_.seen.wait_ms = Some(90_000);
+        assert_eq!(derive(in_).attention, Attention::Waiting);
+        // And with seen-state unreadable a live wait is `?`, not a guess.
+        let mut in_ = inputs(&empty, Some((7, Some(90))), &mut idle);
+        in_.published = Some(published(90_000));
+        in_.ack_ok = false;
+        assert_eq!(derive(in_).attention, Attention::Unknown);
+    }
+
+    #[test]
     fn death_keeps_the_latch_but_claims_no_execution() {
         let mut idle = WeakIdle::default();
         let fold = fold_with(&[(NormEvent::Start, 50_000), (NormEvent::Error, 60_000)]);
@@ -509,7 +573,7 @@ mod tests {
         assert_eq!(d.attention, Attention::Error);
         // An acknowledged error on a dead conversation is clean history.
         let mut in_ = inputs(&fold, None, &mut idle);
-        in_.seen_through = 2;
+        in_.seen.seq = 2;
         let d = derive(in_);
         assert_eq!(d.attention, Attention::None);
     }

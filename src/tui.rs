@@ -399,9 +399,9 @@ impl App {
     /// authored files, then the next collect reflects it.
     ///
     /// On a row carrying unacknowledged attention, `space` writes
-    /// seen-state through the newest unacknowledged event: a
-    /// deliberate acknowledgement, the same one a focus observation
-    /// writes. On a row that is `Busy` with none of that, `space` is the
+    /// seen-state through the newest unacknowledged event and the live
+    /// wait it shows: a deliberate acknowledgement, the same one a focus
+    /// observation writes. On a row that is `Busy` with none of that, `space` is the
     /// authored not-busy mark instead - it names the dismissed `Busy`'s
     /// `effective_since` and is superseded by any newer event or
     /// observation. A `repos` row does neither. A work row decides once
@@ -434,12 +434,13 @@ impl App {
         // pending latch turns the whole keypress into acknowledgements -
         // a not-busy mark written beside unacknowledged attention would
         // contradict it.
-        let ack_only =
-            matches!(row, Row::Work(_)) && convs.iter().any(|c| c.attention_seq.is_some());
+        let pending =
+            |c: &ConversationRow| c.attention_seq.is_some() || c.attention_wait_ms.is_some();
+        let ack_only = matches!(row, Row::Work(_)) && convs.iter().any(|c| pending(c));
         for c in convs {
             let key = store::conversation_key(c.provider.as_str(), &c.session_id);
-            if let Some(through) = c.attention_seq {
-                let _ = store.acknowledge(&key, through);
+            if pending(c) {
+                let _ = store.acknowledge(&key, c.attention_seq.unwrap_or(0), c.attention_wait_ms);
             } else if !ack_only
                 && c.attention == Attention::Working
                 && let Some(since_ms) = c.state_since_ms
@@ -1506,6 +1507,7 @@ mod tests {
                     attention: Attention::Waiting, // coverage: off - the unexecuted instantiation's region edge
                     attention_detail: Some("permission prompt".to_owned()), // coverage: off - the unexecuted instantiation's region edge
                     attention_seq: Some(4),
+                    attention_wait_ms: Some((1_800_000_000 - 120) * 1000),
                     journal_seq: Some(7), // coverage: off - the unexecuted instantiation's region edge
                     last_activity: Some(1_800_000_000 - 120), // coverage: off - the unexecuted instantiation's region edge
                     live: true, // coverage: off - the unexecuted instantiation's region edge
@@ -1549,6 +1551,7 @@ mod tests {
                     attention: Attention::None,
                     attention_detail: None,
                     attention_seq: None,
+                    attention_wait_ms: None,
                     journal_seq: None,
                     last_activity: Some(1_800_000_000 - 3600),
                     live: false,
@@ -1580,6 +1583,7 @@ mod tests {
                     attention: Attention::None,
                     attention_detail: None,
                     attention_seq: None,
+                    attention_wait_ms: None,
                     journal_seq: None,
                     last_activity: None,
                     live: false,
@@ -1797,17 +1801,43 @@ mod tests {
         let store = crate::store::Store::open(dir.clone());
         let mut app = App::new(fixture()).with_store(store);
         // Cursor on the waiting conversation: `space` writes seen-state
-        // through its `attention_seq`.
+        // through its `attention_seq` and the live wait it shows.
         press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
         let seen = crate::store::Store::open(dir.clone()).load().seen;
         let key = store::conversation_key("claude", "8f423bbb-1111-2222-3333-444444444444");
-        assert_eq!(seen.get(&key).copied(), Some(4), "{seen:?}");
+        let wait = Some((1_800_000_000 - 120) * 1000);
+        assert_eq!(
+            seen.get(&key).copied(),
+            Some(store::Seen {
+                seq: 4,
+                wait_ms: wait
+            }),
+            "{seen:?}"
+        );
+        // A wait only the provider published has no sequence: `space`
+        // acknowledges its episode alone.
+        let other = store::conversation_key("claude", "published-wait");
+        let mut snapshot = fixture();
+        snapshot.conversations[0].session_id = "published-wait".to_owned();
+        snapshot.conversations[0].attention_seq = None;
+        app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let seen = crate::store::Store::open(dir.clone()).load().seen;
+        assert_eq!(
+            seen.get(&other).copied(),
+            Some(store::Seen {
+                seq: 0,
+                wait_ms: wait
+            }),
+            "{seen:?}"
+        );
         // Cursor on a plain `Busy` conversation with nothing to ack: `space`
         // writes the not-busy mark naming the `Busy`'s `effective_since`.
         let mut snapshot = fixture();
         snapshot.conversations[0].attention = Attention::Working;
         snapshot.conversations[0].attention_detail = None;
         snapshot.conversations[0].attention_seq = None;
+        snapshot.conversations[0].attention_wait_ms = None;
         snapshot.conversations[0].state = ConversationState::Busy;
         app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
         press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
@@ -1821,6 +1851,7 @@ mod tests {
         snapshot.conversations[0].attention = Attention::Working;
         snapshot.conversations[0].attention_detail = None;
         snapshot.conversations[0].attention_seq = None;
+        snapshot.conversations[0].attention_wait_ms = None;
         snapshot.conversations[0].journal_seq = None;
         snapshot.conversations[0].state = ConversationState::Busy;
         app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
@@ -1853,6 +1884,7 @@ mod tests {
         let mut snapshot = fixture();
         snapshot.conversations[0].attention = Attention::None;
         snapshot.conversations[0].attention_seq = None;
+        snapshot.conversations[0].attention_wait_ms = None;
         snapshot.conversations[0].journal_seq = None;
         app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
         press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
@@ -1876,7 +1908,7 @@ mod tests {
         let loaded = crate::store::Store::open(dir.clone()).load();
         let waiting = store::conversation_key("claude", "8f423bbb-1111-2222-3333-444444444444");
         assert_eq!(
-            loaded.seen.get(&waiting).copied(),
+            loaded.seen.get(&waiting).map(|s| s.seq),
             Some(4),
             "{:?}",
             loaded.seen

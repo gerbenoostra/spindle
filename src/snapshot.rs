@@ -314,6 +314,9 @@ pub struct ConversationRow {
     /// The journal sequence an acknowledgement would write through: the
     /// highest unacknowledged latch. `None` when nothing awaits.
     pub attention_seq: Option<u64>,
+    /// The live wait episode an acknowledgement records: the `since` of a
+    /// `waiting` the user has not seen, epoch milliseconds.
+    pub attention_wait_ms: Option<u64>,
     /// The newest event sequence the conversation has; a not-busy mark
     /// written at it is superseded by anything newer.
     pub journal_seq: Option<u64>,
@@ -483,56 +486,32 @@ impl Collector {
             .map(|i| attachment_of[i].is_some_and(|slot| resolved[slot].liveness.may_be_live()))
             .collect();
 
-        // Focus acknowledgement: a poll that observes a bound pane active,
-        // its window current and its session attached acknowledges the
-        // conversation's unacknowledged events - unless the pane is the
-        // dashboard's own, which cannot prove the user saw the agent.
-        if let Some(store) = &self.store {
-            for (i, conv) in inventory.conversations.iter().enumerate() {
-                let Some(slot) = attachment_of[i] else {
-                    continue;
-                };
-                let Some(pref) = &resolved[slot].attachment.pane else {
-                    continue;
-                };
-                let watched = runtime.panes.panes.iter().any(|p| {
-                    p.id == pref.pane
-                        && p.socket == pref.socket
-                        && p.active
-                        && p.window_active
-                        && p.session_attached > 0
-                });
-                let own = is_own_pane(own_pane, pref);
-                if !watched || own {
-                    continue;
-                }
-                let key = store::conversation_key("claude", &conv.session_id);
-                let through = loaded
-                    .folds
-                    .get(&key)
-                    .map(|f| f.unacked_through(loaded.seen.get(&key).copied().unwrap_or(0)))
-                    .unwrap_or(0);
-                if through == 0 {
-                    continue; // coverage: off - the unexecuted instantiation's region edge
-                } // coverage: off - the unexecuted instantiation's region edge
-                match store.acknowledge(&key, through) {
-                    Ok(()) => {
-                        loaded.seen.insert(key, through);
-                    }
-                    Err(e) => self.model.errors.push(SourceError /* // coverage: off - a store write failure needs the filesystem to fail mid-pass; the latch shows again next pass */ {
-                        // coverage: off - an acknowledge failure needs a store write fault mid-pass; the latch simply shows again next pass
-                        source: "store".to_owned(), // coverage: off - same
-                        detail: format!("seen-state for {key:?}: {e}"), // coverage: off - same
-                    }), // coverage: off - the unexecuted instantiation's region edge
-                }
-            }
-        }
+        // Focus: a poll that observes a bound pane active, its window
+        // current and its session attached proves the user saw the agent -
+        // unless the pane is the dashboard's own, which cannot.
+        let watched: Vec<bool> = (0..inventory.conversations.len())
+            .map(|i| {
+                attachment_of[i]
+                    .and_then(|slot| resolved[slot].attachment.pane.as_ref())
+                    .is_some_and(|pref| {
+                        !is_own_pane(own_pane, pref)
+                            && runtime.panes.panes.iter().any(|p| {
+                                p.id == pref.pane
+                                    && p.socket == pref.socket
+                                    && p.active
+                                    && p.window_active
+                                    && p.session_attached > 0
+                            })
+                    })
+            })
+            .collect();
 
         // The conversation rows keep their previous Work placement until
         // stage 2 resolves this pass's cwds - a moved checkout shows its
         // last proven anchor rather than flickering to `?` every refresh.
         // The model keeps inventory order so `placements[i]` stays aligned;
         // the attention sort happens per publish.
+        let now_ms = store::epoch_ms(observed_at);
         let mut conversations: Vec<ConversationRow> = Vec::new();
         for (i, conv) in inventory.conversations.iter().enumerate() {
             let resolved_claim = attachment_of[i].map(|slot| &resolved[slot]);
@@ -549,46 +528,44 @@ impl Collector {
                     .may_be_live()
                     .then_some((r.attachment.process.pid, pid_start))
             });
-            let published = (live.is_some() && conv.live.is_some()).then(|| match conv.state() {
-                StateEvidence::Published(p) => {
-                    let observed = conv
-                        .live
-                        .as_ref()
-                        .and_then(|l| l.updated_at)
-                        .unwrap_or(observed_at);
-                    attention::Published {
-                        status: p.status,
-                        waiting_for: p.waiting_for,
-                        observed_ms: store::epoch_ms(observed),
-                        since_ms: conv
-                            .live
-                            .as_ref()
-                            .and_then(|l| l.status_updated_at.or(l.updated_at))
-                            .map(store::epoch_ms),
+            let published = live.and(conv.live.as_ref()).map(|l| attention::Published {
+                status: l.status,
+                waiting_for: l.waiting_for.clone(),
+                observed_ms: store::epoch_ms(l.updated_at.unwrap_or(observed_at)),
+                since_ms: l.status_updated_at.or(l.updated_at).map(store::epoch_ms),
+            });
+            let idle = self.idles.entry(key.clone()).or_default();
+            let derive = |seen: store::Seen, idle: &mut attention::WeakIdle| {
+                attention::derive(attention::Inputs {
+                    fold: loaded.folds.get(&key),
+                    seen,
+                    mark: loaded.marks.get(&key),
+                    published: published.clone(),
+                    live,
+                    now_ms,
+                    ack_ok: loaded.ack_readable,
+                    idle,
+                })
+            };
+            let mut derived = derive(loaded.seen.get(&key).copied().unwrap_or_default(), idle);
+            // A watched conversation's pending attention is acknowledged on
+            // the spot - every unseen latch and the live wait - and the row
+            // derives again on what was stored.
+            if watched[i]
+                && (derived.ack_through > 0 || derived.wait_ms.is_some())
+                && let Some(store) = &self.store
+            {
+                match store.acknowledge(&key, derived.ack_through, derived.wait_ms) {
+                    Ok(seen) => {
+                        loaded.seen.insert(key.clone(), seen);
+                        derived = derive(seen, idle);
                     }
+                    Err(e) => self.model.errors.push(SourceError {
+                        source: "store".to_owned(),
+                        detail: format!("seen-state for {key:?}: {e}"),
+                    }),
                 }
-                #[rustfmt::skip]
-                StateEvidence::Absent => attention::Published { // coverage: off - unreachable: the `conv.live.is_some()` guard means `state()` is always Published here
-                    status: None, // coverage: off - same
-                    waiting_for: None, // coverage: off - same
-                    observed_ms: store::epoch_ms(observed_at), // coverage: off - same
-                    since_ms: None, // coverage: off - same
-                }, // coverage: off - the unexecuted instantiation's region edge
-            }); // coverage: off - the unexecuted instantiation's region edge
-            #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
-            let derived = attention::derive(attention::Inputs { // coverage: off - the unexecuted instantiation's region edge
-                // coverage: off - the unexecuted instantiation's region edge
-                // coverage: off - the unexecuted instantiation's region edge
-                // coverage: off - the unexecuted instantiation's region edge
-                fold: loaded.folds.get(&key), // coverage: off - the unexecuted instantiation's region edge
-                seen_through: loaded.seen.get(&key).copied().unwrap_or(0), // coverage: off - the unexecuted instantiation's region edge
-                mark: loaded.marks.get(&key), // coverage: off - the unexecuted instantiation's region edge
-                published, // coverage: off - the unexecuted instantiation's region edge
-                live,      // coverage: off - the unexecuted instantiation's region edge
-                now_ms: store::epoch_ms(observed_at), // coverage: off - the unexecuted instantiation's region edge
-                ack_ok: loaded.ack_readable, // coverage: off - the unexecuted instantiation's region edge
-                idle: self.idles.entry(key).or_default(),
-            }); // coverage: off - the unexecuted instantiation's region edge
+            }
             let carried = self // coverage: off - the unexecuted instantiation's region edge
                 .model // coverage: off - the unexecuted instantiation's region edge
                 .conversations // coverage: off - the unexecuted instantiation's region edge
@@ -1409,6 +1386,7 @@ fn conversation_row(
         attention: derived.attention,
         attention_detail: derived.attention_detail,
         attention_seq: (derived.ack_through > 0).then_some(derived.ack_through),
+        attention_wait_ms: derived.wait_ms,
         journal_seq: (derived.journal_seq > 0).then_some(derived.journal_seq),
         last_activity: conv.last_activity().map(epoch),
         live: conv.live.is_some(),
@@ -1582,6 +1560,7 @@ mod tests {
             attention,
             attention_detail: None,
             ack_through: 0,
+            wait_ms: None,
             journal_seq: 0,
             marked: false,
         }
@@ -1932,6 +1911,7 @@ mod tests {
             attention,
             attention_detail: None,
             attention_seq: None,
+            attention_wait_ms: None,
             journal_seq: None,
             last_activity: None,
             live: false,

@@ -505,9 +505,34 @@ fn attention_flows_end_to_end() {
     );
     let seen = Store::open(store_dir(&env)).load().seen;
     assert_eq!(
-        seen.get(&agent_sessions::store::conversation_key("claude", LIVE_ID)),
-        Some(&3)
+        seen.get(&agent_sessions::store::conversation_key("claude", LIVE_ID))
+            .map(|s| s.seq),
+        Some(3)
     );
+
+    // A wait that opens while the pane is watched is seen on the next
+    // poll: the agent still waits, but nothing asks for attention, and
+    // the row leaves `Needs you`.
+    hook("PermissionRequest");
+    let snapshot = collect(&env, &world.tmux.socket);
+    let conv = snapshot
+        .conversations
+        .iter()
+        .find(|c| c.session_id == LIVE_ID)
+        .unwrap();
+    assert_eq!(conv.state, ConversationState::Waiting);
+    assert_eq!(
+        conv.attention,
+        Attention::None,
+        "focus acknowledged the wait"
+    );
+    assert_eq!(conv.attention_wait_ms, None);
+    let work = snapshot
+        .work
+        .iter()
+        .find(|w| w.name == "feat-login")
+        .unwrap();
+    assert_eq!(work.section, None);
 
     // Kill the agent: within one refresh the process claim is dead, the
     // latch is acknowledged already - nothing ghost-busy, nothing lost.
@@ -569,6 +594,7 @@ fn cursor_movement_writes_no_seen_state() {
             attention: Attention::Waiting,
             attention_detail: Some("permission prompt".to_owned()),
             attention_seq: Some(1),
+            attention_wait_ms: None,
             journal_seq: Some(1),
             last_activity: None,
             live: true,
@@ -602,8 +628,9 @@ fn cursor_movement_writes_no_seen_state() {
     assert_eq!(
         loaded
             .seen
-            .get(&agent_sessions::store::conversation_key("claude", "s1")),
-        Some(&1)
+            .get(&agent_sessions::store::conversation_key("claude", "s1"))
+            .map(|s| s.seq),
+        Some(1)
     );
 }
 

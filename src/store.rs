@@ -331,17 +331,20 @@ impl Fold {
         }
         self.last_seq = self.last_seq.max(record.seq);
     }
+}
 
-    /// The highest commit sequence of retained events above `seen` - what
-    /// an acknowledgement writes through. `0` means nothing awaits ack.
-    pub fn unacked_through(&self, seen: u64) -> u64 {
-        self.retained
-            .iter()
-            .filter(|r| r.seq > seen)
-            .map(|r| r.seq)
-            .max()
-            .unwrap_or(0)
-    }
+/// One conversation's acknowledgement: the retained events seen through
+/// a commit sequence, and the live wait episode seen - named by its
+/// `effective_since`, since a wait the provider publishes carries no
+/// sequence. A newer wait episode starts unseen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Seen {
+    /// Retained events at or below this commit sequence are seen.
+    #[serde(default)]
+    pub seq: u64,
+    /// The `effective_since` of the live wait the user has seen, epoch ms.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
 }
 
 /// An authored not-busy mark: it names the `effective_since` of the `Busy`
@@ -372,8 +375,8 @@ struct Checkpoint {
 #[derive(Debug, Default)]
 pub struct Loaded {
     pub folds: HashMap<String, Fold>,
-    /// Conversation key -> highest acknowledged commit sequence.
-    pub seen: HashMap<String, u64>,
+    /// Conversation key -> what the user has acknowledged.
+    pub seen: HashMap<String, Seen>,
     /// Conversation key -> the authored not-busy mark.
     pub marks: HashMap<String, Mark>,
     /// Records excluded or files unreadable - isolated, never fatal.
@@ -552,19 +555,32 @@ impl Store {
         )
     }
 
-    /// Acknowledge every event on `key` through `through_seq`: the whole
+    /// Acknowledge every retained event on `key` through `through_seq`,
+    /// and the live wait episode `wait_ms` names when one shows. The whole
     /// `seen.json` map is rewritten atomically under the store lock, so
-    /// two acknowledgements cannot lose one another. `space` and the
-    /// focus observation both land here.
-    pub fn acknowledge(&self, key: &str, through_seq: u64) -> io::Result<()> {
+    /// two acknowledgements cannot lose one another; the sequence never
+    /// moves backwards. `space` and the focus observation both land here.
+    /// Returns the conversation's acknowledgement as stored.
+    pub fn acknowledge(
+        &self,
+        key: &str,
+        through_seq: u64,
+        wait_ms: Option<u64>,
+    ) -> io::Result<Seen> {
         fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
         let _lock = Lock::acquire(&self.dir.join(LOCK))?;
         let mut seen = self.read_seen_for_update()?;
-        if seen.get(key).copied().unwrap_or(0) >= through_seq {
-            return Ok(());
+        let old = seen.get(key).copied().unwrap_or_default();
+        let new = Seen {
+            seq: old.seq.max(through_seq),
+            wait_ms: wait_ms.or(old.wait_ms),
+        };
+        if new == old {
+            return Ok(old);
         }
-        seen.insert(key.to_owned(), through_seq);
-        self.write_seen(&seen)
+        seen.insert(key.to_owned(), new);
+        self.write_seen(&seen)?;
+        Ok(new)
     }
 
     /// Record the authored not-busy mark: `since_ms` names the `Busy`'s
@@ -726,10 +742,10 @@ impl Store {
         }
     }
 
-    /// The seen-state map: conversation key -> acknowledged sequence.
-    fn read_seen(&self, errors: &mut Vec<SourceError>) -> HashMap<String, u64> {
+    /// The seen-state map: conversation key -> its acknowledgement.
+    fn read_seen(&self, errors: &mut Vec<SourceError>) -> HashMap<String, Seen> {
         self.read_authored(SEEN, errors)
-            .map(|authored: Authored<HashMap<String, u64>>| authored.data)
+            .map(|authored: Authored<HashMap<String, Seen>>| authored.data)
             .unwrap_or_default()
     }
 
@@ -737,14 +753,14 @@ impl Store {
     /// clean or be absent - an unreadable, malformed or future-schema
     /// file is refused as `InvalidData` so the rewrite never turns its
     /// bytes into an empty map.
-    fn read_seen_for_update(&self) -> io::Result<HashMap<String, u64>> {
+    fn read_seen_for_update(&self) -> io::Result<HashMap<String, Seen>> {
         let mut errors = Vec::new();
         let seen = self.read_seen(&mut errors);
         update_read(errors)?;
         Ok(seen)
     }
 
-    fn write_seen(&self, seen: &HashMap<String, u64>) -> io::Result<()> {
+    fn write_seen(&self, seen: &HashMap<String, Seen>) -> io::Result<()> {
         self.write_authored(SEEN, seen)
     }
 
@@ -1193,9 +1209,27 @@ mod tests {
         let temp = TempStore::new();
         let store = temp.store();
         let key = conversation_key("claude", "s1");
-        store.acknowledge(&key, 7).unwrap();
-        store.acknowledge(&key, 3).unwrap(); // backwards is a no-op
-        assert_eq!(store.load().seen[&key], 7);
+        store.acknowledge(&key, 7, None).unwrap();
+        store.acknowledge(&key, 3, None).unwrap(); // backwards is a no-op
+        assert_eq!(store.load().seen[&key].seq, 7);
+        // A wait episode joins the sequence without moving it back, and a
+        // later sequence-only acknowledgement keeps the episode.
+        let seen = store.acknowledge(&key, 0, Some(42_000)).unwrap();
+        assert_eq!(
+            seen,
+            Seen {
+                seq: 7,
+                wait_ms: Some(42_000)
+            }
+        );
+        store.acknowledge(&key, 9, None).unwrap();
+        assert_eq!(
+            store.load().seen[&key],
+            Seen {
+                seq: 9,
+                wait_ms: Some(42_000)
+            }
+        );
         store.mark_not_busy(&key, 123_000, 7).unwrap();
         let loaded = store.load();
         assert_eq!(loaded.marks[&key].since_ms, 123_000);
@@ -1226,7 +1260,7 @@ mod tests {
             serde_json::json!({"v": 99, "data": {}}).to_string(),
         ] {
             fs::write(temp.path(SEEN), &bytes).unwrap();
-            let err = store.acknowledge(&key, 3).unwrap_err();
+            let err = store.acknowledge(&key, 3, None).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert_eq!(fs::read(temp.path(SEEN)).unwrap(), bytes.as_bytes());
             fs::write(temp.path(MARKS), &bytes).unwrap();
@@ -1273,8 +1307,7 @@ mod tests {
             Apply::Accepted
         );
         assert_eq!(fold.retained.len(), 1);
-        assert_eq!(fold.unacked_through(0), 4);
-        assert_eq!(fold.unacked_through(4), 0);
+        assert_eq!(fold.retained[0].seq, 4);
     }
 
     #[test]
@@ -1520,7 +1553,7 @@ mod tests {
         // fails rather than clobbering a concurrent write.
         let held = Lock::acquire(&temp.path(LOCK)).unwrap();
         let err = store
-            .acknowledge(&key_a, 1)
+            .acknowledge(&key_a, 1, None)
             .expect_err("a held lock blocks an acknowledgement");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         let err = store
@@ -1532,20 +1565,20 @@ mod tests {
         let a = std::thread::spawn({
             let store = Store::open(temp.0.clone());
             let key = key_a.clone();
-            move || store.acknowledge(&key, 5)
+            move || store.acknowledge(&key, 5, None)
         });
         let b = std::thread::spawn({
             let store = Store::open(temp.0.clone());
             let key = key_b.clone();
-            move || store.acknowledge(&key, 9)
+            move || store.acknowledge(&key, 9, None)
         });
         std::thread::sleep(Duration::from_millis(200));
         drop(held);
         a.join().expect("ack a joins").expect("ack a");
         b.join().expect("ack b joins").expect("ack b");
         let seen = store.load().seen;
-        assert_eq!(seen[&key_a], 5);
-        assert_eq!(seen[&key_b], 9);
+        assert_eq!(seen[&key_a].seq, 5);
+        assert_eq!(seen[&key_b].seq, 9);
     }
 
     #[test]
@@ -1555,7 +1588,7 @@ mod tests {
         // Absent is a first run: nothing acknowledged, nothing distrusted.
         assert!(store.load().ack_readable);
         let key = conversation_key("claude", "s1");
-        store.acknowledge(&key, 3).unwrap();
+        store.acknowledge(&key, 3, None).unwrap();
         assert!(store.load().ack_readable);
         // Malformed seen-state cannot prove what was acknowledged.
         fs::write(temp.path(SEEN), "{oops").unwrap();
