@@ -43,12 +43,9 @@ pub const SCHEMA: u32 = 1;
 /// scan stays trivial.
 const COMPACT_AFTER: usize = 128;
 
-/// A lock older than this is abandoned by a dead holder and stolen; a hook
-/// must never wait forever on a write that crashed.
-const LOCK_STALE: Duration = Duration::from_secs(30);
-
-/// How long `acquire` waits for a live holder before giving up - long
-/// enough for a real append (milliseconds) many times over.
+/// How long `acquire` waits for the holder before giving up - long enough
+/// for a real append (milliseconds) many times over, short enough that a
+/// hook never stalls its agent.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 const JOURNAL: &str = "journal.log";
@@ -832,75 +829,42 @@ struct Authored<T> {
     data: T,
 }
 
-/// The lock on `journal.lock`: `create_new` so only one holder exists.
-/// A lock older than [`LOCK_STALE`] is a dead holder's and is stolen.
+/// The exclusive OS advisory lock on `journal.lock`. The kernel releases
+/// it when the holder closes the file or dies, so a crashed writer never
+/// leaves a lock behind to judge stale or steal. The file itself stays:
+/// unlinking a lock file another process may be waiting on would let two
+/// holders lock two different files.
 struct Lock {
-    path: PathBuf,
+    _file: fs::File,
 }
 
 impl Lock {
+    /// Take the lock, polling until [`LOCK_WAIT`] expires; then
+    /// `WouldBlock`, so a hook reports the failure instead of hanging.
     fn acquire(path: &Path) -> io::Result<Lock> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
         let deadline = SystemTime::now() + LOCK_WAIT;
         loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(mut file) => {
-                    // coverage: off - a write failure into a fresh lock
-                    // needs a filesystem fault
-                    writeln!(file, "{}", std::process::id())?; // coverage: off - a write failure into a fresh lock needs a filesystem fault
-                    return Ok(Lock {
-                        path: path.to_owned(),
-                    });
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if stale_lock(path) {
-                        let _ = fs::remove_file(path); // coverage: off - the unexecuted instantiation's region edge
-                        continue;
-                    }
-                    if SystemTime::now() > deadline {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            format!("{}: lock held", path.display()),
-                        ));
-                    }
+            match file.try_lock() {
+                Ok(()) => return Ok(Lock { _file: file }),
+                Err(fs::TryLockError::WouldBlock) if SystemTime::now() <= deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                Err(e) => return Err(e), // coverage: off - the unexecuted instantiation's region edge
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!("{}: lock held", path.display()),
+                    ));
+                }
+                Err(fs::TryLockError::Error(e)) => return Err(e),
             }
         }
     }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        // coverage: off - the unexecuted instantiation's region edge
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-/// A lock is stale when its holder can no longer hold it: older than
-/// [`LOCK_STALE`], or empty because a holder died between create and write.
-fn stale_lock(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else
-    /* // coverage: off - a lock that vanishes between create_new and stat is a race */
-    {
-        // coverage: off - the unexecuted instantiation's region edge
-        return true; // coverage: off - a lock that vanishes between create_new and stat is a race
-    };
-    if meta.len() == 0 {
-        // The pid write follows the create in the same breath; only a dead
-        // writer leaves an empty lock - but give it one second of grace.
-        return meta
-            .modified()
-            .ok() // coverage: off - the unexecuted instantiation's region edge
-            .is_some_and(|m| m.elapsed().unwrap_or_default() > Duration::from_secs(1));
-    }
-    meta.modified()
-        .ok()
-        .is_some_and(|m| m.elapsed().unwrap_or_default() > LOCK_STALE)
 }
 
 /// A mutation's read precondition: a clean or absent authored file passes;
@@ -1413,28 +1377,29 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_lock_is_stolen_a_held_one_waits_out() {
+    fn a_dead_holders_lock_frees_a_held_one_waits_out() {
         let temp = TempStore::new();
         let store = temp.store();
         let lock = temp.path(LOCK);
-        // A lock a dead holder abandoned: aged past the stale window, so
-        // the next writer steals it and commits normally.
+        // A lock file a crashed writer left behind holds no lock: the
+        // kernel released it with the holder, so the next writer commits.
         fs::create_dir_all(&temp.0).unwrap();
-        fs::File::create(&lock).unwrap();
-        fs::File::open(&lock)
-            .unwrap()
-            .set_modified(SystemTime::now() - LOCK_STALE - Duration::from_secs(1))
-            .unwrap();
+        fs::write(&lock, "12345\n").unwrap();
         store
             .append(record("claude", "s1", "Stop", NormEvent::End))
-            .expect("a stale lock is stolen");
-        // A lock held fresh - a written pid makes it a live holder's, not
-        // an empty dead file - waits out the deadline, then reports it.
-        fs::write(&lock, "12345\n").unwrap();
+            .expect("an unheld lock file is taken");
+        // A live holder - another open file description - is waited out
+        // until the deadline, then reported, and its lock stays intact.
+        let held = Lock::acquire(&lock).unwrap();
         let err = store
             .append(record("claude", "s1", "Stop", NormEvent::End))
-            .expect_err("a held lock is not stolen");
+            .expect_err("a held lock is not taken");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(lock.exists());
+        drop(held);
+        store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .expect("a released lock is taken");
     }
 
     #[test]
@@ -1458,12 +1423,13 @@ mod tests {
             .expect_err("a journal directory fails the open");
         assert_eq!(err.kind(), io::ErrorKind::IsADirectory);
         // And a lock path that is a directory makes acquire fail outright:
-        // not AlreadyExists, not stale - a plain error.
+        // the open's own error, not a wait for a holder.
+        fs::remove_file(temp.path(LOCK)).unwrap();
         fs::create_dir_all(temp.path(LOCK)).unwrap();
         let err = store
             .append(record("claude", "s1", "Stop", NormEvent::End))
             .expect_err("a lock directory fails the open");
-        assert_ne!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_ne!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
