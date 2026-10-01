@@ -634,51 +634,128 @@ fn cursor_movement_writes_no_seen_state() {
     );
 }
 
-/// The checked-in parity table: the projection's summary words and glyphs
-/// are what the contract says, not what the code happened to emit.
+/// Drive one parity sequence - normalized event words, `ack` for an
+/// acknowledgement of everything pending, `-` for none - through the
+/// journal reduction and arbitration on a live process.
+fn drive(sequence: &str) -> agent_sessions::attention::Derived {
+    use agent_sessions::attention::{Inputs, WeakIdle, derive};
+    use agent_sessions::store::{Fold, NormEvent, Record, Seen};
+    let mut fold = Fold::default();
+    let mut seen = Seen::default();
+    let mut idle = WeakIdle::default();
+    let now_ms = 1_000_000;
+    let mut run = |fold: &Fold, seen: Seen| {
+        derive(Inputs {
+            fold: Some(fold),
+            seen,
+            mark: None,
+            published: None,
+            live: Some((7, Some(0))),
+            now_ms,
+            ack_ok: true,
+            idle: &mut idle,
+        })
+    };
+    let words: Vec<&str> = sequence.split_whitespace().filter(|w| *w != "-").collect();
+    for (i, word) in words.iter().enumerate() {
+        if *word == "ack" {
+            let pending = run(&fold, seen);
+            seen = Seen {
+                seq: seen.seq.max(pending.ack_through),
+                wait_ms: pending.wait_ms.or(seen.wait_ms),
+            };
+            continue;
+        }
+        let event = match *word {
+            "start" => NormEvent::Start,
+            "activity" => NormEvent::Activity,
+            "awaiting" => NormEvent::Awaiting,
+            "end" => NormEvent::End,
+            "error" => NormEvent::Error,
+            other => panic!("`{other}` is not a normalized event in `{sequence}`"),
+        };
+        let mut record = Record::new("claude", "s1", word);
+        record.event = Some(event);
+        record.seq = i as u64 + 1;
+        record.at = now_ms - 10_000 + i as u64 * 1_000;
+        fold.apply(&record);
+    }
+    run(&fold, seen)
+}
+
+/// The checked-in parity table, executed: every row's event sequences,
+/// driven through reduction and arbitration, produce its detailed state,
+/// summary and glyph - and the stated orderings are what derivation picks.
 #[test]
 fn the_parity_table_is_what_the_code_emits() {
+    use agent_sessions::attention::rollup;
+    use agent_sessions::store::Exec;
     let table = include_str!("fixtures/attention-parity.md");
     let rows = support::markdown::table_after(table, "# Attention parity");
     // Drop the header and separator rows.
     let rows: Vec<Vec<String>> = rows.into_iter().skip(2).collect();
-    let glyphs: std::collections::HashMap<&str, &str> = [
-        ("waiting", "!"),
-        ("error", "✗"),
-        ("done", "✓"),
-        ("working", "●"),
-        ("unknown", "?"),
-        ("none", ""),
-    ]
-    .into_iter()
-    .collect();
+    assert_eq!(rows.len(), 6, "every projection row is driven");
     for row in rows {
-        let (condition, _detailed, summary, glyph) =
-            (&row[0], &row[1], row[2].as_str(), row[3].as_str());
-        let expected = glyphs
-            .get(summary)
-            .copied()
-            .unwrap_or_else(|| panic!("`{summary}` is not a known attention word: {row:?}"));
-        let glyph = match glyph {
-            "blank" => "",
-            other => other,
-        };
-        assert_eq!(glyph, expected, "{condition}: summary `{summary}`");
+        let (condition, events, detailed, summary, glyph) =
+            (&row[0], &row[1], &row[2], row[3].as_str(), row[4].as_str());
+        let glyph = if glyph == "blank" { "" } else { glyph };
+        let summary = if summary == "none" { "" } else { summary };
+        for sequence in events.split(',') {
+            let sequence = sequence.trim().trim_matches('`');
+            let d = drive(sequence);
+            assert_eq!(d.attention.label(), summary, "{condition}: `{sequence}`");
+            assert_eq!(d.attention.glyph(), glyph, "{condition}: `{sequence}`");
+            // The detailed state: the execution it names, or - for an
+            // acknowledgement - the execution the same events had unseen.
+            let allowed: Vec<Exec> = match detailed.as_str() {
+                "Busy" => vec![Exec::Busy],
+                "Idle + CompletedUnseen" => vec![Exec::Idle],
+                "Waiting(reason)" => vec![Exec::Waiting],
+                "Idle or Unknown + retained error" => vec![Exec::Idle, Exec::Unknown],
+                "Unknown" => vec![Exec::Unknown],
+                "the detailed state, unchanged" => {
+                    vec![drive(&sequence.replace(" ack", "")).exec]
+                }
+                other => panic!("`{other}` is not a detailed state this test reads"),
+            };
+            assert!(
+                allowed.contains(&d.exec),
+                "{condition}: `{sequence}` is {:?}",
+                d.exec
+            );
+        }
     }
-    // The orderings are stated in prose; the code enforces them.
-    assert!(table.contains("waiting > error > done > working"));
-    assert!(table.contains("error > done > waiting > working"));
-    assert!(Attention::Waiting.rank() < Attention::Error.rank());
-    assert!(Attention::Error.rank() < Attention::CompletedUnseen.rank());
-    assert!(Attention::CompletedUnseen.rank() < Attention::Working.rank());
-    assert!(Attention::Error.precedence() < Attention::CompletedUnseen.precedence());
-    assert!(Attention::CompletedUnseen.precedence() < Attention::Waiting.precedence());
-    assert!(Attention::Waiting.precedence() < Attention::Working.precedence());
-    // And the glyph map matches the table's third column.
-    assert_eq!(Attention::Waiting.glyph(), "!");
-    assert_eq!(Attention::Error.glyph(), "✗");
-    assert_eq!(Attention::CompletedUnseen.glyph(), "✓");
-    assert_eq!(Attention::Working.glyph(), "●");
-    assert_eq!(Attention::Unknown.glyph(), "?");
-    assert_eq!(Attention::None.glyph(), "");
+
+    // The orderings, stated in prose, decide what derivation shows. On one
+    // row the earlier latch of each adjacent pair outlives the later one;
+    // across rows the rollup picks by rank.
+    let event_of = |word: &str| match word {
+        "error" => "error",
+        "done" => "end",
+        "waiting" => "awaiting",
+        "working" => "activity",
+        other => panic!("`{other}` names no attention"),
+    };
+    let ordering = |prose: &str| -> Vec<String> {
+        let (_, after) = table
+            .split_once(prose)
+            .unwrap_or_else(|| panic!("no `{prose}` line"));
+        let order = after.split('`').nth(1).expect("the ordering is quoted");
+        order.split(" > ").map(str::to_owned).collect()
+    };
+    let precedence = ordering("Per-pane latch precedence");
+    assert_eq!(precedence, ["error", "done", "waiting", "working"]);
+    for pair in precedence.windows(2) {
+        let sequence = format!("start {} {}", event_of(&pair[0]), event_of(&pair[1]));
+        assert_eq!(drive(&sequence).attention.label(), pair[0], "`{sequence}`");
+    }
+    let rank = ordering("Cross-pane rank");
+    assert_eq!(rank, ["waiting", "error", "done", "working"]);
+    for pair in rank.windows(2) {
+        let panes = [
+            drive(&format!("start {}", event_of(&pair[1]))).attention,
+            drive(&format!("start {}", event_of(&pair[0]))).attention,
+        ];
+        assert_eq!(rollup(panes.iter()).label(), pair[0], "{pair:?}");
+    }
 }

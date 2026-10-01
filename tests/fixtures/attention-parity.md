@@ -4,14 +4,20 @@ The dashboard's unacknowledged-attention projection, kept row-for-row with
 the shared attention contract: the detailed state the conversation carries,
 the summary it shows until acknowledged, and the glyph a row leads with.
 
-| Event or effective condition           | Detailed state                  | Summary while unseen | Glyph |
-| -------------------------------------- | ------------------------------- | -------------------- | ----- |
-| Turn active                            | Busy                            | working              | ●     |
-| Clean turn end                         | Idle + CompletedUnseen          | done                 | ✓     |
-| Blocked on the human                   | Waiting(reason)                 | waiting              | !     |
-| Aborted turn                           | Idle or Unknown + retained error | error               | ✗     |
-| Acknowledged end, error or wait        | the detailed state, unchanged   | none                 | blank |
-| No reliable signal                     | Unknown                         | unknown              | ?     |
+The `Events` column is what the test drives through the journal reduction
+and arbitration on a live process: normalized events in commit order,
+`ack` for an acknowledgement of everything pending at that point, and `-`
+for no events at all. A cell may list several sequences, comma-separated;
+each must produce the row.
+
+| Event or effective condition    | Events                                                  | Detailed state                   | Summary while unseen | Glyph |
+| ------------------------------- | ------------------------------------------------------- | -------------------------------- | -------------------- | ----- |
+| Turn active                     | `start`, `start activity`                               | Busy                             | working              | ●     |
+| Clean turn end                  | `start end`                                             | Idle + CompletedUnseen           | done                 | ✓     |
+| Blocked on the human            | `start awaiting`                                        | Waiting(reason)                  | waiting              | !     |
+| Aborted turn                    | `start error`                                           | Idle or Unknown + retained error | error                | ✗     |
+| Acknowledged end, error or wait | `start end ack`, `start error ack`, `start awaiting ack` | the detailed state, unchanged    | none                 | blank |
+| No reliable signal              | `-`                                                     | Unknown                          | unknown              | ?     |
 
 ## Ordering
 
