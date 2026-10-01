@@ -584,7 +584,7 @@ impl Collector {
                 published, // coverage: off - the unexecuted instantiation's region edge
                 live,      // coverage: off - the unexecuted instantiation's region edge
                 now_ms: store::epoch_ms(observed_at), // coverage: off - the unexecuted instantiation's region edge
-                ack_ok: loaded.readable, // coverage: off - the unexecuted instantiation's region edge
+                ack_ok: loaded.ack_readable, // coverage: off - the unexecuted instantiation's region edge
                 idle: self.idles.entry(key).or_default(),
             }); // coverage: off - the unexecuted instantiation's region edge
             let carried = self

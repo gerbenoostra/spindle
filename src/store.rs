@@ -14,6 +14,10 @@
 //! - `seen.json`, `marks.json` - authored records (acknowledgement and the
 //!   not-busy mark) as whole-file atomic renames.
 //!
+//! `journal.lock` is the one mutation lock: appends, compaction and the
+//! authored files' read-modify-writes all hold it, so a rewrite can never
+//! interleave with a concurrent read or commit.
+//!
 //! Every record carries a schema version; readers accept the current and
 //! immediately previous one (an absent `v` reads as the pre-versioned
 //! schema). A future-versioned or malformed record is excluded from
@@ -376,10 +380,23 @@ pub struct Loaded {
     pub errors: Vec<SourceError>,
     /// The highest committed sequence the store knows.
     pub max_seq: u64,
-    /// Whether the store could be read at all. When `false`,
-    /// acknowledgement cannot be established and attention is `Unknown`
-    /// rather than a guessed glyph.
-    pub readable: bool,
+    /// Whether acknowledgement can be established: the checkpoint history
+    /// and `seen.json` both answered (absent is an answer). When `false`,
+    /// attention is `Unknown` rather than a guessed glyph.
+    pub ack_readable: bool,
+    /// Whether the checkpoint is usable; absent counts as usable.
+    /// Compaction rewrites it, so an unusable one defers compaction rather
+    /// than overwrite bytes a newer schema may have written.
+    checkpoint_ok: bool,
+}
+
+/// The journal tail's read: every parseable record in committed order
+/// plus whether the file stayed clean. `compactable` is false the moment
+/// any frame is excluded or malformed - a compaction rewrites the file to
+/// nothing, and bytes the reduction cannot carry are data loss.
+struct JournalRead {
+    records: Vec<Record>,
+    compactable: bool,
 }
 
 /// The journal record key a conversation's events fold under.
@@ -429,6 +446,7 @@ impl Store {
         let through = checkpoint.map_or(0, |c| c.through);
         let tail = self
             .read_journal(&mut Vec::new())
+            .records
             .iter()
             .map(|r| r.seq)
             .max()
@@ -438,12 +456,52 @@ impl Store {
 
     /// Read the store: checkpoint, then the journal tail folded on top.
     /// A tail larger than the compaction bound is folded into a fresh
-    /// checkpoint on the spot - reaping and maintenance run on read.
-    /// Best-effort: a failed compaction is reported and the unfolded tail
-    /// simply answers again next time.
+    /// checkpoint on the spot - reaping and maintenance run on read, but
+    /// only under the store's mutation lock, and only when the tail re-read
+    /// under that lock still exceeds the bound on a journal that stayed
+    /// clean: an append or another compaction committed between the two
+    /// reads is never compacted over, and an excluded frame never is
+    /// either. Best-effort: a failed compaction is reported and the
+    /// unfolded tail simply answers again next time.
     pub fn load(&self) -> Loaded {
+        let (loaded, tail, compactable) = self.load_once();
+        if tail <= COMPACT_AFTER || !compactable || !loaded.checkpoint_ok {
+            return loaded;
+        }
+        match Lock::acquire(&self.dir.join(LOCK)) {
+            Ok(_lock) => {
+                let (mut loaded, tail, compactable) = self.load_once();
+                if tail > COMPACT_AFTER && compactable && loaded.checkpoint_ok {
+                    // coverage: off - a compaction failure needs a rename or fsync to fail; the tail answers again next read
+                    #[rustfmt::skip]
+                    match self.compact(&loaded.folds, loaded.max_seq) {
+                        Ok(()) => {}
+                        Err(e) => loaded.errors.push(SourceError { // coverage: off - same
+                            source: "store".to_owned(), // coverage: off - same
+                            detail: format!("compaction: {e}"), // coverage: off - same
+                        }), // coverage: off - same
+                    };
+                }
+                loaded
+            }
+            Err(e) => {
+                let mut loaded = loaded;
+                loaded.errors.push(SourceError {
+                    source: "store".to_owned(),
+                    detail: format!("compaction: {e}"),
+                });
+                loaded
+            }
+        }
+    }
+
+    /// One full read of the store with no writes: checkpoint, journal
+    /// tail folded on top, then the authored files. Returns the loaded
+    /// view, the count of tail records a fold accepted, and whether the
+    /// journal stayed clean enough that compacting it loses nothing.
+    fn load_once(&self) -> (Loaded, usize, bool) {
         let mut errors = Vec::new();
-        let mut readable = true;
+        let mut checkpoint_ok = true;
         let mut folds = HashMap::new();
         let mut through = 0u64;
         match self.read_checkpoint(&mut errors) {
@@ -454,14 +512,15 @@ impl Store {
             None if self.dir.join(CHECKPOINT).exists() => {
                 // A checkpoint that exists but cannot be used (malformed
                 // or future) degrades the store: the tail alone is not the
-                // history.
-                readable = false;
+                // history, and it must never be compacted over.
+                checkpoint_ok = false;
             }
             None => {}
         }
         let mut tail = 0usize;
         let mut max_seq = through;
-        for record in self.read_journal(&mut errors) {
+        let journal = self.read_journal(&mut errors);
+        for record in &journal.records {
             max_seq = max_seq.max(record.seq);
             if record.seq <= through || record.v > SCHEMA || record.session.is_empty() {
                 continue;
@@ -470,36 +529,37 @@ impl Store {
             folds
                 .entry(conversation_key(&record.provider, &record.session))
                 .or_default()
-                .apply(&record);
+                .apply(record);
         }
-        if readable && tail > COMPACT_AFTER {
-            // coverage: off - a compaction failure needs a rename or fsync
-            // to fail; the tail simply answers again next read
-            errors.extend(
-                self.compact(&folds, max_seq) // coverage: off - same
-                    .map_err(|e| SourceError {
-                        // coverage: off - same
-                        source: "store".to_owned(), // coverage: off - same
-                        detail: format!("compaction: {e}"), // coverage: off - same
-                    }) // coverage: off - a compaction failure needs a rename or fsync to fail
-                    .err(), // coverage: off - same
-            );
-        } // coverage: off - the unexecuted instantiation's region edge
-        Loaded {
-            folds, // coverage: off - the unexecuted instantiation's region edge
-            seen: self.read_seen(&mut errors),
-            marks: self.read_marks(&mut errors), // coverage: off - the unexecuted instantiation's region edge
-            errors,
-            max_seq,
-            readable,
-        }
+        let seen = self.read_seen(&mut errors);
+        let marks = self.read_marks(&mut errors);
+        // Acknowledgement stands on both halves reading: the history a
+        // `seen` sequence indexes into, and `seen.json` itself - absent is
+        // a first run, malformed is a guess refused.
+        let ack_readable = checkpoint_ok && !errors.iter().any(|e| e.source == SEEN);
+        (
+            Loaded {
+                folds,
+                seen,
+                marks,
+                errors,
+                max_seq,
+                ack_readable,
+                checkpoint_ok,
+            },
+            tail,
+            journal.compactable,
+        )
     }
 
     /// Acknowledge every event on `key` through `through_seq`: the whole
-    /// `seen.json` map is rewritten atomically. `space` and the focus
-    /// observation both land here.
+    /// `seen.json` map is rewritten atomically under the store lock, so
+    /// two acknowledgements cannot lose one another. `space` and the
+    /// focus observation both land here.
     pub fn acknowledge(&self, key: &str, through_seq: u64) -> io::Result<()> {
-        let mut seen = self.read_seen(&mut Vec::new());
+        fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
+        let _lock = Lock::acquire(&self.dir.join(LOCK))?;
+        let mut seen = self.read_seen_for_update()?;
         if seen.get(key).copied().unwrap_or(0) >= through_seq {
             return Ok(());
         }
@@ -510,7 +570,9 @@ impl Store {
     /// Record the authored not-busy mark: `since_ms` names the `Busy`'s
     /// `effective_since`, `seq` the commit sequence it was written at.
     pub fn mark_not_busy(&self, key: &str, since_ms: u64, seq: u64) -> io::Result<()> {
-        let mut marks = self.read_marks(&mut Vec::new());
+        fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
+        let _lock = Lock::acquire(&self.dir.join(LOCK))?;
+        let mut marks = self.read_marks_for_update()?;
         marks.insert(
             key.to_owned(),
             Mark {
@@ -568,15 +630,22 @@ impl Store {
         }
     }
 
-    /// Every record in the journal tail, committed order. A framing error -
+    /// The journal tail: every parseable record in committed order, plus
+    /// whether the file stayed clean enough to compact. A framing error -
     /// a truncated length or payload - ends the tail there: the corrupt
-    /// suffix can hide nothing of the valid prefix.
-    fn read_journal(&self, errors: &mut Vec<SourceError>) -> Vec<Record> {
+    /// suffix can hide nothing of the valid prefix. `compactable` is
+    /// false for any frame the reduction cannot carry back, since a
+    /// rewrite would drop its bytes.
+    fn read_journal(&self, errors: &mut Vec<SourceError>) -> JournalRead {
         let path = self.dir.join(JOURNAL);
         let Some(bytes) = read_file(&path, "journal", errors) else {
-            return Vec::new();
+            return JournalRead {
+                records: Vec::new(),
+                compactable: true,
+            };
         };
         let mut records = Vec::new();
+        let mut compactable = true;
         let mut cursor = 0usize;
         while cursor + 4 <= bytes.len() {
             let len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
@@ -589,6 +658,7 @@ impl Store {
                         path.display()
                     ),
                 });
+                compactable = false;
                 break;
             }
             let frame = &bytes[cursor..cursor + len];
@@ -608,6 +678,7 @@ impl Store {
                         // Excluded from derivation, retained on disk - and
                         // its commit sequence still counts, so a future
                         // record never lets a writer reissue `seq`.
+                        compactable = false;
                         errors.push(SourceError {
                             source: "journal".to_owned(),
                             detail: format!(
@@ -618,16 +689,28 @@ impl Store {
                             ),
                         });
                     }
+                    if record.session.is_empty() {
+                        // The record folds onto no conversation, so a
+                        // checkpoint cannot carry it either.
+                        compactable = false;
+                    }
                     records.push(record);
                 }
-                None => errors.push(SourceError {
-                    source: "journal".to_owned(),
-                    detail: format!("{}: record at byte {cursor} does not parse", path.display()),
-                }),
+                None => {
+                    compactable = false;
+                    errors.push(SourceError {
+                        source: "journal".to_owned(),
+                        detail: format!(
+                            "{}: record at byte {cursor} does not parse",
+                            path.display()
+                        ),
+                    });
+                }
             }
             cursor += len;
         }
         if bytes.len() - cursor > 0 && cursor + 4 > bytes.len() {
+            compactable = false;
             errors.push(SourceError {
                 source: "journal".to_owned(),
                 detail: format!(
@@ -637,7 +720,10 @@ impl Store {
                 ),
             });
         }
-        records
+        JournalRead {
+            records,
+            compactable,
+        }
     }
 
     /// The seen-state map: conversation key -> acknowledged sequence.
@@ -645,6 +731,17 @@ impl Store {
         self.read_authored(SEEN, errors)
             .map(|authored: Authored<HashMap<String, u64>>| authored.data)
             .unwrap_or_default()
+    }
+
+    /// The same map for a read-modify-write: the file must have read
+    /// clean or be absent - an unreadable, malformed or future-schema
+    /// file is refused as `InvalidData` so the rewrite never turns its
+    /// bytes into an empty map.
+    fn read_seen_for_update(&self) -> io::Result<HashMap<String, u64>> {
+        let mut errors = Vec::new();
+        let seen = self.read_seen(&mut errors);
+        update_read(errors)?;
+        Ok(seen)
     }
 
     fn write_seen(&self, seen: &HashMap<String, u64>) -> io::Result<()> {
@@ -655,6 +752,14 @@ impl Store {
         self.read_authored(MARKS, errors)
             .map(|authored: Authored<HashMap<String, Mark>>| authored.data)
             .unwrap_or_default()
+    }
+
+    /// The marks map under the same update precondition as seen-state.
+    fn read_marks_for_update(&self) -> io::Result<HashMap<String, Mark>> {
+        let mut errors = Vec::new();
+        let marks = self.read_marks(&mut errors);
+        update_read(errors)?;
+        Ok(marks)
     }
 
     fn write_marks(&self, marks: &HashMap<String, Mark>) -> io::Result<()> {
@@ -780,6 +885,23 @@ fn stale_lock(path: &Path) -> bool {
     meta.modified()
         .ok()
         .is_some_and(|m| m.elapsed().unwrap_or_default() > LOCK_STALE)
+}
+
+/// A mutation's read precondition: a clean or absent authored file passes;
+/// anything the reader reported becomes `InvalidData` carrying the same
+/// details, so the rewrite never erases bytes it could not carry.
+fn update_read(errors: Vec<SourceError>) -> io::Result<()> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        errors
+            .iter()
+            .map(|e| format!("{}: {}", e.source, e.detail))
+            .collect::<Vec<_>>()
+            .join("; "),
+    ))
 }
 
 /// `path`'s whole contents; `None` on a missing file (the normal first-run
@@ -1056,7 +1178,7 @@ mod tests {
         )
         .unwrap();
         let loaded = store.load();
-        assert!(!loaded.readable);
+        assert!(!loaded.ack_readable);
         assert!(loaded.folds.is_empty());
         assert!(
             loaded
@@ -1090,6 +1212,31 @@ mod tests {
         .unwrap();
         let loaded = store.load();
         assert!(loaded.marks.is_empty());
+        assert!(loaded.errors.iter().any(|e| e.source == MARKS));
+    }
+
+    #[test]
+    fn a_mutation_never_overwrites_an_authored_file_it_cannot_read() {
+        let temp = TempStore::new();
+        fs::create_dir_all(&temp.0).unwrap();
+        let store = temp.store();
+        let key = conversation_key("claude", "s1");
+        for bytes in [
+            "{oops".to_owned(),
+            serde_json::json!({"v": 99, "data": {}}).to_string(),
+        ] {
+            fs::write(temp.path(SEEN), &bytes).unwrap();
+            let err = store.acknowledge(&key, 3).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(temp.path(SEEN)).unwrap(), bytes.as_bytes());
+            fs::write(temp.path(MARKS), &bytes).unwrap();
+            let err = store.mark_not_busy(&key, 1_000, 3).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(temp.path(MARKS)).unwrap(), bytes.as_bytes());
+        }
+        // The same bytes stay a best-effort read: reported, not fatal.
+        let loaded = store.load();
+        assert!(loaded.errors.iter().any(|e| e.source == SEEN));
         assert!(loaded.errors.iter().any(|e| e.source == MARKS));
     }
 
@@ -1201,7 +1348,7 @@ mod tests {
         fs::create_dir_all(&temp.0).unwrap();
         fs::write(temp.path(CHECKPOINT), b"{oops").unwrap();
         let loaded = store.load();
-        assert!(!loaded.readable);
+        assert!(!loaded.ack_readable);
         assert!(
             loaded
                 .errors
@@ -1284,5 +1431,239 @@ mod tests {
             .append(record("claude", "s1", "Stop", NormEvent::End))
             .expect_err("a lock directory fails the open");
         assert_ne!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn compaction_keeps_a_future_frame_untouched() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        for _ in 0..=COMPACT_AFTER {
+            store
+                .append(record("claude", "s1", "Evt", NormEvent::End))
+                .unwrap();
+        }
+        let journal = temp.path(JOURNAL);
+        let mut bytes = fs::read(&journal).unwrap();
+        let future = b"{\"v\":99,\"seq\":130,\"provider\":\"claude\",\"session\":\"s2\",\"native\":\"Stop\",\"event\":\"end\"}";
+        bytes.extend_from_slice(&(future.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(future);
+        fs::write(&journal, &bytes).unwrap();
+        let loaded = store.load();
+        // The tail is past the bound, but the future frame is not this
+        // build's to rewrite: the journal stays byte-for-byte and no
+        // checkpoint appears.
+        assert_eq!(fs::read(&journal).unwrap(), bytes);
+        assert!(!temp.path(CHECKPOINT).exists());
+        assert!(
+            loaded
+                .errors
+                .iter()
+                .any(|e| e.detail.contains("newer than"))
+        );
+    }
+
+    #[test]
+    fn compaction_keeps_a_malformed_frame_untouched() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        for _ in 0..=COMPACT_AFTER {
+            store
+                .append(record("claude", "s1", "Evt", NormEvent::End))
+                .unwrap();
+        }
+        let journal = temp.path(JOURNAL);
+        let mut bytes = fs::read(&journal).unwrap();
+        let bad = b"[1,2,3]";
+        bytes.extend_from_slice(&(bad.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(bad);
+        fs::write(&journal, &bytes).unwrap();
+        let loaded = store.load();
+        assert_eq!(fs::read(&journal).unwrap(), bytes);
+        assert!(!temp.path(CHECKPOINT).exists());
+        assert!(
+            loaded
+                .errors
+                .iter()
+                .any(|e| e.detail.contains("does not parse"))
+        );
+    }
+
+    #[test]
+    fn compaction_never_rewrites_an_unusable_checkpoint() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        for _ in 0..=COMPACT_AFTER {
+            store
+                .append(record("claude", "s1", "Evt", NormEvent::End))
+                .unwrap();
+        }
+        fs::write(temp.path(CHECKPOINT), b"{oops").unwrap();
+        let journal = fs::read(temp.path(JOURNAL)).unwrap();
+        let loaded = store.load();
+        assert!(!loaded.ack_readable);
+        // The malformed checkpoint is evidence of a schema this build may
+        // not read: compaction must not overwrite it, so the journal
+        // stays too.
+        assert_eq!(fs::read(temp.path(CHECKPOINT)).unwrap(), b"{oops");
+        assert_eq!(fs::read(temp.path(JOURNAL)).unwrap(), journal);
+    }
+
+    #[test]
+    fn concurrent_acknowledgements_preserve_every_key() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        fs::create_dir_all(&temp.0).unwrap();
+        let key_a = conversation_key("claude", "a");
+        let key_b = conversation_key("claude", "b");
+        // While the shared lock is held, an authored update cannot slip
+        // its read-modify-write past it: it waits out the deadline and
+        // fails rather than clobbering a concurrent write.
+        let held = Lock::acquire(&temp.path(LOCK)).unwrap();
+        let err = store
+            .acknowledge(&key_a, 1)
+            .expect_err("a held lock blocks an acknowledgement");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        let err = store
+            .mark_not_busy(&key_a, 1, 1)
+            .expect_err("a held lock blocks a mark");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        // Two acknowledgements parked on the lock each take it over the
+        // whole read-modify-write once it frees, so both keys survive.
+        let a = std::thread::spawn({
+            let store = Store::open(temp.0.clone());
+            let key = key_a.clone();
+            move || store.acknowledge(&key, 5)
+        });
+        let b = std::thread::spawn({
+            let store = Store::open(temp.0.clone());
+            let key = key_b.clone();
+            move || store.acknowledge(&key, 9)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+        a.join().expect("ack a joins").expect("ack a");
+        b.join().expect("ack b joins").expect("ack b");
+        let seen = store.load().seen;
+        assert_eq!(seen[&key_a], 5);
+        assert_eq!(seen[&key_b], 9);
+    }
+
+    #[test]
+    fn seen_state_readability_gates_acknowledgement() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        // Absent is a first run: nothing acknowledged, nothing distrusted.
+        assert!(store.load().ack_readable);
+        let key = conversation_key("claude", "s1");
+        store.acknowledge(&key, 3).unwrap();
+        assert!(store.load().ack_readable);
+        // Malformed seen-state cannot prove what was acknowledged.
+        fs::write(temp.path(SEEN), "{oops").unwrap();
+        let loaded = store.load();
+        assert!(!loaded.ack_readable);
+        assert!(loaded.errors.iter().any(|e| e.source == SEEN));
+        // Nor can a schema written by a newer build.
+        fs::write(
+            temp.path(SEEN),
+            serde_json::json!({"v": 99, "data": {}}).to_string(),
+        )
+        .unwrap();
+        let loaded = store.load();
+        assert!(!loaded.ack_readable);
+        assert!(
+            loaded
+                .errors
+                .iter()
+                .any(|e| e.detail.contains("newer than"))
+        );
+    }
+
+    #[test]
+    fn compaction_and_append_share_the_lock() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        for _ in 0..=COMPACT_AFTER {
+            store
+                .append(record("claude", "s1", "Evt", NormEvent::End))
+                .unwrap();
+        }
+        let journal = temp.path(JOURNAL);
+        let before = fs::read(&journal).unwrap();
+        // A held lock blocks compaction itself: the read still answers,
+        // reports the failure, and leaves every byte on disk.
+        let held = Lock::acquire(&journal.with_file_name(LOCK)).unwrap();
+        let loaded = store.load();
+        assert!(
+            loaded
+                .errors
+                .iter()
+                .any(|e| e.detail.contains("compaction")),
+            "{:?}",
+            loaded.errors
+        );
+        assert_eq!(fs::read(&journal).unwrap(), before);
+        // Now an append and two reads contend for the same lock. Whichever
+        // order they run in, the append commits the next monotonic
+        // sequence and the second read sees the first's compaction.
+        let appender = std::thread::spawn({
+            let store = Store::open(temp.0.clone());
+            move || store.append(record("claude", "appended", "Stop", NormEvent::End))
+        });
+        let mut loaders = Vec::new();
+        for _ in 0..2 {
+            loaders.push(std::thread::spawn({
+                let store = Store::open(temp.0.clone());
+                move || store.load().max_seq
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+        let seq = appender
+            .join()
+            .expect("append joins")
+            .expect("append commits");
+        assert_eq!(seq, (COMPACT_AFTER + 2) as u64);
+        for loader in loaders {
+            assert!(loader.join().expect("load joins") <= seq);
+        }
+        let loaded = store.load();
+        let fold = &loaded.folds[&conversation_key("claude", "appended")];
+        assert_eq!(fold.last_seq, seq);
+        assert_eq!(loaded.max_seq, seq);
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+    }
+
+    #[test]
+    fn a_frame_arriving_between_the_compaction_reads_still_stops_it() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        for _ in 0..=COMPACT_AFTER {
+            store
+                .append(record("claude", "s1", "Evt", NormEvent::End))
+                .unwrap();
+        }
+        let journal = temp.path(JOURNAL);
+        let held = Lock::acquire(&temp.path(LOCK)).unwrap();
+        let loader = std::thread::spawn({
+            let store = Store::open(temp.0.clone());
+            move || store.load()
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        // The frame lands while the read waits on the lock: the re-read
+        // under the lock sees it and must not rewrite it away.
+        let mut bytes = fs::read(&journal).unwrap();
+        let bad = b"[1,2,3]";
+        bytes.extend_from_slice(&(bad.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(bad);
+        fs::write(&journal, &bytes).unwrap();
+        drop(held);
+        let loaded = loader.join().expect("load joins");
+        assert_eq!(fs::read(&journal).unwrap(), bytes);
+        assert!(
+            loaded
+                .errors
+                .iter()
+                .any(|e| e.detail.contains("does not parse"))
+        );
     }
 }
