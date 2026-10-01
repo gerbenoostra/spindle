@@ -69,7 +69,7 @@ fn collect(env: &Env<'_>, socket: &Path) -> agent_sessions::snapshot::Snapshot {
 fn collect_as(
     env: &Env<'_>,
     socket: &Path,
-    own: Option<&agent_sessions::tmux::PaneId>,
+    own: Option<&agent_sessions::tmux::PaneRef>,
 ) -> agent_sessions::snapshot::Snapshot {
     let runtime = Runtime::observe_over(std::slice::from_ref(&socket.to_path_buf()));
     let mut collector = Collector::new(env.home.join(".claude")).with_store(store_dir(env));
@@ -467,7 +467,10 @@ fn attention_flows_end_to_end() {
     let pane_id = world
         .tmux
         .tmux(&["display-message", "-t", "agents", "-p", "#{pane_id}"]);
-    let own = agent_sessions::tmux::PaneId::parse(pane_id.trim()).expect("the pane id parses");
+    let own = agent_sessions::tmux::PaneRef {
+        socket: world.tmux.socket.clone(),
+        pane: agent_sessions::tmux::PaneId::parse(pane_id.trim()).expect("the pane id parses"),
+    };
     let snapshot = collect_as(&env, &world.tmux.socket, Some(&own));
     let conv = snapshot
         .conversations

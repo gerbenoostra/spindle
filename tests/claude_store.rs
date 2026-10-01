@@ -458,8 +458,11 @@ fn the_snapshot_holds_live_transcript_and_merged_conversations() {
     let root = world.home.join(".claude");
     let mut collector = Collector::new(root);
     let runtime = Runtime::observe_over(std::slice::from_ref(&world.tmux.socket));
-    let own = agent_sessions::tmux::PaneId::parse(&world.pane_id);
-    let with_pane = collector.collect(&runtime, own.as_ref());
+    let own = agent_sessions::tmux::PaneRef {
+        socket: world.tmux.socket.clone(),
+        pane: agent_sessions::tmux::PaneId::parse(&world.pane_id).expect("the pane id parses"),
+    };
+    let with_pane = collector.collect(&runtime, Some(&own));
     assert_eq!(with_pane.own_pane.as_deref(), Some(world.pane_id.as_str()));
 }
 

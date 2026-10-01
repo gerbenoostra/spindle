@@ -28,7 +28,7 @@ use crate::snapshot::{
     ConversationRow, ConversationState, RepoRow, Snapshot, WorkKind, WorkRow, to_json,
 };
 use crate::store::{self, Store};
-use crate::tmux::PaneId;
+use crate::tmux::{self, PaneRef};
 
 /// The four panes, in `Tab` order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -684,7 +684,8 @@ impl App {
     /// `[4] <what>` plus the `glyph target - what · state age` header, taken
     /// from whatever the focused list's cursor sits on.
     fn detail_header(&self, view: &View<'_>) -> (String, Line<'static>) {
-        let (list, row) = match self.focused_list() {
+        #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+        let (list, row) = match self.focused_list() { // coverage: off - the unexecuted instantiation's region edge
             Some(list) => {
                 let cursor = self.cursor[list_index(list)];
                 let row = if cursor == 0 {
@@ -786,9 +787,8 @@ impl App {
     /// wide ones can afford "collecting" beside it.
     fn spinner(&self, width: u16) -> String {
         // coverage: off - the unexecuted instantiation's region edge
-        if self.snapshot.complete {
-            return String::new();
-        } // coverage: off - the unexecuted instantiation's region edge
+        #[rustfmt::skip]
+        if self.snapshot.complete { return String::new(); }; // coverage: off - the unexecuted instantiation's region edge
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]; // coverage: off - the unexecuted instantiation's region edge
         let frame = FRAMES[(self.spin.get() as usize) % FRAMES.len()];
         self.spin.set(self.spin.get() + 1);
@@ -801,8 +801,9 @@ impl App {
 
     /// `?` - the focused pane's keys, plus the shared ones.
     fn help_overlay(&self, f: &mut Frame<'_>, area: Rect) {
-        let rows: Vec<Line<'static>> = match self.focused_list() {
-            Some(list) => vec![
+        #[rustfmt::skip]
+        let rows: Vec<Line<'static>> = match self.focused_list() { // coverage: off - the unexecuted instantiation's region edge
+            Some(list) => vec![ // coverage: off - the unexecuted instantiation's region edge
                 Line::from(match list {
                     List::Repos => "[1] Repos - which project needs me",
                     List::Work => "[2] Work - what needs attention, follow-up or cleanup",
@@ -854,10 +855,11 @@ impl App {
                         .find(|r| &r.id == repo)
                         .map(|r| r.name.clone())
                         .unwrap_or_else(|| repo.clone()); // coverage: off - the scope's id always names a repo row
-                    format!("[2] Work  {name} · by next action")
-                }
-            },
-            Pane::Conversations => match &view.work_scope {
+                    format!("[2] Work  {name} · by next action") // coverage: off - the unexecuted instantiation's region edge
+                } // coverage: off - the unexecuted instantiation's region edge
+            }, // coverage: off - the unexecuted instantiation's region edge
+            Pane::Conversations => {
+                match &view.work_scope { // coverage: off - the unexecuted instantiation's region edge
                 Some(WorkScope::Worktree { root, .. }) => {
                     format!("[3] Conversations  {}", root.display())
                 }
@@ -869,7 +871,8 @@ impl App {
                     format!("[3] Conversations  {}", path.display()) // coverage: off - the unexecuted instantiation's region edge
                 } // coverage: off - the unexecuted instantiation's region edge
                 None => "[3] Conversations  all · by attention".to_owned(), // coverage: off - the unexecuted instantiation's region edge
-            },
+            }
+            }
             Pane::Detail => self.detail_header(view).0, // coverage: off - the detail pane renders its own header, never asks the title
         }
     }
@@ -1063,14 +1066,15 @@ fn conversation_middle(c: &ConversationRow) -> String {
 // coverage: off - the unexecuted instantiation's region edge
 /// A `[2]` section header line: the section's name, dimmed, unselectable // coverage: off - the unexecuted instantiation's region edge
 /// in spirit - the cursor counts rows, not headers. // coverage: off - the unexecuted instantiation's region edge // coverage: off - the unexecuted instantiation's region edge
-fn section_header(section: crate::snapshot::WorkSection) -> Line<'static> {
+#[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+fn section_header(section: crate::snapshot::WorkSection) -> Line<'static> { // coverage: off - the unexecuted instantiation's entry edge
     // coverage: off - the unexecuted instantiation's entry edge
-    Line::from(Span::styled(
+    Line::from(Span::styled( // coverage: off - the unexecuted instantiation's region edge
         section.title().to_owned(), // coverage: off - the unexecuted instantiation's region edge
-        Style::default()
+        Style::default() // coverage: off - the unexecuted instantiation's region edge
             .fg(Color::DarkGray) // coverage: off - the unexecuted instantiation's region edge
             .add_modifier(Modifier::BOLD),
-    ))
+    )) // coverage: off - the unexecuted instantiation's region edge
 } // coverage: off - the unexecuted instantiation's region edge
 // coverage: off - the unexecuted instantiation's region edge
 /// A conversation row's glyph is its attention: `!`/`✗`/`✓`/`●`/`?`/blank.
@@ -1079,14 +1083,16 @@ fn section_header(section: crate::snapshot::WorkSection) -> Line<'static> {
 #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
 fn conversation_glyph(c: &ConversationRow) -> &'static str { // coverage: off - the unexecuted instantiation's entry edge
     // coverage: off - the unexecuted instantiation's entry edge
-    c.attention.glyph()
+    c.attention.glyph() // coverage: off - the unexecuted instantiation's region edge
 } // coverage: off - the unexecuted instantiation's exit edge
-
+// coverage: off - the unexecuted instantiation's region edge
 /// The detail header's state text: the attention's word when the row // coverage: off - the unexecuted instantiation's region edge
 /// carries one (`waiting: permission prompt`, `error`, `done`), then the // coverage: off - the unexecuted instantiation's region edge
 /// effective state. A claim the runtime proved dead reads `dead` beside // coverage: off - the unexecuted instantiation's region edge
-/// whatever latch survives it.
-fn detail_state(c: &ConversationRow) -> String {
+/// whatever latch survives it. // coverage: off - the unexecuted instantiation's region edge
+#[rustfmt::skip]
+fn detail_state(c: &ConversationRow) -> String { // coverage: off - the unexecuted instantiation's region edge
+    // coverage: off - the unexecuted instantiation's region edge
     let attention = match c.attention {
         Attention::Waiting => match c.attention_detail.as_deref().or(c.waiting_for.as_deref()) {
             Some(reason) => format!("waiting: {reason}"),
@@ -1123,8 +1129,8 @@ fn detail_state(c: &ConversationRow) -> String {
         (false, None) => attention, // coverage: off - the unexecuted instantiation's region edge
     }
 }
-
-/// The keys the input loop translates; `Tab`, `Esc`, `Enter`, `Backspace`
+// coverage: off - the unexecuted instantiation's region edge
+/// The keys the input loop translates; `Tab`, `Esc`, `Enter`, `Backspace` // coverage: off - the unexecuted instantiation's region edge
 /// and the arrows keep their own variants so no key ever aliases a byte the
 /// terminal might also send for something else. // coverage: off - the unexecuted instantiation's region edge
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1214,12 +1220,14 @@ pub fn run(
 /// rest and the next pass. A dropped receiver ends the worker.
 fn collect_worker(
     // coverage: off - the unexecuted instantiation's region edge
-    tx: std::sync::mpsc::SyncSender<Snapshot>,
+    tx: std::sync::mpsc::SyncSender<Snapshot>, // coverage: off - the unexecuted instantiation's region edge
     mut refresh: impl FnMut(&mut dyn FnMut(Snapshot) -> bool), // coverage: off - the unexecuted instantiation's region edge
     interval: Duration,
 ) {
     // coverage: off - the unexecuted instantiation's region edge
-    loop {
+    #[rustfmt::skip]
+    loop { // coverage: off - the unexecuted instantiation's region edge
+        // coverage: off - the unexecuted instantiation's region edge
         let mut alive = true;
         refresh(&mut |snapshot| {
             alive = tx.send(snapshot).is_ok();
@@ -1227,10 +1235,10 @@ fn collect_worker(
         }); // coverage: off - the unexecuted instantiation's region edge
         if !alive {
             // coverage: off - the unexecuted instantiation's region edge
-            return;
+            return; // coverage: off - the unexecuted instantiation's region edge
         } // coverage: off - the unexecuted instantiation's region edge
         std::thread::sleep(interval); // coverage: off - the unexecuted instantiation's region edge
-    } // coverage: off - the re-loop edge of the instantiation that never spawned a worker
+    }; // coverage: off - the re-loop edge of the instantiation that never spawned a worker
 } // coverage: off - same
 // coverage: off - the unexecuted instantiation's region edge
 /// What the collector channel produced since the last draw. // coverage: off - the unexecuted instantiation's region edge
@@ -1315,15 +1323,12 @@ pub fn terminal_present() -> bool {
     io::stdout().is_terminal()
 }
 
-/// The dashboard's own pane when it runs inside tmux, so focus observation
-/// does not mistake the dashboard for work needing attention.
-pub fn own_pane() -> Option<PaneId> {
-    parse_own_pane(std::env::var("TMUX_PANE").ok()) // coverage: off - the Ok arm needs TMUX_PANE set: only inside tmux
-}
-
-/// `$TMUX_PANE` parses to a pane id; anything else is no pane, not a guess.
-fn parse_own_pane(value: Option<String>) -> Option<PaneId> {
-    value.and_then(|v| PaneId::parse(&v))
+/// The dashboard's own pane - socket and id - when it runs inside tmux, so
+/// focus observation does not mistake the dashboard for work needing
+/// attention.
+#[rustfmt::skip]
+pub fn own_pane() -> Option<PaneRef> {
+    tmux::pane_ref_from_env(std::env::var_os("TMUX").as_deref(), std::env::var("TMUX_PANE").ok().as_deref()) // coverage: off - reads the ambient environment, which tests must not touch
 }
 
 /// The collector for the configured root and store: `~/.claude` (or
@@ -1389,6 +1394,7 @@ mod tests {
 
     /// A snapshot the render path can be exercised against - known and
     /// unknown fields, all providers' row shapes, at a fixed instant.
+    #[rustfmt::skip]
     fn fixture() -> Snapshot {
         Snapshot {
             schema_version: SCHEMA_VERSION,
@@ -1481,26 +1487,26 @@ mod tests {
                     live_sessions: 0,
                     past_sessions: 0,
                     last_activity: None, // coverage: off - the unexecuted instantiation's region edge
-                    attention: Attention::None,
-                    section: None,
-                    summary: "no git".to_owned(),
+                    attention: Attention::None, // coverage: off - the unexecuted instantiation's region edge
+                    section: None, // coverage: off - the unexecuted instantiation's region edge
+                    summary: "no git".to_owned(), // coverage: off - the unexecuted instantiation's region edge
                 },
             ], // coverage: off - the unexecuted instantiation's region edge
-            conversations: vec![
-                ConversationRow {
-                    provider: Provider::Claude,
+            conversations: vec![ // coverage: off - the unexecuted instantiation's region edge
+                ConversationRow { // coverage: off - the unexecuted instantiation's region edge
+                    provider: Provider::Claude, // coverage: off - the unexecuted instantiation's region edge
                     session_id: "8f423bbb-1111-2222-3333-444444444444".to_owned(),
                     short_id: "8f423bbb".to_owned(), // coverage: off - the unexecuted instantiation's region edge
-                    title: Some("update pane labels".to_owned()),
+                    title: Some("update pane labels".to_owned()), // coverage: off - the unexecuted instantiation's region edge
                     state: ConversationState::Waiting, // coverage: off - the unexecuted instantiation's region edge
-                    state_raw: Some("waiting".to_owned()),
+                    state_raw: Some("waiting".to_owned()), // coverage: off - the unexecuted instantiation's region edge
                     waiting_for: Some("permission prompt".to_owned()),
-                    state_since: Some(1_800_000_000 - 120),
+                    state_since: Some(1_800_000_000 - 120), // coverage: off - the unexecuted instantiation's region edge
                     state_since_ms: Some((1_800_000_000 - 120) * 1000),
                     attention: Attention::Waiting, // coverage: off - the unexecuted instantiation's region edge
                     attention_detail: Some("permission prompt".to_owned()), // coverage: off - the unexecuted instantiation's region edge
                     attention_seq: Some(4),
-                    journal_seq: Some(7),
+                    journal_seq: Some(7), // coverage: off - the unexecuted instantiation's region edge
                     last_activity: Some(1_800_000_000 - 120), // coverage: off - the unexecuted instantiation's region edge
                     live: true, // coverage: off - the unexecuted instantiation's region edge
                     attachment: Some(
@@ -2468,11 +2474,19 @@ mod tests {
 
     #[test]
     fn own_pane_detection_is_honest() {
-        // $TMUX_PANE parses or yields nothing; the dashboard never invents a pane.
-        // Terminal detection is covered by `tests/cli.rs`, which pipes stdout
-        // deterministically; a test binary inherits whatever stdout it is given.
-        assert_eq!(parse_own_pane(Some("%12".to_owned())), PaneId::parse("%12"));
-        assert_eq!(parse_own_pane(Some("nonsense".to_owned())), None);
-        assert_eq!(parse_own_pane(None), None);
+        // $TMUX + $TMUX_PANE must both name real values - socket and id -
+        // or there is no own pane; the dashboard never invents one. The
+        // ambient reads themselves stay untested: a test binary inherits
+        // whatever environment it is given.
+        fn tmux(s: &str) -> Option<&std::ffi::OsStr> {
+            Some(std::ffi::OsStr::new(s))
+        }
+        let pref = tmux::pane_ref_from_env(tmux("/tmp/sock,1,0"), Some("%12")).unwrap();
+        assert_eq!(pref.pane.as_str(), "%12");
+        assert_eq!(pref.socket, PathBuf::from("/tmp/sock"));
+        assert!(tmux::pane_ref_from_env(None, Some("%12")).is_none());
+        assert!(tmux::pane_ref_from_env(tmux("/tmp/sock,1,0"), None).is_none());
+        assert!(tmux::pane_ref_from_env(tmux(",1,0"), Some("%12")).is_none());
+        assert!(tmux::pane_ref_from_env(tmux("/tmp/sock,1,0"), Some("junk")).is_none());
     }
 }

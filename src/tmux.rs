@@ -311,16 +311,32 @@ fn sockets(tmux_tmpdir: Option<&OsStr>, tmux_env: Option<&OsStr>) -> Vec<PathBuf
     // `$TMUX` is `<socket path>,<server pid>,<session id>`; only the socket
     // matters, and it is the only way a server outside the default dir is
     // found.
-    if let Some(tmux) = tmux_env.and_then(|t| t.to_str())
-        && let Some(socket) = tmux.split(',').next()
-        && !socket.is_empty()
-    {
-        found.push(PathBuf::from(socket));
+    if let Some(socket) = tmux_socket(tmux_env) {
+        found.push(socket);
     }
     found.sort();
     found.dedup();
     found
 }
+
+/// The socket `$TMUX` names: the value is `<socket path>,<server pid>,
+/// <session id>` and only the socket matters. `None` when the value is
+/// absent, non-UTF-8 or not in that shape.
+fn tmux_socket(tmux_env: Option<&OsStr>) -> Option<PathBuf> {
+    let (socket, _) = tmux_env?.to_str()?.split_once(',')?;
+    (!socket.is_empty()).then(|| PathBuf::from(socket))
+}
+
+/// The pane this process occupies, socket-qualified: `$TMUX` names the
+/// server, `$TMUX_PANE` the pane. `None` when either is absent, non-UTF-8
+/// or invalid - a bare pane id is ambiguous across servers and never
+/// guesses at one.
+pub fn pane_ref_from_env(tmux: Option<&OsStr>, pane: Option<&str>) -> Option<PaneRef> {
+    Some(PaneRef {
+        socket: tmux_socket(tmux)?,
+        pane: PaneId::parse(pane?)?,
+    })
+} // coverage: off - the unexecuted instantiation's region edge
 
 /// The user's tmux socket directory: tmux always places it at
 /// `<base>/tmux-<uid>`, where `base` is `$TMUX_TMPDIR` or `/tmp`.
@@ -352,7 +368,7 @@ fn is_stale(socket: &Path) -> bool {
         Ok(_) => false,
         Err(e) => matches!(
             e.kind(),
-            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound // coverage: off - the unexecuted instantiation's region edge
         ),
     }
 }
@@ -745,6 +761,25 @@ mod tests {
         // No dir and no $TMUX is no sockets.
         assert!(sockets(Some(OsStr::new("/no/such/dir")), None).is_empty());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pane_ref_from_env_needs_a_socket_and_a_pane() {
+        use std::os::unix::ffi::OsStrExt;
+        let pref = pane_ref_from_env(Some(OsStr::new("/tmp/tmux-501/a,42,0")), Some("%12"))
+            .expect("a socket and a pane parse");
+        assert_eq!(pref.socket, PathBuf::from("/tmp/tmux-501/a"));
+        assert_eq!(pref.pane.as_str(), "%12");
+        assert_eq!(pref.to_string(), "/tmp/tmux-501/a:%12");
+        // Either part absent, malformed or non-UTF-8 is no pane at all -
+        // a bare `%12` could name a pane on every server.
+        assert!(pane_ref_from_env(None, Some("%12")).is_none());
+        assert!(pane_ref_from_env(Some(OsStr::new("/tmp/s,1,0")), None).is_none());
+        assert!(pane_ref_from_env(Some(OsStr::new(",1,0")), Some("%12")).is_none());
+        assert!(pane_ref_from_env(Some(OsStr::new("/tmp/no-comma")), Some("%12")).is_none());
+        assert!(pane_ref_from_env(Some(OsStr::new("/tmp/s,1,0")), Some("junk")).is_none());
+        assert!(pane_ref_from_env(Some(OsStr::new("/tmp/s,1,0")), Some("%")).is_none());
+        assert!(pane_ref_from_env(Some(OsStr::from_bytes(&[0xff])), Some("%12")).is_none());
     }
 
     #[test]

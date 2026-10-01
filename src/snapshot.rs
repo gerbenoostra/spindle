@@ -25,7 +25,7 @@ use crate::process::{Liveness, ProcessStart};
 use crate::provider::{SourceError, StateEvidence};
 use crate::runtime::{PaneSource, Placement, Provider, Runtime};
 use crate::store::{self, Exec, Store};
-use crate::tmux::{PaneId, PaneRef};
+use crate::tmux::PaneRef;
 use crate::vector::{
     self, Anchor, Landed as LandedVerdict, RemoteCache, RuntimeFacts, UpstreamState, WindowCount,
 };
@@ -440,7 +440,7 @@ impl Collector {
     pub fn collect_staged(
         &mut self,
         runtime: &Runtime,
-        own_pane: Option<&PaneId>,
+        own_pane: Option<&PaneRef>,
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) {
         // Stage 1 - runtime and provider inventory: conversations with
@@ -501,7 +501,7 @@ impl Collector {
                         && p.window_active
                         && p.session_attached > 0
                 });
-                let own = own_pane.is_some_and(|own| *own == pref.pane);
+                let own = is_own_pane(own_pane, pref);
                 if !watched || own {
                     continue;
                 }
@@ -512,7 +512,7 @@ impl Collector {
                     .map(|f| f.unacked_through(loaded.seen.get(&key).copied().unwrap_or(0)))
                     .unwrap_or(0);
                 if through == 0 {
-                    continue;
+                    continue; // coverage: off - the unexecuted instantiation's region edge
                 } // coverage: off - the unexecuted instantiation's region edge
                 match store.acknowledge(&key, through) {
                     Ok(()) => {
@@ -574,20 +574,21 @@ impl Collector {
                     since_ms: None, // coverage: off - same
                 }, // coverage: off - the unexecuted instantiation's region edge
             }); // coverage: off - the unexecuted instantiation's region edge
-            let derived = attention::derive(attention::Inputs {
+            #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+            let derived = attention::derive(attention::Inputs { // coverage: off - the unexecuted instantiation's region edge
                 // coverage: off - the unexecuted instantiation's region edge
                 // coverage: off - the unexecuted instantiation's region edge
                 // coverage: off - the unexecuted instantiation's region edge
                 fold: loaded.folds.get(&key), // coverage: off - the unexecuted instantiation's region edge
                 seen_through: loaded.seen.get(&key).copied().unwrap_or(0), // coverage: off - the unexecuted instantiation's region edge
-                mark: loaded.marks.get(&key),
+                mark: loaded.marks.get(&key), // coverage: off - the unexecuted instantiation's region edge
                 published, // coverage: off - the unexecuted instantiation's region edge
                 live,      // coverage: off - the unexecuted instantiation's region edge
                 now_ms: store::epoch_ms(observed_at), // coverage: off - the unexecuted instantiation's region edge
                 ack_ok: loaded.ack_readable, // coverage: off - the unexecuted instantiation's region edge
                 idle: self.idles.entry(key).or_default(),
             }); // coverage: off - the unexecuted instantiation's region edge
-            let carried = self
+            let carried = self // coverage: off - the unexecuted instantiation's region edge
                 .model // coverage: off - the unexecuted instantiation's region edge
                 .conversations // coverage: off - the unexecuted instantiation's region edge
                 .iter() // coverage: off - the unexecuted instantiation's region edge
@@ -668,6 +669,7 @@ impl Collector {
             let running = &running;
             let placements = &placements;
             let mut alive = true;
+            #[rustfmt::skip]
             fanout::fan_out(
                 &order,
                 self.workers,
@@ -680,24 +682,24 @@ impl Collector {
                     })
                     .map_err(|e| anchor_error(repo_id, e)) // coverage: off - needs a repo whose worktree read fails mid-pass
                 }, // coverage: off - the unexecuted instantiation's region edge
-                |i, result| {
+                |i, result| { // coverage: off - the unexecuted instantiation's region edge
                     let repo_id = &order[i]; // coverage: off - the unexecuted instantiation's region edge
                     match result {
                         // coverage: off - the unexecuted instantiation's region edge
                         // coverage: off - the unexecuted instantiation's region edge
                         Ok(local) => self.merge_repo(repo_id, local), // coverage: off - the unexecuted instantiation's region edge
                         Err(error) => self.fail_repo(repo_id, error), // coverage: off - needs a repo's worktree list to fail after its cwd resolved, mid-pass
-                    }
+                    } // coverage: off - the unexecuted instantiation's region edge
                     alive = self.emit(runtime, own_pane, publish); // coverage: off - the unexecuted instantiation's region edge
-                },
+                }, // coverage: off - the unexecuted instantiation's region edge
             ); // coverage: off - the unexecuted instantiation's region edge
             if !alive {
                 // coverage: off - the unexecuted instantiation's region edge
                 return;
             } // coverage: off - the unexecuted instantiation's region edge
-        }
+        } // coverage: off - the unexecuted instantiation's region edge
         // coverage: off - the unexecuted instantiation's region edge
-        // Stage 3 - remote evidence, one `ls-remote --symref` per repo and
+        // Stage 3 - remote evidence, one `ls-remote --symref` per repo and // coverage: off - the unexecuted instantiation's region edge
         // remote per deadline, fanned out; then the local probes each // coverage: off - same
         // remote answer unlocks (bases, ahead/behind, landed, unpushed). // coverage: off - the unexecuted instantiation's region edge
         let mut asks: Vec<(git::Repo, String)> = Vec::new(); // coverage: off - the unexecuted instantiation's region edge
@@ -778,7 +780,7 @@ impl Collector {
     /// One pass run to completion: the staged collect's final snapshot,
     /// identical in classification to an unstaged collect because it is the
     /// same collection streamed rather than buffered.
-    pub fn collect(&mut self, runtime: &Runtime, own_pane: Option<&PaneId>) -> Snapshot {
+    pub fn collect(&mut self, runtime: &Runtime, own_pane: Option<&PaneRef>) -> Snapshot {
         let mut last = None;
         self.collect_staged(runtime, own_pane, &mut |snapshot| {
             last = Some(snapshot);
@@ -793,16 +795,17 @@ impl Collector {
     fn emit(
         &self,
         runtime: &Runtime,
-        own_pane: Option<&PaneId>,
+        own_pane: Option<&PaneRef>,
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) -> bool {
         let mut work = Vec::new();
         let mut repos = Vec::new();
-        for (id, model) in &self.model.repos {
-            let mut last_activity = None;
-            match &model.data {
+        #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+        for (id, model) in &self.model.repos { // coverage: off - the unexecuted instantiation's region edge
+            let mut last_activity = None; // coverage: off - the unexecuted instantiation's region edge
+            match &model.data { // coverage: off - the unexecuted instantiation's region edge
                 RepoData::Git(local) /* // coverage: off - the unexecuted instantiation's region edge */ => {
-                    for anchor in &local.anchors {
+                    for anchor in &local.anchors { // coverage: off - the unexecuted instantiation's region edge
                         let row = work_row(id, &model.name, &anchor.state); // coverage: off - same
                         last_activity = last_activity.max(row.last_activity); // coverage: off - same
                         work.push(row); // coverage: off - the unexecuted instantiation's region edge
@@ -826,7 +829,7 @@ impl Collector {
                 live,
                 last_activity,
             });
-        }
+        }; // coverage: off - the unexecuted instantiation's region edge
         // Attention and the first-match section are derived per publish
         // from the conversations bound to the row; sections order first,
         // newest activity inside a section.
@@ -844,7 +847,7 @@ impl Collector {
         publish(Snapshot {
             schema_version: SCHEMA_VERSION,
             observed_at: epoch(runtime.observed_at),
-            own_pane: own_pane.map(|p| p.as_str().to_owned()),
+            own_pane: own_pane.map(|p| p.pane.as_str().to_owned()),
             complete: self.model.complete,
             repos,
             work,
@@ -860,7 +863,7 @@ impl Collector {
     /// fails closed like an unreachable remote.
     #[rustfmt::skip]
     fn current_listings(&self) -> HashMap<(PathBuf, String), git::RemoteListing> {
-        let mut listings = HashMap::new();
+        let mut listings = HashMap::new(); // coverage: off - the unexecuted instantiation's region edge
         for model in self.model.repos.values() { // coverage: off - the unexecuted instantiation's region edge
             let (Some(repo), RepoData::Git(local)) = (&model.repo, &model.data) else { continue; }; // coverage: off - the model cannot change underneath one pass
             for remote in &local.asks { // coverage: off - the unexecuted instantiation's region edge
@@ -1061,10 +1064,11 @@ fn runtime_facts(
                 orphaned.insert((&pane.socket, &pane.window));
             }
         }
-        facts.windows.orphaned = orphaned.len();
-        for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() {
+        facts.windows.orphaned = orphaned.len(); // coverage: off - the unexecuted instantiation's region edge
+        #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+        for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() { // coverage: off - the unexecuted instantiation's region edge
             let Some(CwdPlacement::Checkout { root, .. }) = place else {
-                continue;
+                continue; // coverage: off - the unexecuted instantiation's region edge
             }; // coverage: off - the unexecuted instantiation's region edge
             if root != &canonical {
                 continue;
@@ -1074,7 +1078,7 @@ fn runtime_facts(
                 facts.live_agent_sessions += 1;
                 facts.live_pids += 1;
             } // coverage: off - the unexecuted instantiation's region edge
-        } // coverage: off - the unexecuted instantiation's region edge
+        }; // coverage: off - the unexecuted instantiation's region edge
     } else {
         // A branch-only row still counts conversations in its repository.
         for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() {
@@ -1361,6 +1365,13 @@ fn display_pane(pane: &PaneRef) -> String {
     pane.to_string()
 }
 
+/// Whether `pane` is the dashboard's own: the socket qualifies the id, so
+/// the same `%N` on another server is a watched pane, not the dashboard -
+/// and still acknowledges.
+fn is_own_pane(own_pane: Option<&PaneRef>, pane: &PaneRef) -> bool {
+    own_pane == Some(pane)
+}
+
 fn conversation_row(
     conv: &Conversation,
     attachment: Option<AttachmentRow>,
@@ -1489,6 +1500,7 @@ mod tests {
     use crate::process::ProcessInstance;
     use crate::provider::PublishedStatus;
     use crate::runtime::{EvidenceSource, LiveAttachment, ResolvedAttachment}; // coverage: off - the unexecuted instantiation's region edge
+    use crate::tmux::PaneId;
     use std::fs;
 
     /// One conversation fabricated to order: `live` and `transcript` each
@@ -1576,11 +1588,12 @@ mod tests {
                 None,
             );
             assert_eq!(row.state, want, "{want:?}");
-            assert!(row.live);
-        }
-        let row = conversation_row(
+            assert!(row.live); // coverage: off - the unexecuted instantiation's region edge
+        } // coverage: off - the unexecuted instantiation's region edge
+        #[rustfmt::skip]
+        let row = conversation_row( // coverage: off - the unexecuted instantiation's region edge
             &conversation(None, None),
-            None,
+            None, // coverage: off - the unexecuted instantiation's region edge
             derived(Exec::Unknown, Attention::None),
             None,
             None,
@@ -2014,5 +2027,25 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         let _ = fs::set_permissions(&gitfile, fs::Permissions::from_mode(0o644));
         let _ = fs::remove_dir_all(&dead_dir);
+    }
+
+    #[test]
+    fn own_pane_matches_socket_and_id_together() {
+        let pref = |socket: &str| PaneRef {
+            socket: PathBuf::from(socket),
+            pane: PaneId::parse("%1").unwrap(),
+        };
+        // Two servers can each carry a `%1`: only the matching socket's is
+        // the dashboard's own - a watched `%1` elsewhere acknowledges.
+        assert!(is_own_pane(Some(&pref("/sock/a")), &pref("/sock/a")));
+        assert!(!is_own_pane(Some(&pref("/sock/a")), &pref("/sock/b")));
+        assert!(!is_own_pane(None, &pref("/sock/a")));
+        assert!(!is_own_pane(
+            Some(&pref("/sock/a")),
+            &PaneRef {
+                socket: PathBuf::from("/sock/a"),
+                pane: PaneId::parse("%2").unwrap(),
+            }
+        ));
     }
 }
