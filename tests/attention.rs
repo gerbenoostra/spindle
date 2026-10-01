@@ -363,8 +363,8 @@ fn an_unknown_provider_is_a_usage_error() {
     assert!(out.stdout.is_empty());
 }
 
-/// The full walk the task's verification asks for: busy -> waiting ->
-/// completed-unseen, through JSON and the store, then killed-pid reaping.
+/// The full walk: busy -> waiting -> completed-unseen, through JSON and
+/// the store, then focus acknowledgement and killed-pid reaping.
 #[test]
 fn attention_flows_end_to_end() {
     if !tmux_or_skip() {
@@ -452,8 +452,8 @@ fn attention_flows_end_to_end() {
         .find(|c| c.session_id == LIVE_ID)
         .unwrap();
     assert_eq!(conv.state, ConversationState::Idle);
-    // Precedence: the retained waiting latch still outranks the done.
-    // Both are unacknowledged events on the same conversation.
+    // Both latches are unacknowledged on the same conversation; per-row
+    // precedence shows the unseen `done` over the retained waiting latch.
     assert_eq!(conv.attention, Attention::CompletedUnseen);
     assert_eq!(conv.attention_seq, Some(3));
 
@@ -570,8 +570,8 @@ fn attention_flows_end_to_end() {
     let _ = client.wait();
 }
 
-/// `enter`/deliberate-jump seen-state is T9's; cursor movement must never
-/// acknowledge. The store only moves on `space`.
+/// Cursor movement must never acknowledge: in the TUI only a deliberate
+/// `space` moves the store.
 #[test]
 fn cursor_movement_writes_no_seen_state() {
     let dir = TempDir::new("attention-space");
