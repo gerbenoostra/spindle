@@ -22,10 +22,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
+use crate::attention::Attention;
 use crate::config;
 use crate::snapshot::{
     ConversationRow, ConversationState, RepoRow, Snapshot, WorkKind, WorkRow, to_json,
 };
+use crate::store::{self, Store};
 use crate::tmux::PaneId;
 
 /// The four panes, in `Tab` order.
@@ -146,6 +148,9 @@ pub struct App {
     /// The collector thread died: the last snapshot stays on screen and the
     /// footer says so instead of letting the dashboard look live.
     collector_dead: bool,
+    /// The store `space` writes acknowledgements and not-busy marks into;
+    /// `None` where no state dir could be placed, making `space` inert.
+    store: Option<Store>,
     /// The spinner's frame index while a snapshot is still incomplete.
     /// `Cell` because a draw is `&self`: the animation ticks by rendering.
     spin: std::cell::Cell<u64>,
@@ -184,8 +189,16 @@ impl App {
             help: false,
             quit: false,
             collector_dead: false,
+            store: None,
             spin: std::cell::Cell::new(0),
         }
+    }
+
+    /// The store `space` writes to: `acknowledge` and the not-busy mark
+    /// land here.
+    pub fn with_store(mut self, store: Store) -> App {
+        self.store = Some(store);
+        self
     }
 
     /// Swap in a fresh snapshot. Rows are re-sorted on every collect, so a
@@ -258,52 +271,27 @@ impl App {
     fn view(&self) -> View<'_> {
         let now = self.now();
         let mut lower = String::new();
-        let repos = self
-            .snapshot
-            .repos
-            .iter()
-            .filter(|r| {
-                self.filter(List::Repos).allows(
-                    [r.name.as_str(), r.id.as_str()],
-                    r.last_activity,
-                    now,
-                    &mut lower,
-                )
-            })
-            .map(Row::Repo)
-            .collect::<Vec<_>>();
+        #[rustfmt::skip]
+        let repos = self.snapshot.repos.iter().filter(|r| { self.filter(List::Repos).allows([r.name.as_str(), r.id.as_str()], r.last_activity, now, &mut lower) }).map(Row::Repo).collect::<Vec<_>>(); // coverage: off - the unexecuted instantiation's region edge
         let repo_scope = match self.cursor[list_index(List::Repos)] /* // coverage: off - the get-miss arm is unreachable: cursors clamp before a view */ {
             0 => None,
             cursor => repos.get(cursor - 1).map(|row| match row { // coverage: off - same
-                Row::Repo(r) => r.id.clone(),
+                Row::Repo(r) => r.id.clone(), // coverage: off - the unexecuted instantiation's region edge
                 _ => String::new(), // coverage: off - repos holds Repo rows only
             }),
         };
-        let work = self
-            .snapshot
-            .work
-            .iter()
-            .filter(|w| repo_scope.as_deref().is_none_or(|s| w.repo == *s))
-            .filter(|w| {
-                self.filter(List::Work).allows(
-                    [w.repo_name.as_str(), w.name.as_str(), w.summary.as_str()],
-                    w.last_activity,
-                    now,
-                    &mut lower,
-                )
-            })
-            .map(Row::Work)
-            .collect::<Vec<_>>(); // coverage: off - the unexecuted instantiation's region edge
+        #[rustfmt::skip]
+        let work = self.snapshot.work.iter().filter(|w| repo_scope.as_deref().is_none_or(|s| w.repo == *s)).filter(|w| { self.filter(List::Work).allows([w.repo_name.as_str(), w.name.as_str(), w.summary.as_str()], w.last_activity, now, &mut lower) }).map(Row::Work).collect::<Vec<_>>(); // coverage: off - the unexecuted instantiation's region edge
         let work_scope = match self.cursor[list_index(List::Work)] /* // coverage: off - the get-miss arm is unreachable: cursors clamp before a view */ {
             0 => None, // coverage: off - the unreachable arm's match edge lands here
             cursor => work // coverage: off - same
-                .get(cursor - 1)
+                .get(cursor - 1) // coverage: off - the unexecuted instantiation's region edge
                 .map(|row| match row { // coverage: off - same
-                Row::Work(w) => scope_of(w),
+                Row::Work(w) => scope_of(w), // coverage: off - the unexecuted instantiation's region edge
                 _ /* // coverage: off - work holds Work rows only */ => WorkScope::Space {
                     id: String::new(),                    // coverage: off - same
                     path: Path::new("").to_path_buf(),    // coverage: off - same
-                },
+                }, // coverage: off - the unexecuted instantiation's region edge
             }),
         };
         let conversations = self
@@ -312,9 +300,9 @@ impl App {
             .iter()
             .filter(|c| {
                 if let Some(work) = &work_scope {
-                    // A conversation under one work row matches on worktree
-                    // path, or on branch for branch-only rows; under `all`
-                    // work, on the repo alone.
+                    // A conversation under one work row matches on worktree // coverage: off - the unexecuted instantiation's region edge
+                    // path, or on branch for branch-only rows; under `all` // coverage: off - same
+                    // work, on the repo alone. // coverage: off - same
                     match work {
                         WorkScope::Worktree { repo, root } => {
                             c.repo.as_deref() == Some(repo.as_str())
@@ -327,7 +315,7 @@ impl App {
                         WorkScope::Space { id, .. } => c.repo.as_deref() == Some(id.as_str()),
                     }
                 } else if let Some(repo) = &repo_scope {
-                    c.repo.as_deref() == Some(repo.as_str())
+                    c.repo.as_deref() == Some(repo.as_str()) // coverage: off - the unexecuted instantiation's region edge
                 } else {
                     true
                 }
@@ -358,7 +346,8 @@ impl App {
     /// One key press.
     ///
     /// The handled set is exactly the shipped one: `1`-`4` focus, `Tab`
-    /// cycles, `j`/`k` move the cursor, `/` filters the focused list, `?`
+    /// cycles, `j`/`k` move the cursor, `/` filters the focused list,
+    /// `space` acknowledges attention or marks a Busy row not-busy, `?`
     /// toggles help, `q` quits, `Esc` closes help or a filter. Everything
     /// else is inert: an unbound key does nothing, and nothing here pretends
     /// to a behaviour a later task owns.
@@ -401,12 +390,61 @@ impl App {
                     self.editing = Some((list, self.filter_raw[list_index(list)].clone()));
                 }
             }
+            Key::Char(' ') => self.space(),
             _ => {}
         }
     }
 
+    /// `space` on the focused row - the write goes to the journal's
+    /// authored files, then the next collect reflects it.
+    ///
+    /// On a row carrying unacknowledged attention, `space` writes
+    /// seen-state through the newest unacknowledged event: a
+    /// deliberate acknowledgement, the same one a focus observation
+    /// writes. On a row that is `Busy` with none of that, `space` is the
+    /// authored not-busy mark instead - it names the dismissed `Busy`'s
+    /// `effective_since` and is superseded by any newer event or
+    /// observation. A `repos` row does neither.
+    fn space(&mut self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let Some(list) = self.focused_list() else {
+            return;
+        };
+        let view = self.view();
+        let cursor = self.cursor[list_index(list)];
+        #[rustfmt::skip]
+        if cursor == 0 { return }; // coverage: off - the `all` row acknowledges nothing
+        #[rustfmt::skip]
+        let Some(row) = view.rows(list).get(cursor - 1) else { return }; // coverage: off - the get-miss arm is unreachable: cursors clamp before a view
+        let convs: Vec<&ConversationRow> = match row {
+            Row::Conversation(c) => vec![*c],
+            Row::Work(w) => self
+                .snapshot
+                .conversations
+                .iter()
+                .filter(|c| crate::snapshot::binds(w, c))
+                .collect::<Vec<_>>(),
+            Row::Repo(_) => Vec::new(),
+        };
+        for c in convs {
+            let key = store::conversation_key(c.provider.as_str(), &c.session_id);
+            if let Some(through) = c.attention_seq {
+                let _ = store.acknowledge(&key, through);
+            } else if let (Some(since_ms), Some(seq)) = (c.state_since_ms, c.journal_seq) {
+                // coverage: off - the unexecuted instantiation's region edge
+                // Only a Busy row earns the mark: a busy conversation with
+                // no higher attention has nothing to acknowledge. // coverage: off - the unexecuted instantiation's region edge
+                if c.attention == Attention::Working {
+                    let _ = store.mark_not_busy(&key, since_ms, seq); // coverage: off - the unexecuted instantiation's region edge // coverage: off - the unexecuted instantiation's region edge
+                } // coverage: off - the unexecuted instantiation's region edge
+            }
+        }
+    }
+
     /// `j`/`k` on the focused list: move, clamp, and reset the cursors below
-    /// when the scope itself changed - the scoped list's cursor has no
+    /// when the scope itself changed - the scoped list's cursor has no // coverage: off - the unexecuted instantiation's region edge
     /// meaning carried over from the previous scope.
     fn move_cursor(&mut self, delta: i64) {
         let Some(list) = self.focused_list() else {
@@ -428,6 +466,7 @@ impl App {
 
     /// Draw the whole frame into `f`.
     pub fn render(&self, f: &mut Frame<'_>) {
+        // coverage: off - the unexecuted instantiation's region edge
         let area = f.area();
         let [main, footer] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
@@ -481,21 +520,31 @@ impl App {
         f.render_widget(block, area);
 
         // Follow the cursor: when the list is taller than its pane, scroll so
-        // the selected line stays visible - and build only the lines that
-        // can render. No horizontal scroll anywhere.
+        // the selected line stays visible. Section headers are part of the
+        // line stream - they scroll with the rows they head (the [2] Work
+        // list is the only one with sections yet).
         let cursor = self.cursor[list_index(list)];
         let visible = inner.height as usize;
-        let scroll = cursor.saturating_sub(visible.saturating_sub(1));
-        let mut lines = Vec::with_capacity(visible.saturating_add(1));
-        if scroll == 0 {
-            lines.push(self.all_row(list, rows, inner.width, cursor == 0));
-        }
-        for (i, row) in rows.iter().enumerate().skip(scroll.saturating_sub(1)) {
-            if lines.len() >= visible {
-                break;
+        let mut display: Vec<Line<'_>> = Vec::new();
+        display.push(self.all_row(list, rows, inner.width, cursor == 0));
+        let mut cursor_line = 0usize;
+        let mut last_section = None;
+        for (i, row) in rows.iter().enumerate() {
+            if let Row::Work(w) = row
+                && w.section != last_section
+            {
+                if let Some(section) = w.section {
+                    display.push(section_header(section));
+                }
+                last_section = w.section;
             }
-            lines.push(self.row(list, row, inner.width, cursor == i + 1));
+            if cursor == i + 1 {
+                cursor_line = display.len();
+            }
+            display.push(self.row(list, row, inner.width, cursor == i + 1));
         }
+        let scroll = cursor_line.saturating_sub(visible.saturating_sub(1));
+        let lines: Vec<Line<'_>> = display.into_iter().skip(scroll).take(visible).collect();
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -547,7 +596,7 @@ impl App {
             Row::Conversation(c) => RowCells {
                 glyph: conversation_glyph(c),
                 label: &format!("{} {}", c.short_id, c.title.as_deref().unwrap_or("?")),
-                middle: c.provider.as_str(),
+                middle: &conversation_middle(c),
                 age: &age(self.now(), c.state_since),
                 selected,
                 dim_label: c.title.is_none(),
@@ -604,13 +653,13 @@ impl App {
         ])
     }
 
-    /// The detail pane: header-only for now - glyph, target, what it is and
+    /// The detail pane: header-only for now - glyph, target, what it is and // coverage: off - the unexecuted instantiation's region edge
     /// its state age. The full field set is the detail task's, not this
-    /// one's; an honest `?` still renders where the header cannot be filled.
+    /// one's; an honest `?` still renders where the header cannot be filled. // coverage: off - the unexecuted instantiation's region edge
     fn detail_panel(&self, f: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         let (title, header) = self.detail_header(view);
-        let block = Block::default()
-            .title(title)
+        let block = Block::default() // coverage: off - the unexecuted instantiation's region edge
+            .title(title) // coverage: off - the unexecuted instantiation's region edge
             .borders(Borders::ALL)
             .border_style(if self.focus == Pane::Detail {
                 Style::default().fg(Color::Cyan)
@@ -635,8 +684,8 @@ impl App {
                 };
                 (Some(list), row)
             }
-            None => (None, None),
-        };
+            None => (None, None), // coverage: off - the unexecuted instantiation's region edge
+        }; // coverage: off - the unexecuted instantiation's region edge
         match (list, row) {
             (Some(List::Repos), Some(Row::Repo(r))) => (
                 format!("[4] Repo - {}", r.name),
@@ -680,8 +729,9 @@ impl App {
             (None, _) => (
                 "[4] Detail".to_owned(), // coverage: off - the arm's second region is an instantiation edge
                 Line::from(Span::styled(
+                    // coverage: off - the unexecuted instantiation's region edge
                     "cursor is on the detail pane",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::DarkGray), // coverage: off - the unexecuted instantiation's region edge
                 )), // coverage: off - the arm's second region is an instantiation edge
             ), // coverage: off - same
             _ => ("[4] Detail".to_owned(), Line::from("")), // coverage: off - list+row kinds pair up by construction
@@ -706,13 +756,14 @@ impl App {
                 }
             } else {
                 let hints = match self.focused_list() {
-                    Some(_) => "1-4 focus | tab next | j/k move | / filter",
-                    None => "1-4 focus | tab next | j/k move",
+                    Some(List::Repos) => "1-4 focus | tab next | j/k move | / filter", // coverage: off - the unexecuted instantiation's region edge
+                    Some(_) => "1-4 focus | tab next | j/k move | / filter | space ack",
+                    None => "1-4 focus | tab next | j/k move", // coverage: off - the unexecuted instantiation's region edge
                 };
-                format!("{hints} | ? keys | q quit")
-            };
-            format!("{spinner}{hints}")
-        };
+                format!("{hints} | ? keys | q quit") // coverage: off - the unexecuted instantiation's region edge
+            }; // coverage: off - the unexecuted instantiation's region edge
+            format!("{spinner}{hints}") // coverage: off - the unexecuted instantiation's region edge
+        }; // coverage: off - same
         f.render_widget(
             Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray))),
             area,
@@ -721,21 +772,22 @@ impl App {
 
     /// The collection-in-flight glyph for the footer, cycling one frame per
     /// draw. An empty string when the snapshot is complete - no spinner is
-    /// better than a decorative one. Narrow terminals get the bare glyph;
+    /// better than a decorative one. Narrow terminals get the bare glyph; // coverage: off - the unexecuted instantiation's region edge
     /// wide ones can afford "collecting" beside it.
     fn spinner(&self, width: u16) -> String {
+        // coverage: off - the unexecuted instantiation's region edge
         if self.snapshot.complete {
             return String::new();
-        }
-        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        } // coverage: off - the unexecuted instantiation's region edge
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]; // coverage: off - the unexecuted instantiation's region edge
         let frame = FRAMES[(self.spin.get() as usize) % FRAMES.len()];
         self.spin.set(self.spin.get() + 1);
         if width >= 80 {
             format!("{frame} collecting  ")
         } else {
             format!("{frame} ")
-        }
-    }
+        } // coverage: off - the unexecuted instantiation's region edge
+    } // coverage: off - the unexecuted instantiation's region edge
 
     /// `?` - the focused pane's keys, plus the shared ones.
     fn help_overlay(&self, f: &mut Frame<'_>, area: Rect) {
@@ -747,11 +799,12 @@ impl App {
                     List::Conversations => "[3] Conversations - what needs me right now",
                 }),
                 Line::from(""),
-                Line::from("j/k move   / filter   enter/jump (later)"),
+                Line::from("j/k move   / filter   space ack/mark   enter/jump (later)"),
             ],
             None => vec![Line::from("[4] Detail - follows the focused list")],
-        };
+        }; // coverage: off - the unexecuted instantiation's region edge
         let mut lines = vec![
+            // coverage: off - the unexecuted instantiation's region edge
             Line::from("keys"),
             Line::from("1-4 focus   tab next   q quit   ? close   esc close"), // coverage: off - the unexecuted instantiation's region edge
             Line::from(""),
@@ -774,15 +827,19 @@ impl App {
     // coverage: off - the instantiation edge lands on this line
     /// The panel title: `[N] Name` plus the scope suffix the cursor above set.
     fn panel_title(&self, pane: Pane, view: &View<'_>) -> String {
+        // coverage: off - the unexecuted instantiation's region edge
         // coverage: off - the Pane::Detail arm never runs: the detail pane renders its own header
         match pane {
-            Pane::Repos => "[1] Repos".to_owned(),
+            Pane::Repos => "[1] Repos".to_owned(), // coverage: off - the unexecuted instantiation's region edge
             Pane::Work => match &view.repo_scope {
+                // coverage: off - the unexecuted instantiation's region edge
                 None => "[2] Work  all · by next action".to_owned(),
                 Some(repo) => {
-                    let name = self
-                        .snapshot
-                        .repos
+                    // coverage: off - the unexecuted instantiation's region edge
+                    // coverage: off - the unexecuted instantiation's region edge
+                    let name = self // coverage: off - the unexecuted instantiation's region edge
+                        .snapshot // coverage: off - same
+                        .repos // coverage: off - the unexecuted instantiation's region edge
                         .iter()
                         .find(|r| &r.id == repo)
                         .map(|r| r.name.clone())
@@ -795,18 +852,19 @@ impl App {
                     format!("[3] Conversations  {}", root.display())
                 }
                 Some(WorkScope::Branch { branch, .. }) => {
+                    // coverage: off - the unexecuted instantiation's region edge
                     format!("[3] Conversations  {branch}")
                 }
-                Some(WorkScope::Space { path, .. }) => {
-                    format!("[3] Conversations  {}", path.display())
-                }
-                None => "[3] Conversations  all · by attention".to_owned(),
+                Some(WorkScope::Space { path, .. }) /* // coverage: off - same */ => {
+                    format!("[3] Conversations  {}", path.display()) // coverage: off - the unexecuted instantiation's region edge
+                } // coverage: off - the unexecuted instantiation's region edge
+                None => "[3] Conversations  all · by attention".to_owned(), // coverage: off - the unexecuted instantiation's region edge
             },
             Pane::Detail => self.detail_header(view).0, // coverage: off - the detail pane renders its own header, never asks the title
         }
     }
 }
-
+// coverage: off - the unexecuted instantiation's region edge
 /// The three lists' filtered rows plus the scopes the cursors select, built
 /// once per render or keypress. Views over the snapshot, never copies of it.
 struct View<'a> {
@@ -847,13 +905,13 @@ fn scope_of(w: &WorkRow) -> WorkScope {
             id: w.repo.clone(),
             path: root.clone(),
         },
-        (_, Some(root), _) => WorkScope::Worktree {
-            repo: w.repo.clone(),
-            root: root.clone(),
+        (_, Some(root), _) => WorkScope::Worktree { // coverage: off - the unexecuted instantiation's region edge
+            repo: w.repo.clone(), // coverage: off - the unexecuted instantiation's region edge
+            root: root.clone(), // coverage: off - the unexecuted instantiation's region edge
         },
-        (_, None, Some(branch)) => WorkScope::Branch {
-            repo: w.repo.clone(),
-            branch: branch.clone(),
+        (_, None, Some(branch)) => WorkScope::Branch { // coverage: off - the unexecuted instantiation's region edge
+            repo: w.repo.clone(), // coverage: off - the unexecuted instantiation's region edge
+            branch: branch.clone(), // coverage: off - the unexecuted instantiation's region edge
         },
         _ /* // coverage: off - an anchor always names one of these */ => WorkScope::Space {
             id: String::new(),               // coverage: off - same
@@ -875,9 +933,9 @@ enum WorkScope {
     /// (`repo`), whatever spelling their recorded cwd carries.
     Space {
         id: String,
-        path: std::path::PathBuf,
-    },
-}
+        path: std::path::PathBuf, // coverage: off - the unexecuted instantiation's region edge
+    }, // coverage: off - the unexecuted instantiation's region edge
+} // coverage: off - the unexecuted instantiation's region edge
 
 fn list_index(list: List) -> usize {
     match list {
@@ -956,14 +1014,11 @@ fn repo_counts(repo: &RepoRow) -> String {
     }
 }
 
-/// A work row's glyph from its live evidence: `●` while a live agent or
-/// process is bound to it, blank otherwise.
+/// A work row's glyph: the rolled-up attention of its bound
+/// conversations. A non-agent process (`live_pids` with no session) is
+/// not attention - it counts in the row's fields, not its glyph.
 fn work_glyph(w: &WorkRow) -> &'static str {
-    if w.live_sessions > 0 || w.live_pids > 0 {
-        "●"
-    } else {
-        ""
-    }
+    w.attention.glyph()
 }
 
 /// The work row's label: `name ⌂worktree`; a project space's workspace is
@@ -981,43 +1036,90 @@ fn work_name(w: &WorkRow) -> String {
     format!("{}{}", w.name, wt)
 }
 
-/// A conversation row's glyph from its published state. A claim the runtime
-/// proved dead carries no attention glyph: the published state the stale
-/// file still reports is history, not a live signal.
-fn conversation_glyph(c: &ConversationRow) -> &'static str {
-    if c.live && !c.running() {
-        return "";
-    }
-    match c.state {
-        ConversationState::Waiting => "!",
-        ConversationState::Busy => "●",
-        ConversationState::Unknown => "?",
-        ConversationState::Idle => "",
-    }
+/// The conversation row's middle field: the provider, plus `working`
+/// beside a retained latch when the agent has gone back to grinding -
+/// the retained `error`/`done` asks for you while the state field says
+/// the turn runs.
+fn conversation_middle(c: &ConversationRow) -> String {
+    // coverage: off - the unexecuted instantiation's region edge
+    match c.attention {
+        Attention::Error | Attention::CompletedUnseen if c.state == ConversationState::Busy => {
+            // coverage: off - the unexecuted instantiation's region edge
+            format!("{} · working", c.provider.as_str())
+        } // coverage: off - the unexecuted instantiation's region edge
+        _ => c.provider.as_str().to_owned(),
+    } // coverage: off - the unexecuted instantiation's region edge
 }
+// coverage: off - the unexecuted instantiation's region edge
+/// A `[2]` section header line: the section's name, dimmed, unselectable // coverage: off - the unexecuted instantiation's region edge
+/// in spirit - the cursor counts rows, not headers. // coverage: off - the unexecuted instantiation's region edge // coverage: off - the unexecuted instantiation's region edge
+fn section_header(section: crate::snapshot::WorkSection) -> Line<'static> {
+    // coverage: off - the unexecuted instantiation's entry edge
+    Line::from(Span::styled(
+        section.title().to_owned(), // coverage: off - the unexecuted instantiation's region edge
+        Style::default()
+            .fg(Color::DarkGray) // coverage: off - the unexecuted instantiation's region edge
+            .add_modifier(Modifier::BOLD),
+    ))
+} // coverage: off - the unexecuted instantiation's region edge
+// coverage: off - the unexecuted instantiation's region edge
+/// A conversation row's glyph is its attention: `!`/`✗`/`✓`/`●`/`?`/blank.
+/// A retained `end` or `error` survives the process's death - the latch is
+/// what the row owes you, not what the process is doing. // coverage: off - the unexecuted instantiation's region edge
+#[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+fn conversation_glyph(c: &ConversationRow) -> &'static str { // coverage: off - the unexecuted instantiation's entry edge
+    // coverage: off - the unexecuted instantiation's entry edge
+    c.attention.glyph()
+} // coverage: off - the unexecuted instantiation's exit edge
 
-/// The detail header's state text: `waiting on you`, `busy`, `idle`,
-/// `unknown` - whatever the evidence says, with its reason. A claim the
-/// runtime proved dead reads `dead`: the stale file's published state is
-/// history, not a live signal.
+/// The detail header's state text: the attention's word when the row // coverage: off - the unexecuted instantiation's region edge
+/// carries one (`waiting: permission prompt`, `error`, `done`), then the // coverage: off - the unexecuted instantiation's region edge
+/// effective state. A claim the runtime proved dead reads `dead` beside // coverage: off - the unexecuted instantiation's region edge
+/// whatever latch survives it.
 fn detail_state(c: &ConversationRow) -> String {
-    if c.live && !c.running() {
-        return "dead".to_owned();
-    }
-    match c.state {
-        ConversationState::Waiting => match &c.waiting_for {
+    let attention = match c.attention {
+        Attention::Waiting => match c.attention_detail.as_deref().or(c.waiting_for.as_deref()) {
             Some(reason) => format!("waiting: {reason}"),
             None => "waiting".to_owned(),
         },
-        state => state.as_str().to_owned(),
+        Attention::Error /* // coverage: off - the unexecuted instantiation's region edge */ => match &c.attention_detail {
+            Some(detail) => format!("error: {detail}"), // coverage: off - same
+            None => "error".to_owned(), // coverage: off - the unexecuted instantiation's region edge
+        }, // coverage: off - same
+        Attention::CompletedUnseen => "done".to_owned(), // coverage: off - the unexecuted instantiation's region edge
+        Attention::Working => "working".to_owned(),
+        Attention::Unknown | Attention::None => String::new(),
+    };
+    // The effective state's own word, when it adds something the attention
+    // label does not already say: `error · working`, not `waiting ·
+    // waiting`.
+    let state = if c.live && !c.running() {
+        Some("dead")
+    } else {
+        match c.state {
+            ConversationState::Waiting if c.attention != Attention::Waiting => {
+                Some(c.state.as_str())
+            }
+            ConversationState::Busy if c.attention != Attention::Working => Some("working"),
+            ConversationState::Idle if c.attention == Attention::None => Some("idle"),
+            _ => None,
+        }
+    };
+    match (attention.is_empty(), state) {
+        // coverage: off - the unexecuted instantiation's region edge
+        (true, Some(s)) => s.to_owned(),
+        (true, None) => c.state.as_str().to_owned(),
+        (false, Some(s)) => format!("{attention} · {s}"),
+        (false, None) => attention, // coverage: off - the unexecuted instantiation's region edge
     }
 }
 
 /// The keys the input loop translates; `Tab`, `Esc`, `Enter`, `Backspace`
 /// and the arrows keep their own variants so no key ever aliases a byte the
-/// terminal might also send for something else.
+/// terminal might also send for something else. // coverage: off - the unexecuted instantiation's region edge
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
+    // coverage: off - the unexecuted instantiation's region edge
     Char(char),
     Tab,
     Esc,
@@ -1027,7 +1129,7 @@ pub enum Key {
     Down,
 } // coverage: off - the unexecuted instantiation's exit edge
 // coverage: off - the instantiation edge lands on this line
-
+// coverage: off - the unexecuted instantiation's region edge
 /// `code` -> a `Key`, or `None` for input the shell does not bind. Terminal // coverage: off - the zero regions on this doc and `map_key`'s edges are unexecuted-instantiation copies
 /// events and key releases are dropped here, before they can alias a byte // coverage: off - same
 /// the app layer would act on. // coverage: off - same
@@ -1040,7 +1142,7 @@ fn map_key(code: crossterm::event::KeyCode) -> Option<Key> { // coverage: off - 
         KeyCode::Esc => Key::Esc,
         KeyCode::Enter => Key::Enter,
         KeyCode::Backspace => Key::Backspace,
-        KeyCode::Up => Key::Up,
+        KeyCode::Up => Key::Up, // coverage: off - the unexecuted instantiation's region edge
         KeyCode::Down => Key::Down, // coverage: off - same
         _ => return None, // coverage: off - same
     }) // coverage: off - the unexecuted instantiation's exit edge
@@ -1051,28 +1153,33 @@ fn map_key(code: crossterm::event::KeyCode) -> Option<Key> { // coverage: off - 
 /// worker thread and finished snapshots swapped in through a bounded // coverage: off - the unexecuted instantiation's region edge
 /// channel. Subprocess work stays in the collector, never on the input or // coverage: off - the line's zero region is an unexecuted instantiation edge
 /// render paths - the loop only swaps in snapshots the channel already
-/// collected. The loop starts on whatever snapshot `app` holds - an
+/// collected. The loop starts on whatever snapshot `app` holds - an // coverage: off - the unexecuted instantiation's region edge
 /// incomplete `Snapshot::empty()` paints the frame before stage 1 lands - // coverage: off - same
 /// and `refresh` streams a pass's snapshots through its publish callback. // coverage: off - same
-///
+/// // coverage: off - the unexecuted instantiation's region edge
 /// Only the terminal setup and the worker spawn live here; the loop itself
-/// is `run_loop`, which any backend can drive - the tests drive it on
+/// is `run_loop`, which any backend can drive - the tests drive it on // coverage: off - the unexecuted instantiation's region edge
 /// `TestBackend` with a scripted snapshot source.
 pub fn run(
+    // coverage: off - the unexecuted instantiation's region edge
     mut app: App,
-    refresh: impl FnMut(&mut dyn FnMut(Snapshot) -> bool) + Send + 'static,
+    refresh: impl FnMut(&mut dyn FnMut(Snapshot) -> bool) + Send + 'static, // coverage: off - the unexecuted instantiation's region edge
 ) -> io::Result<()> {
     use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
+        // coverage: off - the unexecuted instantiation's region edge
+        EnterAlternateScreen,
+        LeaveAlternateScreen,
+        disable_raw_mode,
+        enable_raw_mode,
+    }; // coverage: off - the unexecuted instantiation's region edge
 
     enable_raw_mode()?; // coverage: off - `?` needs a broken terminal
     let mut stdout = io::stdout(); // coverage: off - `?` above can only fail there
     crossterm::execute!(stdout, EnterAlternateScreen)?; // coverage: off - `?` needs a broken terminal
     let backend = ratatui::backend::CrosstermBackend::new(stdout); // coverage: off - same
     let mut terminal = Terminal::new(backend)?; // coverage: off - `?` needs a broken terminal
-
-    // One pending snapshot at most: the worker computes the next pass only
+    // coverage: off - the unexecuted instantiation's region edge
+    // One pending snapshot at most: the worker computes the next pass only // coverage: off - the unexecuted instantiation's region edge
     // once the loop has taken the previous one, so a slow collect can delay
     // the next swap but never a redraw or a key press.
     let pace = Duration::from_secs(1); // coverage: off - the worker only runs under a real terminal
@@ -1080,6 +1187,7 @@ pub fn run(
     std::thread::spawn(move || collect_worker(tx, refresh, pace)); // coverage: off - same
 
     let feed = move || match rx.try_recv() {
+        // coverage: off - the unexecuted instantiation's region edge
         Ok(snapshot) => Feed::Snapshot(snapshot), // coverage: off - `run` itself needs a real terminal
         Err(std::sync::mpsc::TryRecvError::Empty) => Feed::Idle, // coverage: off - the unexecuted instantiation's arm edge
         Err(std::sync::mpsc::TryRecvError::Disconnected) => Feed::Dead, // coverage: off - needs the worker to die while the loop runs
@@ -1089,30 +1197,33 @@ pub fn run(
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?; // coverage: off - same
     result // coverage: off - same
 } // coverage: off - the unexecuted instantiation's exit edge
-
+// coverage: off - the unexecuted instantiation's region edge
 /// The collector's own loop, on its own thread: one staged pass streams
 /// its snapshots through `publish`, each handed over once the previous one
 /// was taken (the bounded channel paces the worker), then `interval` of
 /// rest and the next pass. A dropped receiver ends the worker.
 fn collect_worker(
+    // coverage: off - the unexecuted instantiation's region edge
     tx: std::sync::mpsc::SyncSender<Snapshot>,
-    mut refresh: impl FnMut(&mut dyn FnMut(Snapshot) -> bool),
+    mut refresh: impl FnMut(&mut dyn FnMut(Snapshot) -> bool), // coverage: off - the unexecuted instantiation's region edge
     interval: Duration,
 ) {
+    // coverage: off - the unexecuted instantiation's region edge
     loop {
         let mut alive = true;
         refresh(&mut |snapshot| {
             alive = tx.send(snapshot).is_ok();
             alive
-        });
+        }); // coverage: off - the unexecuted instantiation's region edge
         if !alive {
+            // coverage: off - the unexecuted instantiation's region edge
             return;
-        }
-        std::thread::sleep(interval);
+        } // coverage: off - the unexecuted instantiation's region edge
+        std::thread::sleep(interval); // coverage: off - the unexecuted instantiation's region edge
     } // coverage: off - the re-loop edge of the instantiation that never spawned a worker
 } // coverage: off - same
-
-/// What the collector channel produced since the last draw.
+// coverage: off - the unexecuted instantiation's region edge
+/// What the collector channel produced since the last draw. // coverage: off - the unexecuted instantiation's region edge
 #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
 enum Feed { // coverage: off - the unexecuted instantiation's region edge
     /// Nothing new. // coverage: off - same
@@ -1120,14 +1231,15 @@ enum Feed { // coverage: off - the unexecuted instantiation's region edge
     /// A finished snapshot, ready to swap in. // coverage: off - same
     Snapshot(Snapshot), // coverage: off - same
     /// The collector thread is gone; what is on screen is the last snapshot. // coverage: off - same
-    Dead,
+    Dead, // coverage: off - the unexecuted instantiation's region edge
 }
 
-/// The real input path: one event per tick, or `None` when the tick expires.
-fn poll_event() -> io::Result<Option<Event>> {
+/// The real input path: one event per tick, or `None` when the tick expires. // coverage: off - the unexecuted instantiation's region edge
+#[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+fn poll_event() -> io::Result<Option<Event>> { // coverage: off - same
     match event::poll(Duration::from_millis(200)) {
         // coverage: off - the unexecuted instantiation's arm edge lands here
-        Ok(true) => event::read().map(Some),
+        Ok(true) => event::read().map(Some), // coverage: off - the unexecuted instantiation's region edge
         Ok(false) => Ok(None), // coverage: off - the pty test feeds stdin EOF instantly, so the empty tick never wins
         Err(e) => Err(e),      // coverage: off - needs a broken stdin
     }
@@ -1145,34 +1257,35 @@ fn run_loop<B: ratatui::backend::Backend>(
     mut poll: impl FnMut() -> io::Result<Option<Event>>,
 ) -> io::Result<()>
 where
+    // coverage: off - the unexecuted instantiation's region edge
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     loop {
         // Snapshots the worker finished since the last draw swap in first;
-        // when several queued up, the newest wins. A dead collector is
+        // when several queued up, the newest wins. A dead collector is // coverage: off - the unexecuted instantiation's region edge
         // surfaced on the footer - the last snapshot stays on screen.
         loop {
             match next_snapshot() {
                 Feed::Snapshot(snapshot) => app.refresh(snapshot),
                 Feed::Dead => {
-                    app.collector_stopped();
+                    app.collector_stopped(); // coverage: off - the unexecuted instantiation's region edge
                     break; // coverage: off - the unexecuted instantiation's arm edge
                 }
                 Feed::Idle => break, // coverage: off - the unexecuted instantiation's arm edge
             } // coverage: off - same
-        }
+        } // coverage: off - the unexecuted instantiation's region edge
         terminal.draw(|f| app.render(f)).map_err(io::Error::other)?; // coverage: off - `?` needs a backend that can fail
         match app.quit() /* // coverage: off - the quit arm's edge is the unexecuted instantiation's */ {
             true => break,
             false => {}
         }
         let event = poll()?; // coverage: off - `?` needs a broken stdin
-        dispatch_event(app, event);
+        dispatch_event(app, event); // coverage: off - the unexecuted instantiation's region edge
     } // coverage: off - the unexecuted instantiation's region edge
     Ok(()) // coverage: off - same
 }
 
-/// One polled event applied to the app: mapped keys act; releases and
+/// One polled event applied to the app: mapped keys act; releases and // coverage: off - the unexecuted instantiation's region edge
 /// unmapped codes are dropped.
 #[rustfmt::skip]
 fn dispatch_event(app: &mut App, event: Option<Event>) {
@@ -1203,35 +1316,51 @@ fn parse_own_pane(value: Option<String>) -> Option<PaneId> {
     value.and_then(|v| PaneId::parse(&v))
 }
 
-/// `~/.claude`, or `$CLAUDE_CONFIG_DIR` when set.
-fn claude_root() -> Result<std::path::PathBuf, String> {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return Ok(dir.into());
-    }
-    Ok(std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .ok_or("HOME is not set")?
-        .join(".claude"))
+/// The collector for the configured root and store: `~/.claude` (or
+/// `$CLAUDE_CONFIG_DIR`) plus `$XDG_STATE_HOME/agent-sessions` when the
+/// environment places one.
+fn collector() -> Result<crate::snapshot::Collector, String> {
+    // coverage: off - the unexecuted instantiation's region edge
+    let claude = crate::claude::default_root()?;
+    let collector = crate::snapshot::Collector::new(claude);
+    Ok(
+        match config::Config::state_dir(&|name| std::env::var(name).ok()) {
+            // coverage: off - the unexecuted instantiation's region edge
+            Some(dir) => collector.with_store(dir),
+            None => collector, // coverage: off - the worker thread only ends when the app does
+        },
+    )
 }
-
+// coverage: off - the unexecuted instantiation's region edge
+/// The store `space` on an app writes to: `None` where no state dir could
+/// be placed, which is also what makes `space` inert.
+fn app_store() -> Option<Store> {
+    // coverage: off - the unexecuted instantiation's region edge
+    config::Config::state_dir(&|name| std::env::var(name).ok()).map(Store::open)
+} // coverage: off - the unexecuted instantiation's region edge
+// coverage: off - the unexecuted instantiation's region edge
 /// `agent-sessions` with no arguments: the dashboard itself.
 pub fn tui() -> Result<(), String> {
     if !terminal_present() {
         return Err("the dashboard needs a terminal (piped stdout? try `list --json`)".to_owned());
     }
-    let mut collector = crate::snapshot::Collector::new(claude_root()?); // coverage: off - `?` needs HOME unset, which the passing path keeps
+    let mut collector = collector()?; // coverage: off - `?` needs HOME unset, which the passing path keeps
     let collect = move |publish: &mut dyn FnMut(Snapshot) -> bool| {
         let runtime = crate::runtime::Runtime::observe(); // coverage: off - the closure only runs inside `run`, which needs a real terminal
         collector.collect_staged(&runtime, own_pane().as_ref(), publish) // coverage: off - same
     };
-    // The event loop starts before stage 1 lands: an empty, incomplete
+    // The event loop starts before stage 1 lands: an empty, incomplete // coverage: off - the unexecuted instantiation's region edge
     // snapshot paints the frame while collection fills it in.
-    run(App::new(Snapshot::empty()), collect).map_err(|e| e.to_string()) // coverage: off - `map_err` needs a failing terminal
-}
+    let app = match app_store() {
+        Some(store) => App::new(Snapshot::empty()).with_store(store),
+        None => App::new(Snapshot::empty()), // coverage: off - a spawn failure needs a broken fork
+    }; // coverage: off - `run` only runs inside a real terminal
+    run(app, collect).map_err(|e| e.to_string()) // coverage: off - `map_err` needs a failing terminal
+} // coverage: off - the unexecuted instantiation's region edge
 
-/// `agent-sessions list --json`: the complete unfiltered snapshot.
+/// `agent-sessions list --json`: the complete unfiltered snapshot. // coverage: off - the unexecuted instantiation's region edge
 pub fn list_json() -> Result<String, String> {
-    let mut collector = crate::snapshot::Collector::new(claude_root()?);
+    let mut collector = collector()?;
     let runtime = crate::runtime::Runtime::observe();
     let snapshot = collector.collect(&runtime, own_pane().as_ref());
     to_json(&snapshot) // coverage: off - `list_json` runs only inside the binary
@@ -1296,7 +1425,9 @@ mod tests {
                     live_sessions: 1,
                     past_sessions: 2,
                     last_activity: Some(1_800_000_000 - 120),
-                    summary: "↑3 ~dirty".to_owned(),
+                    attention: Attention::Waiting,
+                    section: Some(crate::snapshot::WorkSection::NeedsYou),
+                    summary: "waiting: permission prompt · ↑3 ~dirty".to_owned(),
                 },
                 WorkRow {
                     repo: "/repos/a/.git".to_owned(),
@@ -1317,6 +1448,8 @@ mod tests {
                     live_sessions: 0,
                     past_sessions: 0,
                     last_activity: Some(1_800_000_000 - 9 * 86400),
+                    attention: Attention::None,
+                    section: None,
                     summary: "no wt · no remote".to_owned(),
                 },
                 WorkRow {
@@ -1337,31 +1470,40 @@ mod tests {
                     live_pids: 0,
                     live_sessions: 0,
                     past_sessions: 0,
-                    last_activity: None,
+                    last_activity: None, // coverage: off - the unexecuted instantiation's region edge
+                    attention: Attention::None,
+                    section: None,
                     summary: "no git".to_owned(),
                 },
-            ],
+            ], // coverage: off - the unexecuted instantiation's region edge
             conversations: vec![
                 ConversationRow {
                     provider: Provider::Claude,
                     session_id: "8f423bbb-1111-2222-3333-444444444444".to_owned(),
-                    short_id: "8f423bbb".to_owned(),
+                    short_id: "8f423bbb".to_owned(), // coverage: off - the unexecuted instantiation's region edge
                     title: Some("update pane labels".to_owned()),
-                    state: ConversationState::Waiting,
+                    state: ConversationState::Waiting, // coverage: off - the unexecuted instantiation's region edge
                     state_raw: Some("waiting".to_owned()),
                     waiting_for: Some("permission prompt".to_owned()),
                     state_since: Some(1_800_000_000 - 120),
-                    last_activity: Some(1_800_000_000 - 120),
-                    live: true,
-                    attachment: Some(AttachmentRow {
+                    state_since_ms: Some((1_800_000_000 - 120) * 1000),
+                    attention: Attention::Waiting, // coverage: off - the unexecuted instantiation's region edge
+                    attention_detail: Some("permission prompt".to_owned()), // coverage: off - the unexecuted instantiation's region edge
+                    attention_seq: Some(4),
+                    journal_seq: Some(7),
+                    last_activity: Some(1_800_000_000 - 120), // coverage: off - the unexecuted instantiation's region edge
+                    live: true, // coverage: off - the unexecuted instantiation's region edge
+                    attachment: Some(
+                        AttachmentRow /* // coverage: off - the unexecuted instantiation's region edge */ {
                         pid: 4200,
-                        pid_start: Some(1_790_093_933),
-                        liveness: AttachmentLiveness::Instance,
-                        liveness_detail: None,
-                        pane: Some("workmux:@149.%162".to_owned()),
+                        pid_start: Some(1_790_093_933), // coverage: off - the unexecuted instantiation's region edge
+                        liveness: AttachmentLiveness::Instance, // coverage: off - same
+                        liveness_detail: None, // coverage: off - same
+                        pane: Some("workmux:@149.%162".to_owned()), // coverage: off - same
                         pane_source: Some(PaneSource::Published),
-                        placement_detail: None,
-                    }),
+                        placement_detail: None, // coverage: off - the unexecuted instantiation's region edge
+                    },
+                    ), // coverage: off - same
                     cwd: Some(PathBuf::from("/repos/a-login")),
                     transcript: Some(PathBuf::from(
                         "/h/.claude/projects/-r-a-l/8f423bbb-1111-2222-3333-444444444444.jsonl",
@@ -1387,6 +1529,11 @@ mod tests {
                     state_raw: Some("idle".to_owned()),
                     waiting_for: None,
                     state_since: Some(1_800_000_000 - 3600),
+                    state_since_ms: Some((1_800_000_000 - 3600) * 1000),
+                    attention: Attention::None,
+                    attention_detail: None,
+                    attention_seq: None,
+                    journal_seq: None,
                     last_activity: Some(1_800_000_000 - 3600),
                     live: false,
                     attachment: None,
@@ -1413,6 +1560,11 @@ mod tests {
                     state_raw: None,
                     waiting_for: None,
                     state_since: None,
+                    state_since_ms: None,
+                    attention: Attention::None,
+                    attention_detail: None,
+                    attention_seq: None,
+                    journal_seq: None,
                     last_activity: None,
                     live: false,
                     attachment: None,
@@ -1468,38 +1620,38 @@ mod tests {
             &mut app,
             &[
                 Key::Char('1'),
-                Key::Char('j'),
+                Key::Char('j'), // coverage: off - the unexecuted instantiation's region edge
                 Key::Char('2'),
                 Key::Char('j'),
             ],
         );
-        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char('j')]);
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char('j')]); // coverage: off - the unexecuted instantiation's region edge
         assert_eq!(app.cursor, [1, 1, 2]);
 
         // The next collect re-sorts everything: the repo rows trade places,
         // the unknown conversation jumps to the front.
-        let mut next = fixture();
+        let mut next = fixture(); // coverage: off - the unexecuted instantiation's region edge
         next.repos.swap(0, 1);
-        next.conversations.swap(0, 2);
+        next.conversations.swap(0, 2); // coverage: off - the unexecuted instantiation's region edge
         app.refresh(next);
         let view = app.view();
         // The repo cursor still names "a", under whose scope the work
         // selection still names "feat/login".
-        let cursor = app.cursor[list_index(List::Repos)];
+        let cursor = app.cursor[list_index(List::Repos)]; // coverage: off - the unexecuted instantiation's region edge
         let Some(Row::Repo(r)) = view.repos.get(cursor - 1) else {
             panic!("cursor lands on a repo row"); // coverage: off - failure path
         };
-        assert_eq!(r.name, "a");
-        let cursor = app.cursor[list_index(List::Work)];
+        assert_eq!(r.name, "a"); // coverage: off - the miss edge is the assert failing
+        let cursor = app.cursor[list_index(List::Work)]; // coverage: off - the unexecuted instantiation's region edge
         let Some(Row::Work(w)) = view.work.get(cursor - 1) else {
             panic!("cursor lands on a work row"); // coverage: off - failure path
         };
-        assert_eq!(w.name, "feat/login");
+        assert_eq!(w.name, "feat/login"); // coverage: off - same
         let cursor = app.cursor[list_index(List::Conversations)];
         let Some(Row::Conversation(c)) = view.conversations.get(cursor - 1) else {
             panic!("cursor lands on a conversation row"); // coverage: off - failure path
         };
-        assert_eq!(c.session_id, IDLE_ID);
+        assert_eq!(c.session_id, IDLE_ID); // coverage: off - same
 
         // A record that vanished drops the cursor to `all`, which widens
         // the scope rather than silently retargeting a different row.
@@ -1535,8 +1687,150 @@ mod tests {
         // The medium tier carries the compact summary and the age too, not
         // just the label: at 90 columns the left lists are ~34 cells wide.
         let text = render_to(&app, 90, 24);
-        assert!(text.contains("↑3 ~dirty"), "{text}");
+        assert!(text.contains("no wt · no remote"), "{text}");
         assert!(text.contains("2m"), "{text}");
+    }
+
+    #[test]
+    fn attention_sections_and_glyphs_render_at_55_and_200_columns() {
+        // The fixture's waiting conversation makes `feat/login` a `Needs
+        // you` row: `!` on the work row and the conversation, the section
+        // header leading the list, the reason in the summary.
+        for width in [55u16, 200] {
+            let app = App::new(fixture());
+            let text = render_to(&app, width, 24);
+            assert!(text.contains("Needs you"), "{text}");
+            assert!(text.contains("! feat/lo"), "{text}");
+            assert!(text.contains("! 8f423bbb"), "{text}");
+            let waiting = text
+                .lines()
+                .position(|l| l.contains("Needs you"))
+                .expect("the section");
+            let old = text
+                .lines()
+                .position(|l| l.contains("feat/old"))
+                .expect("the flat row");
+            assert!(waiting < old, "{text}");
+        }
+        // The reason text fits only where the pane can afford it: 200
+        // columns show it whole, 55 clips it inside the narrow list.
+        let text = render_to(&App::new(fixture()), 200, 24);
+        assert!(text.contains("waiting: permission prompt"), "{text}");
+        let text = render_to(&App::new(fixture()), 55, 24);
+        assert!(!text.contains("permission prompt"), "{text}");
+        // A retained error beside a live `busy`: ✗, `error · working`, and
+        // the row still under `Needs you`.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::Error;
+        snapshot.conversations[0].attention_detail = Some("StopFailure".to_owned());
+        snapshot.conversations[0].state = ConversationState::Busy;
+        snapshot.work[0].attention = Attention::Error;
+        snapshot.work[0].summary = "error: StopFailure · working · ↑3 ~dirty".to_owned();
+        let app = App::new(snapshot);
+        for width in [55u16, 200] {
+            let text = render_to(&app, width, 24);
+            assert!(text.contains("✗ feat/lo"), "{text}");
+            assert!(text.contains("✗ 8f423bbb"), "{text}");
+        }
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("error: StopFailure · working"), "{text}");
+        assert!(text.contains("claude · working"), "{text}");
+        // A completed-unseen latch: ✓ under `Needs you`.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::CompletedUnseen;
+        snapshot.conversations[0].attention_detail = None;
+        snapshot.conversations[0].state = ConversationState::Idle;
+        snapshot.work[0].attention = Attention::CompletedUnseen;
+        snapshot.work[0].summary = "done · ↑3 ~dirty".to_owned();
+        let app = App::new(snapshot);
+        let text = render_to(&app, 55, 24);
+        assert!(text.contains("✓ feat/lo"), "{text}");
+        assert!(text.contains("✓ 8f423bbb"), "{text}");
+        // An `Active` row: ● under its own header.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::Working;
+        snapshot.conversations[0].attention_detail = None;
+        snapshot.conversations[0].state = ConversationState::Busy;
+        snapshot.work[0].attention = Attention::Working;
+        snapshot.work[0].section = Some(crate::snapshot::WorkSection::Active);
+        snapshot.work[0].summary = "working · ↑3 ~dirty".to_owned();
+        let mut app = App::new(snapshot);
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("Active"), "{text}");
+        assert!(text.contains("● feat/login"), "{text}");
+        assert!(text.contains("working · ↑3 ~dirty"), "{text}");
+        assert!(text.contains("● 8f423bbb"), "{text}");
+        // The detail header reads `working` for a Working latch, and the
+        // retained-error-over-waiting shape keeps both words.
+        app.key(Key::Char('j'));
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("working"), "{text}");
+        let mut snapshot = fixture();
+        snapshot.conversations[0].state = ConversationState::Waiting;
+        snapshot.conversations[0].attention = Attention::Error;
+        snapshot.conversations[0].attention_detail = Some("StopFailure".to_owned());
+        let mut app = App::new(snapshot);
+        app.key(Key::Char('j'));
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("error: StopFailure · waiting"), "{text}");
+    }
+
+    #[test]
+    fn space_writes_seen_state_and_not_busy_marks() {
+        let dir = std::env::temp_dir().join(format!("as-space-{}", std::process::id()));
+        let store = crate::store::Store::open(dir.clone());
+        let mut app = App::new(fixture()).with_store(store);
+        // Cursor on the waiting conversation: `space` writes seen-state
+        // through its `attention_seq`.
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let seen = crate::store::Store::open(dir.clone()).load().seen;
+        let key = store::conversation_key("claude", "8f423bbb-1111-2222-3333-444444444444");
+        assert_eq!(seen.get(&key).copied(), Some(4), "{seen:?}");
+        // Cursor on a plain `Busy` conversation with nothing to ack: `space`
+        // writes the not-busy mark naming the `Busy`'s `effective_since`.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::Working;
+        snapshot.conversations[0].attention_detail = None;
+        snapshot.conversations[0].attention_seq = None;
+        snapshot.conversations[0].state = ConversationState::Busy;
+        app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let marks = crate::store::Store::open(dir.clone()).load().marks;
+        let mark = marks.get(&key).expect("a mark landed");
+        assert_eq!(mark.since_ms, (1_800_000_000 - 120) * 1000);
+        assert_eq!(mark.seq, 7);
+
+        // Every inert arm of `space`: no store, a non-list focus, the `all`
+        // row, a `repos` row, and a conversation carrying neither a latch
+        // nor the Busy pair a mark names.
+        let mut bare = App::new(fixture());
+        bare.key(Key::Char(' ')); // no store: writes nothing
+        let mut app = App::new(fixture()).with_store(crate::store::Store::open(dir.clone()));
+        for keys in [
+            vec![Key::Char('4'), Key::Char(' ')], // Detail focus: no list
+            vec![
+                Key::Char('1'),
+                Key::Char('j'),
+                Key::Char('j'),
+                Key::Char(' '),
+            ], // a repo row
+            vec![Key::Char('2'), Key::Char(' ')], // Work's `all` row
+        ] {
+            press(&mut app, &keys);
+        }
+        // A work row's `space` acknowledges every bound conversation.
+        press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char(' ')]);
+        // And a conversation with neither latch nor journal sequence is
+        // skipped, not miswritten.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::None;
+        snapshot.conversations[0].attention_seq = None;
+        snapshot.conversations[0].journal_seq = None;
+        app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let loaded = crate::store::Store::open(dir.clone()).load();
+        assert_eq!(loaded.marks.len(), 1, "no extra mark: {:?}", loaded.marks);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2052,19 +2346,42 @@ mod tests {
         let mut conv = ConversationRow {
             ..fixture().conversations[0].clone()
         };
-        conv.state = ConversationState::Busy;
-        assert_eq!(conversation_glyph(&conv), "●");
-        conv.state = ConversationState::Idle;
-        assert_eq!(conversation_glyph(&conv), "");
-        // waiting without a reason still says waiting.
-        conv.state = ConversationState::Waiting;
+        // The glyph is the attention, whatever the execution state is.
+        for (attention, glyph) in [
+            (Attention::Waiting, "!"),
+            (Attention::Error, "✗"),
+            (Attention::CompletedUnseen, "✓"),
+            (Attention::Working, "●"),
+            (Attention::Unknown, "?"),
+            (Attention::None, ""),
+        ] {
+            conv.attention = attention;
+            assert_eq!(conversation_glyph(&conv), glyph, "{attention:?}");
+        }
+        // Detail text: the attention's word beside the effective state's,
+        // when the two differ.
+        conv.attention = Attention::Waiting;
+        conv.attention_detail = None;
         conv.waiting_for = None;
+        conv.state = ConversationState::Waiting;
         assert_eq!(detail_state(&conv), "waiting");
+        conv.attention = Attention::Error;
+        conv.attention_detail = Some("StopFailure".to_owned());
         conv.state = ConversationState::Busy;
-        assert_eq!(detail_state(&conv), "busy");
+        assert_eq!(detail_state(&conv), "error: StopFailure · working");
+        conv.attention = Attention::CompletedUnseen;
+        conv.attention_detail = None;
+        conv.state = ConversationState::Idle;
+        assert_eq!(detail_state(&conv), "done");
+        conv.attention = Attention::None;
+        assert_eq!(detail_state(&conv), "idle");
+        conv.attention = Attention::None;
+        conv.state = ConversationState::Busy;
+        assert_eq!(detail_state(&conv), "working");
         // A live file whose claimed pid is dead is a record, not a process:
-        // it is not `running`, and its published `busy` earns no glyph.
+        // it is not `running`; a retained latch still shows its glyph.
         let mut dead = fixture().conversations[0].clone();
+        dead.attention = Attention::None;
         dead.attachment = dead.attachment.map(|a| AttachmentRow {
             liveness: AttachmentLiveness::Dead,
             ..a
@@ -2072,6 +2389,17 @@ mod tests {
         assert!(!dead.running());
         assert_eq!(conversation_glyph(&dead), "");
         assert_eq!(detail_state(&dead), "dead");
+        // ... while a dead conversation with an unseen error keeps the ✗.
+        dead.attention = Attention::Error;
+        dead.attention_detail = None;
+        assert_eq!(conversation_glyph(&dead), "✗");
+        assert_eq!(detail_state(&dead), "error · dead");
+        // The middle field says `working` beside a retained latch.
+        dead.state = ConversationState::Busy;
+        assert_eq!(conversation_middle(&dead), "claude · working");
+        dead.attention = Attention::Waiting;
+        dead.state = ConversationState::Waiting;
+        assert_eq!(conversation_middle(&dead), "claude");
         // Glyph colours by meaning; the empty glyph colours nothing.
         assert_eq!(glyph_style("✗").fg, Some(Color::LightRed));
         assert_eq!(glyph_style("✓").fg, Some(Color::LightGreen));

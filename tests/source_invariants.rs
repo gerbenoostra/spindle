@@ -150,6 +150,43 @@ fn production_sources_never_name_a_git_write() {
     }
 }
 
+/// File-writing calls, as substrings. Every write the tool performs lands
+/// inside its own store under `$XDG_STATE_HOME/agent-sessions/` and goes
+/// through `src/store.rs` - the journal, the checkpoint, the seen-state and
+/// the not-busy marks. Agent files, transcripts, tmux options, Git config
+/// and window names are not ours to write, so no other module may hold a
+/// write primitive.
+const WRITE_CALLS: [&str; 8] = [
+    "fs::write",
+    "File::create",
+    "create_dir_all",
+    "OpenOptions",
+    "fs::rename",
+    "remove_file",
+    "set_permissions",
+    "fs::copy",
+];
+
+#[test]
+fn only_the_store_module_writes_files() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    for path in rust_sources(&src) {
+        let text = fs::read_to_string(&path).expect("a source file this crate owns");
+        let production = production_part(&text, &path);
+        let module = path.file_name().and_then(|n| n.to_str());
+        if module == Some("store.rs") {
+            continue;
+        }
+        for call in WRITE_CALLS {
+            assert!(
+                !production.contains(call),
+                "{}: writes through {call}, which belongs in src/store.rs",
+                path.display()
+            );
+        }
+    }
+}
+
 /// The text of `file` up to its unit-test module, after asserting the
 /// `#[cfg(test)]` convention that makes that cut safe.
 fn production_part<'a>(text: &'a str, path: &Path) -> &'a str {

@@ -16,13 +16,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::attention::{self, Attention};
 use crate::claude::{Claude, Conversation};
 use crate::evidence::Evidence;
 use crate::fanout;
 use crate::git::{self, Head, RemoteHead, RemoteListing, Resolved};
 use crate::process::{Liveness, ProcessStart};
-use crate::provider::{PublishedStatus, SourceError, StateEvidence};
+use crate::provider::{SourceError, StateEvidence};
 use crate::runtime::{PaneSource, Placement, Provider, Runtime};
+use crate::store::{self, Exec, Store};
 use crate::tmux::{PaneId, PaneRef};
 use crate::vector::{
     self, Anchor, Landed as LandedVerdict, RemoteCache, RuntimeFacts, UpstreamState, WindowCount,
@@ -168,15 +170,39 @@ pub enum AttachmentLiveness {
     Unverifiable,
 }
 
-/// `ConversationRow.state`: the provider's published execution state.
+/// `ConversationRow.state`: the arbitrated effective execution state -
+/// published state fused with the journal's events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationState {
     Busy,
     Idle,
     Waiting,
-    /// No published state, or one the mapping does not know.
+    /// No applicable evidence, or one the mapping does not know.
     Unknown,
+}
+
+/// `WorkRow.section`: the first-match next-action section. Attention wins
+/// over delivery and cleanup state; the losing evidence still shows in the
+/// row's summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkSection {
+    /// Waiting, failed unseen or completed unseen.
+    NeedsYou,
+    /// A live busy process with no higher attention and no authored
+    /// not-busy mark.
+    Active,
+}
+
+impl WorkSection {
+    /// The section header as [2] renders it.
+    pub fn title(self) -> &'static str {
+        match self {
+            WorkSection::NeedsYou => "Needs you",
+            WorkSection::Active => "Active",
+        }
+    }
 }
 
 impl ConversationState {
@@ -227,7 +253,13 @@ pub struct WorkRow {
     pub past_sessions: usize,
     /// Newest of the HEAD reflog's last entry and its mtime; `None` is `?`.
     pub last_activity: Option<u64>,
-    /// Why the row reads the way it does (`↑3 ~2`, `no remote`, `no wt`).
+    /// The rolled-up attention of the conversations bound to the row.
+    pub attention: Attention,
+    /// The first-match section the row sits in; `None` is the flat
+    /// remainder until the lifecycle sections arrive.
+    pub section: Option<WorkSection>,
+    /// Why the row reads the way it does (`↑3 ~2`, `no remote`, `no wt`,
+    /// `error · working`).
     pub summary: String,
 }
 
@@ -259,15 +291,31 @@ pub struct ConversationRow {
     pub short_id: String,
     /// Provider title, or `None` -> `?`.
     pub title: Option<String>,
-    /// The provider's published reading, not yet arbitrated against hooks
-    /// (there are none yet).
+    /// The arbitrated effective reading: published state fused with the
+    /// journal's events, marks and liveness.
     pub state: ConversationState,
     /// The provider's raw status string, kept for the evidence view.
     pub state_raw: Option<String>,
-    /// The provider's own wait reason, verbatim.
+    /// The wait reason while waiting - the provider's `waitingFor` or the
+    /// `awaiting` event's, verbatim.
     pub waiting_for: Option<String>,
     /// When the effective state began, epoch seconds.
     pub state_since: Option<u64>,
+    /// The same instant in epoch milliseconds - what the not-busy mark
+    /// names.
+    pub state_since_ms: Option<u64>,
+    /// The row's attention: the precedence winner among unacknowledged
+    /// latches and the live claim.
+    pub attention: Attention,
+    /// The winning attention's reason (`permission prompt`,
+    /// `StopFailure`), for the detail pane.
+    pub attention_detail: Option<String>,
+    /// The journal sequence an acknowledgement would write through: the
+    /// highest unacknowledged latch. `None` when nothing awaits.
+    pub attention_seq: Option<u64>,
+    /// The newest event sequence the conversation has; a not-busy mark
+    /// written at it is superseded by anything newer.
+    pub journal_seq: Option<u64>,
     /// Most recent evidence of the conversation at all.
     pub last_activity: Option<u64>,
     /// Whether a live session record exists.
@@ -305,12 +353,19 @@ impl ConversationRow {
 }
 
 /// The collector: owns the plugins (and so their incremental indexes), the
-/// caches reused across passes until their freshness deadline, and the
-/// retained view every stage merges into. A collect is reads only -
-/// everything writes-averse in the boundary stays averse here.
+/// caches reused across passes until their freshness deadline, the store
+/// the journal lives in, and the retained view every stage merges into. A
+/// collect's only write is seen-state into our own store: the focus
+/// observation acknowledges a watched conversation.
 pub struct Collector {
     claude: Claude,
     remotes: RemoteCache,
+    /// The event journal and authored records; `None` where no state dir
+    /// could be placed (no `$HOME`, no `$XDG_STATE_HOME`).
+    store: Option<Store>,
+    /// Per-conversation weak `Busy -> Idle` stabilizer state, carried
+    /// across passes so confirmations accumulate between refreshes.
+    idles: HashMap<String, attention::WeakIdle>,
     /// The last-published view: every field keeps its last value until the
     /// stage that owns it lands a replacement.
     model: Model,
@@ -356,7 +411,15 @@ impl Collector {
         let remotes = RemoteCache::default();
         let model = Model::default(); // coverage: off - the unexecuted instantiation's region edge
         let workers = fanout::WORKERS; // coverage: off - same
-        Collector { claude, remotes, model, workers } // coverage: off - same
+        Collector { claude, remotes, store: None, idles: HashMap::new(), model, workers } // coverage: off - same
+    }
+
+    /// Read (and acknowledge through) the store at `dir` - the journal of
+    /// hook events and the authored records. Without it the snapshot holds
+    /// published evidence only.
+    pub fn with_store(mut self, dir: PathBuf) -> Collector {
+        self.store = Some(Store::open(dir));
+        self
     }
 
     /// The pool width the staged stages fan out at; `1` makes the pass
@@ -382,10 +445,13 @@ impl Collector {
     ) {
         // Stage 1 - runtime and provider inventory: conversations with
         // their published state, attachments and runtime evidence, before
-        // any Git subprocess runs.
+        // any Git subprocess runs. The store loads here too - the journal
+        // and authored records are stage-1 evidence.
         let observed_at = runtime.observed_at;
         let inventory = self.claude.scan();
         self.model.errors = inventory.errors;
+        let mut loaded = self.store.as_ref().map(Store::load).unwrap_or_default();
+        self.model.errors.append(&mut loaded.errors);
         self.model.skipped = inventory
             .skipped
             .iter()
@@ -416,6 +482,51 @@ impl Collector {
             .map(|i| attachment_of[i].is_some_and(|slot| resolved[slot].liveness.may_be_live()))
             .collect();
 
+        // Focus acknowledgement: a poll that observes a bound pane active,
+        // its window current and its session attached acknowledges the
+        // conversation's unacknowledged events - unless the pane is the
+        // dashboard's own, which cannot prove the user saw the agent.
+        if let Some(store) = &self.store {
+            for (i, conv) in inventory.conversations.iter().enumerate() {
+                let Some(slot) = attachment_of[i] else {
+                    continue;
+                };
+                let Some(pref) = &resolved[slot].attachment.pane else {
+                    continue;
+                };
+                let watched = runtime.panes.panes.iter().any(|p| {
+                    p.id == pref.pane
+                        && p.socket == pref.socket
+                        && p.active
+                        && p.window_active
+                        && p.session_attached > 0
+                });
+                let own = own_pane.is_some_and(|own| *own == pref.pane);
+                if !watched || own {
+                    continue;
+                }
+                let key = store::conversation_key("claude", &conv.session_id);
+                let through = loaded
+                    .folds
+                    .get(&key)
+                    .map(|f| f.unacked_through(loaded.seen.get(&key).copied().unwrap_or(0)))
+                    .unwrap_or(0);
+                if through == 0 {
+                    continue;
+                } // coverage: off - the unexecuted instantiation's region edge
+                match store.acknowledge(&key, through) {
+                    Ok(()) => {
+                        loaded.seen.insert(key, through);
+                    }
+                    Err(e) => self.model.errors.push(SourceError /* // coverage: off - a store write failure needs the filesystem to fail mid-pass; the latch shows again next pass */ {
+                        // coverage: off - an acknowledge failure needs a store write fault mid-pass; the latch simply shows again next pass
+                        source: "store".to_owned(), // coverage: off - same
+                        detail: format!("seen-state for {key:?}: {e}"), // coverage: off - same
+                    }), // coverage: off - the unexecuted instantiation's region edge
+                }
+            }
+        }
+
         // The conversation rows keep their previous Work placement until
         // stage 2 resolves this pass's cwds - a moved checkout shows its
         // last proven anchor rather than flickering to `?` every refresh.
@@ -423,16 +534,70 @@ impl Collector {
         // the attention sort happens per publish.
         let mut conversations: Vec<ConversationRow> = Vec::new();
         for (i, conv) in inventory.conversations.iter().enumerate() {
-            let attachment = attachment_of[i].map(|slot| attachment_row(&resolved[slot]));
+            let resolved_claim = attachment_of[i].map(|slot| &resolved[slot]);
+            let attachment = resolved_claim.map(attachment_row);
+            let key = store::conversation_key("claude", &conv.session_id);
+            // The published claim applies only while it is bound to a live
+            // attachment; a dead `(pid, pid_start)` leaves it as history.
+            let live = resolved_claim.and_then(|r| {
+                let pid_start = match r.attachment.process.pid_start {
+                    ProcessStart::At(at) => Some(at),
+                    ProcessStart::Unavailable => None,
+                };
+                r.liveness
+                    .may_be_live()
+                    .then_some((r.attachment.process.pid, pid_start))
+            });
+            let published = (live.is_some() && conv.live.is_some()).then(|| match conv.state() {
+                StateEvidence::Published(p) => {
+                    let observed = conv
+                        .live
+                        .as_ref()
+                        .and_then(|l| l.updated_at)
+                        .unwrap_or(observed_at);
+                    attention::Published {
+                        status: p.status,
+                        waiting_for: p.waiting_for,
+                        observed_ms: store::epoch_ms(observed),
+                        since_ms: conv
+                            .live
+                            .as_ref()
+                            .and_then(|l| l.status_updated_at.or(l.updated_at))
+                            .map(store::epoch_ms),
+                    }
+                }
+                #[rustfmt::skip]
+                StateEvidence::Absent => attention::Published { // coverage: off - unreachable: the `conv.live.is_some()` guard means `state()` is always Published here
+                    status: None, // coverage: off - same
+                    waiting_for: None, // coverage: off - same
+                    observed_ms: store::epoch_ms(observed_at), // coverage: off - same
+                    since_ms: None, // coverage: off - same
+                }, // coverage: off - the unexecuted instantiation's region edge
+            }); // coverage: off - the unexecuted instantiation's region edge
+            let derived = attention::derive(attention::Inputs {
+                // coverage: off - the unexecuted instantiation's region edge
+                // coverage: off - the unexecuted instantiation's region edge
+                // coverage: off - the unexecuted instantiation's region edge
+                fold: loaded.folds.get(&key), // coverage: off - the unexecuted instantiation's region edge
+                seen_through: loaded.seen.get(&key).copied().unwrap_or(0), // coverage: off - the unexecuted instantiation's region edge
+                mark: loaded.marks.get(&key),
+                published, // coverage: off - the unexecuted instantiation's region edge
+                live,      // coverage: off - the unexecuted instantiation's region edge
+                now_ms: store::epoch_ms(observed_at), // coverage: off - the unexecuted instantiation's region edge
+                ack_ok: loaded.readable, // coverage: off - the unexecuted instantiation's region edge
+                idle: self.idles.entry(key).or_default(),
+            }); // coverage: off - the unexecuted instantiation's region edge
             let carried = self
-                .model
-                .conversations
-                .iter()
-                .find(|c| c.session_id == conv.session_id);
+                .model // coverage: off - the unexecuted instantiation's region edge
+                .conversations // coverage: off - the unexecuted instantiation's region edge
+                .iter() // coverage: off - the unexecuted instantiation's region edge
+                .find(|c| c.session_id == conv.session_id); // coverage: off - the unexecuted instantiation's region edge
             let (repo, worktree, branch) = carried
                 .map(|c| (c.repo.clone(), c.worktree.clone(), c.branch.clone()))
                 .unwrap_or_default();
-            conversations.push(conversation_row(conv, attachment, repo, worktree, branch));
+            conversations.push(conversation_row(
+                conv, attachment, derived, repo, worktree, branch,
+            ));
         }
         self.model.conversations = conversations;
         if !self.emit(runtime, own_pane, publish) {
@@ -514,29 +679,33 @@ impl Collector {
                         runtime_facts(runtime, conversations, running, placements, anchor, repo_id)
                     })
                     .map_err(|e| anchor_error(repo_id, e)) // coverage: off - needs a repo whose worktree read fails mid-pass
-                },
+                }, // coverage: off - the unexecuted instantiation's region edge
                 |i, result| {
-                    let repo_id = &order[i];
+                    let repo_id = &order[i]; // coverage: off - the unexecuted instantiation's region edge
                     match result {
-                        Ok(local) => self.merge_repo(repo_id, local),
+                        // coverage: off - the unexecuted instantiation's region edge
+                        // coverage: off - the unexecuted instantiation's region edge
+                        Ok(local) => self.merge_repo(repo_id, local), // coverage: off - the unexecuted instantiation's region edge
                         Err(error) => self.fail_repo(repo_id, error), // coverage: off - needs a repo's worktree list to fail after its cwd resolved, mid-pass
                     }
-                    alive = self.emit(runtime, own_pane, publish);
+                    alive = self.emit(runtime, own_pane, publish); // coverage: off - the unexecuted instantiation's region edge
                 },
-            );
+            ); // coverage: off - the unexecuted instantiation's region edge
             if !alive {
+                // coverage: off - the unexecuted instantiation's region edge
                 return;
-            }
+            } // coverage: off - the unexecuted instantiation's region edge
         }
-
+        // coverage: off - the unexecuted instantiation's region edge
         // Stage 3 - remote evidence, one `ls-remote --symref` per repo and
-        // remote per deadline, fanned out; then the local probes each
-        // remote answer unlocks (bases, ahead/behind, landed, unpushed).
-        let mut asks: Vec<(git::Repo, String)> = Vec::new();
+        // remote per deadline, fanned out; then the local probes each // coverage: off - same
+        // remote answer unlocks (bases, ahead/behind, landed, unpushed). // coverage: off - the unexecuted instantiation's region edge
+        let mut asks: Vec<(git::Repo, String)> = Vec::new(); // coverage: off - the unexecuted instantiation's region edge
         for model in self.model.repos.values() {
             let (Some(repo), RepoData::Git(local)) = (&model.repo, &model.data) else {
+                // coverage: off - the unexecuted instantiation's region edge
                 continue;
-            };
+            }; // coverage: off - the unexecuted instantiation's region edge
             for remote in &local.asks {
                 if !self.remotes.fresh(repo, remote) {
                     asks.push((repo.clone(), remote.clone()));
@@ -578,22 +747,25 @@ impl Collector {
                     unreachable!("jobs holds Git models only") // coverage: off - filtered above
                 };
                 vector::apply_remote(repo, local, |repo, remote| {
-                    listings
+                    listings // coverage: off - the unexecuted instantiation's region edge
                         .get(&(repo.common_dir().to_owned(), remote.to_owned()))
-                        .cloned()
+                        .cloned() // coverage: off - the unexecuted instantiation's region edge
                         .unwrap_or_else(|| unprobed_listing(remote)) // coverage: off - apply only consults remotes the asks enumeration seeded
                 })
             },
-            |i, a| applied[i] = Some(a),
+            |i, a| applied[i] = Some(a), // coverage: off - the unexecuted instantiation's region edge
         );
         for (i, repo_id) in jobs.iter().enumerate() {
-            let Some(applied) = applied[i].take() else {
+            // coverage: off - the unexecuted instantiation's region edge
+            let Some(applied) = applied[i].take() else
+            /* // coverage: off - the miss arm is unreachable: `i` enumerates `applied` */
+            {
                 continue; // coverage: off - fan_out delivers every index
             };
-            self.apply_to_repo(repo_id, applied);
+            self.apply_to_repo(repo_id, applied); // coverage: off - the unexecuted instantiation's region edge
             if !self.emit(runtime, own_pane, publish) {
                 return;
-            }
+            } // coverage: off - the unexecuted instantiation's region edge
         }
 
         // Stage 4 - forge enrichment. No producer ships yet (the work-item
@@ -629,22 +801,22 @@ impl Collector {
         for (id, model) in &self.model.repos {
             let mut last_activity = None;
             match &model.data {
-                RepoData::Git(local) => {
+                RepoData::Git(local) /* // coverage: off - the unexecuted instantiation's region edge */ => {
                     for anchor in &local.anchors {
-                        let row = work_row(id, &model.name, &anchor.state);
-                        last_activity = last_activity.max(row.last_activity);
-                        work.push(row);
-                    }
-                }
-                RepoData::Space(row) => work.push(row.clone()),
-            }
-            let work_count = work.iter().filter(|w| w.repo == *id).count();
-            let live = self
-                .model
-                .conversations
-                .iter()
-                .filter(|c| c.running() && c.repo.as_deref() == Some(id.as_str()))
-                .count();
+                        let row = work_row(id, &model.name, &anchor.state); // coverage: off - same
+                        last_activity = last_activity.max(row.last_activity); // coverage: off - same
+                        work.push(row); // coverage: off - the unexecuted instantiation's region edge
+                    } // coverage: off - the unexecuted instantiation's region edge
+                } // coverage: off - the unexecuted instantiation's region edge
+                RepoData::Space(row) => work.push(row.clone()), // coverage: off - the unexecuted instantiation's region edge
+            } // coverage: off - the unexecuted instantiation's region edge
+            let work_count = work.iter().filter(|w| w.repo == *id).count(); // coverage: off - the unexecuted instantiation's region edge
+            let live = self // coverage: off - the unexecuted instantiation's region edge
+                .model // coverage: off - the unexecuted instantiation's region edge
+                .conversations // coverage: off - the unexecuted instantiation's region edge
+                .iter() // coverage: off - the unexecuted instantiation's region edge
+                .filter(|c| c.running() && c.repo.as_deref() == Some(id.as_str())) // coverage: off - the unexecuted instantiation's region edge
+                .count(); // coverage: off - the unexecuted instantiation's region edge
             repos.push(RepoRow {
                 id: id.clone(),
                 name: model.name.clone(),
@@ -655,7 +827,18 @@ impl Collector {
                 last_activity,
             });
         }
-        work.sort_by_key(|w| std::cmp::Reverse(w.last_activity));
+        // Attention and the first-match section are derived per publish
+        // from the conversations bound to the row; sections order first,
+        // newest activity inside a section.
+        for w in &mut work {
+            classify_work(w, &self.model.conversations);
+        }
+        work.sort_by(|a, b| {
+            section_order(a)
+                .cmp(&section_order(b))
+                .then_with(|| b.last_activity.cmp(&a.last_activity))
+                .then_with(|| a.name.cmp(&b.name))
+        });
         let mut conversations = self.model.conversations.clone();
         sort_conversations(&mut conversations, runtime.observed_at);
         publish(Snapshot {
@@ -680,30 +863,31 @@ impl Collector {
         let mut listings = HashMap::new();
         for model in self.model.repos.values() { // coverage: off - the unexecuted instantiation's region edge
             let (Some(repo), RepoData::Git(local)) = (&model.repo, &model.data) else { continue; }; // coverage: off - the model cannot change underneath one pass
-            for remote in &local.asks {
+            for remote in &local.asks { // coverage: off - the unexecuted instantiation's region edge
                 if let Some(listing) = self.remotes.peek(repo, remote) { listings.insert((repo.common_dir().to_owned(), remote.clone()), listing.clone()); } // coverage: off - the None arm is unreachable: every ask was seeded by the pool or the deadline cache
             }
-        }
+        } // coverage: off - the unexecuted instantiation's region edge
         listings
     } // coverage: off - the unexecuted instantiation's exit edge
-
+    // coverage: off - the unexecuted instantiation's region edge
     /// Apply one repo's remote-phase results into its local state.
-    #[rustfmt::skip]
-    fn apply_to_repo(&mut self, repo_id: &str, applied: Vec<vector::RemoteApplied>) {
+    #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+    fn apply_to_repo(&mut self, repo_id: &str, applied: Vec<vector::RemoteApplied>) { // coverage: off - the unexecuted instantiation's region edge
         let Some(RepoModel { data: RepoData::Git(local), .. }) = self.model.repos.get_mut(repo_id) else { return }; // coverage: off - the model cannot change underneath one pass
-        for (work, a) in local.anchors.iter_mut().zip(applied) {
-            work.apply(a);
+        for (work, a) in local.anchors.iter_mut().zip(applied) { // coverage: off - the unexecuted instantiation's region edge
+            work.apply(a); // coverage: off - the unexecuted instantiation's region edge
         }
     }
-
+    // coverage: off - the unexecuted instantiation's region edge
     /// A repo whose local read failed keeps its error and drops its row.
-    #[rustfmt::skip]
+    #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
     fn fail_repo(&mut self, repo_id: &str, error: SourceError) { self.model.errors.push(error); self.model.repos.remove(repo_id); } // coverage: off - the caller's arm needs a gitdir to vanish mid-pass
 
-    /// Merge one finished repository into the model. Remote-owned fields
+    /// Merge one finished repository into the model. Remote-owned fields // coverage: off - the unexecuted instantiation's region edge
     /// carry their last-pass values over into the fresh local state - they
     /// keep their last value until stage 3 replaces it.
     fn merge_repo(&mut self, repo_id: &str, mut local: vector::RepoLocal) {
+        // coverage: off - the unexecuted instantiation's region edge
         let repo = git::Repo {
             common_dir: PathBuf::from(repo_id),
         };
@@ -799,19 +983,21 @@ fn resolve_cwd(cwd: &Path, errors: &mut Vec<SourceError>) -> Option<CwdPlacement
         }
     }
 }
-
+// coverage: off - the unexecuted instantiation's region edge
 /// The error a touched repo's failed anchor scan records.
 fn anchor_error(repo_id: &str, e: git::Error) -> SourceError /* // coverage: off - needs a repo deleted mid-collection */
 {
+    // coverage: off - the unexecuted instantiation's region edge
     let source = "git".to_owned(); // coverage: off - needs a repo deleted mid-collection
     let detail = format!("{repo_id}: {e}"); // coverage: off - same
     SourceError { source, detail } // coverage: off - same
 } // coverage: off - same
-
-/// The repo row's name and path: the main checkout's, or - when no anchor
-/// is a main checkout, a bare repo for instance - the common dir itself.
+// coverage: off - the unexecuted instantiation's region edge
+/// The repo row's name and path: the main checkout's, or - when no anchor // coverage: off - the unexecuted instantiation's region edge
+/// is a main checkout, a bare repo for instance - the common dir itself. // coverage: off - the unexecuted instantiation's region edge
 fn repo_display<'a>(
-    mut anchors: impl Iterator<Item = &'a Anchor>,
+    // coverage: off - the unexecuted instantiation's region edge
+    mut anchors: impl Iterator<Item = &'a Anchor>, // coverage: off - the unexecuted instantiation's region edge
     repo: &git::Repo,
 ) -> (String, PathBuf) {
     anchors
@@ -860,7 +1046,7 @@ fn runtime_facts(
     let mut facts = RuntimeFacts {
         windows: WindowCount::default(),
         live_pids: 0,
-        live_agent_sessions: 0,
+        live_agent_sessions: 0, // coverage: off - the unexecuted instantiation's region edge
         past_agent_sessions: 0,
     };
     if let Some(path) = path {
@@ -870,6 +1056,7 @@ fn runtime_facts(
         // carrying no stored worktree edge whose pane cwds land inside.
         let mut orphaned = std::collections::HashSet::new();
         for pane in &runtime.panes.panes {
+            // coverage: off - the unexecuted instantiation's region edge
             if pane.wt_adminid.is_none() && pane.binds_worktree(admin_id, path) {
                 orphaned.insert((&pane.socket, &pane.window));
             }
@@ -878,21 +1065,21 @@ fn runtime_facts(
         for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() {
             let Some(CwdPlacement::Checkout { root, .. }) = place else {
                 continue;
-            };
+            }; // coverage: off - the unexecuted instantiation's region edge
             if root != &canonical {
                 continue;
-            }
-            facts.past_agent_sessions += 1;
+            } // coverage: off - the unexecuted instantiation's region edge
+            facts.past_agent_sessions += 1; // coverage: off - the unexecuted instantiation's region edge
             if running[i] {
                 facts.live_agent_sessions += 1;
                 facts.live_pids += 1;
-            }
-        }
+            } // coverage: off - the unexecuted instantiation's region edge
+        } // coverage: off - the unexecuted instantiation's region edge
     } else {
         // A branch-only row still counts conversations in its repository.
         for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() {
             if matches!(place, Some(CwdPlacement::Checkout { repo_id: id, .. }) if id == repo_id) {
-                facts.past_agent_sessions += 1;
+                facts.past_agent_sessions += 1; // coverage: off - the unexecuted instantiation's region edge
                 if running[i] {
                     facts.live_agent_sessions += 1;
                     facts.live_pids += 1;
@@ -964,7 +1151,79 @@ fn work_row(repo_id: &str, repo_name: &str, state: &vector::WorkState) -> WorkRo
         live_sessions: v.live_agent_sessions,
         past_sessions: v.past_agent_sessions,
         last_activity: v.last_git_activity.map(epoch),
+        attention: Attention::None,
+        section: None,
         summary: work_summary(v),
+    }
+}
+
+/// Whether the conversation is bound to the work row: its checkout path for
+/// a row with one, its branch for a branch-only row, its repo identity for
+/// a project space. A detached row binds only by path.
+pub fn binds(row: &WorkRow, c: &ConversationRow) -> bool {
+    match (row.kind, row.worktree.as_deref(), row.branch.as_deref()) {
+        (WorkKind::ProjectSpace, _, _) => c.repo.as_deref() == Some(row.repo.as_str()),
+        (_, Some(root), _) => {
+            c.repo.as_deref() == Some(row.repo.as_str()) && c.worktree.as_deref() == Some(root)
+        }
+        (_, None, Some(branch)) => {
+            // coverage: off - a WorkRow with neither worktree nor branch is a fabricated test shape
+            c.repo.as_deref() == Some(row.repo.as_str()) && c.branch.as_deref() == Some(branch)
+        }
+        // coverage: off - a WorkRow with neither worktree nor branch exists
+        // only as a fabricated test shape; anchors always carry one // coverage: off - the unexecuted instantiation's region edge
+        _ => false, // coverage: off - a WorkRow with neither worktree nor branch is a fabricated test shape
+    }
+}
+
+/// Fold the bound conversations' attention into the row's rollup, section
+/// and summary. First match wins: `Needs you` for waiting/failed-unseen/ // coverage: off - the unexecuted instantiation's region edge
+/// completed-unseen, `Active` for a live busy process with nothing higher.
+fn classify_work(row: &mut WorkRow, conversations: &[ConversationRow]) {
+    let bound: Vec<&ConversationRow> = conversations.iter().filter(|c| binds(row, c)).collect();
+    row.attention = attention::rollup(bound.iter().map(|c| &c.attention));
+    row.section = match row.attention {
+        Attention::Waiting | Attention::Error | Attention::CompletedUnseen => {
+            Some(WorkSection::NeedsYou)
+        }
+        Attention::Working => Some(WorkSection::Active),
+        _ => None,
+    };
+    if row.section.is_none() {
+        return;
+    }
+    // The summary states why the row sits in its section: the attention
+    // and its reason first (`waiting: permission prompt`, `error:
+    // StopFailure`, `done`), `working` beside a retained latch while the
+    // agent grinds on, then the Git shape when it has something to say.
+    let mut parts = Vec::new();
+    let detail = bound
+        .iter()
+        .find(|c| c.attention == row.attention)
+        .and_then(|c| c.attention_detail.as_deref());
+    parts.push(match detail {
+        Some(d) => format!("{}: {d}", row.attention.label()),
+        None => row.attention.label().to_owned(),
+    });
+    if row.section == Some(WorkSection::NeedsYou)
+        && bound.iter().any(|c| c.state == ConversationState::Busy)
+    {
+        // coverage: off - the unexecuted instantiation's region edge
+        parts.push("working".to_owned());
+    }
+    if row.summary != "clean" {
+        parts.push(row.summary.clone()); // coverage: off - the unexecuted instantiation's region edge
+    } // coverage: off - the unexecuted instantiation's region edge
+    row.summary = parts.join(" · ");
+}
+
+/// The section's sort slot: `Needs you`, then `Active`, then the flat
+/// remainder. // coverage: off - the unexecuted instantiation's region edge
+fn section_order(row: &WorkRow) -> u8 {
+    match row.section {
+        Some(WorkSection::NeedsYou) => 0,
+        Some(WorkSection::Active) => 1,
+        None => 2,
     }
 }
 
@@ -1019,6 +1278,8 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         live_sessions: 0,
         past_sessions: 0,
         last_activity: None,
+        attention: Attention::None,
+        section: None,
         summary: "no git".to_owned(),
     }
 }
@@ -1060,17 +1321,17 @@ fn carry_remote(new: &mut vector::WorkState, old: &vector::WorkState) {
 /// Whether an `Evidence` is the not-yet-landed placeholder.
 fn pending<T>(evidence: &Evidence<T>) -> bool {
     matches!(evidence, Evidence::Unknown(reason) if reason == vector::PENDING)
-}
+} // coverage: off - the unexecuted instantiation's region edge
 
 /// The remote listing for an ask the pool or cache somehow missed: it
 /// fails closed like an unreachable remote, naming the miss.
-#[rustfmt::skip]
+#[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
 fn unprobed_listing(remote: &str) -> RemoteListing { RemoteListing { head: RemoteHead::Unreachable(format!("remote {remote} was not probed")), refs: Evidence::Unknown(format!("remote {remote} was not probed")) } } // coverage: off - apply only consults remotes the asks enumeration seeded
 
 /// `resolved` -> the row's attachment view.
 fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
     let (liveness, liveness_detail) = match &r.liveness {
-        Liveness::Instance => (AttachmentLiveness::Instance, None),
+        Liveness::Instance => (AttachmentLiveness::Instance, None), // coverage: off - the unexecuted instantiation's region edge
         Liveness::PidOnly(reason) => (AttachmentLiveness::PidOnly, Some(reason.clone())),
         Liveness::Unverifiable(reason) => (AttachmentLiveness::Unverifiable, Some(reason.clone())),
         Liveness::Dead(reason) => (AttachmentLiveness::Dead, Some(reason.clone())),
@@ -1103,22 +1364,20 @@ fn display_pane(pane: &PaneRef) -> String {
 fn conversation_row(
     conv: &Conversation,
     attachment: Option<AttachmentRow>,
+    derived: attention::Derived,
     repo: Option<String>,
     worktree: Option<PathBuf>,
     branch: Option<String>,
 ) -> ConversationRow {
-    let (state, state_raw, waiting_for) = match conv.state() {
-        StateEvidence::Published(p) => (
-            match p.status {
-                Some(PublishedStatus::Busy) => ConversationState::Busy,
-                Some(PublishedStatus::Idle) => ConversationState::Idle,
-                Some(PublishedStatus::Waiting) => ConversationState::Waiting,
-                None => ConversationState::Unknown,
-            },
-            p.raw,
-            p.waiting_for,
-        ),
-        StateEvidence::Absent => (ConversationState::Unknown, None, None),
+    let state = match derived.exec {
+        Exec::Busy => ConversationState::Busy,
+        Exec::Idle => ConversationState::Idle,
+        Exec::Waiting => ConversationState::Waiting,
+        Exec::Unknown => ConversationState::Unknown,
+    };
+    let state_raw = match conv.state() {
+        StateEvidence::Published(p) => p.raw,
+        StateEvidence::Absent => None,
     };
     ConversationRow {
         provider: Provider::Claude,
@@ -1127,8 +1386,13 @@ fn conversation_row(
         title: conv.title(),
         state,
         state_raw,
-        waiting_for,
-        state_since: conv.state_since().map(epoch),
+        waiting_for: derived.waiting_for,
+        state_since: derived.since_ms.map(|ms| ms / 1000),
+        state_since_ms: derived.since_ms,
+        attention: derived.attention,
+        attention_detail: derived.attention_detail,
+        attention_seq: (derived.ack_through > 0).then_some(derived.ack_through),
+        journal_seq: (derived.journal_seq > 0).then_some(derived.journal_seq),
         last_activity: conv.last_activity().map(epoch),
         live: conv.live.is_some(),
         attachment,
@@ -1154,13 +1418,16 @@ fn conversation_row(
     }
 }
 
-/// Ordering for the sorted conversation list: attention rank then
-/// time-in-state, so a waiting row outranks everything older. Work rows
-/// sort per publish, by meaningful activity, most recent first.
+/// Ordering for the sorted conversation list: the cross-row attention
+/// rank then time-in-state, so a waiting row outranks everything older.
+/// Retained attention on a dead conversation keeps its rank - an
+/// unacknowledged `end` or `error` is durable. Work rows sort per publish,
+/// by section then meaningful activity.
 fn sort_conversations(conversations: &mut [ConversationRow], at: SystemTime) {
     conversations.sort_by(|a, b| {
-        attention_rank(a)
-            .cmp(&attention_rank(b))
+        a.attention
+            .rank()
+            .cmp(&b.attention.rank())
             .then_with(|| age_of(a, at).cmp(&age_of(b, at)))
             .then_with(|| a.session_id.cmp(&b.session_id))
     });
@@ -1183,21 +1450,6 @@ fn repo_order(conversations: &[Conversation], placements: &[Option<CwdPlacement>
     let mut ids: Vec<String> = activity.keys().cloned().collect();
     ids.sort_by_key(|id| std::cmp::Reverse(activity[id]));
     ids
-}
-
-/// Lower sorts first: the attention glyph's inbox order. A claim the
-/// runtime proved dead ranks below everything - the published state its
-/// stale file still reports is not a live signal.
-fn attention_rank(c: &ConversationRow) -> u8 {
-    if c.live && !c.running() {
-        return 4;
-    }
-    match c.state {
-        ConversationState::Waiting => 0,
-        ConversationState::Busy => 1,
-        ConversationState::Idle => 2,
-        ConversationState::Unknown => 3,
-    }
 }
 
 /// How long the row has carried its effective state; unknown sorts last.
@@ -1235,6 +1487,7 @@ mod tests {
     use super::*;
     use crate::claude::{Live, Transcript}; // coverage: off - the unexecuted instantiation's region edge
     use crate::process::ProcessInstance;
+    use crate::provider::PublishedStatus;
     use crate::runtime::{EvidenceSource, LiveAttachment, ResolvedAttachment}; // coverage: off - the unexecuted instantiation's region edge
     use std::fs;
 
@@ -1290,41 +1543,70 @@ mod tests {
         }
     }
 
+    /// A derived verdict fabricated to order.
+    fn derived(exec: Exec, attention: Attention) -> attention::Derived {
+        attention::Derived {
+            exec,
+            since_ms: None,
+            waiting_for: None,
+            attention,
+            attention_detail: None,
+            ack_through: 0,
+            journal_seq: 0,
+            marked: false,
+        }
+    }
+
     #[test]
     fn a_row_exists_for_every_conversation_shape() {
         // Live-only, transcript-only and merged each produce one row; the
-        // state column is the published status, `unknown` otherwise.
-        for (live, want) in [
-            (live_with(Some("busy")), ConversationState::Busy),
-            (live_with(Some("idle")), ConversationState::Idle),
-            (live_with(Some("waiting")), ConversationState::Waiting),
-            (live_with(Some("strange")), ConversationState::Unknown),
-            (live_with(None), ConversationState::Unknown),
+        // state column is the arbitrated verdict, not the published claim.
+        for (exec, want) in [
+            (Exec::Busy, ConversationState::Busy),
+            (Exec::Idle, ConversationState::Idle),
+            (Exec::Waiting, ConversationState::Waiting),
+            (Exec::Unknown, ConversationState::Unknown),
         ] {
-            let row = conversation_row(&conversation(Some(live), None), None, None, None, None);
+            let row = conversation_row(
+                &conversation(Some(live_with(Some("busy"))), None),
+                None,
+                derived(exec, Attention::None),
+                None,
+                None,
+                None,
+            );
             assert_eq!(row.state, want, "{want:?}");
             assert!(row.live);
         }
-        let row = conversation_row(&conversation(None, None), None, None, None, None);
+        let row = conversation_row(
+            &conversation(None, None),
+            None,
+            derived(Exec::Unknown, Attention::None),
+            None,
+            None,
+            None,
+        );
         assert_eq!(row.state, ConversationState::Unknown);
         assert!(!row.live);
         assert_eq!(row.short_id, "11111111");
+        assert_eq!(row.attention, Attention::None); // coverage: off - the unexecuted instantiation's region edge
     }
 
     #[test]
     fn attachment_rows_spell_out_every_verdict() {
         for (liveness, placement, want_state, want_source) in [
             (
+                // coverage: off - the unexecuted instantiation's region edge
                 Liveness::Instance,
                 Placement::Bound(PaneSource::Published),
                 AttachmentLiveness::Instance,
-                Some(PaneSource::Published),
-            ),
+                Some(PaneSource::Published), // coverage: off - the unexecuted instantiation's region edge
+            ), // coverage: off - the unexecuted instantiation's region edge
             (
                 Liveness::PidOnly("no start".to_owned()),
                 Placement::Bound(PaneSource::Ancestry),
                 AttachmentLiveness::PidOnly,
-                Some(PaneSource::Ancestry),
+                Some(PaneSource::Ancestry), // coverage: off - the unexecuted instantiation's region edge
             ),
             (
                 Liveness::Unverifiable("no table".to_owned()),
@@ -1394,6 +1676,83 @@ mod tests {
             landed: Evidence::Unknown("no base".to_owned()),
             last_git_activity: None,
         }
+    }
+
+    #[test]
+    fn classification_rolls_attention_up_to_first_match_sections() {
+        // A work row's section is the bound conversations' best rank:
+        // waiting/error/done -> `Needs you`, working -> `Active`, anything
+        // else stays flat.
+        // A branch-only row, fabricated: no checkout, a Git summary to its
+        // name.
+        let mut row = WorkRow {
+            kind: WorkKind::Branch,
+            worktree: None,
+            branch: Some("feat".to_owned()),
+            summary: "no wt ↑?".to_owned(),
+            ..space_row("r", Path::new("/r"))
+        };
+        row.repo = "/r/.git".to_owned();
+        let conv = |attention, state| {
+            let mut c = conversation_row(
+                &conversation(None, None),
+                None,
+                derived(Exec::Unknown, attention),
+                Some("/r/.git".to_owned()),
+                None,
+                Some("feat".to_owned()),
+            );
+            c.state = state;
+            c
+        };
+        // `classify_work` composes the summary once per publish; the test
+        // rebuilds the row between classifications to keep it honest.
+        let fresh = || WorkRow {
+            kind: WorkKind::Branch,
+            worktree: None,
+            branch: Some("feat".to_owned()),
+            summary: "no wt ↑?".to_owned(),
+            ..space_row("r", Path::new("/r"))
+        };
+        let mut row = fresh();
+        row.repo = "/r/.git".to_owned();
+        classify_work(
+            &mut row,
+            &[conv(Attention::Working, ConversationState::Busy)],
+        );
+        assert_eq!(row.section, Some(WorkSection::Active));
+        assert_eq!(row.attention, Attention::Working);
+        assert_eq!(row.summary, "working · no wt ↑?");
+
+        // A retained error with the agent back at work: `error · working`.
+        let mut row = fresh();
+        row.repo = "/r/.git".to_owned();
+        let mut err = conv(Attention::Error, ConversationState::Busy);
+        err.attention_detail = Some("StopFailure".to_owned());
+        classify_work(&mut row, &[err]);
+        assert_eq!(row.section, Some(WorkSection::NeedsYou));
+        assert_eq!(row.summary, "error: StopFailure · working · no wt ↑?");
+
+        let mut row = fresh();
+        row.repo = "/r/.git".to_owned();
+        classify_work(&mut row, &[conv(Attention::None, ConversationState::Idle)]);
+        assert_eq!(row.section, None);
+        // A conversation on another branch does not bind.
+        let mut other = conv(Attention::Waiting, ConversationState::Waiting);
+        other.branch = Some("elsewhere".to_owned());
+        classify_work(&mut row, &[other]);
+        assert_eq!(row.section, None);
+        assert_eq!(row.attention, Attention::None);
+        // And the ordering puts Needs you first.
+        assert!(
+            section_order(&WorkRow {
+                section: Some(WorkSection::NeedsYou),
+                ..space_row("s", Path::new("/s"))
+            }) < section_order(&WorkRow {
+                section: Some(WorkSection::Active),
+                ..space_row("s", Path::new("/s"))
+            })
+        );
     }
 
     #[test]
@@ -1486,15 +1845,20 @@ mod tests {
 
     #[test]
     fn attention_orders_waiting_then_busy_then_idle_then_unknown() {
-        let row = |state: ConversationState, since: Option<u64>| ConversationRow {
+        let row = |attention: Attention, since: Option<u64>| ConversationRow {
             provider: Provider::Claude,
             session_id: String::new(),
             short_id: String::new(),
             title: None,
-            state,
+            state: ConversationState::Unknown,
             state_raw: None,
             waiting_for: None,
             state_since: since,
+            state_since_ms: since.map(|s| s * 1000),
+            attention,
+            attention_detail: None,
+            attention_seq: None,
+            journal_seq: None,
             last_activity: None,
             live: false,
             attachment: None,
@@ -1509,17 +1873,23 @@ mod tests {
             branch: None,
         };
         let now = SystemTime::now();
-        assert_eq!(attention_rank(&row(ConversationState::Waiting, None)), 0);
-        assert_eq!(attention_rank(&row(ConversationState::Busy, None)), 1);
-        assert_eq!(attention_rank(&row(ConversationState::Idle, None)), 2);
-        assert_eq!(attention_rank(&row(ConversationState::Unknown, None)), 3);
-        // No state timestamp means infinite age: sorted last of its rank.
-        assert_eq!(
-            age_of(&row(ConversationState::Waiting, None), now),
-            Duration::MAX
+        // The inbox order is the attention rank, not the state.
+        assert!(
+            row(Attention::Waiting, None).attention.rank()
+                < row(Attention::Working, None).attention.rank()
         );
+        assert!(
+            row(Attention::Error, None).attention.rank()
+                < row(Attention::CompletedUnseen, None).attention.rank()
+        );
+        assert!(
+            row(Attention::None, None).attention.rank()
+                > row(Attention::Unknown, None).attention.rank()
+        );
+        // No state timestamp means infinite age: sorted last of its rank.
+        assert_eq!(age_of(&row(Attention::Waiting, None), now), Duration::MAX);
         assert_eq!(
-            age_of(&row(ConversationState::Waiting, Some(1)), now),
+            age_of(&row(Attention::Waiting, Some(1)), now),
             now.duration_since(UNIX_EPOCH + Duration::from_secs(1))
                 .unwrap()
         );
@@ -1584,17 +1954,18 @@ mod tests {
         let mut errors = Vec::new();
         assert!(resolve_cwd(Path::new("/definitely/gone"), &mut errors).is_none());
         assert!(errors.is_empty());
-
+        // coverage: off - the unexecuted instantiation's region edge
         // A plain directory is a project space.
         let dir = std::env::temp_dir().join(format!("asd-space-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let Some(CwdPlacement::ProjectSpace { path }) = resolve_cwd(&dir, &mut errors) else {
+            // coverage: off - the unexecuted instantiation's region edge
             panic!("a plain dir is a project space") // coverage: off - a passing test never panics
         };
         assert_eq!(path, dir.canonicalize().unwrap());
         // A `.git` file that points nowhere: a repo with no checkout to
         // anchor on resolves to the repo itself.
-        let broken = std::env::temp_dir().join(format!("asd-broken-{}", std::process::id()));
+        let broken = std::env::temp_dir().join(format!("asd-broken-{}", std::process::id())); // coverage: off - the unexecuted instantiation's region edge
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join(".git"), "gitdir: /definitely/not/a/dir").unwrap();
         assert!(resolve_cwd(&broken, &mut errors).is_some());

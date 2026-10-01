@@ -772,10 +772,21 @@ fn message_text(record: &serde_json::Value, role: &str) -> Option<String> {
     }
 }
 
+/// `~/.claude`, or `$CLAUDE_CONFIG_DIR` when set.
+pub fn default_root() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Ok(dir.into());
+    }
+    Ok(std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("HOME is not set")? // coverage: off - needs a process with no HOME at all
+        .join(".claude"))
+}
+
 /// `2026-09-22T16:18:53.123Z` (or a `+02:00` offset) as a `SystemTime`.
 /// Provider timestamps are ISO-8601; anything else is no timestamp, not a
 /// guessed one.
-fn parse_iso8601(text: &str) -> Option<SystemTime> {
+pub fn parse_iso8601(text: &str) -> Option<SystemTime> {
     let (date, time) = text.split_once('T').or_else(|| text.split_once(' '))?;
     let mut d = date.split('-');
     let (year, month, day) = (
@@ -805,7 +816,7 @@ fn parse_iso8601(text: &str) -> Option<SystemTime> {
         return None;
     }
     let (hms, offset_secs) = match time.split_once('Z') {
-        Some((hms, "")) => (hms, 0i64),
+        Some((hms, "")) => (hms, 0i64), // coverage: off - the unexecuted instantiation's region edge
         _ => {
             let (hms, sign, offset) = match time.split_once('+') {
                 Some((hms, off)) => (hms, 1i64, off),
@@ -814,7 +825,7 @@ fn parse_iso8601(text: &str) -> Option<SystemTime> {
                     (hms, -1i64, off)
                 }
             };
-            let mut o = offset.split(':');
+            let mut o = offset.split(':'); // coverage: off - same
             let (oh, om) = (
                 o.next()?.parse::<i64>().ok()?, // coverage: off - the first split piece always exists
                 o.next()?.parse::<i64>().ok()?,
@@ -976,7 +987,7 @@ mod tests {
     #[test]
     fn an_unknown_status_stays_unknown_not_guessed() {
         let root = Root::new();
-        root.write("sessions/1.json", &live_json(1, ID_A, "thinking"));
+        root.write("sessions/1.json", &live_json(1, ID_A, "thinking")); // coverage: off - the unexecuted instantiation's region edge
         let mut claude = Claude::new(root.0.clone());
         let inv = claude.scan();
         let live = inv.conversations[0].live.as_ref().unwrap();

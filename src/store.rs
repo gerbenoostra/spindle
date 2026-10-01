@@ -1,0 +1,1288 @@
+//! The versioned store under `$XDG_STATE_HOME/agent-sessions/`: the only
+//! place this tool writes outside a confirmed cleanup or `register`.
+//!
+//! Three file shapes live here:
+//!
+//! - `journal.log` - hook events as length-delimited records (`u32` LE byte
+//!   count + JSON), appended under `journal.lock` with the next monotonic
+//!   commit sequence and fsynced. Concurrent writers can interleave on the
+//!   lock but never overwrite one another: reduction is a pure function of
+//!   committed sequence.
+//! - `checkpoint.json` - the journal's reduction compacted through a commit
+//!   sequence, written sibling-temp + fsync + rename; the journal then
+//!   rewrites to only the tail past that sequence.
+//! - `seen.json`, `marks.json` - authored records (acknowledgement and the
+//!   not-busy mark) as whole-file atomic renames.
+//!
+//! Every record carries a schema version; readers accept the current and
+//! immediately previous one (an absent `v` reads as the pre-versioned
+//! schema). A future-versioned or malformed record is excluded from
+//! derivation, retained on disk and reported for the evidence view, and a
+//! corrupt journal tail never hides the valid prefix.
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::provider::SourceError;
+
+/// The record schema this build reads and writes. `0` - an unversioned
+/// record from before the field existed - reads as the previous schema.
+pub const SCHEMA: u32 = 1;
+
+/// Compact once the journal's un-checkpointed tail passes this many
+/// records: enough that a busy day never rewrites, small enough that a
+/// scan stays trivial.
+const COMPACT_AFTER: usize = 128;
+
+/// A lock older than this is abandoned by a dead holder and stolen; a hook
+/// must never wait forever on a write that crashed.
+const LOCK_STALE: Duration = Duration::from_secs(30);
+
+/// How long `acquire` waits for a live holder before giving up - long
+/// enough for a real append (milliseconds) many times over.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+const JOURNAL: &str = "journal.log";
+const LOCK: &str = "journal.lock";
+const CHECKPOINT: &str = "checkpoint.json";
+const SEEN: &str = "seen.json";
+const MARKS: &str = "marks.json";
+
+/// The normalized event a native hook event maps to - the event vocabulary
+/// the shared projection uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormEvent {
+    /// A new turn or prompt.
+    Start,
+    /// Work continuing inside a turn.
+    Activity,
+    /// Blocked on the human.
+    Awaiting,
+    /// A clean turn end.
+    End,
+    /// The turn aborted.
+    Error,
+    /// Session teardown is coming; never reaps on its own.
+    TeardownHint,
+}
+
+impl NormEvent {
+    /// The execution class the event claims. `TeardownHint` is none at
+    /// all: it is diagnostic, not a state.
+    pub fn execution(self) -> Option<Exec> {
+        match self {
+            NormEvent::Start | NormEvent::Activity => Some(Exec::Busy),
+            NormEvent::Awaiting => Some(Exec::Waiting),
+            NormEvent::End => Some(Exec::Idle),
+            NormEvent::Error => Some(Exec::Unknown),
+            NormEvent::TeardownHint => None,
+        }
+    }
+
+    /// Whether the event is attention a human must acknowledge - the latch
+    /// kind. `Start` and `Activity` acknowledge rather than latch.
+    pub fn latches(self) -> bool {
+        matches!(
+            self,
+            NormEvent::Awaiting | NormEvent::End | NormEvent::Error
+        )
+    }
+}
+
+/// Effective execution state, derived - not a provider's word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exec {
+    Busy,
+    Idle,
+    Waiting,
+    /// No applicable evidence, or none that proves a live state.
+    Unknown,
+}
+
+/// One committed journal record: one hook ping. Field names stay short -
+/// every record carries them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Record {
+    /// Schema version; absent is the pre-versioned schema and still reads.
+    #[serde(default)]
+    pub v: u32,
+    /// The journal commit sequence: the local, monotonic order.
+    #[serde(default)]
+    pub seq: u64,
+    /// When this process committed it, epoch milliseconds.
+    #[serde(default)]
+    pub at: u64,
+    /// Who wrote it (`agent-sessions/<version>`), for the evidence view.
+    #[serde(default)]
+    pub writer: String,
+    /// The provider's wire name (`claude`, `vibe`, `devin`).
+    #[serde(default)]
+    pub provider: String,
+    /// The provider's own session id. May be empty when the payload carried
+    /// none: the record is kept but reduces onto no conversation.
+    #[serde(default)]
+    pub session: String,
+    /// The provider's native event name, verbatim.
+    #[serde(default)]
+    pub native: String,
+    /// The normalized event; `None` on an unmapped ping, which is retained
+    /// as diagnostic activity with a five-second weak `Busy` lease.
+    #[serde(default)]
+    pub event: Option<NormEvent>,
+    /// The producer's own timestamp, epoch milliseconds.
+    #[serde(default)]
+    pub pts: Option<u64>,
+    /// The producer's own sequence; a lower one than already seen rejects
+    /// the record as reordered.
+    #[serde(default)]
+    pub pseq: Option<u64>,
+    /// The process instance the hook resolved, when it could.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// The instance's start, epoch seconds.
+    #[serde(default)]
+    pub pid_start: Option<u64>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// The wait reason an `awaiting` carries, or the native name an
+    /// `error` came in as - evidence-view material.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl Record {
+    /// A record as `hook` builds it: sequence and commit time are the
+    /// store's to assign.
+    pub fn new(provider: &str, session: &str, native: &str) -> Record {
+        Record {
+            v: SCHEMA,
+            seq: 0,
+            at: 0,
+            writer: writer(),
+            provider: provider.to_owned(),
+            session: session.to_owned(),
+            native: native.to_owned(),
+            event: None,
+            pts: None,
+            pseq: None,
+            pid: None,
+            pid_start: None,
+            cwd: None,
+            reason: None,
+        }
+    }
+}
+
+/// The newest mapped event on a conversation: the lifecycle claim hooks
+/// make. Process identity rides along so a delayed event from a demoted
+/// attachment cannot mutate the replacement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastEvent {
+    pub kind: NormEvent,
+    /// The journal commit sequence that produced it.
+    pub seq: u64,
+    /// When the effective state it implies began; duplicates and
+    /// same-class continuations preserve it rather than reset it.
+    pub since_ms: u64,
+    /// When this event itself was observed (producer time, else commit).
+    pub observed_ms: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub pid_start: Option<u64>,
+}
+
+/// A latched attention event: an `awaiting`, `end` or `error` a `start`
+/// has not implicitly acknowledged. Seen-state acknowledgement applies at
+/// derive time, not here - the journal never rewrites.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Retained {
+    pub seq: u64,
+    pub kind: NormEvent,
+    pub at_ms: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// The reduced state of one conversation's journal records - what a
+/// checkpoint persists so the whole log never needs replaying.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Fold {
+    /// Newest committed record on the conversation.
+    #[serde(default)]
+    pub last_seq: u64,
+    /// Newest mapped event, the lifecycle claim.
+    #[serde(default)]
+    pub last_event: Option<LastEvent>,
+    /// Attention events no `start` has acknowledged.
+    #[serde(default)]
+    pub retained: Vec<Retained>,
+    /// Newest unmapped ping `(seq, epoch ms)` - the weak `Busy` lease.
+    #[serde(default)]
+    pub ping: Option<(u64, u64)>,
+    /// The producer-sequence high-water mark; older rejects as reordered.
+    #[serde(default)]
+    pub pseq_high: Option<u64>,
+}
+
+/// How one record landed in a fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Apply {
+    /// New information, folded in.
+    Accepted,
+    /// An already-seen producer sequence: the observation refreshes its
+    /// time but the effective `since` stands.
+    Duplicate,
+    /// A producer sequence below the high-water mark: reordered source
+    /// evidence, rejected.
+    Stale,
+}
+
+impl Fold {
+    /// Fold one committed record into the conversation's reduction.
+    /// Deterministic in commit order: two writers cannot overwrite one
+    /// another, and replaying the same sequence yields the same fold.
+    pub fn apply(&mut self, record: &Record) -> Apply {
+        // Producer sequences reject reordering when the source supplies
+        // them; an equal sequence is a duplicate heartbeat, not new
+        // evidence.
+        if let Some(pseq) = record.pseq {
+            match self.pseq_high {
+                Some(high) if pseq < high => return Apply::Stale,
+                Some(high) if pseq == high => {
+                    self.refresh_observed(record);
+                    return Apply::Duplicate;
+                }
+                _ => self.pseq_high = Some(pseq),
+            }
+        }
+        self.last_seq = self.last_seq.max(record.seq);
+        let observed = record.pts.unwrap_or(record.at);
+        let Some(kind) = record.event else {
+            self.ping = Some((record.seq, observed));
+            return Apply::Accepted;
+        };
+        if kind == NormEvent::TeardownHint {
+            // Diagnostic only: it never reaps and never claims execution.
+            return Apply::Accepted;
+        }
+        if kind == NormEvent::Start {
+            // A new prompt acknowledges everything retained: answering
+            // implies the attention was seen.
+            self.retained.clear();
+        }
+        if kind.latches() {
+            self.retained.push(Retained {
+                seq: record.seq,
+                kind,
+                at_ms: observed,
+                reason: record
+                    .reason
+                    .clone()
+                    .or_else(|| Some(record.native.clone())),
+            });
+        }
+        // `since` survives inside one execution class: an `activity`
+        // heartbeat continues the `start`'s Busy rather than restarting
+        // the clock.
+        let execution = kind.execution();
+        let since = match (&self.last_event, execution) {
+            (Some(prev), Some(exec)) if prev.kind.execution() == Some(exec) => prev.since_ms,
+            _ => observed,
+        };
+        self.last_event = Some(LastEvent {
+            kind,
+            seq: record.seq,
+            since_ms: since,
+            observed_ms: observed,
+            reason: record.reason.clone(),
+            pid: record.pid,
+            pid_start: record.pid_start,
+        });
+        Apply::Accepted
+    }
+
+    /// A duplicate heartbeat refreshes the observation time of whatever it
+    /// duplicates - the lease's expiry moves, the `since` does not.
+    fn refresh_observed(&mut self, record: &Record) {
+        let observed = record.pts.unwrap_or(record.at);
+        if let Some(event) = &mut self.last_event
+            && (event.seq == record.seq
+                || event.kind.execution() == record.event.and_then(|e| e.execution()))
+        {
+            event.observed_ms = event.observed_ms.max(observed);
+        }
+        if let Some((_, at)) = &mut self.ping
+            && record.event.is_none()
+        {
+            *at = (*at).max(observed);
+        }
+        self.last_seq = self.last_seq.max(record.seq);
+    }
+
+    /// The highest commit sequence of retained events above `seen` - what
+    /// an acknowledgement writes through. `0` means nothing awaits ack.
+    pub fn unacked_through(&self, seen: u64) -> u64 {
+        self.retained
+            .iter()
+            .filter(|r| r.seq > seen)
+            .map(|r| r.seq)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// An authored not-busy mark: it names the `effective_since` of the `Busy`
+/// it dismisses and the commit sequence at write time, so any newer event
+/// or observation supersedes it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Mark {
+    /// The dismissed `Busy`'s `effective_since`, epoch milliseconds.
+    pub since_ms: u64,
+    /// The journal commit sequence when the mark was written.
+    pub seq: u64,
+    /// When the mark was written, epoch milliseconds.
+    pub at_ms: u64,
+}
+
+/// The checkpoint file: the reduction at `through` commit sequence.
+#[derive(Debug, Serialize, Deserialize)]
+struct Checkpoint {
+    #[serde(default)]
+    v: u32,
+    through: u64,
+    #[serde(default)]
+    folds: HashMap<String, Fold>,
+}
+
+/// The whole store, read: per-conversation folds plus the authored files.
+/// A conversation's fold key is `provider\0session_id`.
+#[derive(Debug, Default)]
+pub struct Loaded {
+    pub folds: HashMap<String, Fold>,
+    /// Conversation key -> highest acknowledged commit sequence.
+    pub seen: HashMap<String, u64>,
+    /// Conversation key -> the authored not-busy mark.
+    pub marks: HashMap<String, Mark>,
+    /// Records excluded or files unreadable - isolated, never fatal.
+    pub errors: Vec<SourceError>,
+    /// The highest committed sequence the store knows.
+    pub max_seq: u64,
+    /// Whether the store could be read at all. When `false`,
+    /// acknowledgement cannot be established and attention is `Unknown`
+    /// rather than a guessed glyph.
+    pub readable: bool,
+}
+
+/// The journal record key a conversation's events fold under.
+pub fn conversation_key(provider: &str, session_id: &str) -> String {
+    format!("{provider}\u{0}{session_id}")
+}
+
+/// A store rooted at `dir` (`$XDG_STATE_HOME/agent-sessions/`). Every
+/// method tolerates a missing directory: a first run has no store.
+pub struct Store {
+    dir: PathBuf,
+}
+
+impl Store {
+    pub fn open(dir: PathBuf) -> Store {
+        Store { dir }
+    }
+
+    /// Append one record as the next commit: lock, sequence, write, fsync.
+    /// Returns the assigned commit sequence.
+    pub fn append(&self, mut record: Record) -> io::Result<u64> {
+        fs::create_dir_all(&self.dir)?;
+        let _lock = Lock::acquire(&self.dir.join(LOCK))?;
+        let seq = self.next_seq()?; // coverage: off - next_seq reads through the error-retaining loaders; it cannot fail
+        record.seq = seq;
+        record.at = now_ms();
+        record.v = SCHEMA;
+        record.writer = writer();
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?; // coverage: off - a Record always serializes
+        let journal = self.dir.join(JOURNAL);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&journal)?; // coverage: off - the unexecuted instantiation's region edge
+        let len = (bytes.len() as u32).to_le_bytes();
+        file.write_all(&len)?; // coverage: off - a write failure needs the filesystem to fail under an open handle
+        file.write_all(&bytes)?; // coverage: off - same
+        file.sync_all()?; // coverage: off - an fsync failure needs a broken filesystem
+        Ok(seq)
+    }
+
+    /// The commit sequence one past the current tip: the checkpoint's
+    /// `through` plus the journal tail's newest record.
+    fn next_seq(&self) -> io::Result<u64> {
+        let checkpoint = self.read_checkpoint(&mut Vec::new());
+        let through = checkpoint.map_or(0, |c| c.through);
+        let tail = self
+            .read_journal(&mut Vec::new())
+            .iter()
+            .map(|r| r.seq)
+            .max()
+            .unwrap_or(0);
+        Ok(through.max(tail) + 1)
+    }
+
+    /// Read the store: checkpoint, then the journal tail folded on top.
+    /// A tail larger than the compaction bound is folded into a fresh
+    /// checkpoint on the spot - reaping and maintenance run on read.
+    /// Best-effort: a failed compaction is reported and the unfolded tail
+    /// simply answers again next time.
+    pub fn load(&self) -> Loaded {
+        let mut errors = Vec::new();
+        let mut readable = true;
+        let mut folds = HashMap::new();
+        let mut through = 0u64;
+        match self.read_checkpoint(&mut errors) {
+            Some(c) => {
+                through = c.through;
+                folds = c.folds;
+            }
+            None if self.dir.join(CHECKPOINT).exists() => {
+                // A checkpoint that exists but cannot be used (malformed
+                // or future) degrades the store: the tail alone is not the
+                // history.
+                readable = false;
+            }
+            None => {}
+        }
+        let mut tail = 0usize;
+        let mut max_seq = through;
+        for record in self.read_journal(&mut errors) {
+            max_seq = max_seq.max(record.seq);
+            if record.seq <= through || record.v > SCHEMA || record.session.is_empty() {
+                continue;
+            }
+            tail += 1;
+            folds
+                .entry(conversation_key(&record.provider, &record.session))
+                .or_default()
+                .apply(&record);
+        }
+        if readable && tail > COMPACT_AFTER {
+            // coverage: off - a compaction failure needs a rename or fsync
+            // to fail; the tail simply answers again next read
+            errors.extend(
+                self.compact(&folds, max_seq) // coverage: off - same
+                    .map_err(|e| SourceError {
+                        // coverage: off - same
+                        source: "store".to_owned(), // coverage: off - same
+                        detail: format!("compaction: {e}"), // coverage: off - same
+                    }) // coverage: off - a compaction failure needs a rename or fsync to fail
+                    .err(), // coverage: off - same
+            );
+        } // coverage: off - the unexecuted instantiation's region edge
+        Loaded {
+            folds, // coverage: off - the unexecuted instantiation's region edge
+            seen: self.read_seen(&mut errors),
+            marks: self.read_marks(&mut errors), // coverage: off - the unexecuted instantiation's region edge
+            errors,
+            max_seq,
+            readable,
+        }
+    }
+
+    /// Acknowledge every event on `key` through `through_seq`: the whole
+    /// `seen.json` map is rewritten atomically. `space` and the focus
+    /// observation both land here.
+    pub fn acknowledge(&self, key: &str, through_seq: u64) -> io::Result<()> {
+        let mut seen = self.read_seen(&mut Vec::new());
+        if seen.get(key).copied().unwrap_or(0) >= through_seq {
+            return Ok(());
+        }
+        seen.insert(key.to_owned(), through_seq);
+        self.write_seen(&seen)
+    }
+
+    /// Record the authored not-busy mark: `since_ms` names the `Busy`'s
+    /// `effective_since`, `seq` the commit sequence it was written at.
+    pub fn mark_not_busy(&self, key: &str, since_ms: u64, seq: u64) -> io::Result<()> {
+        let mut marks = self.read_marks(&mut Vec::new());
+        marks.insert(
+            key.to_owned(),
+            Mark {
+                since_ms,
+                seq,
+                at_ms: now_ms(),
+            },
+        );
+        self.write_marks(&marks)
+    }
+
+    /// Write the checkpoint for `folds` at `through` and rewrite the
+    /// journal to nothing past it - checkpoint first, so a crash between
+    /// the two renames leaves stale tail records that simply re-skip.
+    fn compact(&self, folds: &HashMap<String, Fold>, through: u64) -> io::Result<()> {
+        let checkpoint = Checkpoint {
+            v: SCHEMA,
+            through,
+            folds: folds.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&checkpoint)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?; // coverage: off - a checkpoint always serializes
+        write_atomic(&self.dir.join(CHECKPOINT), &bytes)?; // coverage: off - needs the store's filesystem to fail
+        // The tail restarts empty; every record at or below `through` is // coverage: off - the unexecuted instantiation's region edge
+        // carried by the checkpoint and skipped on the next read.
+        write_atomic(&self.dir.join(JOURNAL), &[])?; // coverage: off - same
+        Ok(()) // coverage: off - the unexecuted instantiation's region edge
+    }
+    // coverage: off - the unexecuted instantiation's region edge
+    /// The checkpoint's folds, or `None` when absent/unreadable/future. // coverage: off - the unexecuted instantiation's region edge
+    /// Errors are retained rather than thrown.
+    fn read_checkpoint(&self, errors: &mut Vec<SourceError>) -> Option<Checkpoint> {
+        let path = self.dir.join(CHECKPOINT); // coverage: off - the unexecuted instantiation's region edge
+        let bytes = read_file(&path, "checkpoint", errors)?;
+        match serde_json::from_slice::<Checkpoint>(&bytes) {
+            Ok(c) if c.v <= SCHEMA => Some(c),
+            Ok(c) => {
+                errors.push(SourceError {
+                    source: "checkpoint".to_owned(),
+                    detail: format!(
+                        "{}: schema v{} is newer than v{SCHEMA}",
+                        path.display(),
+                        c.v
+                    ),
+                });
+                None
+            }
+            Err(e) => {
+                errors.push(SourceError {
+                    source: "checkpoint".to_owned(),
+                    detail: format!("{}: {e}", path.display()),
+                });
+                None
+            }
+        }
+    }
+
+    /// Every record in the journal tail, committed order. A framing error -
+    /// a truncated length or payload - ends the tail there: the corrupt
+    /// suffix can hide nothing of the valid prefix.
+    fn read_journal(&self, errors: &mut Vec<SourceError>) -> Vec<Record> {
+        let path = self.dir.join(JOURNAL);
+        let Some(bytes) = read_file(&path, "journal", errors) else {
+            return Vec::new();
+        };
+        let mut records = Vec::new();
+        let mut cursor = 0usize;
+        while cursor + 4 <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if cursor + len > bytes.len() {
+                errors.push(SourceError {
+                    source: "journal".to_owned(),
+                    detail: format!(
+                        "{}: truncated record at byte {cursor} ({len} bytes announced)",
+                        path.display()
+                    ),
+                });
+                break;
+            }
+            let frame = &bytes[cursor..cursor + len];
+            // A record is always a JSON object. serde would happily decode
+            // an array positionally into the struct's defaults, which would
+            // let corrupt bytes masquerade as a committed record.
+            let is_object = frame
+                .iter()
+                .find(|b| !b.is_ascii_whitespace())
+                .is_some_and(|b| *b == b'{');
+            match is_object
+                .then(|| serde_json::from_slice::<Record>(frame))
+                .and_then(|r| r.ok())
+            {
+                Some(record) => {
+                    if record.v > SCHEMA {
+                        // Excluded from derivation, retained on disk - and
+                        // its commit sequence still counts, so a future
+                        // record never lets a writer reissue `seq`.
+                        errors.push(SourceError {
+                            source: "journal".to_owned(),
+                            detail: format!(
+                                "{}: record seq {} carries schema v{}, newer than v{SCHEMA}",
+                                path.display(),
+                                record.seq,
+                                record.v
+                            ),
+                        });
+                    }
+                    records.push(record);
+                }
+                None => errors.push(SourceError {
+                    source: "journal".to_owned(),
+                    detail: format!("{}: record at byte {cursor} does not parse", path.display()),
+                }),
+            }
+            cursor += len;
+        }
+        if bytes.len() - cursor > 0 && cursor + 4 > bytes.len() {
+            errors.push(SourceError {
+                source: "journal".to_owned(),
+                detail: format!(
+                    "{}: {} trailing bytes",
+                    path.display(),
+                    bytes.len() - cursor
+                ),
+            });
+        }
+        records
+    }
+
+    /// The seen-state map: conversation key -> acknowledged sequence.
+    fn read_seen(&self, errors: &mut Vec<SourceError>) -> HashMap<String, u64> {
+        self.read_authored(SEEN, errors)
+            .map(|authored: Authored<HashMap<String, u64>>| authored.data)
+            .unwrap_or_default()
+    }
+
+    fn write_seen(&self, seen: &HashMap<String, u64>) -> io::Result<()> {
+        self.write_authored(SEEN, seen)
+    }
+
+    fn read_marks(&self, errors: &mut Vec<SourceError>) -> HashMap<String, Mark> {
+        self.read_authored(MARKS, errors)
+            .map(|authored: Authored<HashMap<String, Mark>>| authored.data)
+            .unwrap_or_default()
+    }
+
+    fn write_marks(&self, marks: &HashMap<String, Mark>) -> io::Result<()> {
+        self.write_authored(MARKS, marks)
+    }
+
+    /// One authored file read: future or malformed content is reported and
+    /// treated as absent - never guessed.
+    fn read_authored<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+        errors: &mut Vec<SourceError>,
+    ) -> Option<Authored<T>> {
+        let path = self.dir.join(name);
+        let bytes = read_file(&path, name, errors)?;
+        match serde_json::from_slice::<Authored<T>>(&bytes) {
+            Ok(a) if a.v <= SCHEMA => Some(a),
+            Ok(a) => {
+                errors.push(SourceError {
+                    source: name.to_owned(),
+                    detail: format!(
+                        "{}: schema v{} is newer than v{SCHEMA}",
+                        path.display(),
+                        a.v
+                    ),
+                });
+                None
+            }
+            Err(e) => {
+                errors.push(SourceError {
+                    source: name.to_owned(),
+                    detail: format!("{}: {e}", path.display()),
+                });
+                None
+            }
+        }
+    }
+
+    fn write_authored<T: Serialize>(&self, name: &str, data: &T) -> io::Result<()> {
+        fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
+        let authored = Authored { v: SCHEMA, data }; // coverage: off - the unexecuted instantiation's region edge
+        let bytes = serde_json::to_vec_pretty(&authored)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?; // coverage: off - the envelope always serializes
+        write_atomic(&self.dir.join(name), &bytes) // coverage: off - the unexecuted instantiation's region edge
+    }
+}
+// coverage: off - the unexecuted instantiation's region edge
+/// The shared envelope for `seen.json` and `marks.json`.
+#[derive(Debug, Serialize, Deserialize)]
+struct Authored<T> {
+    // coverage: off - the unexecuted instantiation's region edge
+    #[serde(default)]
+    v: u32,
+    data: T,
+}
+
+/// The lock on `journal.lock`: `create_new` so only one holder exists.
+/// A lock older than [`LOCK_STALE`] is a dead holder's and is stolen.
+struct Lock {
+    path: PathBuf,
+}
+
+impl Lock {
+    fn acquire(path: &Path) -> io::Result<Lock> {
+        let deadline = SystemTime::now() + LOCK_WAIT;
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(mut file) => {
+                    // coverage: off - a write failure into a fresh lock
+                    // needs a filesystem fault
+                    writeln!(file, "{}", std::process::id())?; // coverage: off - a write failure into a fresh lock needs a filesystem fault
+                    return Ok(Lock {
+                        path: path.to_owned(),
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if stale_lock(path) {
+                        let _ = fs::remove_file(path); // coverage: off - the unexecuted instantiation's region edge
+                        continue;
+                    }
+                    if SystemTime::now() > deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            format!("{}: lock held", path.display()),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Err(e), // coverage: off - the unexecuted instantiation's region edge
+            }
+        }
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // coverage: off - the unexecuted instantiation's region edge
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// A lock is stale when its holder can no longer hold it: older than
+/// [`LOCK_STALE`], or empty because a holder died between create and write.
+fn stale_lock(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else
+    /* // coverage: off - a lock that vanishes between create_new and stat is a race */
+    {
+        // coverage: off - the unexecuted instantiation's region edge
+        return true; // coverage: off - a lock that vanishes between create_new and stat is a race
+    };
+    if meta.len() == 0 {
+        // The pid write follows the create in the same breath; only a dead
+        // writer leaves an empty lock - but give it one second of grace.
+        return meta
+            .modified()
+            .ok() // coverage: off - the unexecuted instantiation's region edge
+            .is_some_and(|m| m.elapsed().unwrap_or_default() > Duration::from_secs(1));
+    }
+    meta.modified()
+        .ok()
+        .is_some_and(|m| m.elapsed().unwrap_or_default() > LOCK_STALE)
+}
+
+/// `path`'s whole contents; `None` on a missing file (the normal first-run
+/// case) and an error retained on any other failure.
+fn read_file(path: &Path, source: &str, errors: &mut Vec<SourceError>) -> Option<Vec<u8>> {
+    match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            errors.push(SourceError {
+                source: source.to_owned(),
+                detail: format!("{}: {e}", path.display()),
+            });
+            None
+        }
+    }
+}
+
+/// `bytes` -> `path` atomically: sibling temp, fsync, rename, fsync the
+/// directory so the rename itself survives.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> /* // coverage: off - a directory-creation failure needs a filesystem fault */
+{
+    if let Some(dir) = path.parent() {
+        // coverage: off - the unexecuted instantiation's region edge
+        fs::create_dir_all(dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
+    } // coverage: off - the unexecuted instantiation's region edge
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    {
+        // coverage: off - the unexecuted instantiation's region edge
+        let mut file = fs::File::create(&tmp)?; // coverage: off - a create failure needs a filesystem fault
+        file.write_all(bytes)?; // coverage: off - same
+        file.sync_all()?; // coverage: off - an fsync failure needs a broken filesystem
+    } // coverage: off - the unexecuted instantiation's region edge
+    fs::rename(&tmp, path)?; // coverage: off - a failed rename needs a filesystem fault
+    if let Some(dir) = path.parent()
+        && let Ok(dir) = fs::File::open(dir)
+    {
+        // coverage: off - the unexecuted instantiation's region edge
+        let _ = dir.sync_all(); // coverage: off - the unexecuted instantiation's region edge
+    } // coverage: off - the unexecuted instantiation's exit edge
+    Ok(())
+} // coverage: off - the unexecuted instantiation's region edge
+
+/// Epoch milliseconds.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH) // coverage: off - the unexecuted instantiation's region edge
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// `system_time` -> epoch milliseconds.
+pub fn epoch_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+/// The writer identity a record carries.
+fn writer() -> String {
+    format!("agent-sessions/{}", env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempStore(PathBuf);
+    impl TempStore {
+        fn new() -> TempStore {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "agent-sessions-store-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            TempStore(path)
+        }
+        fn store(&self) -> Store {
+            Store::open(self.0.clone())
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn record(provider: &str, session: &str, native: &str, event: NormEvent) -> Record {
+        let mut r = Record::new(provider, session, native);
+        r.event = Some(event);
+        r
+    }
+
+    #[test]
+    fn concurrent_writers_get_unique_monotonic_sequences() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = Store::open(temp.0.clone());
+            handles.push(std::thread::spawn(move || {
+                (0..8)
+                    .map(|_| {
+                        store
+                            .append(record("claude", &format!("s{i}"), "Stop", NormEvent::End))
+                            .expect("append")
+                    })
+                    .collect::<Vec<u64>>()
+            }));
+        }
+        let mut seqs: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("writer joins"))
+            .collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs, (1..=64).collect::<Vec<_>>());
+        let loaded = store.load();
+        assert_eq!(loaded.max_seq, 64);
+        assert_eq!(loaded.folds.len(), 8);
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+    }
+
+    #[test]
+    fn a_corrupt_tail_never_hides_the_valid_prefix() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .unwrap();
+        // A torn write: an announced record that never arrives, then
+        // trailing garbage.
+        let journal = temp.path(JOURNAL);
+        let mut bytes = fs::read(&journal).unwrap();
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(b"{\"v\":1,\"seq\":2");
+        fs::write(&journal, &bytes).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.folds.len(), 1);
+        assert!(loaded.errors.iter().any(|e| e.source == "journal"));
+    }
+
+    #[test]
+    fn a_malformed_record_is_isolated_not_fatal() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .unwrap();
+        // A record whose payload is JSON but not a Record shape: an array.
+        let journal = temp.path(JOURNAL);
+        let mut bytes = fs::read(&journal).unwrap();
+        let bad = b"[1,2,3]";
+        bytes.extend_from_slice(&(bad.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(bad);
+        fs::write(&journal, &bytes).unwrap();
+        store
+            .append(record("claude", "s2", "Stop", NormEvent::End))
+            .unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.folds.len(), 2, "{:?}", loaded.folds);
+        assert!(loaded.errors.iter().any(|e| e.source == "journal"));
+    }
+
+    #[test]
+    fn a_future_schema_record_is_excluded_and_reported() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .unwrap();
+        let journal = temp.path(JOURNAL);
+        let mut bytes = fs::read(&journal).unwrap();
+        let future = b"{\"v\":99,\"seq\":2,\"provider\":\"claude\",\"session\":\"s2\",\"native\":\"Stop\",\"event\":\"end\"}";
+        bytes.extend_from_slice(&(future.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(future);
+        fs::write(&journal, &bytes).unwrap();
+        let loaded = store.load();
+        // s2 reduces to nothing - the record stays on disk, reported.
+        assert_eq!(loaded.folds.len(), 1);
+        assert!(loaded.max_seq >= 2);
+        assert!(
+            loaded
+                .errors
+                .iter()
+                .any(|e| e.detail.contains("newer than"))
+        );
+    }
+
+    #[test]
+    fn compaction_replays_to_the_same_reduction() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        for i in 0..COMPACT_AFTER {
+            let event = match i % 4 {
+                0 => NormEvent::Start,
+                1 => NormEvent::Activity,
+                2 => NormEvent::Awaiting,
+                _ => NormEvent::End,
+            };
+            let mut r = record("claude", "s1", "Evt", event);
+            r.reason = Some("why".to_owned());
+            store.append(r).unwrap();
+        }
+        // An `end` as the very last record, so the reduction has a latch.
+        let mut r = record("claude", "s1", "Stop", NormEvent::End);
+        r.reason = None;
+        store.append(r).unwrap();
+        let before = store.load();
+        assert_eq!(before.folds.len(), 1, "{:?}", before.folds);
+        let through = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(temp.path(CHECKPOINT)).expect("a checkpoint was written"),
+        )
+        .unwrap();
+        assert_eq!(through["through"], before.max_seq);
+        assert!(fs::read(temp.path(JOURNAL)).unwrap().is_empty());
+        let after = store.load();
+        let key = conversation_key("claude", "s1");
+        for (label, loaded) in [("before", &before), ("after", &after)] {
+            let fold = &loaded.folds[&key];
+            assert_eq!(fold.last_seq, before.max_seq, "{label}");
+            assert_eq!(
+                fold.last_event.as_ref().map(|e| e.kind),
+                Some(NormEvent::End),
+                "{label}"
+            );
+            // The retained latch set is identical through compaction: an
+            // awaiting the last `start` never cleared, then two `end`s.
+            let kinds: Vec<NormEvent> = fold.retained.iter().map(|r| r.kind).collect();
+            assert_eq!(
+                kinds,
+                vec![NormEvent::Awaiting, NormEvent::End, NormEvent::End],
+                "{label}"
+            );
+        }
+        assert!(after.errors.is_empty(), "{:?}", after.errors);
+    }
+
+    #[test]
+    fn a_previous_schema_checkpoint_still_reads() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .unwrap();
+        let loaded = store.load();
+        let fold = loaded.folds[&conversation_key("claude", "s1")].clone();
+        // Hand-write a checkpoint at the pre-versioned schema (v absent).
+        fs::create_dir_all(&temp.0).unwrap();
+        fs::write(
+            temp.path(CHECKPOINT),
+            serde_json::to_string(&serde_json::json!({
+                "through": loaded.max_seq,
+                "folds": { conversation_key("claude", "s1"): fold },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(temp.path(JOURNAL), b"").unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.folds.len(), 1);
+        assert_eq!(loaded.max_seq, 1);
+    }
+
+    #[test]
+    fn a_future_checkpoint_is_unreadable_and_reported() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        fs::create_dir_all(&temp.0).unwrap();
+        fs::write(
+            temp.path(CHECKPOINT),
+            serde_json::json!({"v": 99, "through": 5, "folds": {}}).to_string(),
+        )
+        .unwrap();
+        let loaded = store.load();
+        assert!(!loaded.readable);
+        assert!(loaded.folds.is_empty());
+        assert!(
+            loaded
+                .errors
+                .iter()
+                .any(|e| e.detail.contains("newer than"))
+        );
+    }
+
+    #[test]
+    fn seen_and_marks_round_trip_atomically() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let key = conversation_key("claude", "s1");
+        store.acknowledge(&key, 7).unwrap();
+        store.acknowledge(&key, 3).unwrap(); // backwards is a no-op
+        assert_eq!(store.load().seen[&key], 7);
+        store.mark_not_busy(&key, 123_000, 7).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.marks[&key].since_ms, 123_000);
+        assert_eq!(loaded.marks[&key].seq, 7);
+        // A malformed authored file reports and reads empty.
+        fs::write(temp.path(SEEN), "{oops").unwrap();
+        let loaded = store.load();
+        assert!(loaded.seen.is_empty());
+        assert!(loaded.errors.iter().any(|e| e.source == SEEN));
+        fs::write(
+            temp.path(MARKS),
+            serde_json::json!({"v": 9, "data": {}}).to_string(),
+        )
+        .unwrap();
+        let loaded = store.load();
+        assert!(loaded.marks.is_empty());
+        assert!(loaded.errors.iter().any(|e| e.source == MARKS));
+    }
+
+    #[test]
+    fn fold_rejects_reordered_and_duplicates_refresh_observation() {
+        let mut fold = Fold::default();
+        let key = |pseq: Option<u64>, seq: u64, at: u64, event: NormEvent| {
+            let mut r = record("claude", "s1", "Evt", event);
+            r.pseq = pseq;
+            r.seq = seq;
+            r.at = at;
+            r
+        };
+        // A stale producer sequence is rejected; a duplicate refreshes the
+        // observation without resetting `since`.
+        assert_eq!(
+            fold.apply(&key(Some(5), 1, 1000, NormEvent::Start)),
+            Apply::Accepted
+        );
+        assert_eq!(
+            fold.apply(&key(Some(3), 2, 1100, NormEvent::Activity)),
+            Apply::Stale
+        );
+        assert_eq!(
+            fold.apply(&key(Some(5), 3, 1200, NormEvent::Start)),
+            Apply::Duplicate
+        );
+        let last = fold.last_event.as_ref().unwrap();
+        assert_eq!(last.since_ms, 1000);
+        assert_eq!(last.observed_ms, 1200);
+        // And an event without a producer sequence always lands.
+        assert_eq!(
+            fold.apply(&key(None, 4, 1300, NormEvent::End)),
+            Apply::Accepted
+        );
+        assert_eq!(fold.retained.len(), 1);
+        assert_eq!(fold.unacked_through(0), 4);
+        assert_eq!(fold.unacked_through(4), 0);
+    }
+
+    #[test]
+    fn a_start_acknowledges_everything_retained() {
+        let mut fold = Fold::default();
+        for (seq, event) in [
+            (1, NormEvent::Start),
+            (2, NormEvent::End),
+            (3, NormEvent::Error),
+            (4, NormEvent::Awaiting),
+        ] {
+            let mut r = record("claude", "s1", "Evt", event);
+            r.seq = seq;
+            r.at = seq * 1000;
+            fold.apply(&r);
+        }
+        assert_eq!(fold.retained.len(), 3);
+        let mut r = record("claude", "s1", "UserPromptSubmit", NormEvent::Start);
+        r.seq = 5;
+        r.at = 5000;
+        fold.apply(&r);
+        assert!(fold.retained.is_empty());
+        // A teardown hint is diagnostic only: it latches nothing and does
+        // not move the execution claim.
+        let mut r = record("claude", "s1", "SessionEnd", NormEvent::TeardownHint);
+        r.seq = 6;
+        fold.apply(&r);
+        assert_eq!(fold.last_event.unwrap().kind, NormEvent::Start);
+    }
+
+    #[test]
+    fn an_empty_session_id_reduces_to_no_conversation() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        store
+            .append(record("claude", "", "Stop", NormEvent::End))
+            .unwrap();
+        let loaded = store.load();
+        assert!(loaded.folds.is_empty());
+        assert_eq!(loaded.max_seq, 1);
+    }
+
+    #[test]
+    fn a_teardown_hint_claims_no_execution() {
+        assert_eq!(NormEvent::TeardownHint.execution(), None);
+        assert_eq!(NormEvent::End.execution(), Some(Exec::Idle));
+        assert_eq!(NormEvent::Awaiting.execution(), Some(Exec::Waiting));
+        assert!(!NormEvent::Activity.latches());
+    }
+
+    #[test]
+    fn a_duplicate_ping_refreshes_its_lease() {
+        let mut fold = Fold::default();
+        let mut ping = Record::new("claude", "s1", "OddEvent");
+        ping.seq = 1;
+        ping.at = 1_000;
+        ping.pseq = Some(9);
+        assert_eq!(fold.apply(&ping), Apply::Accepted);
+        // The same producer sequence again is a heartbeat: the observation
+        // refreshes and the ping's clock moves, but nothing latches.
+        ping.seq = 2;
+        ping.at = 1_500;
+        assert_eq!(fold.apply(&ping), Apply::Duplicate);
+        assert_eq!(fold.ping, Some((1, 1_500)));
+    }
+
+    #[test]
+    fn a_malformed_checkpoint_reports_and_reads_as_absent() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        fs::create_dir_all(&temp.0).unwrap();
+        fs::write(temp.path(CHECKPOINT), b"{oops").unwrap();
+        let loaded = store.load();
+        assert!(!loaded.readable);
+        assert!(
+            loaded
+                .errors
+                .iter()
+                .any(|e| e.source == "checkpoint" && e.detail.contains("checkpoint.json"))
+        );
+    }
+
+    #[test]
+    fn a_sub_frame_tail_reports_the_trailing_bytes() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .unwrap();
+        // Three trailing bytes: not even a length fits.
+        let journal = temp.path(JOURNAL);
+        let mut bytes = fs::read(&journal).unwrap();
+        bytes.extend_from_slice(b"\x01\x00\x00");
+        fs::write(&journal, &bytes).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.folds.len(), 1);
+        assert!(
+            loaded
+                .errors
+                .iter()
+                .any(|e| e.detail.contains("trailing bytes"))
+        );
+    }
+
+    #[test]
+    fn a_stale_lock_is_stolen_a_held_one_waits_out() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let lock = temp.path(LOCK);
+        // A lock a dead holder abandoned: aged past the stale window, so
+        // the next writer steals it and commits normally.
+        fs::create_dir_all(&temp.0).unwrap();
+        fs::File::create(&lock).unwrap();
+        fs::File::open(&lock)
+            .unwrap()
+            .set_modified(SystemTime::now() - LOCK_STALE - Duration::from_secs(1))
+            .unwrap();
+        store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .expect("a stale lock is stolen");
+        // A lock held fresh - a written pid makes it a live holder's, not
+        // an empty dead file - waits out the deadline, then reports it.
+        fs::write(&lock, "12345\n").unwrap();
+        let err = store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .expect_err("a held lock is not stolen");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn an_unreadable_store_file_is_one_error_not_a_crash() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        fs::create_dir_all(&temp.0).unwrap();
+        // A directory where the journal should be: the read fails, the
+        // error is retained, the rest of the store still answers.
+        fs::create_dir_all(temp.path(JOURNAL)).unwrap();
+        let loaded = store.load();
+        assert!(
+            loaded.errors.iter().any(|e| e.source == "journal"),
+            "{:?}",
+            loaded.errors
+        );
+        // Appending with a journal directory fails the open - the error
+        // propagates as an io::Error, not a panic.
+        let err = store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .expect_err("a journal directory fails the open");
+        assert_eq!(err.kind(), io::ErrorKind::IsADirectory);
+        // And a lock path that is a directory makes acquire fail outright:
+        // not AlreadyExists, not stale - a plain error.
+        fs::create_dir_all(temp.path(LOCK)).unwrap();
+        let err = store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .expect_err("a lock directory fails the open");
+        assert_ne!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+}

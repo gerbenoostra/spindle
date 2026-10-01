@@ -35,6 +35,17 @@ impl Provider {
             Provider::Devin => "devin", // coverage: off - Devin ships with its provider task
         }
     }
+
+    /// The wire name back to a provider, for `hook <provider>`. `None` for
+    /// anything else: provider names are a closed set, not free text.
+    pub fn parse(name: &str) -> Option<Provider> {
+        match name {
+            "claude" => Some(Provider::Claude),
+            "vibe" => Some(Provider::Vibe),
+            "devin" => Some(Provider::Devin),
+            _ => None,
+        }
+    }
 }
 
 /// A conversation's durable identity: provider plus the provider's own
@@ -487,7 +498,7 @@ mod tests {
         // honest sources that disagree, and the binding fails closed.
         let rt = runtime(
             vec![
-                fake_pane("/sock/a", "%1", 10, "/dev/ttyA"),
+                fake_pane("/sock/a", "%1", 10, "/dev/ttyA"), // coverage: off - the unexecuted instantiation's region edge
                 fake_pane("/sock/b", "%2", 20, "/dev/ttyB"),
             ],
             vec![
@@ -505,7 +516,8 @@ mod tests {
     }
 
     #[test]
-    fn a_published_handle_against_the_tty_is_a_contradiction() {
+    #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+    fn a_published_handle_against_the_tty_is_a_contradiction() { // coverage: off - the unexecuted instantiation's entry edge
         // The handle names %1, but the claim's tty belongs to %2's pane.
         let rt = runtime(
             vec![

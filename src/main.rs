@@ -12,10 +12,11 @@ const HELP: &str = "\
 agent-sessions - one dashboard for every agentic session and worktree
 
 usage:
-  agent-sessions              the dashboard (needs a terminal)
-  agent-sessions list --json  the complete snapshot, unfiltered
-  agent-sessions --version    version, and the executable that is actually running
-  agent-sessions --help       this text
+  agent-sessions                      the dashboard (needs a terminal)
+  agent-sessions list --json          the complete snapshot, unfiltered
+  agent-sessions hook <agent> <event> one hook ping, payload on stdin
+  agent-sessions --version            version, and the executable that is actually running
+  agent-sessions --help               this text
 ";
 
 fn main() -> ExitCode {
@@ -48,8 +49,7 @@ fn run() -> Result<ExitCode, String> {
         .collect::<Result<Vec<_>, _>>()?;
     // Bare `agent-sessions` is the dashboard itself. Subcommands arrive
     // together with the behaviour behind them; anything that has not shipped
-    // yet - `hook`, `register`, `doctor` - is a usage error, never a silent
-    // no-op.
+    // yet - `register`, `doctor` - is a usage error, never a silent no-op.
     match free.as_slice() {
         [] if !json => match agent_sessions::tui::tui() {
             Ok(()) => Ok(ExitCode::SUCCESS), // coverage: off - tui() only succeeds with a real terminal
@@ -68,6 +68,18 @@ fn run() -> Result<ExitCode, String> {
                 Ok(ExitCode::FAILURE)
             }
         },
+        // The provider's hook payload arrives on stdin; the command emits
+        // nothing and exits zero on any write failure so the agent is never
+        // broken by its own instrumentation.
+        [cmd, provider, event] if cmd == "hook" => {
+            use std::io::Read;
+            let mut payload = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut payload);
+            match agent_sessions::hook::run(provider, event, &payload) {
+                Ok(()) => Ok(ExitCode::SUCCESS),
+                Err(e) => Err(e),
+            }
+        }
         // `--json` was already consumed out of `free`; put it back in the
         // complaint when it is the argument being rejected.
         _ => Err(format!(
