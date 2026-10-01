@@ -299,7 +299,8 @@ pub struct ConversationRow {
     /// The wait reason while waiting - the provider's `waitingFor` or the
     /// `awaiting` event's, verbatim.
     pub waiting_for: Option<String>,
-    /// When the effective state began, epoch seconds.
+    /// When the effective state began, epoch seconds; without a live claim,
+    /// the provider's status time or the transcript's newest record.
     pub state_since: Option<u64>,
     /// The same instant in epoch milliseconds - what the not-busy mark
     /// names.
@@ -1398,7 +1399,12 @@ fn conversation_row(
         state,
         state_raw,
         waiting_for: derived.waiting_for,
-        state_since: derived.since_ms.map(|ms| ms / 1000),
+        // Without a live claim arbitration proves no `since`; the row keeps
+        // the provider's own time so history still has an age.
+        state_since: derived
+            .since_ms
+            .map(|ms| ms / 1000)
+            .or_else(|| conv.state_since().map(epoch)),
         state_since_ms: derived.since_ms,
         attention: derived.attention,
         attention_detail: derived.attention_detail,
@@ -1513,24 +1519,36 @@ mod tests {
         }
     }
 
-    fn live_with(status: Option<&str>) -> Live {
+    /// A live record publishing `busy`; tests override what they need.
+    fn live() -> Live {
         Live {
             file: PathBuf::from("/root/sessions/1.json"),
             pid: 1,
             pid_start: ProcessStart::Unavailable,
             cwd: None,
             tmux: None,
-            status_raw: status.map(str::to_owned),
-            status: status.and_then(|s| match s {
-                "busy" => Some(PublishedStatus::Busy),
-                "idle" => Some(PublishedStatus::Idle),
-                "waiting" => Some(PublishedStatus::Waiting),
-                _ => None,
-            }),
+            status_raw: Some("busy".to_owned()),
+            status: Some(PublishedStatus::Busy),
             waiting_for: None,
             updated_at: None,
             status_updated_at: None,
             name: None,
+        }
+    }
+
+    /// A transcript whose newest record is at `last_at`.
+    fn transcript_at(last_at: SystemTime) -> Transcript {
+        Transcript {
+            file: PathBuf::from("/root/projects/-r/1.jsonl"),
+            slug: "-r".to_owned(),
+            session_id: "11111111-2222-3333-4444-555555555555".to_owned(),
+            project_cwd: None,
+            summary: None,
+            latest_prompt: None,
+            latest_reply: None,
+            first_at: None,
+            last_at: Some(last_at),
+            malformed_lines: 0,
         }
     }
 
@@ -1580,7 +1598,7 @@ mod tests {
             (Exec::Unknown, ConversationState::Unknown),
         ] {
             let row = conversation_row(
-                &conversation(Some(live_with(Some("busy"))), None),
+                &conversation(Some(live()), None),
                 None,
                 derived(exec, Attention::None),
                 None,
@@ -1603,6 +1621,49 @@ mod tests {
         assert!(!row.live);
         assert_eq!(row.short_id, "11111111");
         assert_eq!(row.attention, Attention::None); // coverage: off - the unexecuted instantiation's region edge
+    }
+
+    #[test]
+    fn a_row_without_a_live_claim_keeps_the_provider_time() {
+        // Arbitration proves no `since` without a live process, but the
+        // row still has an age: the published status time, else the
+        // transcript's newest record - so history keeps its age column and
+        // survives an `age:` filter.
+        let at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let row = conversation_row(
+            &conversation(None, Some(transcript_at(at))),
+            None,
+            derived(Exec::Unknown, Attention::None),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(row.state_since, Some(1_800_000_000));
+        // A not-busy mark names only an arbitrated `since`.
+        assert_eq!(row.state_since_ms, None);
+        let mut live = live();
+        live.status_updated_at = Some(at + Duration::from_secs(60));
+        let row = conversation_row(
+            &conversation(Some(live), Some(transcript_at(at))),
+            None,
+            derived(Exec::Unknown, Attention::None),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(row.state_since, Some(1_800_000_060));
+        // An arbitrated `since` wins over the provider's.
+        let mut d = derived(Exec::Busy, Attention::Working);
+        d.since_ms = Some(1_700_000_000_000);
+        let row = conversation_row(
+            &conversation(None, Some(transcript_at(at))),
+            None,
+            d,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(row.state_since, Some(1_700_000_000));
     }
 
     #[test]
@@ -2000,7 +2061,7 @@ mod tests {
 
     /// A conversation whose live record sits at `cwd`.
     fn live_at(cwd: &Path) -> Live {
-        let mut live = live_with(None);
+        let mut live = live();
         live.cwd = Some(cwd.to_owned());
         live
     }
