@@ -9,11 +9,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::evidence::Evidence;
 use crate::forge;
-use crate::git::{self, Head, RemoteHead, RemoteListing, Repo, UpstreamConfig};
+use crate::git::{self, Head, RemoteHead, RemoteListing, Repo, Track, UpstreamConfig};
 
 /// What a Work row is anchored on. Branch incarnations and detached
 /// worktrees are the Git anchors; non-Git paths are project spaces and never
@@ -211,6 +211,29 @@ impl RemoteCache {
         }
     }
 
+    /// Whether the stored answer for `remote` still stands - the staged
+    /// collector asks a remote again only once this turns false.
+    pub fn fresh(&self, repo: &Repo, remote: &str) -> bool {
+        let key = (repo.common_dir().to_owned(), remote.to_owned());
+        self.listings
+            .get(&key)
+            .is_some_and(|(asked, _)| still_fresh(*asked, SystemTime::now(), self.deadline))
+    }
+
+    /// Store a freshly asked listing: the remote pool's answer enters under
+    /// the same deadline a lazy ask would have set.
+    pub fn seed(&mut self, repo: &Repo, remote: &str, listing: RemoteListing) {
+        let key = (repo.common_dir().to_owned(), remote.to_owned());
+        self.listings.insert(key, (SystemTime::now(), listing));
+    }
+
+    /// The stored listing, without asking. `None` only when the remote was
+    /// never probed - callers that enumerate their asks first never miss.
+    pub fn peek(&self, repo: &Repo, remote: &str) -> Option<&RemoteListing> {
+        let key = (repo.common_dir().to_owned(), remote.to_owned());
+        self.listings.get(&key).map(|(_, listing)| listing)
+    }
+
     /// The remote's listing, asked again once the stored one is older
     /// than the deadline. A failed ask is stored too: `Unknown` until the
     /// next ask, not a retry storm against an unreachable host.
@@ -239,102 +262,235 @@ fn still_fresh(asked: SystemTime, now: SystemTime, deadline: Duration) -> bool {
         .is_ok_and(|elapsed| elapsed < deadline)
 }
 
-/// Collect the vector for one anchor. Reads only; all runtime fields come
-/// from `runtime`.
-pub fn collect(repo: &Repo, anchor: &Anchor, runtime: RuntimeFacts) -> WorkState {
-    collect_cached(repo, &mut RemoteCache::default(), anchor, runtime)
+/// The reason remote-owned fields carry while their stage has not landed:
+/// an honest `?`, not a guess at the last value.
+pub const PENDING: &str = "collection pending";
+
+/// The remote-independent half of an anchor's state, kept between the
+/// local and remote stages so the remote stage recomputes nothing.
+struct AnchorLocal {
+    /// `branch.<name>.remote`/`.merge` - from the `for-each-ref` batch when
+    /// available, the `config` probes otherwise. `None` on a detached head.
+    config: Option<Result<UpstreamConfig, git::Error>>,
+    /// The upstream remote's URL or a forge-parseable remote name.
+    remote_url: Option<String>,
+    /// The anchor tip's ref spec (`refs/heads/<name>` or a detached sha);
+    /// `None` for an unborn HEAD.
+    head: Option<String>,
+    /// Batched `upstream:track`; `None` keeps the `@{u}` probe in apply.
+    track: Option<Track>,
+    /// A detached anchor's unreachable-commit count - already collected,
+    /// since it is a local `rev-list`, not remote evidence.
+    unreachable: Option<Evidence<u64>>,
+    dirty: Evidence<bool>,
+    last_git_activity: Option<SystemTime>,
 }
 
-/// [`collect`] with a caller-owned [`RemoteCache`], so a batch over a
-/// repository's anchors asks the network once per remote, not once per row.
-pub fn collect_cached(
-    repo: &Repo,
-    cache: &mut RemoteCache,
-    anchor: &Anchor,
-    runtime: RuntimeFacts,
-) -> WorkState {
-    let config = anchor.branch().map(|branch| repo.upstream_config(branch));
-    let upstream = match &config {
-        None => UpstreamState::NotApplicable,
-        Some(Ok(config)) => upstream_state(repo, config, cache),
-        Some(Err(e)) => UpstreamState::Unknown(format!("upstream config: {e}")),
-    };
-    // The configured remote names itself even when it cannot be reached, so
-    // it still feeds base resolution and forge routing.
-    let configured_remote = match config {
-        Some(Ok(UpstreamConfig::Full { remote, .. })) => Some(remote),
-        _ => None,
-    };
-    let remote_url = configured_remote.as_deref().and_then(|remote| {
-        repo.remote_url(remote).ok().flatten().or_else(|| {
-            // `branch.<name>.remote` may be the URL itself rather than a
-            // configured remote name; there is no `remote.<name>.url` to
-            // look up then, but a forge can still be asked.
-            forge::parse_remote(remote).map(|_| remote.to_owned())
-        })
-    });
-    let base = resolve_base(repo, configured_remote.as_deref(), cache);
+/// One anchor with its local facts and current vector state.
+pub struct AnchorWork {
+    /// Local facts live; remote-owned fields stay `Unknown(PENDING)` until
+    /// [`apply_remote`].
+    pub state: WorkState,
+    local: AnchorLocal,
+}
 
-    // A ref spec for the anchor's tip that resolves from the common dir:
-    // `HEAD` alone would name the main worktree's HEAD.
-    let head = match anchor {
-        Anchor::Branch { name } => Some(format!("refs/heads/{name}")),
-        Anchor::Worktree { head, .. } => match head {
-            Head::Branch(name) => Some(format!("refs/heads/{name}")),
-            Head::Detached(sha) => Some(sha.clone()),
-            Head::Unborn(_) => None,
-        },
-    };
-
-    let (landed, commits_ahead, unpushed) = match &head {
-        None => (
-            Evidence::Unknown("unborn HEAD".to_owned()),
-            Evidence::Unknown("unborn HEAD".to_owned()),
-            Evidence::Unknown("unborn HEAD".to_owned()),
-        ),
-        Some(head) => {
-            let commits = commits_ahead(repo, head, &base);
-            let landed = landed(repo, head, &base);
-            let unpushed = match anchor {
-                // A detached HEAD has no upstream; what removal loses is
-                // what no ref reaches.
-                Anchor::Worktree {
-                    head: Head::Detached(_),
-                    ..
-                } => match repo.unreachable_commits(head) {
-                    Ok(count) => Evidence::Known(count),
-                    Err(e) => Evidence::Unknown(format!("unreachable count: {e}")),
-                },
-                _ => unpushed_commits(repo, anchor.branch(), &upstream, &commits),
-            };
-            (landed, commits, unpushed)
+impl AnchorWork {
+    /// The remote name stage 3 must ask for this anchor: its configured
+    /// upstream remote, or the repository's lone remote when the anchor has
+    /// none - the same remote [`resolve_base`] would consult.
+    fn ask(&self, remotes: &Result<Vec<String>, git::Error>) -> Option<String> {
+        match configured_remote(&self.local.config) {
+            Some(remote) => Some(remote.to_owned()),
+            None => match remotes {
+                Ok(remotes) if remotes.len() == 1 => Some(remotes[0].clone()),
+                _ => None,
+            },
         }
-    };
+    }
 
-    let (dirty, last_git_activity) = match anchor {
-        Anchor::Worktree {
-            path,
-            admin_id,
-            main,
-            ..
-        } => (
-            repo.dirty(path),
-            worktree_head_log(*main, admin_id.as_deref())
-                .and_then(|log| repo.reflog_activity(&log)),
-        ),
-        Anchor::Branch { name } => (
-            Evidence::Known(false),
-            repo.reflog_activity(&PathBuf::from(format!("logs/refs/heads/{name}"))),
-        ),
-    };
+    /// Patch the remote-owned fields from a finished [`apply_remote`].
+    pub fn apply(&mut self, applied: RemoteApplied) {
+        self.state.base = applied.base;
+        self.state.vector.upstream_state = applied.upstream_state;
+        self.state.vector.commits_ahead_of_base = applied.commits_ahead;
+        self.state.vector.unpushed_commits = applied.unpushed;
+        self.state.vector.landed = applied.landed;
+    }
+}
 
-    WorkState {
+/// The remote-owned fields of one anchor, computed by [`apply_remote`].
+#[derive(Debug)]
+pub struct RemoteApplied {
+    pub upstream_state: UpstreamState,
+    pub base: Evidence<Base>,
+    pub commits_ahead: Evidence<u64>,
+    pub unpushed: Evidence<u64>,
+    pub landed: Evidence<Landed>,
+}
+
+/// One repository's local collection: every anchor and the repo-level
+/// evidence the remote stage re-uses.
+pub struct RepoLocal {
+    /// `git remote`, kept as the result: base resolution fails closed on
+    /// the error exactly like the per-anchor path.
+    remotes: Result<Vec<String>, git::Error>,
+    /// Remote name -> `refs/remotes/<r>/HEAD` target, covering every remote
+    /// the anchors can ask for. A missing key is "no such symref".
+    local_heads: HashMap<String, Result<Option<String>, String>>,
+    /// The anchors with their local facts and pending states.
+    pub anchors: Vec<AnchorWork>,
+    /// The distinct remote names [`apply_remote`] will consult.
+    pub asks: Vec<String>,
+}
+
+/// Stage 2 for one repository: worktrees, branches and every fact local
+/// Git proves, from one `for-each-ref` when the platform's git batches
+/// (>= 2.41) and the per-branch probes otherwise. `runtime_of` supplies the
+/// agent-visible facts per anchor; errors fail the repository, not its
+/// neighbours.
+pub fn collect_local_repo(
+    repo: &Repo,
+    runtime_of: impl Fn(&Anchor) -> RuntimeFacts,
+) -> Result<RepoLocal, git::Error> {
+    // The batch is best-effort: an older git rejects the atom format and
+    // every batched fact falls back to its per-branch probe.
+    let facts = repo.ref_facts().ok();
+    let mut anchors = Vec::new();
+    let mut checked_out = std::collections::HashSet::new();
+    for wt in repo.worktrees()? {
+        if wt.bare {
+            continue;
+        }
+        if let Head::Branch(name) | Head::Unborn(name) = &wt.head {
+            checked_out.insert(name.clone());
+        }
+        anchors.push(Anchor::Worktree {
+            path: wt.path,
+            admin_id: wt.admin_id,
+            head: wt.head,
+            locked: wt.locked,
+            main: wt.main,
+        });
+    }
+    match facts.as_ref() {
+        // `%(worktreepath)` is the batch's checked-out evidence: a branch
+        // checked out nowhere is a branch-only anchor. Probed equivalent
+        // to the porcelain HEAD fields, including prunable worktrees.
+        Some(facts) => {
+            // Refname order, as `for-each-ref` printed them: the work-row
+            // order would otherwise shuffle whenever two rows tie.
+            let mut names: Vec<&String> = facts.branches.keys().collect();
+            names.sort();
+            for name in names {
+                let fact = &facts.branches[name];
+                if fact.worktree.is_none() && !checked_out.contains(name) {
+                    anchors.push(Anchor::Branch { name: name.clone() });
+                }
+            }
+        }
+        None => unchecked_branch_anchors(repo, &checked_out, &mut anchors)?, // coverage: off - the `?` arm needs a git too old for the atoms
+    }
+
+    let works: Vec<AnchorWork> = anchors
+        .into_iter()
+        .map(|anchor| {
+            let runtime = runtime_of(&anchor);
+            anchor_work(repo, anchor, facts.as_ref(), runtime)
+        })
+        .collect();
+    let remotes = repo.remotes();
+    let asks = remote_asks(&works, &remotes);
+    let local_heads = local_heads(repo, &asks, facts.as_ref());
+    Ok(RepoLocal {
+        remotes,
+        local_heads,
+        anchors: works,
+        asks,
+    })
+}
+
+/// The branch-only fallback when the batch read failed (`%(worktreepath)`
+/// answers "checked out nowhere" and `for-each-ref` predates the atoms).
+#[rustfmt::skip]
+fn unchecked_branch_anchors(repo: &Repo, checked_out: &std::collections::HashSet<String>, anchors: &mut Vec<Anchor>) -> Result<(), git::Error> { // coverage: off - needs a git too old for the atoms
+    for name in repo.local_branches()? { if !checked_out.contains(&name) { anchors.push(Anchor::Branch { name }); } } // coverage: off - same
+    Ok(()) // coverage: off - same
+} // coverage: off - same
+
+/// The remotes [`apply_remote`] will consult for these anchors: every
+/// configured upstream remote, plus the lone remote of a single-remote
+/// repository for anchors without one - the set `resolve_base` chooses
+/// from, asked once per repo per deadline.
+fn remote_asks(works: &[AnchorWork], remotes: &Result<Vec<String>, git::Error>) -> Vec<String> {
+    let mut asks = std::collections::BTreeSet::new();
+    for work in works {
+        if let Some(remote) = work.ask(remotes) {
+            asks.insert(remote);
+        }
+    }
+    asks.into_iter().collect()
+}
+
+/// `refs/remotes/<r>/HEAD` targets for the asked remotes: the batch's
+/// `%(symref)` atoms when present, one `symbolic-ref` per remote otherwise.
+fn local_heads(
+    repo: &Repo,
+    asks: &[String],
+    facts: Option<&git::RefFacts>,
+) -> HashMap<String, Result<Option<String>, String>> {
+    asks.iter()
+        .map(|remote| {
+            let head = match facts {
+                Some(facts) => Ok(facts.remote_heads.get(remote).cloned()),
+                None => repo.local_remote_head(remote).map_err(|e| e.to_string()), // coverage: off - needs a git too old for the atoms
+            };
+            (remote.clone(), head)
+        })
+        .collect()
+}
+
+/// The remote-independent reads for one anchor: upstream config, remote
+/// URL, tip spec, workspace facts, and - where the batch supplied it -
+/// `upstream:track` and the tip's committerdate.
+fn anchor_work(
+    repo: &Repo,
+    anchor: Anchor,
+    facts: Option<&git::RefFacts>,
+    runtime: RuntimeFacts,
+) -> AnchorWork {
+    let branch = anchor.branch();
+    let fact = branch.and_then(|b| facts.and_then(|f| f.branches.get(b)));
+    let config = branch.map(|b| upstream_config(repo, b, fact));
+    let local = AnchorLocal {
+        remote_url: remote_url(repo, &config),
+        config,
+        head: head_spec(&anchor),
+        track: fact.and_then(|f| f.track),
+        unreachable: match &anchor {
+            // A detached HEAD has no upstream; what removal loses is what
+            // no ref reaches - a local `rev-list`, so it is collected now.
+            Anchor::Worktree {
+                head: Head::Detached(sha),
+                ..
+            } => Some(match repo.unreachable_commits(sha) {
+                Ok(count) => Evidence::Known(count),
+                Err(e) => Evidence::Unknown(format!("unreachable count: {e}")),
+            }),
+            _ => None,
+        },
+        dirty: match &anchor {
+            Anchor::Worktree { path, .. } => repo.dirty(path),
+            Anchor::Branch { .. } => Evidence::Known(false),
+        },
+        last_git_activity: last_git_activity(repo, &anchor, fact),
+    };
+    let state = WorkState {
         repo: repo.clone(),
         anchor: anchor.clone(),
-        remote_url,
-        base,
+        remote_url: local.remote_url.clone(),
+        base: Evidence::Unknown(PENDING.to_owned()),
         vector: StateVector {
-            worktree: match anchor {
+            worktree: match &anchor {
                 Anchor::Worktree { path, .. } => Some(path.clone()),
                 Anchor::Branch { .. } => None,
             },
@@ -342,14 +498,176 @@ pub fn collect_cached(
             live_pids: runtime.live_pids,
             live_agent_sessions: runtime.live_agent_sessions,
             past_agent_sessions: runtime.past_agent_sessions,
-            dirty,
-            commits_ahead_of_base: commits_ahead,
-            upstream_state: upstream,
-            unpushed_commits: unpushed,
-            landed,
-            last_git_activity,
+            dirty: local.dirty.clone(),
+            commits_ahead_of_base: Evidence::Unknown(PENDING.to_owned()),
+            upstream_state: UpstreamState::Unknown(PENDING.to_owned()),
+            unpushed_commits: local
+                .unreachable
+                .clone()
+                .unwrap_or_else(|| Evidence::Unknown(PENDING.to_owned())),
+            landed: Evidence::Unknown(PENDING.to_owned()),
+            last_git_activity: local.last_git_activity,
+        },
+    };
+    AnchorWork { state, local } // coverage: off - the unexecuted instantiation's region edge
+}
+
+/// Newest of the reflog's last entry, its mtime, and - when the batch
+/// supplied it - the tip's committerdate. The committerdate matters when a // coverage: off - the unexecuted instantiation's region edge
+/// branch moved without a reflog write; a probe path keeps reflog only.
+fn last_git_activity(
+    repo: &Repo,
+    anchor: &Anchor,
+    fact: Option<&git::BranchFact>,
+) -> Option<SystemTime> {
+    let committed = fact
+        .and_then(|f| f.committer_date)
+        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
+    match anchor {
+        Anchor::Worktree { admin_id, main, .. } => {
+            worktree_head_log(*main, admin_id.as_deref()).and_then(|log| repo.reflog_activity(&log))
+        }
+        Anchor::Branch { name } => {
+            let reflog = repo.reflog_activity(&PathBuf::from(format!("logs/refs/heads/{name}")));
+            [reflog, committed].into_iter().flatten().max()
+        }
+    }
+} // coverage: off - the unexecuted instantiation's exit edge
+
+/// `branch.<name>.remote`/`.merge`: the batch's `upstream:remotename` and
+/// `upstream:remoteref` pair when they resolve - exactly the `Full` case -
+/// and the config probes otherwise, which is how a partial pair or an
+/// unresolvable remote name keeps its distinct fail-closed reading.
+fn upstream_config(
+    repo: &Repo,
+    branch: &str,
+    fact: Option<&git::BranchFact>,
+) -> Result<UpstreamConfig, git::Error> {
+    match fact.and_then(|f| f.upstream.clone()) {
+        Some((remote, merge)) => Ok(UpstreamConfig::Full { remote, merge }),
+        None => repo.upstream_config(branch),
+    }
+} // coverage: off - the unexecuted instantiation's exit edge
+
+/// The configured remote names itself even when it cannot be reached, so it
+/// still feeds base resolution and forge routing. The URL is the remote's
+/// configured `remote.<name>.url`, or the name itself when it parses as a
+/// forge remote (`branch.<name>.remote` may carry the URL directly).
+fn remote_url(repo: &Repo, config: &Option<Result<UpstreamConfig, git::Error>>) -> Option<String> {
+    let remote = configured_remote(config)?;
+    repo.remote_url(remote)
+        .ok()
+        .flatten()
+        .or_else(|| forge::parse_remote(remote).map(|_| remote.to_owned()))
+}
+
+/// The remote a `Full` upstream names; any other shape has none.
+fn configured_remote(config: &Option<Result<UpstreamConfig, git::Error>>) -> Option<&str> {
+    match config {
+        Some(Ok(UpstreamConfig::Full { remote, .. })) => Some(remote.as_str()),
+        _ => None,
+    }
+}
+
+/// A ref spec for the anchor's tip that resolves from the common dir:
+/// `HEAD` alone would name the main worktree's HEAD.
+fn head_spec(anchor: &Anchor) -> Option<String> {
+    match anchor {
+        Anchor::Branch { name } => Some(format!("refs/heads/{name}")),
+        Anchor::Worktree { head, .. } => match head {
+            Head::Branch(name) => Some(format!("refs/heads/{name}")),
+            Head::Detached(sha) => Some(sha.clone()),
+            Head::Unborn(_) => None,
         },
     }
+}
+
+/// Stage 3 for one repository: the remote-owned fields of every anchor.
+/// `listing_of(repo, remote)` answers the remote's advertised listing - the
+/// collector's pre-fetched map in the staged path, a lazy [`RemoteCache`]
+/// in the direct one - and `ahead-behind` runs once per distinct proven
+/// base rather than per branch.
+pub fn apply_remote(
+    repo: &Repo,
+    local: &RepoLocal,
+    mut listing_of: impl FnMut(&Repo, &str) -> RemoteListing,
+) -> Vec<RemoteApplied> {
+    // First the upstream state and the base, so the ahead-behind batches
+    // group anchors by their proven base ref.
+    let resolved: Vec<(UpstreamState, Evidence<Base>)> = local
+        .anchors
+        .iter()
+        .map(|work| {
+            let upstream = upstream_state_of(&work.local.config, |remote| {
+                remote_refs(&listing_of(repo, remote))
+            });
+            let base = resolve_base(
+                repo,
+                configured_remote(&work.local.config),
+                &local.remotes,
+                &local.local_heads,
+                |remote| listing_of(repo, remote).head.clone(),
+            );
+            (upstream, base)
+        })
+        .collect();
+
+    // One `%(ahead-behind:<ref>)` per distinct proven base ref: the ahead
+    // count is `rev-list --count <ref>..<branch>` and `ahead == 0` is the
+    // ancestor test `landed` opens with. A failed or missing batch entry
+    // keeps the per-branch probes.
+    let mut batches: HashMap<String, HashMap<String, (u64, u64)>> = HashMap::new();
+    for (_, base) in &resolved {
+        if let Evidence::Known(base) = base {
+            batches
+                .entry(base.local_ref.clone())
+                .or_insert_with(|| repo.ahead_behind(&base.local_ref).unwrap_or_default());
+        }
+    }
+
+    local
+        .anchors
+        .iter()
+        .zip(resolved)
+        .map(|(work, (upstream, base))| {
+            let (commits_ahead, landed, unpushed) = match &work.local.head {
+                None /* // coverage: off - the unborn arm's second region is an unexecuted-instantiation edge */ => (
+                    Evidence::Unknown("unborn HEAD".to_owned()),
+                    Evidence::Unknown("unborn HEAD".to_owned()),
+                    Evidence::Unknown("unborn HEAD".to_owned()),
+                ),
+                Some(head) => {
+                    let ahead = base.known().and_then(|b| {
+                        head.strip_prefix("refs/heads/").and_then(|name| {
+                            batches.get(&b.local_ref)?.get(name).copied() // coverage: off - every proven base was batched above
+                        })
+                    });
+                    let commits = commits_ahead(repo, head, &base, ahead.map(|(a, _)| a));
+                    let landed = landed(repo, head, &base, ahead.map(|(a, _)| a == 0));
+                    let unpushed = match &work.local.unreachable {
+                        // A detached HEAD has no upstream; the unreachable
+                        // count collected in stage 2 is what removal loses.
+                        Some(unreachable) => unreachable.clone(),
+                        None => unpushed_commits(
+                            repo,
+                            work.state.anchor.branch(),
+                            work.local.track,
+                            &upstream,
+                            &commits,
+                        ),
+                    };
+                    (commits, landed, unpushed)
+                }
+            };
+            RemoteApplied {
+                upstream_state: upstream,
+                base,
+                commits_ahead,
+                unpushed,
+                landed,
+            }
+        })
+        .collect()
 }
 
 /// `$GIT_COMMON_DIR/logs/HEAD` for the main worktree,
@@ -367,12 +685,21 @@ fn worktree_head_log(main: bool, admin_id: Option<&str>) -> Option<PathBuf> {
 /// A read-only `ls-remote` decides whether the remote still advertises the
 /// configured merge ref. An unreachable remote is `Unknown`, not `remote_gone`:
 /// gone is only claimed when the remote answered and did not have the ref.
-fn upstream_state(repo: &Repo, config: &UpstreamConfig, cache: &mut RemoteCache) -> UpstreamState {
+fn upstream_state_of(
+    config: &Option<Result<UpstreamConfig, git::Error>>,
+    mut refs_of: impl FnMut(&str) -> Evidence<std::sync::Arc<Vec<String>>>,
+) -> UpstreamState {
+    let Some(config) = config else {
+        return UpstreamState::NotApplicable;
+    };
     match config {
-        UpstreamConfig::None => UpstreamState::NeverPushed,
-        UpstreamConfig::Partial => UpstreamState::Unknown("incomplete upstream config".to_owned()),
-        UpstreamConfig::Full { remote, merge } => {
-            match remote_refs(repo, remote, cache).map(|refs| refs.iter().any(|r| r == merge)) {
+        Err(e) => UpstreamState::Unknown(format!("upstream config: {e}")),
+        Ok(UpstreamConfig::None) => UpstreamState::NeverPushed,
+        Ok(UpstreamConfig::Partial) => {
+            UpstreamState::Unknown("incomplete upstream config".to_owned())
+        }
+        Ok(UpstreamConfig::Full { remote, merge }) => {
+            match refs_of(remote).map(|refs| refs.iter().any(|r| r == merge)) {
                 Evidence::Known(true) => UpstreamState::Tracked {
                     remote: remote.clone(),
                     merge_ref: merge.clone(),
@@ -387,19 +714,10 @@ fn upstream_state(repo: &Repo, config: &UpstreamConfig, cache: &mut RemoteCache)
     }
 }
 
-/// The remote's advertised ref listing, once per repo+remote per deadline.
-/// The `Arc` share is a refcount bump, not a copy of the whole listing.
-fn remote_refs(
-    repo: &Repo,
-    remote: &str,
-    cache: &mut RemoteCache,
-) -> Evidence<std::sync::Arc<Vec<String>>> {
-    cache.listing(repo, remote).refs.clone()
-}
-
-/// The remote's advertised HEAD, once per repo+remote per deadline.
-fn remote_head(repo: &Repo, remote: &str, cache: &mut RemoteCache) -> RemoteHead {
-    cache.listing(repo, remote).head.clone()
+/// The remote's advertised ref listing: `refs` is an `Arc` share, so
+/// repeated membership checks are refcount bumps, not copies.
+fn remote_refs(listing: &RemoteListing) -> Evidence<std::sync::Arc<Vec<String>>> {
+    listing.refs.clone()
 }
 
 /// The base branch: the symbolic HEAD of the upstream remote, or of the
@@ -411,11 +729,13 @@ fn remote_head(repo: &Repo, remote: &str, cache: &mut RemoteCache) -> RemoteHead
 fn resolve_base(
     repo: &Repo,
     upstream_remote: Option<&str>,
-    cache: &mut RemoteCache,
+    remotes: &Result<Vec<String>, git::Error>,
+    local_heads: &HashMap<String, Result<Option<String>, String>>,
+    mut head_of: impl FnMut(&str) -> RemoteHead,
 ) -> Evidence<Base> {
     let remote = match upstream_remote {
         Some(remote) => remote.to_owned(),
-        None => match repo.remotes() {
+        None => match remotes {
             Ok(remotes) if remotes.len() == 1 => remotes[0].clone(),
             Ok(remotes) => {
                 return Evidence::Unknown(format!(
@@ -428,16 +748,17 @@ fn resolve_base(
     };
 
     // A `.` remote is the repository itself and has no remote-tracking
-    // symref to consult.
+    // symref to consult. An unprobed remote name reads as no symref, which
+    // is what `symbolic-ref` reports for it too.
     let local = if remote == "." {
         None
     } else {
-        match repo.local_remote_head(&remote) {
-            Ok(local) => local,
-            Err(e) => return Evidence::Unknown(format!("local remote HEAD: {e}")), // coverage: off - `remotes()` already failed on a repo this broken
+        match local_heads.get(&remote) {
+            Some(Err(e)) => return Evidence::Unknown(format!("local remote HEAD: {e}")),
+            entry => entry.and_then(|r| r.clone().ok().flatten()),
         }
     };
-    let branch = match remote_head(repo, &remote, cache) {
+    let branch = match head_of(&remote) {
         RemoteHead::Advertised(advertised) => match &local {
             Some(local) if *local != advertised => {
                 return Evidence::Unknown(format!(
@@ -480,27 +801,48 @@ fn resolve_base(
     }
 }
 
-fn commits_ahead(repo: &Repo, head: &str, base: &Evidence<Base>) -> Evidence<u64> {
+/// `rev-list --count <base>..<head>`, or the batch's ahead count when the
+/// branch was in one - same number, no spawn.
+fn commits_ahead(
+    repo: &Repo,
+    head: &str,
+    base: &Evidence<Base>,
+    ahead: Option<u64>,
+) -> Evidence<u64> {
     match base {
         Evidence::Unknown(reason) => Evidence::Unknown(format!("no proven base ({reason})")),
-        Evidence::Known(base) => match repo.rev_list_count(&base.local_ref, head) {
-            Ok(count) => Evidence::Known(count),
-            Err(e) => Evidence::Unknown(format!("rev-list: {e}")),
+        Evidence::Known(base) => match ahead {
+            Some(count) => Evidence::Known(count),
+            None => match repo.rev_list_count(&base.local_ref, head) {
+                Ok(count) => Evidence::Known(count),
+                Err(e) => Evidence::Unknown(format!("rev-list: {e}")),
+            },
         },
     }
 }
 
 /// Ancestry first; when HEAD is no ancestor, the squash/rebase shape is
 /// checked by requiring every path HEAD changed relative to the merge base
-/// to be identical on the base. No delta at all is not landed.
-fn landed(repo: &Repo, head: &str, base: &Evidence<Base>) -> Evidence<Landed> {
+/// to be identical on the base. No delta at all is not landed. `ancestor`
+/// carries the batch's `ahead == 0` verdict when one exists - exactly
+/// `merge-base --is-ancestor` - and `None` keeps the probe.
+fn landed(
+    repo: &Repo,
+    head: &str,
+    base: &Evidence<Base>,
+    ancestor: Option<bool>,
+) -> Evidence<Landed> {
     let Evidence::Known(base) = base else {
         return Evidence::Unknown(format!(
             "no proven base ({})",
             base.reason().unwrap_or_default()
         ));
     };
-    match repo.is_ancestor(head, &base.local_ref) {
+    let ancestor = match ancestor {
+        Some(ancestor) => Evidence::Known(ancestor),
+        None => repo.is_ancestor(head, &base.local_ref),
+    };
+    match ancestor {
         Evidence::Known(true) => return Evidence::Known(Landed::AncestorMerged),
         Evidence::Unknown(reason) => return Evidence::Unknown(reason),
         Evidence::Known(false) => {}
@@ -529,25 +871,81 @@ fn landed(repo: &Repo, head: &str, base: &Evidence<Base>) -> Evidence<Landed> {
 
 /// Commits the configured upstream does not have. A branch that was never
 /// pushed - or a detached HEAD - has no upstream at all, so every commit
-/// past the base is unpushed by definition. `@\{u}` resolves through the
-/// refspec, which is why it handles a merge ref naming a different remote
-/// branch.
+/// past the base is unpushed by definition. The batch's `upstream:track`
+/// ahead count answers it directly when present; `@{u}` resolves through
+/// the refspec otherwise, which is why it handles a merge ref naming a
+/// different remote branch and fails closed when the tracking ref is gone.
 fn unpushed_commits(
     repo: &Repo,
     branch: Option<&str>,
+    track: Option<Track>,
     upstream: &UpstreamState,
     commits_ahead: &Evidence<u64>,
 ) -> Evidence<u64> {
     match (upstream, branch) {
         (UpstreamState::NeverPushed | UpstreamState::NotApplicable, _) => commits_ahead.clone(),
-        (_, Some(branch)) => {
-            let upstream_ref = format!("{branch}@{{u}}");
-            match repo.rev_list_count(&upstream_ref, &format!("refs/heads/{branch}")) {
-                Ok(count) => Evidence::Known(count),
-                Err(e) => Evidence::Unknown(format!("unpushed count via @{{u}}: {e}")),
+        (_, Some(branch)) => match track {
+            Some(Track::Counts { ahead, .. }) => Evidence::Known(ahead),
+            _ => {
+                let upstream_ref = format!("{branch}@{{u}}");
+                match repo.rev_list_count(&upstream_ref, &format!("refs/heads/{branch}")) {
+                    Ok(count) => Evidence::Known(count),
+                    Err(e) => Evidence::Unknown(format!("unpushed count via @{{u}}: {e}")),
+                }
             }
-        }
+        },
         _ => Evidence::Unknown("no branch for an upstream".to_owned()), // coverage: off - a tracked upstream implies a branch
+    }
+}
+
+/// Collect the vector for one anchor. Reads only; all runtime fields come
+/// from `runtime`.
+pub fn collect(repo: &Repo, anchor: &Anchor, runtime: RuntimeFacts) -> WorkState {
+    collect_cached(repo, &mut RemoteCache::default(), anchor, runtime)
+}
+
+/// [`collect`] with a caller-owned [`RemoteCache`], so a batch over a
+/// repository's anchors asks the network once per remote, not once per row.
+/// This is the per-branch path the batched collection must agree with:
+/// every remote answer still comes lazily through `cache`.
+pub fn collect_cached(
+    repo: &Repo,
+    cache: &mut RemoteCache,
+    anchor: &Anchor,
+    runtime: RuntimeFacts,
+) -> WorkState {
+    let remotes = repo.remotes();
+    let mut local = probe_repo_local(repo, anchor.clone(), runtime, remotes);
+    let applied = apply_remote(repo, &local, |r, name| cache.listing(r, name).clone());
+    let mut work = local
+        .anchors
+        .pop()
+        .expect("probe_repo_local built one anchor"); // coverage: off - it always builds exactly one
+    let applied = applied
+        .into_iter()
+        .next()
+        .expect("apply_remote returns one entry per anchor"); // coverage: off - same
+    work.apply(applied);
+    work.state
+}
+
+/// The single-anchor [`RepoLocal`] of the per-branch path: config, remote
+/// name and workspace facts from the probes the batch replaces, asks and
+/// local HEAD symrefs probed exactly as `resolve_base` would consult them.
+fn probe_repo_local(
+    repo: &Repo,
+    anchor: Anchor,
+    runtime: RuntimeFacts,
+    remotes: Result<Vec<String>, git::Error>,
+) -> RepoLocal {
+    let work = anchor_work(repo, anchor, None, runtime);
+    let asks = remote_asks(std::slice::from_ref(&work), &remotes);
+    let local_heads = local_heads(repo, &asks, None);
+    RepoLocal {
+        remotes,
+        local_heads,
+        anchors: vec![work],
+        asks,
     }
 }
 
@@ -674,6 +1072,32 @@ mod tests {
             common_dir: dir.clone(),
         };
         assert!(anchors(&repo).unwrap().is_empty());
+        // The staged local read agrees: no checkouts, no asks, nothing for
+        // the remote stage to apply.
+        let local = collect_local_repo(&repo, |_| RuntimeFacts::default()).unwrap(); // coverage: off - the panic edge is a failed assertion
+        assert!(local.anchors.is_empty() && local.asks.is_empty());
+        let applied = apply_remote(&repo, &local, |_, _| panic!("no anchors")); // coverage: off - proves the listing callback never runs
+        assert!(applied.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_broken_repo_fails_local_collection_cleanly() {
+        // A gitdir that is a plain file: `worktree list` fails, and the
+        // error propagates rather than producing invented anchors.
+        let dir =
+            std::env::temp_dir().join(format!("agent-sessions-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("not-a-repo");
+        std::fs::write(&file, "x").unwrap();
+        let repo = Repo { common_dir: file };
+        let result = collect_local_repo(&repo, |_| RuntimeFacts::default()); // coverage: off - the unexecuted instantiation's region edge
+        let err = match result {
+            Ok(_) => panic!("a broken repo cannot collect"), // coverage: off - the panic edge is a failed assertion
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("worktree"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

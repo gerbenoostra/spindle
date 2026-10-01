@@ -3,6 +3,7 @@
 pub mod claude;
 pub mod config;
 pub mod evidence;
+pub mod fanout;
 pub mod forge;
 pub mod git;
 pub mod process;

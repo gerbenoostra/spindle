@@ -18,7 +18,8 @@ use serde::Serialize;
 
 use crate::claude::{Claude, Conversation};
 use crate::evidence::Evidence;
-use crate::git::{self, Head, Resolved};
+use crate::fanout;
+use crate::git::{self, Head, RemoteHead, RemoteListing, Resolved};
 use crate::process::{Liveness, ProcessStart};
 use crate::provider::{PublishedStatus, SourceError, StateEvidence};
 use crate::runtime::{PaneSource, Placement, Provider, Runtime};
@@ -40,6 +41,10 @@ pub struct Snapshot {
     /// The pane the dashboard itself occupies (`$TMUX_PANE`), when it runs
     /// inside tmux - carried so focus observation can exclude it.
     pub own_pane: Option<String>,
+    /// Whether every collection stage has landed. `false` while evidence
+    /// is still arriving: unlanded fields read as unknowns (`?`) and the
+    /// status bar keeps its spinner until this turns `true`.
+    pub complete: bool,
     pub repos: Vec<RepoRow>,
     pub work: Vec<WorkRow>,
     pub conversations: Vec<ConversationRow>,
@@ -53,6 +58,26 @@ pub struct Snapshot {
     /// socket, so these pile up; each is skipped without a `tmux` spawn,
     /// and the count keeps a socket dir full of them visible.
     pub stale_sockets: usize,
+}
+
+impl Snapshot {
+    /// The pre-collection view the TUI draws first: an empty, incomplete
+    /// snapshot so the dashboard paints its frame before the collector's
+    /// first stage lands.
+    pub fn empty() -> Snapshot {
+        Snapshot {
+            schema_version: SCHEMA_VERSION,
+            observed_at: epoch(SystemTime::now()),
+            own_pane: None,
+            complete: false,
+            repos: Vec::new(),
+            work: Vec::new(),
+            conversations: Vec::new(),
+            errors: Vec::new(),
+            skipped: Vec::new(),
+            stale_sockets: 0,
+        }
+    }
 }
 
 /// A repository - or a non-git project space - as the `[1]` list sees it.
@@ -279,33 +304,95 @@ impl ConversationRow {
     }
 }
 
-/// The collector: owns the plugins (and so their incremental indexes) and
-/// the caches reused across passes until their freshness deadline. A
-/// collect is reads only - everything writes-averse in the boundary stays
-/// averse here.
+/// The collector: owns the plugins (and so their incremental indexes), the
+/// caches reused across passes until their freshness deadline, and the
+/// retained view every stage merges into. A collect is reads only -
+/// everything writes-averse in the boundary stays averse here.
 pub struct Collector {
     claude: Claude,
     remotes: RemoteCache,
+    /// The last-published view: every field keeps its last value until the
+    /// stage that owns it lands a replacement.
+    model: Model,
+    /// Pool width for per-repository and per-remote fan-out.
+    workers: usize,
+}
+
+/// The retained view one refresh stages into place. Published snapshots
+/// are rebuilt from it, so nothing visible ever regresses to `?` once it
+/// was proven - the only exception is evidence this pass has already
+/// replaced or dropped.
+#[derive(Default)]
+struct Model {
+    conversations: Vec<ConversationRow>,
+    repos: BTreeMap<String, RepoModel>,
+    errors: Vec<SourceError>,
+    skipped: Vec<String>,
+    stale_sockets: usize,
+    complete: bool,
+}
+
+/// One repository - or a non-git project space - as the model holds it.
+struct RepoModel {
+    /// The repository itself; `None` for a project space.
+    repo: Option<git::Repo>,
+    name: String,
+    path: PathBuf,
+    data: RepoData,
+}
+
+enum RepoData {
+    /// The anchors with their local facts and merged vector state.
+    Git(vector::RepoLocal),
+    /// The one row a non-git space carries.
+    Space(WorkRow),
 }
 
 impl Collector {
     /// A collector over the Claude store at `claude_root` (`~/.claude`).
+    #[rustfmt::skip]
     pub fn new(claude_root: PathBuf) -> Collector {
-        Collector {
-            claude: Claude::new(claude_root),
-            remotes: RemoteCache::default(),
-        }
+        let claude = Claude::new(claude_root);
+        let remotes = RemoteCache::default();
+        let model = Model::default(); // coverage: off - the unexecuted instantiation's region edge
+        let workers = fanout::WORKERS; // coverage: off - same
+        Collector { claude, remotes, model, workers } // coverage: off - same
     }
 
-    /// One pass: inventory the providers, resolve runtime evidence, then
-    /// resolve every conversation's cwd into repo/worktree/branch anchors
-    /// and collect the work rows' Git evidence. `runtime` is the merged
-    /// process/tmux observation taken for this pass; `own_pane` is the
-    /// pane the dashboard itself sits in, when known.
-    pub fn collect(&mut self, runtime: &Runtime, own_pane: Option<&PaneId>) -> Snapshot {
+    /// The pool width the staged stages fan out at; `1` makes the pass
+    /// strictly sequential, which tests use to make the published order
+    /// deterministic.
+    pub fn with_workers(mut self, workers: usize) -> Collector {
+        self.workers = workers.max(1);
+        self
+    }
+
+    /// One complete pass, staged: runtime and provider inventory first,
+    /// then cwd resolution and local Git per repository newest-activity
+    /// first, then remote evidence, then forge. Every stage merges into the
+    /// retained model and publishes one complete immutable snapshot through
+    /// `publish`; a field whose stage has not landed yet reads `?`, like
+    /// any unknown. Returning `false` from `publish` stops the pass early -
+    /// the receiver is gone and more evidence has nowhere to go.
+    pub fn collect_staged(
+        &mut self,
+        runtime: &Runtime,
+        own_pane: Option<&PaneId>,
+        publish: &mut dyn FnMut(Snapshot) -> bool,
+    ) {
+        // Stage 1 - runtime and provider inventory: conversations with
+        // their published state, attachments and runtime evidence, before
+        // any Git subprocess runs.
         let observed_at = runtime.observed_at;
         let inventory = self.claude.scan();
-        let mut errors = inventory.errors;
+        self.model.errors = inventory.errors;
+        self.model.skipped = inventory
+            .skipped
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        self.model.stale_sockets = runtime.panes.stale_sockets;
+        self.model.complete = false;
 
         // Claims -> resolved attachments, kept parallel so each live
         // conversation gets its own liveness/placement verdict back.
@@ -329,66 +416,51 @@ impl Collector {
             .map(|i| attachment_of[i].is_some_and(|slot| resolved[slot].liveness.may_be_live()))
             .collect();
 
-        // Work identity per conversation: the cwd resolves to a checkout, a
-        // bare repo, a project space, or nothing still on disk. Distinct
-        // cwds are few while conversations are many, so each resolves once
-        // per pass - a failure is also one error, not one per conversation.
-        let placements = resolve_cwds(&inventory.conversations, &mut errors);
-
-        // Repos: every distinct repository plus every non-git project space.
-        let mut repos: BTreeMap<String, RepoRow> = BTreeMap::new();
-        // Anchor the repos conversations resolved into, then every anchor of
-        // each touched repo so [2] shows the repo's whole work surface, not
-        // just where agents sat.
-        let mut touched: BTreeMap<String, ()> = BTreeMap::new();
-        for place in placements.iter().flatten() {
-            if let CwdPlacement::Checkout { repo_id, .. } = place {
-                touched.insert(repo_id.clone(), ());
-            }
+        // The conversation rows keep their previous Work placement until
+        // stage 2 resolves this pass's cwds - a moved checkout shows its
+        // last proven anchor rather than flickering to `?` every refresh.
+        // The model keeps inventory order so `placements[i]` stays aligned;
+        // the attention sort happens per publish.
+        let mut conversations: Vec<ConversationRow> = Vec::new();
+        for (i, conv) in inventory.conversations.iter().enumerate() {
+            let attachment = attachment_of[i].map(|slot| attachment_row(&resolved[slot]));
+            let carried = self
+                .model
+                .conversations
+                .iter()
+                .find(|c| c.session_id == conv.session_id);
+            let (repo, worktree, branch) = carried
+                .map(|c| (c.repo.clone(), c.worktree.clone(), c.branch.clone()))
+                .unwrap_or_default();
+            conversations.push(conversation_row(conv, attachment, repo, worktree, branch));
+        }
+        self.model.conversations = conversations;
+        if !self.emit(runtime, own_pane, publish) {
+            return;
         }
 
-        let mut work: Vec<WorkRow> = Vec::new();
-        for repo_id in touched.keys() {
-            let repo = git::Repo {
-                common_dir: PathBuf::from(repo_id),
-            };
-            let anchors = match vector::anchors(&repo) {
-                Ok(anchors) => anchors,
-                Err(e) /* // coverage: off - a repo deleted mid-collection makes anchors() fail */ => {
-                    errors.push(anchor_error(repo_id, e)); // coverage: off - same
-                    continue; // coverage: off - same
+        // Stage 2 - cwd resolution, then local Git per repository ordered
+        // by newest conversation activity. Work identity per conversation:
+        // the cwd resolves to a checkout, a bare repo, a project space, or
+        // nothing still on disk. Distinct cwds are few while conversations
+        // are many, so each resolves once per pass - a failure is one
+        // error, not one per conversation.
+        let placements = resolve_cwds(&inventory.conversations, &mut self.model.errors);
+        for (conv, place) in self.model.conversations.iter_mut().zip(placements.iter()) {
+            let (repo, worktree, branch) = match place {
+                Some(CwdPlacement::Checkout {
+                    repo_id,
+                    root,
+                    branch,
+                }) => (Some(repo_id.clone()), Some(root.clone()), branch.clone()),
+                Some(CwdPlacement::ProjectSpace { path }) => {
+                    (Some(path.display().to_string()), None, None)
                 }
+                None => (None, None, None),
             };
-            // The main checkout names and paths the repo row.
-            let (name, path) = repo_display(&anchors, &repo);
-            for anchor in &anchors {
-                work.push(work_row(
-                    &repo,
-                    &name,
-                    anchor,
-                    &mut self.remotes,
-                    runtime_facts(
-                        runtime,
-                        &inventory.conversations,
-                        &running,
-                        &placements,
-                        anchor,
-                        repo_id,
-                    ),
-                ));
-            }
-            repos.insert(
-                repo_id.clone(),
-                RepoRow {
-                    id: repo_id.clone(),
-                    name,
-                    path,
-                    git: true,
-                    work: 0,
-                    live: 0,
-                    last_activity: None,
-                },
-            );
+            conv.repo = repo;
+            conv.worktree = worktree;
+            conv.branch = branch;
         }
 
         // Non-git project spaces become rows on their own pseudo-repo -
@@ -400,90 +472,267 @@ impl Collector {
                     continue;
                 }
                 let id = path.display().to_string();
-                repos.entry(id.clone()).or_insert_with(|| RepoRow {
-                    id: id.clone(),
-                    name: display_name(path),
-                    path: path.clone(),
-                    git: false,
-                    work: 0,
-                    live: 0,
-                    last_activity: None,
-                });
-                work.push(WorkRow {
-                    repo: id.clone(),
-                    repo_name: display_name(path),
-                    kind: WorkKind::ProjectSpace,
-                    name: display_name(path),
-                    // The row's workspace is the space itself: no checkout,
-                    // but the path is what its conversations anchor on.
-                    worktree: Some(path.clone()),
-                    branch: None,
-                    dirty: None,
-                    commits_ahead: None,
-                    unpushed: None,
-                    upstream: Upstream::NotApplicable,
-                    upstream_detail: None,
-                    landed: None,
-                    base: None,
-                    windows: 0,
-                    live_pids: 0,
-                    live_sessions: 0,
-                    past_sessions: 0,
-                    last_activity: None,
-                    summary: "no git".to_owned(),
-                });
+                self.model
+                    .repos
+                    .entry(id.clone())
+                    .or_insert_with(|| RepoModel {
+                        repo: None,
+                        name: display_name(path),
+                        path: path.clone(),
+                        data: RepoData::Space(space_row(&id, path)),
+                    });
             }
         }
 
-        let mut conversations: Vec<ConversationRow> = Vec::new();
-        for (i, conv) in inventory.conversations.iter().enumerate() {
-            let attachment = attachment_of[i].map(|slot| attachment_row(&resolved[slot]));
-            let (repo, worktree, branch) = match &placements[i] {
-                Some(CwdPlacement::Checkout {
-                    repo_id,
-                    root,
-                    branch,
-                }) => (Some(repo_id.clone()), Some(root.clone()), branch.clone()),
-                Some(CwdPlacement::ProjectSpace { path }) => {
-                    (Some(path.display().to_string()), None, None)
-                }
-                None => (None, None, None),
+        // The repos conversations resolved into, newest activity first.
+        let order = repo_order(&inventory.conversations, &placements);
+        // Repos that fell out of scope leave with this pass's stage 2 -
+        // the stage replaces their rows with nothing, which is an answer.
+        let keep: std::collections::HashSet<String> = order
+            .iter()
+            .cloned()
+            .chain(spaces.iter().map(|p| p.display().to_string()))
+            .collect();
+        self.model.repos.retain(|id, _| keep.contains(id));
+        if !self.emit(runtime, own_pane, publish) {
+            return;
+        }
+
+        {
+            let conversations = &inventory.conversations;
+            let running = &running;
+            let placements = &placements;
+            let mut alive = true;
+            fanout::fan_out(
+                &order,
+                self.workers,
+                |repo_id| {
+                    let repo = git::Repo {
+                        common_dir: PathBuf::from(repo_id),
+                    };
+                    vector::collect_local_repo(&repo, |anchor| {
+                        runtime_facts(runtime, conversations, running, placements, anchor, repo_id)
+                    })
+                    .map_err(|e| anchor_error(repo_id, e)) // coverage: off - needs a repo whose worktree read fails mid-pass
+                },
+                |i, result| {
+                    let repo_id = &order[i];
+                    match result {
+                        Ok(local) => self.merge_repo(repo_id, local),
+                        Err(error) => self.fail_repo(repo_id, error), // coverage: off - needs a repo's worktree list to fail after its cwd resolved, mid-pass
+                    }
+                    alive = self.emit(runtime, own_pane, publish);
+                },
+            );
+            if !alive {
+                return;
+            }
+        }
+
+        // Stage 3 - remote evidence, one `ls-remote --symref` per repo and
+        // remote per deadline, fanned out; then the local probes each
+        // remote answer unlocks (bases, ahead/behind, landed, unpushed).
+        let mut asks: Vec<(git::Repo, String)> = Vec::new();
+        for model in self.model.repos.values() {
+            let (Some(repo), RepoData::Git(local)) = (&model.repo, &model.data) else {
+                continue;
             };
-            conversations.push(conversation_row(conv, attachment, repo, worktree, branch));
+            for remote in &local.asks {
+                if !self.remotes.fresh(repo, remote) {
+                    asks.push((repo.clone(), remote.clone()));
+                }
+            }
+        }
+        fanout::fan_out(
+            &asks,
+            self.workers,
+            |(repo, remote)| repo.remote_listing(remote),
+            |i, listing| {
+                #[rustfmt::skip]
+                let (repo, remote) = &asks[i]; // coverage: off - the bounds arm never fires: `i` enumerates `asks` itself
+                self.remotes.seed(repo, remote, listing); // coverage: off - seed's cached-stat arm never fires: the entry was just written
+            }, // coverage: off - the closure edge of the unexecuted instantiation
+        ); // coverage: off - same
+        // The listings apply reads: every ask, whether the pool just fetched  // coverage: off - the line's zero region is an instantiation edge, not code
+        // it or the cache still held it. A `peek` miss means the asks  // coverage: off - same
+        // enumeration is wrong; it fails closed like an unreachable remote. // coverage: off - the unexecuted instantiation's region edge
+        let listings = &self.current_listings(); // coverage: off - the unexecuted instantiation's region edge
+        let model = &self.model; // coverage: off - same
+        let jobs: Vec<&String> = order
+            .iter()
+            .filter(|id| {
+                model
+                    .repos
+                    .get(*id)
+                    .is_some_and(|m| matches!(m.data, RepoData::Git(_)))
+            })
+            .collect();
+        let mut applied: Vec<Option<Vec<vector::RemoteApplied>>> =
+            jobs.iter().map(|_| None).collect();
+        fanout::fan_out(
+            &jobs,
+            self.workers,
+            |id| {
+                let model = &model.repos[*id];
+                let (Some(repo), RepoData::Git(local)) = (&model.repo, &model.data) else {
+                    unreachable!("jobs holds Git models only") // coverage: off - filtered above
+                };
+                vector::apply_remote(repo, local, |repo, remote| {
+                    listings
+                        .get(&(repo.common_dir().to_owned(), remote.to_owned()))
+                        .cloned()
+                        .unwrap_or_else(|| unprobed_listing(remote)) // coverage: off - apply only consults remotes the asks enumeration seeded
+                })
+            },
+            |i, a| applied[i] = Some(a),
+        );
+        for (i, repo_id) in jobs.iter().enumerate() {
+            let Some(applied) = applied[i].take() else {
+                continue; // coverage: off - fan_out delivers every index
+            };
+            self.apply_to_repo(repo_id, applied);
+            if !self.emit(runtime, own_pane, publish) {
+                return;
+            }
         }
 
-        // Counts roll up: work rows per repo, live conversations per repo,
-        // and the repo's age as the newest activity across its work.
-        for row in &mut repos.values_mut() {
-            row.work = work.iter().filter(|w| w.repo == row.id).count();
-            row.live = conversations
+        // Stage 4 - forge enrichment. No producer ships yet (the work-item
+        // overlay arrives with the cleanup tasks); `gh`/`glab` collectors
+        // plug into the pipeline here rather than being retrofitted.
+        self.model.complete = true;
+        self.emit(runtime, own_pane, publish);
+    }
+
+    /// One pass run to completion: the staged collect's final snapshot,
+    /// identical in classification to an unstaged collect because it is the
+    /// same collection streamed rather than buffered.
+    pub fn collect(&mut self, runtime: &Runtime, own_pane: Option<&PaneId>) -> Snapshot {
+        let mut last = None;
+        self.collect_staged(runtime, own_pane, &mut |snapshot| {
+            last = Some(snapshot);
+            true
+        });
+        last.expect("a staged pass always publishes") // coverage: off - stage 1 always publishes
+    } // coverage: off - the unexecuted instantiation's exit edge
+
+    /// Rebuild the publishable snapshot from the retained model: work rows
+    /// projected from every anchor's state, repo rollups recomputed, and
+    /// the completeness flag as it currently stands.
+    fn emit(
+        &self,
+        runtime: &Runtime,
+        own_pane: Option<&PaneId>,
+        publish: &mut dyn FnMut(Snapshot) -> bool,
+    ) -> bool {
+        let mut work = Vec::new();
+        let mut repos = Vec::new();
+        for (id, model) in &self.model.repos {
+            let mut last_activity = None;
+            match &model.data {
+                RepoData::Git(local) => {
+                    for anchor in &local.anchors {
+                        let row = work_row(id, &model.name, &anchor.state);
+                        last_activity = last_activity.max(row.last_activity);
+                        work.push(row);
+                    }
+                }
+                RepoData::Space(row) => work.push(row.clone()),
+            }
+            let work_count = work.iter().filter(|w| w.repo == *id).count();
+            let live = self
+                .model
+                .conversations
                 .iter()
-                .filter(|c| c.running() && c.repo.as_deref() == Some(row.id.as_str()))
+                .filter(|c| c.running() && c.repo.as_deref() == Some(id.as_str()))
                 .count();
-            row.last_activity = work
-                .iter()
-                .filter(|w| w.repo == row.id)
-                .filter_map(|w| w.last_activity)
-                .max();
+            repos.push(RepoRow {
+                id: id.clone(),
+                name: model.name.clone(),
+                path: model.path.clone(),
+                git: model.repo.is_some(),
+                work: work_count,
+                live,
+                last_activity,
+            });
         }
-
-        sort_rows(&mut work, &mut conversations, observed_at);
-
-        Snapshot {
+        work.sort_by_key(|w| std::cmp::Reverse(w.last_activity));
+        let mut conversations = self.model.conversations.clone();
+        sort_conversations(&mut conversations, runtime.observed_at);
+        publish(Snapshot {
             schema_version: SCHEMA_VERSION,
-            observed_at: epoch(observed_at),
+            observed_at: epoch(runtime.observed_at),
             own_pane: own_pane.map(|p| p.as_str().to_owned()),
-            repos: repos.into_values().collect(),
+            complete: self.model.complete,
+            repos,
             work,
             conversations,
-            errors,
-            skipped: inventory
-                .skipped
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect(),
-            stale_sockets: runtime.panes.stale_sockets,
+            errors: self.model.errors.clone(),
+            skipped: self.model.skipped.clone(),
+            stale_sockets: self.model.stale_sockets,
+        })
+    }
+
+    /// Every ask's last-known listing: fetched this pass, or still fresh
+    /// in the cache. A `peek` miss means the asks enumeration is wrong; it
+    /// fails closed like an unreachable remote.
+    #[rustfmt::skip]
+    fn current_listings(&self) -> HashMap<(PathBuf, String), git::RemoteListing> {
+        let mut listings = HashMap::new();
+        for model in self.model.repos.values() { // coverage: off - the unexecuted instantiation's region edge
+            let (Some(repo), RepoData::Git(local)) = (&model.repo, &model.data) else { continue; }; // coverage: off - the model cannot change underneath one pass
+            for remote in &local.asks {
+                if let Some(listing) = self.remotes.peek(repo, remote) { listings.insert((repo.common_dir().to_owned(), remote.clone()), listing.clone()); } // coverage: off - the None arm is unreachable: every ask was seeded by the pool or the deadline cache
+            }
         }
+        listings
+    } // coverage: off - the unexecuted instantiation's exit edge
+
+    /// Apply one repo's remote-phase results into its local state.
+    #[rustfmt::skip]
+    fn apply_to_repo(&mut self, repo_id: &str, applied: Vec<vector::RemoteApplied>) {
+        let Some(RepoModel { data: RepoData::Git(local), .. }) = self.model.repos.get_mut(repo_id) else { return }; // coverage: off - the model cannot change underneath one pass
+        for (work, a) in local.anchors.iter_mut().zip(applied) {
+            work.apply(a);
+        }
+    }
+
+    /// A repo whose local read failed keeps its error and drops its row.
+    #[rustfmt::skip]
+    fn fail_repo(&mut self, repo_id: &str, error: SourceError) { self.model.errors.push(error); self.model.repos.remove(repo_id); } // coverage: off - the caller's arm needs a gitdir to vanish mid-pass
+
+    /// Merge one finished repository into the model. Remote-owned fields
+    /// carry their last-pass values over into the fresh local state - they
+    /// keep their last value until stage 3 replaces it.
+    fn merge_repo(&mut self, repo_id: &str, mut local: vector::RepoLocal) {
+        let repo = git::Repo {
+            common_dir: PathBuf::from(repo_id),
+        };
+        let prior: HashMap<String, &vector::WorkState> = match self.model.repos.get(repo_id) {
+            Some(RepoModel {
+                data: RepoData::Git(old),
+                ..
+            }) => old
+                .anchors
+                .iter()
+                .map(|w| (anchor_key(&w.state.anchor), &w.state))
+                .collect(),
+            _ => HashMap::new(),
+        };
+        for work in &mut local.anchors {
+            if let Some(old) = prior.get(&anchor_key(&work.state.anchor)) {
+                carry_remote(&mut work.state, old);
+            }
+        }
+        let (name, path) = repo_display(local.anchors.iter().map(|w| &w.state.anchor), &repo);
+        self.model.repos.insert(
+            repo_id.to_owned(),
+            RepoModel {
+                repo: Some(repo),
+                name,
+                path,
+                data: RepoData::Git(local),
+            },
+        );
     }
 }
 
@@ -561,9 +810,11 @@ fn anchor_error(repo_id: &str, e: git::Error) -> SourceError /* // coverage: off
 
 /// The repo row's name and path: the main checkout's, or - when no anchor
 /// is a main checkout, a bare repo for instance - the common dir itself.
-fn repo_display(anchors: &[Anchor], repo: &git::Repo) -> (String, PathBuf) {
+fn repo_display<'a>(
+    mut anchors: impl Iterator<Item = &'a Anchor>,
+    repo: &git::Repo,
+) -> (String, PathBuf) {
     anchors
-        .iter()
         .find_map(|a| match a {
             Anchor::Worktree { path, main, .. } if *main => {
                 Some((display_name(path), path.clone()))
@@ -653,14 +904,10 @@ fn runtime_facts(
 }
 
 /// The `vector::WorkState` collapsed into the row's display contract.
-fn work_row(
-    repo: &git::Repo,
-    repo_name: &str,
-    anchor: &Anchor,
-    remotes: &mut RemoteCache,
-    facts: RuntimeFacts,
-) -> WorkRow {
-    let state = vector::collect_cached(repo, remotes, anchor, facts);
+/// Fields whose stage has not landed read `Unknown` and render `?`, like
+/// any other unknown.
+fn work_row(repo_id: &str, repo_name: &str, state: &vector::WorkState) -> WorkRow {
+    let anchor = &state.anchor;
     let v = &state.vector;
     let (kind, name, branch) = match anchor {
         Anchor::Worktree { head, main, .. } => {
@@ -695,7 +942,7 @@ fn work_row(
         _ => None,
     };
     WorkRow {
-        repo: repo.common_dir().display().to_string(),
+        repo: repo_id.to_owned(),
         repo_name: repo_name.to_owned(),
         kind,
         name,
@@ -747,6 +994,78 @@ fn work_summary(v: &vector::StateVector) -> String {
     }
     parts.join(" ")
 }
+
+/// A non-git space's single row: the space anchors conversations but has
+/// no Git evidence, so every Git cell is a plain unknown or n/a.
+fn space_row(repo_id: &str, path: &Path) -> WorkRow {
+    WorkRow {
+        repo: repo_id.to_owned(),
+        repo_name: display_name(path),
+        kind: WorkKind::ProjectSpace,
+        name: display_name(path),
+        // The row's workspace is the space itself: no checkout, but the
+        // path is what its conversations anchor on.
+        worktree: Some(path.to_owned()),
+        branch: None,
+        dirty: None,
+        commits_ahead: None,
+        unpushed: None,
+        upstream: Upstream::NotApplicable,
+        upstream_detail: None,
+        landed: None,
+        base: None,
+        windows: 0,
+        live_pids: 0,
+        live_sessions: 0,
+        past_sessions: 0,
+        last_activity: None,
+        summary: "no git".to_owned(),
+    }
+}
+
+/// The identity a work anchor keeps across passes: a branch anchor is its
+/// name; a worktree anchor is its path plus the head it sits on, so a
+/// worktree that switches branch counts as a different anchor - carrying
+/// the old branch's remote evidence onto the new one would lie.
+fn anchor_key(anchor: &Anchor) -> String {
+    match anchor {
+        Anchor::Branch { name } => format!("b\u{0}{name}"),
+        Anchor::Worktree { path, head, .. } => {
+            let head = match head {
+                Head::Branch(name) | Head::Unborn(name) => name.as_str(),
+                Head::Detached(sha) => sha.as_str(),
+            };
+            format!("w\u{0}{}\u{0}{head}", path.display())
+        }
+    }
+}
+
+/// Remote-owned fields keep their last-pass value while stage 3 has not
+/// replaced them. Most have no local answer at all - `upstream_state`,
+/// `base`, `commits_ahead` and `landed` are always `collection pending`
+/// after the local phase, so the old answer carries unconditionally.
+/// `unpushed_commits` is the exception: a detached HEAD already counted
+/// its unreachable commits locally, and carrying a stale answer over that
+/// fresh fact would lie.
+fn carry_remote(new: &mut vector::WorkState, old: &vector::WorkState) {
+    new.vector.upstream_state = old.vector.upstream_state.clone();
+    new.base = old.base.clone();
+    new.vector.commits_ahead_of_base = old.vector.commits_ahead_of_base.clone();
+    new.vector.landed = old.vector.landed.clone();
+    if pending(&new.vector.unpushed_commits) {
+        new.vector.unpushed_commits = old.vector.unpushed_commits.clone();
+    }
+}
+
+/// Whether an `Evidence` is the not-yet-landed placeholder.
+fn pending<T>(evidence: &Evidence<T>) -> bool {
+    matches!(evidence, Evidence::Unknown(reason) if reason == vector::PENDING)
+}
+
+/// The remote listing for an ask the pool or cache somehow missed: it
+/// fails closed like an unreachable remote, naming the miss.
+#[rustfmt::skip]
+fn unprobed_listing(remote: &str) -> RemoteListing { RemoteListing { head: RemoteHead::Unreachable(format!("remote {remote} was not probed")), refs: Evidence::Unknown(format!("remote {remote} was not probed")) } } // coverage: off - apply only consults remotes the asks enumeration seeded
 
 /// `resolved` -> the row's attachment view.
 fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
@@ -835,17 +1154,35 @@ fn conversation_row(
     }
 }
 
-/// Ordering for the two sorted lists: work by meaningful activity, most
-/// recent first, unknown last; conversations by attention rank then
-/// time-in-state, so a waiting row outranks everything older.
-fn sort_rows(work: &mut [WorkRow], conversations: &mut [ConversationRow], at: SystemTime) {
-    work.sort_by_key(|w| std::cmp::Reverse(w.last_activity));
+/// Ordering for the sorted conversation list: attention rank then
+/// time-in-state, so a waiting row outranks everything older. Work rows
+/// sort per publish, by meaningful activity, most recent first.
+fn sort_conversations(conversations: &mut [ConversationRow], at: SystemTime) {
     conversations.sort_by(|a, b| {
         attention_rank(a)
             .cmp(&attention_rank(b))
             .then_with(|| age_of(a, at).cmp(&age_of(b, at)))
             .then_with(|| a.session_id.cmp(&b.session_id))
     });
+}
+
+/// The repos stage 2 collects, newest conversation activity first - the
+/// work the user touched most recently fills in first. Ties break on repo
+/// id so the order is deterministic.
+fn repo_order(conversations: &[Conversation], placements: &[Option<CwdPlacement>]) -> Vec<String> {
+    let mut activity: BTreeMap<String, Option<SystemTime>> = BTreeMap::new();
+    for (conv, place) in conversations.iter().zip(placements.iter()) {
+        let Some(CwdPlacement::Checkout { repo_id, .. }) = place else {
+            continue;
+        };
+        let entry = activity.entry(repo_id.clone()).or_default();
+        if *entry < conv.last_activity() {
+            *entry = conv.last_activity();
+        }
+    }
+    let mut ids: Vec<String> = activity.keys().cloned().collect();
+    ids.sort_by_key(|id| std::cmp::Reverse(activity[id]));
+    ids
 }
 
 /// Lower sorts first: the attention glyph's inbox order. A claim the
@@ -896,13 +1233,13 @@ pub fn to_json(snapshot: &Snapshot) -> serde_json::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::{Live, Transcript};
+    use crate::claude::{Live, Transcript}; // coverage: off - the unexecuted instantiation's region edge
     use crate::process::ProcessInstance;
-    use crate::runtime::{EvidenceSource, LiveAttachment, ResolvedAttachment};
+    use crate::runtime::{EvidenceSource, LiveAttachment, ResolvedAttachment}; // coverage: off - the unexecuted instantiation's region edge
     use std::fs;
 
     /// One conversation fabricated to order: `live` and `transcript` each
-    /// optional, so every merge shape can be built.
+    /// optional, so every merge shape can be built. // coverage: off - the line's zero region is an instantiation edge, not code
     fn conversation(live: Option<Live>, transcript: Option<Transcript>) -> Conversation {
         Conversation {
             session_id: "11111111-2222-3333-4444-555555555555".to_owned(),
@@ -1106,12 +1443,12 @@ mod tests {
             common_dir: PathBuf::from("/repos/app.git"),
         };
         // No anchors at all, or only non-main ones: the common dir's name.
-        assert_eq!(repo_display(&[], &repo).0, "app.git");
-        let anchors = vec![Anchor::Branch {
+        assert_eq!(repo_display([].iter(), &repo).0, "app.git");
+        let anchors = [Anchor::Branch {
             name: "keep".to_owned(),
         }];
-        assert_eq!(repo_display(&anchors, &repo).0, "app.git");
-        let anchors = vec![Anchor::Worktree {
+        assert_eq!(repo_display(anchors.iter(), &repo).0, "app.git");
+        let anchors = [Anchor::Worktree {
             path: PathBuf::from("/repos/app"),
             admin_id: None,
             head: Head::Branch("main".to_owned()),
@@ -1119,9 +1456,23 @@ mod tests {
             main: true,
         }];
         assert_eq!(
-            repo_display(&anchors, &repo),
+            repo_display(anchors.iter(), &repo),
             ("app".to_owned(), PathBuf::from("/repos/app"))
         );
+    }
+
+    #[test]
+    fn the_empty_snapshot_is_an_incomplete_nothing() {
+        // What the TUI draws before the first stage lands: renderable, and
+        // honestly incomplete.
+        let empty = Snapshot::empty();
+        assert!(!empty.complete);
+        assert_eq!(empty.schema_version, SCHEMA_VERSION);
+        assert!(empty.repos.is_empty() && empty.work.is_empty());
+        assert!(empty.conversations.is_empty() && empty.errors.is_empty());
+        // The JSON document is how `list --json` prints it.
+        let json = to_json(&empty).expect("an empty snapshot serializes");
+        assert!(json.contains("\"complete\": false"), "{json}");
     }
 
     #[test]

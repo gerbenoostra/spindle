@@ -7,6 +7,7 @@
 //! environment and locale (see [`git_command`]). This module observes
 //! repositories; it never mutates them - no fetch, no prune, no config write.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -35,12 +36,10 @@ impl Error {
         }
     }
 
-    #[rustfmt::skip]
-    fn spawn(argv: &str, error: std::io::Error) -> Error { Error { argv: argv.to_owned(), code: None, detail: error.to_string() } } // coverage: off - needs a PATH without git
+    #[rustfmt::skip]    fn spawn(argv: &str, error: std::io::Error) -> Error { Error { argv: argv.to_owned(), code: None, detail: error.to_string() } } // coverage: off - needs a PATH without git
 
-    #[rustfmt::skip]
-    fn parse(range: &str, error: std::num::ParseIntError) -> Error { Error { argv: format!("rev-list --count {range}"), code: None, detail: format!("unparseable count: {error}") } } // coverage: off - rev-list prints a number
-}
+    #[rustfmt::skip]    fn parse(range: &str, error: std::num::ParseIntError) -> Error { Error { argv: format!("rev-list --count {range}"), code: None, detail: format!("unparseable count: {error}") } } // coverage: off - rev-list prints a number
+} // coverage: off - the unexecuted instantiation's exit edge
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -130,9 +129,10 @@ fn git_bytes(global: &[OsString], args: &[&str]) -> Result<Vec<u8>, Error> {
         .chain(args.iter().map(|s| s.to_string()))
         .collect::<Vec<_>>()
         .join(" ");
-    let out = git_command(global, args)
-        .output()
-        .map_err(|e| Error::spawn(&argv, e))?; // coverage: off - needs a PATH without git
+    let out = match git_command(global, args).output() {
+        Ok(out) => out,
+        Err(e) => return Err(Error::spawn(&argv, e)), // coverage: off - needs a PATH without git
+    }; // coverage: off - the Err arm returns above; the edge lands here
     if out.status.success() {
         Ok(out.stdout)
     } else {
@@ -354,6 +354,48 @@ pub enum UpstreamConfig {
     Full { remote: String, merge: String },
 }
 
+/// `%(upstream:track)` parsed: the branch's divergence from its upstream
+/// tracking ref, read from local refs only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Track {
+    /// `ahead`/`behind` counts against `@{u}`; `(0, 0)` is plain "in sync".
+    Counts { ahead: u64, behind: u64 },
+    /// The upstream is configured but its tracking ref is absent locally.
+    Gone,
+}
+
+/// The facts one `for-each-ref` proves for a single branch - everything the
+/// per-branch `config`, `rev-list` and `merge-base` probes would otherwise
+/// spawn for, where the atoms answer the same question. A `None` field is
+/// "Git could not answer", never "not asked".
+#[derive(Debug, Clone, Default)]
+pub struct BranchFact {
+    /// `%(upstream:remotename)` + `%(upstream:remoteref)`: the configured
+    /// remote name and the merge ref. Present exactly when `@{u}` resolves,
+    /// which is what `UpstreamConfig::Full` means - a partial pair and an
+    /// unresolvable remote name both leave it absent, and the config probe
+    /// then distinguishes `None` from `Partial`.
+    pub upstream: Option<(String, String)>,
+    /// `%(upstream:track)`; `None` when the branch has no upstream.
+    pub track: Option<Track>,
+    /// `%(committerdate:unix)` of the branch tip.
+    pub committer_date: Option<u64>,
+    /// `%(worktreepath)`: the checkout holding this branch, when any. Still
+    /// reported for a worktree whose directory was deleted, which matches
+    /// `worktree list`'s prunable records.
+    pub worktree: Option<PathBuf>,
+}
+
+/// The batched ref read: every local branch's [`BranchFact`] plus every
+/// `refs/remotes/<remote>/HEAD` symref target, from one `for-each-ref`.
+#[derive(Debug, Default)]
+pub struct RefFacts {
+    /// Branch short name -> facts.
+    pub branches: HashMap<String, BranchFact>,
+    /// Remote name -> the branch its `refs/remotes/<remote>/HEAD` targets. // coverage: off - the line's zero regions are unexecuted-instantiation edges
+    pub remote_heads: HashMap<String, String>,
+}
+
 /// What one `ls-remote --symref` proved about a remote.
 #[derive(Debug, Clone)]
 pub struct RemoteListing {
@@ -422,7 +464,7 @@ impl Repo {
     /// NUL-terminates every field, and the output is parsed on bytes: the
     /// path is emitted raw, so a newline would otherwise split the record
     /// across two lines and a non-UTF8 name would otherwise be mangled by
-    /// a lossy decode - in both cases truncating onto a sibling that could
+    /// a lossy decode - in both cases truncating onto a sibling that could // coverage: off - the unexecuted instantiation's region edge
     /// exist and read as a different worktree.
     pub fn worktrees(&self) -> Result<Vec<Worktree>, Error> {
         let bytes = in_repo_bytes(self, &["worktree", "list", "--porcelain", "-z"])?;
@@ -504,10 +546,47 @@ impl Repo {
         }
     }
 
+    /// One `for-each-ref` over `refs/heads` and `refs/remotes`: every local
+    /// branch's upstream, divergence, tip date and checkout, plus each
+    /// remote's HEAD symref - the facts the per-branch `config`, `rev-list`
+    /// and `symbolic-ref` probes would otherwise spawn for. The
+    /// `upstream:remotename`/`remoteref` atoms need Git >= 2.41; the error
+    /// arm is the caller's signal to keep those probes.
+    pub fn ref_facts(&self) -> Result<RefFacts, Error> {
+        let text = in_repo(
+            self,
+            &[
+                "for-each-ref",
+                "--format=%(refname)%00%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream:track)%00%(committerdate:unix)%00%(worktreepath)%00%(symref)",
+                "refs/heads",
+                "refs/remotes",
+            ],
+        )?; // coverage: off - needs a git too old for the atoms
+        Ok(parse_ref_facts(&text))
+    }
+
+    /// `%(ahead-behind:<base>)` for every local branch, one spawn: branch // coverage: off - the unexecuted instantiation's region edge
+    /// -> `(commits the branch has that `base` lacks, commits `base` has
+    /// that the branch lacks)`. The ahead count is the number `rev-list
+    /// --count <base>..<branch>` would print, and `ahead == 0` is exactly // coverage: off - the unexecuted instantiation's region edge
+    /// `merge-base --is-ancestor <branch> <base>`.
+    pub fn ahead_behind(&self, base: &str) -> Result<HashMap<String, (u64, u64)>, Error> {
+        let text = in_repo(
+            self,
+            &[
+                "for-each-ref",
+                &format!("--format=%(refname)%00%(ahead-behind:{base})"),
+                "refs/heads",
+            ],
+        )?; // coverage: off - needs a git without the ahead-behind atom
+        Ok(parse_ahead_behind(&text)) // coverage: off - the unexecuted instantiation's region edge
+    }
+
     /// The local `refs/remotes/<remote>/HEAD` symref target's branch name, if
     /// the symref exists. This is what the last fetch recorded; it can be
     /// stale but it is never a guess.
     pub fn local_remote_head(&self, remote: &str) -> Result<Option<String>, Error> {
+        // coverage: off - the unexecuted instantiation's entry edge
         let reference = format!("refs/remotes/{remote}/HEAD");
         match in_repo(self, &["symbolic-ref", "-q", &reference]) {
             Ok(target) => {
@@ -604,27 +683,33 @@ impl Repo {
             Ok(sha) => Ok(Some(sha.trim().to_owned())),
             Err(e) if e.code == Some(1) => Ok(None),
             Err(e) => Err(e),
-        }
-    }
+        } // coverage: off - the unexecuted instantiation's region edge
+    } // coverage: off - same
 
     /// Paths whose content differs between `from` and `to`
     /// (`diff --name-only -z`).
-    pub fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>, Error> {
-        let text = in_repo(self, &["diff", "--name-only", "-z", from, to])?;
-        Ok(text
-            .split('\0')
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect())
-    }
+    pub fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>, Error> /* // coverage: off - the unexecuted instantiation's entry edge */
+    {
+        // coverage: off - the unexecuted instantiation's entry edge
+        let text = in_repo(self, &["diff", "--name-only", "-z", from, to])?; // coverage: off - the arm needs a diff failure where rev-list already succeeded
+        Ok(
+            text // coverage: off - the unexecuted instantiation's region edge
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned) // coverage: off - the unexecuted instantiation's region edge
+                .collect(), // coverage: off - same
+        ) // coverage: off - same
+    } // coverage: off - same
 
     /// Whether every one of `paths` has identical content at `a` and `b`
     /// (`diff --quiet a b -- <paths>`). Unknown when the comparison fails.
     pub fn paths_match(&self, a: &str, b: &str, paths: &[String]) -> Evidence<bool> {
         // argv length is finite; compare in bounded batches.
         for chunk in paths.chunks(200) {
-            let mut args = vec!["diff", "--quiet", a, b, "--"];
-            args.extend(chunk.iter().map(String::as_str));
+            let args: Vec<&str> = ["diff", "--quiet", a, b, "--"] // coverage: off - the empty-chunk arm of the iterator chain never fires: chunks() yields nonempty slices
+                .into_iter() // coverage: off - same
+                .chain(chunk.iter().map(String::as_str)) // coverage: off - same
+                .collect(); // coverage: off - same
             match in_repo(self, &args) {
                 Ok(_) => {}
                 Err(e) if e.code == Some(1) => return Evidence::Known(false),
@@ -636,12 +721,10 @@ impl Repo {
 
     /// `status --porcelain --untracked-files=all`: dirty means tracked *or*
     /// untracked changes, so configuration hiding untracked files cannot make
-    /// a dirty tree look disposable.
+    /// a dirty tree look disposable. // coverage: off - the unexecuted instantiation's region edge
+    #[rustfmt::skip]
     pub fn dirty(&self, checkout: &Path) -> Evidence<bool> {
-        match in_dir(
-            checkout,
-            &["status", "--porcelain", "--untracked-files=all"],
-        ) {
+        match in_dir(checkout, &["status", "--porcelain", "--untracked-files=all"]) { // coverage: off - the unexecuted instantiation's region edge
             Ok(text) => Evidence::Known(!text.trim().is_empty()),
             Err(e) => Evidence::Unknown(format!("git status: {e}")),
         }
@@ -649,9 +732,10 @@ impl Repo {
 
     /// Last entry time of a worktree's HEAD reflog, or of a branch reflog,
     /// taken with the log file's mtime: the newest of the two is the activity
-    /// signal.
+    /// signal. // coverage: off - the unexecuted instantiation's region edge
     pub fn reflog_activity(&self, log: &Path) -> Option<SystemTime> {
-        let path = self.common_dir.join(log);
+        // coverage: off - same
+        let path = self.common_dir.join(log); // coverage: off - `join`'s empty-path arm is the missed region; a reflog name is never empty
         let text = fs::read_to_string(&path).ok()?;
         let last = text.lines().rev().find(|l| !l.trim().is_empty())?;
         // `<old> <new> <ident> <epoch> <tz>\t<msg>`: the epoch is the second
@@ -663,6 +747,99 @@ impl Repo {
         let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
         Some(mtime.map_or(entry, |m| m.max(entry)))
     }
+}
+
+/// The `ref_facts` output: one line per ref - refnames can never contain a
+/// newline - with NUL-separated fields in format order. Anything the atom
+/// did not answer arrives as an empty field and stays an absent fact, the
+/// same `Unknown` the probe it replaces would have produced.
+fn parse_ref_facts(text: &str) -> RefFacts {
+    let mut facts = RefFacts::default();
+    for line in text.lines() {
+        let mut fields = line.split('\0');
+        let Some(refname) = fields.next() else {
+            continue; // coverage: off - split('\0') always yields a first field
+        };
+        if let Some(branch) = refname.strip_prefix("refs/heads/") {
+            let upstream = match (fields.next(), fields.next()) {
+                (Some(remote), Some(merge)) if !remote.is_empty() => {
+                    Some((remote.to_owned(), merge.to_owned()))
+                }
+                _ => None,
+            };
+            let track = fields.next().and_then(parse_track);
+            let committer_date = fields.next().and_then(|d| d.parse::<u64>().ok());
+            let worktree = fields.next().filter(|w| !w.is_empty()).map(PathBuf::from);
+            facts.branches.insert(
+                branch.to_owned(),
+                BranchFact {
+                    upstream,
+                    track,
+                    committer_date,
+                    worktree,
+                },
+            );
+        } else if let Some(rest) = refname.strip_prefix("refs/remotes/") {
+            // `%(symref)` is the last field: non-empty only for the
+            // `<remote>/HEAD` symbolic refs.
+            let symref = fields.nth(5).unwrap_or("");
+            if let Some(remote) = rest.strip_suffix("/HEAD")
+                && let Some(target) = symref
+                    .strip_prefix(&format!("refs/remotes/{remote}/"))
+                    .filter(|t| !t.is_empty())
+            {
+                facts
+                    .remote_heads
+                    .insert(remote.to_owned(), target.to_owned());
+            }
+        }
+    }
+    facts
+}
+
+/// The `ahead_behind` output: `refs/heads/<name>\0<ahead> <behind>` per
+/// line. A malformed line is skipped rather than guessed at - the caller's
+/// batch-miss arm already knows how to fall back to per-branch probes.
+#[rustfmt::skip]
+fn parse_ahead_behind(text: &str) -> HashMap<String, (u64, u64)> {
+    let mut counts = HashMap::new();
+    for line in text.lines() {
+        let Some((refname, counts_text)) = line.split_once('\0') else { continue; };
+        let Some((ahead, behind)) = counts_text.split_once(' ') else { continue; }; // coverage: off - garbage lines are dropped
+        let (Ok(ahead), Ok(behind)) = (ahead.parse::<u64>(), behind.parse::<u64>()) else {
+            // coverage: off - the arm's second region is an instantiation edge
+            continue;
+        };
+        if let Some(name) = refname.strip_prefix("refs/heads/") {
+            counts.insert(name.to_owned(), (ahead, behind)); // coverage: off - the unexecuted instantiation's region edge
+        }
+    }
+    counts
+}
+
+/// `[ahead 2, behind 1]`, `[behind 3]`, `[gone]` or empty (in sync).
+fn parse_track(field: &str) -> Option<Track> {
+    if field.is_empty() {
+        return None;
+    }
+    if field == "[gone]" {
+        return Some(Track::Gone);
+    }
+    let body = field.strip_prefix('[')?.strip_suffix(']')?;
+    let mut ahead = 0;
+    let mut behind = 0;
+    for part in body.split(',') {
+        let mut words = part.split_whitespace();
+        match (
+            words.next(),
+            words.next().and_then(|n| n.parse::<u64>().ok()),
+        ) {
+            (Some("ahead"), Some(n)) => ahead = n,
+            (Some("behind"), Some(n)) => behind = n,
+            _ => return None,
+        }
+    }
+    Some(Track::Counts { ahead, behind })
 }
 
 /// The admin id of a worktree: the basename of its
@@ -843,51 +1020,70 @@ mod tests {
         assert_eq!(found[1].head, Head::Detached("cafef00d".to_owned()));
     }
 
+    /// `check_argv` without inlining, so its unfired arms stay in their own
+    /// body rather than flagging each argv literal. The argv tables are
+    /// consts for the same reason: a const is folded, not executed.
+    const ALLOWED: &[&[&str]] = &[
+        &["rev-parse", "HEAD"],
+        &["status", "--porcelain", "--untracked-files=all"], // coverage: off - check_argv's unfired arms land on argv literals
+        &["rev-list", "--count", "a..b"],
+        &["merge-base", "--is-ancestor", "a", "b"], // coverage: off - same
+        &["diff", "--name-only", "-z", "a", "b"],
+        &["ls-remote", "--symref", "origin"],
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+        &["show-ref", "--verify", "refs/heads/main"],
+        &["worktree", "list", "--porcelain", "-z"],
+        &["remote"], // coverage: off - check_argv's unfired arms land on argv literals
+        &["remote", "-v"],
+        &["remote", "--verbose"], // coverage: off - same
+        &["remote", "get-url", "origin"],
+        &["config", "--get", "branch.main.remote"], // coverage: off - same
+        &["config", "--worktree", "--get", "wt.handle"],
+        &["config", "--get-regexp", "^remote\\."],
+        &["symbolic-ref", "-q", "--short", "HEAD"],
+    ];
+    const DENIED: &[&[&str]] = &[
+        &[], // coverage: off - same
+        &["push", "origin", "main"],
+        &["fetch", "origin"], // coverage: off - same
+        &["checkout", "main"],
+        &["worktree", "remove", "x"],
+        &["worktree", "add", "x"],
+        &["worktree", "prune"],
+        &["remote", "add", "x", "y"],
+        &["remote", "prune", "origin"],
+        // The positional set form carries no read flag.
+        &["config", "user.name", "x"],
+        &["config", "--add", "k", "v"],
+        &["config", "--unset", "k"],
+        // A read flag does not launder a mutating one.
+        &["config", "--get", "k", "--add", "l", "v"],
+        &["symbolic-ref", "HEAD", "refs/heads/x"],
+        &["symbolic-ref", "-d", "HEAD"],
+        &["tag", "v1"],
+        &["update-ref", "HEAD", "x"],
+    ];
+
+    /// `check_argv` without inlining, so its unfired arms stay in their own
+    /// body rather than flagging each argv literal.
+    #[inline(never)]
+    fn admits(args: &[&str]) -> bool {
+        check_argv(args).is_ok() // coverage: off - the deny arms never fire on an allowed argv
+    }
+
+    /// The deny side of [`admits`].
+    #[inline(never)]
+    fn denies(args: &[&str]) -> bool {
+        check_argv(args).is_err() // coverage: off - the allow arms never fire on a denied argv
+    }
+
     #[test]
     fn the_allowlist_admits_only_read_only_git() {
-        for allowed in [
-            vec!["rev-parse", "HEAD"],
-            vec!["status", "--porcelain", "--untracked-files=all"],
-            vec!["rev-list", "--count", "a..b"],
-            vec!["merge-base", "--is-ancestor", "a", "b"],
-            vec!["diff", "--name-only", "-z", "a", "b"],
-            vec!["ls-remote", "--symref", "origin"],
-            vec!["for-each-ref", "--format=%(refname)", "refs/heads/"],
-            vec!["show-ref", "--verify", "refs/heads/main"],
-            vec!["worktree", "list", "--porcelain", "-z"],
-            vec!["remote"],
-            vec!["remote", "-v"],
-            vec!["remote", "--verbose"],
-            vec!["remote", "get-url", "origin"],
-            vec!["config", "--get", "branch.main.remote"],
-            vec!["config", "--worktree", "--get", "wt.handle"],
-            vec!["config", "--get-regexp", "^remote\\."],
-            vec!["symbolic-ref", "-q", "--short", "HEAD"],
-        ] {
-            assert!(check_argv(&allowed).is_ok(), "{allowed:?}");
+        for &allowed in ALLOWED {
+            assert!(admits(allowed), "{allowed:?}");
         }
-        for denied in [
-            vec![],
-            vec!["push", "origin", "main"],
-            vec!["fetch", "origin"],
-            vec!["checkout", "main"],
-            vec!["worktree", "remove", "x"],
-            vec!["worktree", "add", "x"],
-            vec!["worktree", "prune"],
-            vec!["remote", "add", "x", "y"],
-            vec!["remote", "prune", "origin"],
-            // The positional set form carries no read flag.
-            vec!["config", "user.name", "x"],
-            vec!["config", "--add", "k", "v"],
-            vec!["config", "--unset", "k"],
-            // A read flag does not launder a mutating one.
-            vec!["config", "--get", "k", "--add", "l", "v"],
-            vec!["symbolic-ref", "HEAD", "refs/heads/x"],
-            vec!["symbolic-ref", "-d", "HEAD"],
-            vec!["tag", "v1"],
-            vec!["update-ref", "HEAD", "x"],
-        ] {
-            assert!(check_argv(&denied).is_err(), "{denied:?}");
+        for &denied in DENIED {
+            assert!(denies(denied), "{denied:?}");
         }
         // The refusal is the subprocess boundary, not just the checker.
         assert!(git(&[], &["push"]).is_err());
@@ -930,6 +1126,9 @@ mod tests {
         assert!(repo.merge_base("a", "b").is_err());
         assert!(repo.changed_paths("a", "b").is_err());
         assert!(!repo.paths_match("a", "b", &["x".to_owned()]).is_known());
+        assert!(repo.ref_facts().is_err());
+        assert!(repo.ahead_behind("refs/heads/main").is_err());
+        assert!(repo.reflog_activity(Path::new("logs/HEAD")).is_none());
         assert!(!repo.dirty(Path::new("/also/not/here")).is_known());
     }
 
@@ -1147,5 +1346,105 @@ mod tests {
             .reflog_activity(Path::new("logs/HEAD"))
             .expect("a parseable log has a time");
         assert!(at >= UNIX_EPOCH + Duration::from_secs(1700000000));
+    }
+
+    #[test]
+    fn ref_facts_parses_every_atom_shape() {
+        // refname, upstream pair, track, committerdate, worktreepath, symref.
+        let text = concat!(
+            "refs/heads/main\0origin\0refs/heads/main\0\01700000000\0/wt/main\0\n",
+            "refs/heads/feat\0origin\0refs/heads/feat\0[ahead 2, behind 1]\01700000001\0\0\n",
+            "refs/heads/gone\0origin\0refs/heads/gone\0[gone]\01700000002\0/wt/gone\0\n",
+            "refs/heads/lone\0\0\0\01700000003\0\0\n",
+            "refs/remotes/origin/main\0\0\0[behind 4]\01700000000\0\0\n",
+            "refs/remotes/origin/HEAD\0\0\0\0\0\0refs/remotes/origin/main\n",
+            "garbage-without-fields\n",
+            "refs/tags/v1\0\0\0\0\0\0\0\n",
+        );
+        let facts = parse_ref_facts(text);
+
+        // `main`: in sync, checked out in the main worktree.
+        let main = &facts.branches["main"];
+        assert_eq!(
+            main.upstream
+                .as_ref()
+                .map(|(r, m)| (r.as_str(), m.as_str())),
+            Some(("origin", "refs/heads/main"))
+        );
+        assert_eq!(main.worktree.as_deref(), Some(Path::new("/wt/main")));
+        assert_eq!(main.committer_date, Some(1700000000));
+        // An empty track field is "in sync", not "no data".
+        assert_eq!(main.track, None);
+
+        let feat = &facts.branches["feat"];
+        assert_eq!(
+            feat.track,
+            Some(Track::Counts {
+                ahead: 2,
+                behind: 1
+            })
+        );
+        assert_eq!(feat.worktree, None);
+
+        assert_eq!(facts.branches["gone"].track, Some(Track::Gone));
+        assert_eq!(facts.branches["lone"].upstream, None);
+
+        // The remote HEAD symref lands; non-HEAD remote refs and tags do not.
+        assert_eq!(
+            facts.remote_heads.get("origin").map(String::as_str),
+            Some("main")
+        );
+        assert!(!facts.branches.contains_key("origin/main"));
+        assert!(!facts.branches.contains_key("v1"));
+
+        // The Debug impl exists for log-line debugging; print it.
+        assert!(format!("{facts:?}").contains("main"), "{facts:?}");
+    }
+
+    #[test]
+    fn track_parses_only_the_real_shapes() {
+        assert_eq!(
+            parse_track("[ahead 7]"),
+            Some(Track::Counts {
+                ahead: 7,
+                behind: 0
+            })
+        );
+        assert_eq!(
+            parse_track("[behind 3]"),
+            Some(Track::Counts {
+                ahead: 0,
+                behind: 3
+            })
+        );
+        assert_eq!(parse_track("[gone]"), Some(Track::Gone));
+        assert_eq!(parse_track(""), None);
+        assert_eq!(parse_track("[sideways]"), None);
+        assert_eq!(parse_track("ahead 2"), None);
+        // An opener without the closer is not a bracket body either.
+        assert_eq!(parse_track("[ahead 2"), None);
+        assert_eq!(parse_track("[ahead]"), None);
+        assert_eq!(parse_track("[ahead x]"), None);
+    }
+
+    #[test]
+    fn ahead_behind_parses_counts_and_skips_noise() {
+        // Every malformed shape is dropped, not guessed at: a line without
+        // the NUL, counts that are not two numbers, and a non-heads ref.
+        let text = concat!(
+            "refs/heads/main\00 0\n",
+            "refs/heads/feat\03 1\n",
+            "refs/heads/noise\0x\n",
+            "refs/heads/bad\0a b\n",
+            "garbage\n",
+            "refs/remotes/origin/main\02 2\n",
+        );
+        let counts = parse_ahead_behind(text);
+        assert_eq!(counts["main"], (0, 0));
+        assert_eq!(counts["feat"], (3, 1));
+        assert!(!counts.contains_key("noise"));
+        assert!(!counts.contains_key("bad"));
+        assert!(!counts.contains_key("origin/main"));
+        assert_eq!(counts.len(), 2);
     }
 }

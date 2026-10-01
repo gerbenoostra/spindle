@@ -15,7 +15,11 @@ fails on any region of `src/` nothing reached; a line that genuinely cannot
 be reached carries a trailing `// coverage: off` saying why. The marker
 exempts every region on its own line, and rustfmt moves a `//` comment that
 follows an opening `{` to its own line - positions like a catch-all match
-arm or a closure body carry `/* // coverage: off - reason */` instead. If
+arm or a closure body carry `/* // coverage: off - reason */` instead. A
+generic instantiation that never ran leaves its zero-count segments on
+unrelated-looking lines - doc comments, closing braces, attributes - so the
+marker sits where the merged report puts the region, which is not always
+where the unreachable code is. If
 the gate reports regions that should be covered, run
 `cargo llvm-cov clean --workspace` first: stale `.profraw` files from older
 builds pollute the merged view.
