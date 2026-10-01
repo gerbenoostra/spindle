@@ -341,7 +341,8 @@ pub struct Seen {
     /// Retained events at or below this commit sequence are seen.
     #[serde(default)]
     pub seq: u64,
-    /// The `effective_since` of the live wait the user has seen, epoch ms.
+    /// The `effective_since` of the newest live wait the user has seen,
+    /// epoch ms; any wait that began at or before it is seen.
     #[serde(default)]
     pub wait_ms: Option<u64>,
 }
@@ -564,7 +565,7 @@ impl Store {
         let old = seen.get(key).copied().unwrap_or_default();
         let new = Seen {
             seq: old.seq.max(through_seq),
-            wait_ms: wait_ms.or(old.wait_ms),
+            wait_ms: wait_ms.max(old.wait_ms),
         };
         if new == old {
             return Ok(old);

@@ -340,11 +340,14 @@ pub fn derive(inputs: Inputs<'_>) -> Derived {
         inputs.idle.reset();
     }
 
-    // A live wait is seen once its episode was acknowledged - by its
-    // `since`, or through the sequence of the event that opened it - and
-    // shows again only when a newer wait begins.
+    // A live wait is seen once its episode was acknowledged - through the
+    // sequence of the event that opened it, or by a `since` at or before
+    // the newest wait acknowledged - and shows again only when a newer
+    // wait begins. The comparison is by time, not identity: the hook event
+    // and the provider's record date one wait a few milliseconds apart, and
+    // whichever wins arbitration must read the same acknowledgement.
     let wait_seen = exec == Exec::Waiting
-        && (since_ms.is_some() && inputs.seen.wait_ms == since_ms
+        && (since_ms.is_some_and(|s| inputs.seen.wait_ms.is_some_and(|w| s <= w))
             || winner_seq > 0 && winner_seq <= inputs.seen.seq);
     let wait_ms = if exec == Exec::Waiting && !wait_seen {
         since_ms
@@ -553,6 +556,19 @@ mod tests {
         assert_eq!(d.exec, Exec::Waiting);
         assert_eq!(d.attention, Attention::None);
         assert_eq!(d.wait_ms, None);
+        // The same wait, now dated by the other source a little earlier -
+        // the provider touched its record after a hook-driven wait was
+        // acknowledged - stays seen.
+        let fold = fold_with(&[(NormEvent::Start, 50_000), (NormEvent::Awaiting, 95_000)]);
+        let mut in_ = inputs(&fold, Some((7, Some(90))), &mut idle);
+        let mut touched = published(94_990);
+        touched.observed_ms = 99_000;
+        in_.published = Some(touched);
+        in_.seen = Seen {
+            seq: 2,
+            wait_ms: Some(95_000),
+        };
+        assert_eq!(derive(in_).attention, Attention::None);
         // A newer wait episode is unseen again.
         let mut in_ = inputs(&empty, Some((7, Some(90))), &mut idle);
         in_.published = Some(published(95_000));
