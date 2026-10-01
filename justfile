@@ -282,6 +282,12 @@ _ci-commit rev:
 _ci-snapshot repo commit dir os:
     #!/usr/bin/env bash
     set -euo pipefail
+    # A pre-push hook run from a linked worktree inherits an absolute GIT_DIR
+    # (and, for some git operations, GIT_INDEX_FILE and the like). Left set, every
+    # `git -C "$src"` below would act on the pushing worktree instead of the
+    # snapshot: detaching its HEAD and rewriting its index, with no `.git` in `$src`.
+    # shellcheck disable=SC2046
+    unset $(git rev-parse --local-env-vars)
     src="{{dir}}/src"
     [[ -d "$src/.git" ]] || git init --quiet "$src"
     git -C "$src" fetch --quiet --no-tags "{{repo}}" "{{commit}}"

@@ -2,9 +2,14 @@
 //! two are kept in step by hand, so a job added to one alone would let a local
 //! run pass that CI fails. This holds them equal.
 
+mod support;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
+
+use support::fixture::FixtureRepo;
 
 /// The runner labels `ci.yml` uses, and the justfile list each one maps to.
 const RUNNERS: [(&str, &str); 2] = [
@@ -130,4 +135,74 @@ fn just_list<'a>(justfile: &'a str, name: &str) -> Vec<&'a str> {
 fn read(relative: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+/// A pre-push hook run from a linked worktree inherits an absolute `GIT_DIR`.
+/// `_ci-snapshot` must not let it steer its git calls: they belong to the
+/// snapshot, and otherwise detach the pushing worktree's HEAD.
+#[test]
+fn ci_snapshot_ignores_the_git_dir_a_worktree_hook_inherits() {
+    // It drives `just` against scratch repositories, and runs a
+    // `#!/usr/bin/env bash` recipe: neither exists in the Nix build sandbox,
+    // which sets NIX_BUILD_TOP. `just test` and CI's other jobs run it.
+    if std::env::var_os("NIX_BUILD_TOP").is_some() && std::env::var_os("IN_NIX_SHELL").is_none() {
+        eprintln!("skipped: inside the Nix build sandbox");
+        return;
+    }
+    let repo = FixtureRepo::new("origin");
+    // The commit under snapshot carries the job lists the snapshot reads.
+    repo.commit(
+        &repo.main,
+        "justfile",
+        "ci_macos_jobs := \"probe\"\nci_linux_jobs := \"probe\"\nprobe:\n    @true\n",
+        "probe",
+    );
+    let worktree = repo.dir.join("worktree");
+    repo.git(
+        &repo.main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "pushing",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    let commit = repo
+        .git(&worktree, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    let git_dir = repo
+        .git(&worktree, &["rev-parse", "--absolute-git-dir"])
+        .trim()
+        .to_owned();
+    let dir = repo.dir.join("ci");
+
+    let output = Command::new("just")
+        .arg("--justfile")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("justfile"))
+        .arg("_ci-snapshot")
+        .arg(&worktree)
+        .arg(&commit)
+        .arg(&dir)
+        .arg("macos")
+        .current_dir(&worktree)
+        .env("GIT_DIR", &git_dir)
+        .output()
+        .expect("run just");
+    assert!(
+        output.status.success(),
+        "_ci-snapshot failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dir.join("src/.git").exists(),
+        "the snapshot was not made in its own repository"
+    );
+    assert_eq!(
+        repo.git(&worktree, &["symbolic-ref", "--short", "HEAD"])
+            .trim(),
+        "pushing",
+        "the pushing worktree's HEAD was moved"
+    );
 }
