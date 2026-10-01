@@ -441,14 +441,14 @@ impl App {
             if let Some(through) = c.attention_seq {
                 let _ = store.acknowledge(&key, through);
             } else if !ack_only
-                && let (Some(since_ms), Some(seq)) = (c.state_since_ms, c.journal_seq)
+                && c.attention == Attention::Working
+                && let Some(since_ms) = c.state_since_ms
             {
-                // coverage: off - the unexecuted instantiation's region edge
                 // Only a Busy row earns the mark: a busy conversation with
-                // no higher attention has nothing to acknowledge. // coverage: off - the unexecuted instantiation's region edge
-                if c.attention == Attention::Working {
-                    let _ = store.mark_not_busy(&key, since_ms, seq); // coverage: off - the unexecuted instantiation's region edge // coverage: off - the unexecuted instantiation's region edge
-                } // coverage: off - the unexecuted instantiation's region edge
+                // no higher attention has nothing to acknowledge. A Busy
+                // only the provider published has no journal sequence yet;
+                // the mark sits at zero and any first event supersedes it.
+                let _ = store.mark_not_busy(&key, since_ms, c.journal_seq.unwrap_or(0));
             }
         }
     }
@@ -1815,10 +1815,22 @@ mod tests {
         let mark = marks.get(&key).expect("a mark landed");
         assert_eq!(mark.since_ms, (1_800_000_000 - 120) * 1000);
         assert_eq!(mark.seq, 7);
+        // A `Busy` only the provider published - no hook event yet - is
+        // marked too, at sequence zero: any first event supersedes it.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::Working;
+        snapshot.conversations[0].attention_detail = None;
+        snapshot.conversations[0].attention_seq = None;
+        snapshot.conversations[0].journal_seq = None;
+        snapshot.conversations[0].state = ConversationState::Busy;
+        app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let marks = crate::store::Store::open(dir.clone()).load().marks;
+        assert_eq!(marks.get(&key).map(|m| m.seq), Some(0), "{marks:?}");
 
         // Every inert arm of `space`: no store, a non-list focus, the `all`
-        // row, a `repos` row, and a conversation carrying neither a latch
-        // nor the Busy pair a mark names.
+        // row, a `repos` row, and a conversation that is neither latched nor
+        // Busy.
         let mut bare = App::new(fixture());
         bare.key(Key::Char(' ')); // no store: writes nothing
         let mut app = App::new(fixture()).with_store(crate::store::Store::open(dir.clone()));
@@ -1836,8 +1848,8 @@ mod tests {
         }
         // A work row's `space` acknowledges every bound conversation.
         press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char(' ')]);
-        // And a conversation with neither latch nor journal sequence is
-        // skipped, not miswritten.
+        // And a conversation that is neither latched nor Busy is skipped,
+        // not miswritten.
         let mut snapshot = fixture();
         snapshot.conversations[0].attention = Attention::None;
         snapshot.conversations[0].attention_seq = None;
