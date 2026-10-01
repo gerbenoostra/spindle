@@ -498,7 +498,7 @@ mod tests {
         // honest sources that disagree, and the binding fails closed.
         let rt = runtime(
             vec![
-                fake_pane("/sock/a", "%1", 10, "/dev/ttyA"), // coverage: off - the unexecuted instantiation's region edge
+                fake_pane("/sock/a", "%1", 10, "/dev/ttyA"),
                 fake_pane("/sock/b", "%2", 20, "/dev/ttyB"),
             ],
             vec![
@@ -516,8 +516,7 @@ mod tests {
     }
 
     #[test]
-    #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
-    fn a_published_handle_against_the_tty_is_a_contradiction() { // coverage: off - the unexecuted instantiation's entry edge
+    fn a_published_handle_against_the_tty_is_a_contradiction() {
         // The handle names %1, but the claim's tty belongs to %2's pane.
         let rt = runtime(
             vec![

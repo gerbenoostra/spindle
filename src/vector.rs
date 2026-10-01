@@ -1029,7 +1029,7 @@ mod tests {
         assert!(!state.vector.unpushed_commits.is_known());
         let forge = crate::forge::ForgeStatus {
             item: crate::forge::WorkItem::Unknown,
-            pipeline: crate::forge::Pipeline::Unknown, // coverage: off - the unexecuted instantiation's region edge
+            pipeline: crate::forge::Pipeline::Unknown,
             label: None,
             url: None,
             reason: None,
@@ -1074,9 +1074,9 @@ mod tests {
                 .status
                 .success()
         );
-        let repo = Repo /* // coverage: off - the unexecuted instantiation's region edge */ {
-            common_dir: dir.clone(), // coverage: off - the unexecuted instantiation's region edge
-        }; // coverage: off - the unexecuted instantiation's region edge
+        let repo = Repo {
+            common_dir: dir.clone(),
+        };
         assert!(anchors(&repo).unwrap().is_empty());
         // The staged local read agrees: no checkouts, no asks, nothing for
         // the remote stage to apply.
@@ -1090,11 +1090,11 @@ mod tests {
     #[test]
     fn a_broken_repo_fails_local_collection_cleanly() {
         // A gitdir that is a plain file: `worktree list` fails, and the
-        // error propagates rather than producing invented anchors. // coverage: off - the unexecuted instantiation's region edge
-        let dir = // coverage: off - the unexecuted instantiation's region edge
-            std::env::temp_dir().join(format!("agent-sessions-broken-{}", std::process::id())); // coverage: off - the unexecuted instantiation's region edge
-        let _ = std::fs::remove_dir_all(&dir); // coverage: off - the unexecuted instantiation's region edge
-        std::fs::create_dir_all(&dir).unwrap(); // coverage: off - the unexecuted instantiation's region edge
+        // error propagates rather than producing invented anchors.
+        let dir =
+            std::env::temp_dir().join(format!("agent-sessions-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("not-a-repo");
         std::fs::write(&file, "x").unwrap();
         let repo = Repo { common_dir: file };

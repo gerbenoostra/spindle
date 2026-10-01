@@ -336,7 +336,7 @@ pub fn pane_ref_from_env(tmux: Option<&OsStr>, pane: Option<&str>) -> Option<Pan
         socket: tmux_socket(tmux)?,
         pane: PaneId::parse(pane?)?,
     })
-} // coverage: off - the unexecuted instantiation's region edge
+}
 
 /// The user's tmux socket directory: tmux always places it at
 /// `<base>/tmux-<uid>`, where `base` is `$TMUX_TMPDIR` or `/tmp`.
@@ -368,7 +368,7 @@ fn is_stale(socket: &Path) -> bool {
         Ok(_) => false,
         Err(e) => matches!(
             e.kind(),
-            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound // coverage: off - the unexecuted instantiation's region edge
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
         ),
     }
 }

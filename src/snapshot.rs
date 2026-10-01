@@ -415,7 +415,7 @@ impl Collector {
         let remotes = RemoteCache::default();
         let model = Model::default(); // coverage: off - the unexecuted instantiation's region edge
         let workers = fanout::WORKERS; // coverage: off - same
-        Collector { claude, remotes, store: None, idles: HashMap::new(), model, workers } // coverage: off - same
+        Collector { claude, remotes, store: None, idles: HashMap::new(), model, workers }
     }
 
     /// Read (and acknowledge through) the store at `dir` - the journal of
@@ -560,17 +560,14 @@ impl Collector {
                         loaded.seen.insert(key.clone(), seen);
                         derived = derive(seen, idle);
                     }
-                    Err(e) => self.model.errors.push(SourceError {
-                        source: "store".to_owned(),
-                        detail: format!("seen-state for {key:?}: {e}"),
-                    }),
+                    Err(e) => self.model.errors.push(seen_state_error(&key, e)), // coverage: off - a seen-state write failure needs a store fault mid-pass; the attention shows again next pass
                 }
             }
-            let carried = self // coverage: off - the unexecuted instantiation's region edge
-                .model // coverage: off - the unexecuted instantiation's region edge
-                .conversations // coverage: off - the unexecuted instantiation's region edge
-                .iter() // coverage: off - the unexecuted instantiation's region edge
-                .find(|c| c.session_id == conv.session_id); // coverage: off - the unexecuted instantiation's region edge
+            let carried = self
+                .model
+                .conversations
+                .iter()
+                .find(|c| c.session_id == conv.session_id);
             let (repo, worktree, branch) = carried
                 .map(|c| (c.repo.clone(), c.worktree.clone(), c.branch.clone()))
                 .unwrap_or_default();
@@ -647,7 +644,6 @@ impl Collector {
             let running = &running;
             let placements = &placements;
             let mut alive = true;
-            #[rustfmt::skip]
             fanout::fan_out(
                 &order,
                 self.workers,
@@ -659,33 +655,28 @@ impl Collector {
                         runtime_facts(runtime, conversations, running, placements, anchor, repo_id)
                     })
                     .map_err(|e| anchor_error(repo_id, e)) // coverage: off - needs a repo whose worktree read fails mid-pass
-                }, // coverage: off - the unexecuted instantiation's region edge
-                |i, result| { // coverage: off - the unexecuted instantiation's region edge
-                    let repo_id = &order[i]; // coverage: off - the unexecuted instantiation's region edge
+                },
+                |i, result| {
+                    let repo_id = &order[i];
                     match result {
-                        // coverage: off - the unexecuted instantiation's region edge
-                        // coverage: off - the unexecuted instantiation's region edge
-                        Ok(local) => self.merge_repo(repo_id, local), // coverage: off - the unexecuted instantiation's region edge
+                        Ok(local) => self.merge_repo(repo_id, local),
                         Err(error) => self.fail_repo(repo_id, error), // coverage: off - needs a repo's worktree list to fail after its cwd resolved, mid-pass
-                    } // coverage: off - the unexecuted instantiation's region edge
-                    alive = self.emit(runtime, own_pane, publish); // coverage: off - the unexecuted instantiation's region edge
-                }, // coverage: off - the unexecuted instantiation's region edge
-            ); // coverage: off - the unexecuted instantiation's region edge
+                    }
+                    alive = self.emit(runtime, own_pane, publish);
+                },
+            );
             if !alive {
-                // coverage: off - the unexecuted instantiation's region edge
                 return;
-            } // coverage: off - the unexecuted instantiation's region edge
-        } // coverage: off - the unexecuted instantiation's region edge
-        // coverage: off - the unexecuted instantiation's region edge
-        // Stage 3 - remote evidence, one `ls-remote --symref` per repo and // coverage: off - the unexecuted instantiation's region edge
-        // remote per deadline, fanned out; then the local probes each // coverage: off - same
-        // remote answer unlocks (bases, ahead/behind, landed, unpushed). // coverage: off - the unexecuted instantiation's region edge
-        let mut asks: Vec<(git::Repo, String)> = Vec::new(); // coverage: off - the unexecuted instantiation's region edge
+            }
+        }
+        // Stage 3 - remote evidence, one `ls-remote --symref` per repo and
+        // remote per deadline, fanned out; then the local probes each
+        // remote answer unlocks (bases, ahead/behind, landed, unpushed).
+        let mut asks: Vec<(git::Repo, String)> = Vec::new();
         for model in self.model.repos.values() {
             let (Some(repo), RepoData::Git(local)) = (&model.repo, &model.data) else {
-                // coverage: off - the unexecuted instantiation's region edge
                 continue;
-            }; // coverage: off - the unexecuted instantiation's region edge
+            };
             for remote in &local.asks {
                 if !self.remotes.fresh(repo, remote) {
                     asks.push((repo.clone(), remote.clone()));
@@ -727,25 +718,22 @@ impl Collector {
                     unreachable!("jobs holds Git models only") // coverage: off - filtered above
                 };
                 vector::apply_remote(repo, local, |repo, remote| {
-                    listings // coverage: off - the unexecuted instantiation's region edge
+                    listings
                         .get(&(repo.common_dir().to_owned(), remote.to_owned()))
-                        .cloned() // coverage: off - the unexecuted instantiation's region edge
+                        .cloned()
                         .unwrap_or_else(|| unprobed_listing(remote)) // coverage: off - apply only consults remotes the asks enumeration seeded
                 })
             },
-            |i, a| applied[i] = Some(a), // coverage: off - the unexecuted instantiation's region edge
+            |i, a| applied[i] = Some(a),
         );
         for (i, repo_id) in jobs.iter().enumerate() {
-            // coverage: off - the unexecuted instantiation's region edge
-            let Some(applied) = applied[i].take() else
-            /* // coverage: off - the miss arm is unreachable: `i` enumerates `applied` */
-            {
+            let Some(applied) = applied[i].take() else {
                 continue; // coverage: off - fan_out delivers every index
             };
-            self.apply_to_repo(repo_id, applied); // coverage: off - the unexecuted instantiation's region edge
+            self.apply_to_repo(repo_id, applied);
             if !self.emit(runtime, own_pane, publish) {
                 return;
-            } // coverage: off - the unexecuted instantiation's region edge
+            }
         }
 
         // Stage 4 - forge enrichment. No producer ships yet (the work-item
@@ -778,26 +766,25 @@ impl Collector {
     ) -> bool {
         let mut work = Vec::new();
         let mut repos = Vec::new();
-        #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
-        for (id, model) in &self.model.repos { // coverage: off - the unexecuted instantiation's region edge
-            let mut last_activity = None; // coverage: off - the unexecuted instantiation's region edge
-            match &model.data { // coverage: off - the unexecuted instantiation's region edge
-                RepoData::Git(local) /* // coverage: off - the unexecuted instantiation's region edge */ => {
-                    for anchor in &local.anchors { // coverage: off - the unexecuted instantiation's region edge
-                        let row = work_row(id, &model.name, &anchor.state); // coverage: off - same
-                        last_activity = last_activity.max(row.last_activity); // coverage: off - same
-                        work.push(row); // coverage: off - the unexecuted instantiation's region edge
-                    } // coverage: off - the unexecuted instantiation's region edge
-                } // coverage: off - the unexecuted instantiation's region edge
-                RepoData::Space(row) => work.push(row.clone()), // coverage: off - the unexecuted instantiation's region edge
-            } // coverage: off - the unexecuted instantiation's region edge
-            let work_count = work.iter().filter(|w| w.repo == *id).count(); // coverage: off - the unexecuted instantiation's region edge
-            let live = self // coverage: off - the unexecuted instantiation's region edge
-                .model // coverage: off - the unexecuted instantiation's region edge
-                .conversations // coverage: off - the unexecuted instantiation's region edge
-                .iter() // coverage: off - the unexecuted instantiation's region edge
-                .filter(|c| c.running() && c.repo.as_deref() == Some(id.as_str())) // coverage: off - the unexecuted instantiation's region edge
-                .count(); // coverage: off - the unexecuted instantiation's region edge
+        for (id, model) in &self.model.repos {
+            let mut last_activity = None;
+            match &model.data {
+                RepoData::Git(local) => {
+                    for anchor in &local.anchors {
+                        let row = work_row(id, &model.name, &anchor.state);
+                        last_activity = last_activity.max(row.last_activity);
+                        work.push(row);
+                    }
+                }
+                RepoData::Space(row) => work.push(row.clone()),
+            }
+            let work_count = work.iter().filter(|w| w.repo == *id).count();
+            let live = self
+                .model
+                .conversations
+                .iter()
+                .filter(|c| c.running() && c.repo.as_deref() == Some(id.as_str()))
+                .count();
             repos.push(RepoRow {
                 id: id.clone(),
                 name: model.name.clone(),
@@ -807,7 +794,7 @@ impl Collector {
                 live,
                 last_activity,
             });
-        }; // coverage: off - the unexecuted instantiation's region edge
+        }
         // Attention and the first-match section are derived per publish
         // from the conversations bound to the row; sections order first,
         // newest activity inside a section.
@@ -841,34 +828,33 @@ impl Collector {
     /// fails closed like an unreachable remote.
     #[rustfmt::skip]
     fn current_listings(&self) -> HashMap<(PathBuf, String), git::RemoteListing> {
-        let mut listings = HashMap::new(); // coverage: off - the unexecuted instantiation's region edge
+        let mut listings = HashMap::new();
         for model in self.model.repos.values() { // coverage: off - the unexecuted instantiation's region edge
             let (Some(repo), RepoData::Git(local)) = (&model.repo, &model.data) else { continue; }; // coverage: off - the model cannot change underneath one pass
-            for remote in &local.asks { // coverage: off - the unexecuted instantiation's region edge
+            for remote in &local.asks {
                 if let Some(listing) = self.remotes.peek(repo, remote) { listings.insert((repo.common_dir().to_owned(), remote.clone()), listing.clone()); } // coverage: off - the None arm is unreachable: every ask was seeded by the pool or the deadline cache
             }
-        } // coverage: off - the unexecuted instantiation's region edge
+        }
         listings
     } // coverage: off - the unexecuted instantiation's exit edge
-    // coverage: off - the unexecuted instantiation's region edge
+
     /// Apply one repo's remote-phase results into its local state.
-    #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
-    fn apply_to_repo(&mut self, repo_id: &str, applied: Vec<vector::RemoteApplied>) { // coverage: off - the unexecuted instantiation's region edge
+    #[rustfmt::skip]
+    fn apply_to_repo(&mut self, repo_id: &str, applied: Vec<vector::RemoteApplied>) {
         let Some(RepoModel { data: RepoData::Git(local), .. }) = self.model.repos.get_mut(repo_id) else { return }; // coverage: off - the model cannot change underneath one pass
-        for (work, a) in local.anchors.iter_mut().zip(applied) { // coverage: off - the unexecuted instantiation's region edge
-            work.apply(a); // coverage: off - the unexecuted instantiation's region edge
+        for (work, a) in local.anchors.iter_mut().zip(applied) {
+            work.apply(a);
         }
     }
-    // coverage: off - the unexecuted instantiation's region edge
+
     /// A repo whose local read failed keeps its error and drops its row.
-    #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+    #[rustfmt::skip]
     fn fail_repo(&mut self, repo_id: &str, error: SourceError) { self.model.errors.push(error); self.model.repos.remove(repo_id); } // coverage: off - the caller's arm needs a gitdir to vanish mid-pass
 
-    /// Merge one finished repository into the model. Remote-owned fields // coverage: off - the unexecuted instantiation's region edge
+    /// Merge one finished repository into the model. Remote-owned fields
     /// carry their last-pass values over into the fresh local state - they
     /// keep their last value until stage 3 replaces it.
     fn merge_repo(&mut self, repo_id: &str, mut local: vector::RepoLocal) {
-        // coverage: off - the unexecuted instantiation's region edge
         let repo = git::Repo {
             common_dir: PathBuf::from(repo_id),
         };
@@ -964,21 +950,18 @@ fn resolve_cwd(cwd: &Path, errors: &mut Vec<SourceError>) -> Option<CwdPlacement
         }
     }
 }
-// coverage: off - the unexecuted instantiation's region edge
+
 /// The error a touched repo's failed anchor scan records.
 fn anchor_error(repo_id: &str, e: git::Error) -> SourceError /* // coverage: off - needs a repo deleted mid-collection */
 {
-    // coverage: off - the unexecuted instantiation's region edge
     let source = "git".to_owned(); // coverage: off - needs a repo deleted mid-collection
     let detail = format!("{repo_id}: {e}"); // coverage: off - same
     SourceError { source, detail } // coverage: off - same
 } // coverage: off - same
-// coverage: off - the unexecuted instantiation's region edge
-/// The repo row's name and path: the main checkout's, or - when no anchor // coverage: off - the unexecuted instantiation's region edge
-/// is a main checkout, a bare repo for instance - the common dir itself. // coverage: off - the unexecuted instantiation's region edge
+/// The repo row's name and path: the main checkout's, or - when no anchor
+/// is a main checkout, a bare repo for instance - the common dir itself.
 fn repo_display<'a>(
-    // coverage: off - the unexecuted instantiation's region edge
-    mut anchors: impl Iterator<Item = &'a Anchor>, // coverage: off - the unexecuted instantiation's region edge
+    mut anchors: impl Iterator<Item = &'a Anchor>,
     repo: &git::Repo,
 ) -> (String, PathBuf) {
     anchors
@@ -1027,7 +1010,7 @@ fn runtime_facts(
     let mut facts = RuntimeFacts {
         windows: WindowCount::default(),
         live_pids: 0,
-        live_agent_sessions: 0, // coverage: off - the unexecuted instantiation's region edge
+        live_agent_sessions: 0,
         past_agent_sessions: 0,
     };
     if let Some(path) = path {
@@ -1037,31 +1020,29 @@ fn runtime_facts(
         // carrying no stored worktree edge whose pane cwds land inside.
         let mut orphaned = std::collections::HashSet::new();
         for pane in &runtime.panes.panes {
-            // coverage: off - the unexecuted instantiation's region edge
             if pane.wt_adminid.is_none() && pane.binds_worktree(admin_id, path) {
                 orphaned.insert((&pane.socket, &pane.window));
             }
         }
-        facts.windows.orphaned = orphaned.len(); // coverage: off - the unexecuted instantiation's region edge
-        #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
-        for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() { // coverage: off - the unexecuted instantiation's region edge
+        facts.windows.orphaned = orphaned.len();
+        for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() {
             let Some(CwdPlacement::Checkout { root, .. }) = place else {
-                continue; // coverage: off - the unexecuted instantiation's region edge
-            }; // coverage: off - the unexecuted instantiation's region edge
+                continue;
+            };
             if root != &canonical {
                 continue;
-            } // coverage: off - the unexecuted instantiation's region edge
-            facts.past_agent_sessions += 1; // coverage: off - the unexecuted instantiation's region edge
+            }
+            facts.past_agent_sessions += 1;
             if running[i] {
                 facts.live_agent_sessions += 1;
                 facts.live_pids += 1;
-            } // coverage: off - the unexecuted instantiation's region edge
-        }; // coverage: off - the unexecuted instantiation's region edge
+            }
+        }
     } else {
         // A branch-only row still counts conversations in its repository.
         for (i, (_, place)) in conversations.iter().zip(placements.iter()).enumerate() {
             if matches!(place, Some(CwdPlacement::Checkout { repo_id: id, .. }) if id == repo_id) {
-                facts.past_agent_sessions += 1; // coverage: off - the unexecuted instantiation's region edge
+                facts.past_agent_sessions += 1;
                 if running[i] {
                     facts.live_agent_sessions += 1;
                     facts.live_pids += 1;
@@ -1149,17 +1130,16 @@ pub fn binds(row: &WorkRow, c: &ConversationRow) -> bool {
             c.repo.as_deref() == Some(row.repo.as_str()) && c.worktree.as_deref() == Some(root)
         }
         (_, None, Some(branch)) => {
-            // coverage: off - a WorkRow with neither worktree nor branch is a fabricated test shape
             c.repo.as_deref() == Some(row.repo.as_str()) && c.branch.as_deref() == Some(branch)
         }
-        // coverage: off - a WorkRow with neither worktree nor branch exists
-        // only as a fabricated test shape; anchors always carry one // coverage: off - the unexecuted instantiation's region edge
-        _ => false, // coverage: off - a WorkRow with neither worktree nor branch is a fabricated test shape
+        // A row with neither worktree nor branch binds nothing; anchors
+        // always carry one.
+        _ => false, // coverage: off - a fabricated row shape: anchors always carry a worktree or a branch
     }
 }
 
 /// Fold the bound conversations' attention into the row's rollup, section
-/// and summary. First match wins: `Needs you` for waiting/failed-unseen/ // coverage: off - the unexecuted instantiation's region edge
+/// and summary. First match wins: `Needs you` for waiting/failed-unseen/
 /// completed-unseen, `Active` for a live busy process with nothing higher.
 fn classify_work(row: &mut WorkRow, conversations: &[ConversationRow]) {
     let bound: Vec<&ConversationRow> = conversations.iter().filter(|c| binds(row, c)).collect();
@@ -1190,17 +1170,16 @@ fn classify_work(row: &mut WorkRow, conversations: &[ConversationRow]) {
     if row.section == Some(WorkSection::NeedsYou)
         && bound.iter().any(|c| c.state == ConversationState::Busy)
     {
-        // coverage: off - the unexecuted instantiation's region edge
         parts.push("working".to_owned());
     }
     if row.summary != "clean" {
-        parts.push(row.summary.clone()); // coverage: off - the unexecuted instantiation's region edge
-    } // coverage: off - the unexecuted instantiation's region edge
+        parts.push(row.summary.clone());
+    }
     row.summary = parts.join(" · ");
 }
 
 /// The section's sort slot: `Needs you`, then `Active`, then the flat
-/// remainder. // coverage: off - the unexecuted instantiation's region edge
+/// remainder.
 fn section_order(row: &WorkRow) -> u8 {
     match row.section {
         Some(WorkSection::NeedsYou) => 0,
@@ -1303,17 +1282,17 @@ fn carry_remote(new: &mut vector::WorkState, old: &vector::WorkState) {
 /// Whether an `Evidence` is the not-yet-landed placeholder.
 fn pending<T>(evidence: &Evidence<T>) -> bool {
     matches!(evidence, Evidence::Unknown(reason) if reason == vector::PENDING)
-} // coverage: off - the unexecuted instantiation's region edge
+}
 
 /// The remote listing for an ask the pool or cache somehow missed: it
 /// fails closed like an unreachable remote, naming the miss.
-#[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
+#[rustfmt::skip]
 fn unprobed_listing(remote: &str) -> RemoteListing { RemoteListing { head: RemoteHead::Unreachable(format!("remote {remote} was not probed")), refs: Evidence::Unknown(format!("remote {remote} was not probed")) } } // coverage: off - apply only consults remotes the asks enumeration seeded
 
 /// `resolved` -> the row's attachment view.
 fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
     let (liveness, liveness_detail) = match &r.liveness {
-        Liveness::Instance => (AttachmentLiveness::Instance, None), // coverage: off - the unexecuted instantiation's region edge
+        Liveness::Instance => (AttachmentLiveness::Instance, None),
         Liveness::PidOnly(reason) => (AttachmentLiveness::PidOnly, Some(reason.clone())),
         Liveness::Unverifiable(reason) => (AttachmentLiveness::Unverifiable, Some(reason.clone())),
         Liveness::Dead(reason) => (AttachmentLiveness::Dead, Some(reason.clone())),
@@ -1342,6 +1321,15 @@ fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
 fn display_pane(pane: &PaneRef) -> String {
     pane.to_string()
 }
+
+/// A focus acknowledgement the store refused, reported for the evidence
+/// view.
+fn seen_state_error(key: &str, e: std::io::Error) -> SourceError /* // coverage: off - a seen-state write failure needs a store fault mid-pass */
+{
+    let source = "store".to_owned(); // coverage: off - a seen-state write failure needs a store fault mid-pass
+    let detail = format!("seen-state for {key:?}: {e}"); // coverage: off - same
+    SourceError { source, detail } // coverage: off - same
+} // coverage: off - same
 
 /// Whether `pane` is the dashboard's own: the socket qualifies the id, so
 /// the same `%N` on another server is a watched pane, not the dashboard -
@@ -1585,12 +1573,11 @@ mod tests {
                 None,
             );
             assert_eq!(row.state, want, "{want:?}");
-            assert!(row.live); // coverage: off - the unexecuted instantiation's region edge
-        } // coverage: off - the unexecuted instantiation's region edge
-        #[rustfmt::skip]
-        let row = conversation_row( // coverage: off - the unexecuted instantiation's region edge
+            assert!(row.live);
+        }
+        let row = conversation_row(
             &conversation(None, None),
-            None, // coverage: off - the unexecuted instantiation's region edge
+            None,
             derived(Exec::Unknown, Attention::None),
             None,
             None,
@@ -1599,7 +1586,7 @@ mod tests {
         assert_eq!(row.state, ConversationState::Unknown);
         assert!(!row.live);
         assert_eq!(row.short_id, "11111111");
-        assert_eq!(row.attention, Attention::None); // coverage: off - the unexecuted instantiation's region edge
+        assert_eq!(row.attention, Attention::None);
     }
 
     #[test]
@@ -1649,17 +1636,16 @@ mod tests {
     fn attachment_rows_spell_out_every_verdict() {
         for (liveness, placement, want_state, want_source) in [
             (
-                // coverage: off - the unexecuted instantiation's region edge
                 Liveness::Instance,
                 Placement::Bound(PaneSource::Published),
                 AttachmentLiveness::Instance,
-                Some(PaneSource::Published), // coverage: off - the unexecuted instantiation's region edge
-            ), // coverage: off - the unexecuted instantiation's region edge
+                Some(PaneSource::Published),
+            ),
             (
                 Liveness::PidOnly("no start".to_owned()),
                 Placement::Bound(PaneSource::Ancestry),
                 AttachmentLiveness::PidOnly,
-                Some(PaneSource::Ancestry), // coverage: off - the unexecuted instantiation's region edge
+                Some(PaneSource::Ancestry),
             ),
             (
                 Liveness::Unverifiable("no table".to_owned()),
@@ -1785,6 +1771,16 @@ mod tests {
         classify_work(&mut row, &[err]);
         assert_eq!(row.section, Some(WorkSection::NeedsYou));
         assert_eq!(row.summary, "error: StopFailure · working · no wt ↑?");
+
+        // A clean Git shape adds nothing beside the attention.
+        let mut row = fresh();
+        row.repo = "/r/.git".to_owned();
+        row.summary = "clean".to_owned();
+        classify_work(
+            &mut row,
+            &[conv(Attention::CompletedUnseen, ConversationState::Idle)],
+        );
+        assert_eq!(row.summary, "done");
 
         let mut row = fresh();
         row.repo = "/r/.git".to_owned();
@@ -2008,18 +2004,16 @@ mod tests {
         let mut errors = Vec::new();
         assert!(resolve_cwd(Path::new("/definitely/gone"), &mut errors).is_none());
         assert!(errors.is_empty());
-        // coverage: off - the unexecuted instantiation's region edge
         // A plain directory is a project space.
         let dir = std::env::temp_dir().join(format!("asd-space-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let Some(CwdPlacement::ProjectSpace { path }) = resolve_cwd(&dir, &mut errors) else {
-            // coverage: off - the unexecuted instantiation's region edge
             panic!("a plain dir is a project space") // coverage: off - a passing test never panics
         };
         assert_eq!(path, dir.canonicalize().unwrap());
         // A `.git` file that points nowhere: a repo with no checkout to
         // anchor on resolves to the repo itself.
-        let broken = std::env::temp_dir().join(format!("asd-broken-{}", std::process::id())); // coverage: off - the unexecuted instantiation's region edge
+        let broken = std::env::temp_dir().join(format!("asd-broken-{}", std::process::id()));
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join(".git"), "gitdir: /definitely/not/a/dir").unwrap();
         assert!(resolve_cwd(&broken, &mut errors).is_some());

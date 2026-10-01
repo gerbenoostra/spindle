@@ -127,7 +127,7 @@ impl Payload {
             if let Some(n) = value.as_u64() {
                 // Below 1e12 the number is seconds, not milliseconds.
                 return Some(if n < 1_000_000_000_000 { n * 1000 } else { n });
-            } // coverage: off - the unexecuted instantiation's region edge
+            }
         }
         None
     }
@@ -432,6 +432,13 @@ mod tests {
         );
         assert_eq!(
             payload("{\"timestamp\":1790123456000}").timestamp_ms(),
+            Some(1_790_123_456_000)
+        );
+        // A timestamp that is neither ISO-8601 nor a number is no
+        // timestamp: the next key is tried, then none.
+        assert_eq!(payload("{\"timestamp\":\"soon\"}").timestamp_ms(), None);
+        assert_eq!(
+            payload("{\"timestamp\":\"soon\",\"ts\":1790123456}").timestamp_ms(),
             Some(1_790_123_456_000)
         );
         // Garbage in is an empty payload, not a panic.

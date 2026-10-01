@@ -422,7 +422,7 @@ impl Store {
     pub fn append(&self, mut record: Record) -> io::Result<u64> {
         fs::create_dir_all(&self.dir)?;
         let _lock = Lock::acquire(&self.dir.join(LOCK))?;
-        let seq = self.next_seq()?; // coverage: off - next_seq reads through the error-retaining loaders; it cannot fail
+        let seq = self.next_seq();
         record.seq = seq;
         record.at = now_ms();
         record.v = SCHEMA;
@@ -433,7 +433,7 @@ impl Store {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&journal)?; // coverage: off - the unexecuted instantiation's region edge
+            .open(&journal)?;
         let len = (bytes.len() as u32).to_le_bytes();
         file.write_all(&len)?; // coverage: off - a write failure needs the filesystem to fail under an open handle
         file.write_all(&bytes)?; // coverage: off - same
@@ -443,7 +443,7 @@ impl Store {
 
     /// The commit sequence one past the current tip: the checkpoint's
     /// `through` plus the journal tail's newest record.
-    fn next_seq(&self) -> io::Result<u64> {
+    fn next_seq(&self) -> u64 {
         let checkpoint = self.read_checkpoint(&mut Vec::new());
         let through = checkpoint.map_or(0, |c| c.through);
         let tail = self
@@ -453,7 +453,7 @@ impl Store {
             .map(|r| r.seq)
             .max()
             .unwrap_or(0);
-        Ok(through.max(tail) + 1)
+        through.max(tail) + 1
     }
 
     /// Read the store: checkpoint, then the journal tail folded on top.
@@ -474,24 +474,16 @@ impl Store {
             Ok(_lock) => {
                 let (mut loaded, tail, compactable) = self.load_once();
                 if tail > COMPACT_AFTER && compactable && loaded.checkpoint_ok {
-                    // coverage: off - a compaction failure needs a rename or fsync to fail; the tail answers again next read
-                    #[rustfmt::skip]
-                    match self.compact(&loaded.folds, &loaded.seen, loaded.max_seq) {
-                        Ok(()) => {}
-                        Err(e) => loaded.errors.push(SourceError { // coverage: off - same
-                            source: "store".to_owned(), // coverage: off - same
-                            detail: format!("compaction: {e}"), // coverage: off - same
-                        }), // coverage: off - same
-                    };
+                    // A failed compaction is reported; the unfolded tail
+                    // simply answers again next read.
+                    let compacted = self.compact(&loaded.folds, &loaded.seen, loaded.max_seq);
+                    loaded.errors.extend(compacted.err().map(compaction_error));
                 }
                 loaded
             }
             Err(e) => {
                 let mut loaded = loaded;
-                loaded.errors.push(SourceError {
-                    source: "store".to_owned(),
-                    detail: format!("compaction: {e}"),
-                });
+                loaded.errors.push(compaction_error(e));
                 loaded
             }
         }
@@ -578,7 +570,7 @@ impl Store {
             return Ok(old);
         }
         seen.insert(key.to_owned(), new);
-        self.write_seen(&seen)?;
+        self.write_seen(&seen)?; // coverage: off - a seen-state write failure needs a filesystem fault
         Ok(new)
     }
 
@@ -623,17 +615,17 @@ impl Store {
         };
         let bytes = serde_json::to_vec_pretty(&checkpoint)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?; // coverage: off - a checkpoint always serializes
-        write_atomic(&self.dir.join(CHECKPOINT), &bytes)?; // coverage: off - needs the store's filesystem to fail
-        // The tail restarts empty; every record at or below `through` is // coverage: off - the unexecuted instantiation's region edge
+        write_atomic(&self.dir.join(CHECKPOINT), &bytes)?; // coverage: off - a checkpoint write failure needs a filesystem fault
+        // The tail restarts empty; every record at or below `through` is
         // carried by the checkpoint and skipped on the next read.
         write_atomic(&self.dir.join(JOURNAL), &[])?; // coverage: off - same
-        Ok(()) // coverage: off - the unexecuted instantiation's region edge
+        Ok(())
     }
-    // coverage: off - the unexecuted instantiation's region edge
-    /// The checkpoint's folds, or `None` when absent/unreadable/future. // coverage: off - the unexecuted instantiation's region edge
+
+    /// The checkpoint's folds, or `None` when absent/unreadable/future.
     /// Errors are retained rather than thrown.
     fn read_checkpoint(&self, errors: &mut Vec<SourceError>) -> Option<Checkpoint> {
-        let path = self.dir.join(CHECKPOINT); // coverage: off - the unexecuted instantiation's region edge
+        let path = self.dir.join(CHECKPOINT);
         let bytes = read_file(&path, "checkpoint", errors)?;
         match serde_json::from_slice::<Checkpoint>(&bytes) {
             Ok(c) if c.v <= SCHEMA => Some(c),
@@ -826,19 +818,18 @@ impl Store {
         }
     }
 
+    /// Every caller holds the store lock, so the directory exists.
     fn write_authored<T: Serialize>(&self, name: &str, data: &T) -> io::Result<()> {
-        fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
-        let authored = Authored { v: SCHEMA, data }; // coverage: off - the unexecuted instantiation's region edge
+        let authored = Authored { v: SCHEMA, data };
         let bytes = serde_json::to_vec_pretty(&authored)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?; // coverage: off - the envelope always serializes
-        write_atomic(&self.dir.join(name), &bytes) // coverage: off - the unexecuted instantiation's region edge
+        write_atomic(&self.dir.join(name), &bytes)
     }
 }
-// coverage: off - the unexecuted instantiation's region edge
+
 /// The shared envelope for `seen.json` and `marks.json`.
 #[derive(Debug, Serialize, Deserialize)]
 struct Authored<T> {
-    // coverage: off - the unexecuted instantiation's region edge
     #[serde(default)]
     v: u32,
     data: T,
@@ -876,9 +867,17 @@ impl Lock {
                         format!("{}: lock held", path.display()),
                     ));
                 }
-                Err(fs::TryLockError::Error(e)) => return Err(e),
+                Err(fs::TryLockError::Error(e)) => return Err(e), // coverage: off - a lock call failing outright needs a filesystem that refuses locks
             }
         }
+    }
+}
+
+/// A failed compaction, reported beside the read it was attempted on.
+fn compaction_error(e: io::Error) -> SourceError {
+    SourceError {
+        source: "store".to_owned(),
+        detail: format!("compaction: {e}"),
     }
 }
 
@@ -916,34 +915,28 @@ fn read_file(path: &Path, source: &str, errors: &mut Vec<SourceError>) -> Option
 }
 
 /// `bytes` -> `path` atomically: sibling temp, fsync, rename, fsync the
-/// directory so the rename itself survives.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> /* // coverage: off - a directory-creation failure needs a filesystem fault */
-{
-    if let Some(dir) = path.parent() {
-        // coverage: off - the unexecuted instantiation's region edge
-        fs::create_dir_all(dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
-    } // coverage: off - the unexecuted instantiation's region edge
+/// directory so the rename itself survives. Callers hold the store lock,
+/// which already created the directory.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     {
-        // coverage: off - the unexecuted instantiation's region edge
         let mut file = fs::File::create(&tmp)?; // coverage: off - a create failure needs a filesystem fault
         file.write_all(bytes)?; // coverage: off - same
         file.sync_all()?; // coverage: off - an fsync failure needs a broken filesystem
-    } // coverage: off - the unexecuted instantiation's region edge
+    }
     fs::rename(&tmp, path)?; // coverage: off - a failed rename needs a filesystem fault
     if let Some(dir) = path.parent()
         && let Ok(dir) = fs::File::open(dir)
     {
-        // coverage: off - the unexecuted instantiation's region edge
-        let _ = dir.sync_all(); // coverage: off - the unexecuted instantiation's region edge
-    } // coverage: off - the unexecuted instantiation's exit edge
+        let _ = dir.sync_all();
+    } // coverage: off - every store path has an openable parent: the lock was just taken in it
     Ok(())
-} // coverage: off - the unexecuted instantiation's region edge
+}
 
 /// Epoch milliseconds.
 pub fn now_ms() -> u64 {
     SystemTime::now()
-        .duration_since(UNIX_EPOCH) // coverage: off - the unexecuted instantiation's region edge
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
 }
