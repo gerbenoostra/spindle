@@ -404,7 +404,9 @@ impl App {
     /// writes. On a row that is `Busy` with none of that, `space` is the
     /// authored not-busy mark instead - it names the dismissed `Busy`'s
     /// `effective_since` and is superseded by any newer event or
-    /// observation. A `repos` row does neither.
+    /// observation. A `repos` row does neither. A work row decides once
+    /// for every bound conversation: one pending latch makes the keypress
+    /// acknowledgements only.
     fn space(&mut self) {
         let Some(store) = &self.store else {
             return;
@@ -428,11 +430,19 @@ impl App {
                 .collect::<Vec<_>>(),
             Row::Repo(_) => Vec::new(),
         };
+        // A work row decides once for all its bound conversations: a single
+        // pending latch turns the whole keypress into acknowledgements -
+        // a not-busy mark written beside unacknowledged attention would
+        // contradict it.
+        let ack_only =
+            matches!(row, Row::Work(_)) && convs.iter().any(|c| c.attention_seq.is_some());
         for c in convs {
             let key = store::conversation_key(c.provider.as_str(), &c.session_id);
             if let Some(through) = c.attention_seq {
                 let _ = store.acknowledge(&key, through);
-            } else if let (Some(since_ms), Some(seq)) = (c.state_since_ms, c.journal_seq) {
+            } else if !ack_only
+                && let (Some(since_ms), Some(seq)) = (c.state_since_ms, c.journal_seq)
+            {
                 // coverage: off - the unexecuted instantiation's region edge
                 // Only a Busy row earns the mark: a busy conversation with
                 // no higher attention has nothing to acknowledge. // coverage: off - the unexecuted instantiation's region edge
@@ -1830,6 +1840,31 @@ mod tests {
         press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
         let loaded = crate::store::Store::open(dir.clone()).load();
         assert_eq!(loaded.marks.len(), 1, "no extra mark: {:?}", loaded.marks);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_work_row_space_acknowledges_and_never_marks_beside_attention() {
+        let dir = std::env::temp_dir().join(format!("as-space-wr-{}", std::process::id()));
+        let mut snapshot = fixture();
+        // One bound conversation carries a latch; another bound to the
+        // same work row is Working with a mark pair to its name.
+        snapshot.conversations[1].attention = Attention::Working;
+        snapshot.conversations[1].state = ConversationState::Busy;
+        snapshot.conversations[1].state_since_ms = Some((1_800_000_000 - 300) * 1000);
+        snapshot.conversations[1].journal_seq = Some(9);
+        let mut app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char(' ')]);
+        let loaded = crate::store::Store::open(dir.clone()).load();
+        let waiting = store::conversation_key("claude", "8f423bbb-1111-2222-3333-444444444444");
+        assert_eq!(
+            loaded.seen.get(&waiting).copied(),
+            Some(4),
+            "{:?}",
+            loaded.seen
+        );
+        // The Working conversation earns no mark this keypress.
+        assert!(loaded.marks.is_empty(), "{:?}", loaded.marks);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
