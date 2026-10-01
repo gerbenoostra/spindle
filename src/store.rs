@@ -223,7 +223,9 @@ pub struct Fold {
     /// Newest mapped event, the lifecycle claim.
     #[serde(default)]
     pub last_event: Option<LastEvent>,
-    /// Attention events no `start` has acknowledged.
+    /// Attention events no `start` has acknowledged. Compaction drops the
+    /// ones seen-state acknowledged, so a provider without a `start` event
+    /// does not carry every turn's latch forever.
     #[serde(default)]
     pub retained: Vec<Retained>,
     /// Newest unmapped ping `(seq, epoch ms)` - the weak `Busy` lease.
@@ -474,7 +476,7 @@ impl Store {
                 if tail > COMPACT_AFTER && compactable && loaded.checkpoint_ok {
                     // coverage: off - a compaction failure needs a rename or fsync to fail; the tail answers again next read
                     #[rustfmt::skip]
-                    match self.compact(&loaded.folds, loaded.max_seq) {
+                    match self.compact(&loaded.folds, &loaded.seen, loaded.max_seq) {
                         Ok(()) => {}
                         Err(e) => loaded.errors.push(SourceError { // coverage: off - same
                             source: "store".to_owned(), // coverage: off - same
@@ -600,11 +602,24 @@ impl Store {
     /// Write the checkpoint for `folds` at `through` and rewrite the
     /// journal to nothing past it - checkpoint first, so a crash between
     /// the two renames leaves stale tail records that simply re-skip.
-    fn compact(&self, folds: &HashMap<String, Fold>, through: u64) -> io::Result<()> {
+    /// Latches `seen` acknowledges are dropped: derivation already ignores
+    /// them, so the reduction it answers is unchanged.
+    fn compact(
+        &self,
+        folds: &HashMap<String, Fold>,
+        seen: &HashMap<String, Seen>,
+        through: u64,
+    ) -> io::Result<()> {
+        let mut folds = folds.clone();
+        for (key, fold) in &mut folds {
+            if let Some(seen) = seen.get(key) {
+                fold.retained.retain(|r| r.seq > seen.seq);
+            }
+        }
         let checkpoint = Checkpoint {
             v: SCHEMA,
             through,
-            folds: folds.clone(),
+            folds,
         };
         let bytes = serde_json::to_vec_pretty(&checkpoint)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?; // coverage: off - a checkpoint always serializes
@@ -1119,6 +1134,38 @@ mod tests {
             );
         }
         assert!(after.errors.is_empty(), "{:?}", after.errors);
+    }
+
+    #[test]
+    fn compaction_drops_acknowledged_latches() {
+        // A provider with no `start` event: every turn's `end` latches, and
+        // only seen-state acknowledges them.
+        let temp = TempStore::new();
+        let store = temp.store();
+        let key = conversation_key("vibe", "s1");
+        for _ in 0..COMPACT_AFTER {
+            store
+                .append(record("vibe", "s1", "post_agent", NormEvent::End))
+                .unwrap();
+        }
+        store.acknowledge(&key, 100, None).unwrap();
+        store
+            .append(record("vibe", "s1", "post_agent", NormEvent::End))
+            .unwrap();
+        let before = store.load();
+        assert!(temp.path(CHECKPOINT).exists(), "the tail compacted");
+        let after = store.load();
+        let kept: Vec<u64> = after.folds[&key].retained.iter().map(|r| r.seq).collect();
+        assert_eq!(kept, (101..=before.max_seq).collect::<Vec<_>>());
+        // What derivation answers is the same: only the unseen latches.
+        let unseen = |loaded: &Loaded| {
+            loaded.folds[&key]
+                .retained
+                .iter()
+                .filter(|r| r.seq > loaded.seen[&key].seq)
+                .count()
+        };
+        assert_eq!(unseen(&before), unseen(&after));
     }
 
     #[test]
