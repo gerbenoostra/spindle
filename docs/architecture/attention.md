@@ -59,8 +59,9 @@ User-visible behavior is in [attention](../attention.md).
   milliseconds apart, and whichever wins arbitration must read the same
   acknowledgement; not by sequence (a provider-published wait has none).
 - A provider record without timestamps is dated when first read and keeps
-  that date while unchanged - because re-dating it every poll made each
-  poll a new wait that no acknowledgement could cover.
+  that date while its content and process instance stay unchanged; a
+  replacement process starts a new episode - because re-dating it every
+  poll made each poll a new wait that no acknowledgement could cover.
 - Compaction drops latches seen-state has acknowledged - because Vibe
   publishes no `start`, so its turn-end latches would otherwise accumulate
   forever.

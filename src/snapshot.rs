@@ -1345,30 +1345,38 @@ fn seen_state_error(key: &str, e: std::io::Error) -> SourceError /* // coverage:
     SourceError { source, detail } // coverage: off - same
 } // coverage: off - same
 
-/// A live record's content as far as its stand-in date goes: a change to
-/// any of it is a new reading, dated afresh.
+/// A live record's process instance and content as far as its stand-in date
+/// goes: a change to any of it is a new reading, dated afresh.
 #[derive(Debug, PartialEq)]
 struct Undated {
+    pid: u32,
+    pid_start: ProcessStart,
     status: Option<String>,
     waiting_for: Option<String>,
     first_ms: u64,
 }
 
-/// When `live` was first read in its current content, epoch ms: `now_ms`
-/// for a new or changed record, the remembered time for the same one.
+/// When `live` was first read in its current process instance and content,
+/// epoch ms: `now_ms` for a new or changed record, the remembered time for
+/// the same one.
 fn first_read(
     seen: &mut HashMap<String, Undated>,
     key: &str,
     live: &crate::claude::Live,
     now_ms: u64,
 ) -> u64 {
-    let same = seen
-        .get(key)
-        .is_some_and(|u| u.status == live.status_raw && u.waiting_for == live.waiting_for);
+    let same = seen.get(key).is_some_and(|u| {
+        u.pid == live.pid
+            && u.pid_start == live.pid_start
+            && u.status == live.status_raw
+            && u.waiting_for == live.waiting_for
+    });
     if !same {
         seen.insert(
             key.to_owned(),
             Undated {
+                pid: live.pid,
+                pid_start: live.pid_start,
                 status: live.status_raw.clone(),
                 waiting_for: live.waiting_for.clone(),
                 first_ms: now_ms,
@@ -2119,7 +2127,7 @@ mod tests {
     }
 
     #[test]
-    fn an_undated_record_keeps_its_first_read_time_until_it_changes() {
+    fn an_undated_record_keeps_its_first_read_time_until_content_or_process_changes() {
         let mut seen = HashMap::new();
         let mut live = live();
         assert_eq!(first_read(&mut seen, "k", &live, 1_000), 1_000);
@@ -2131,8 +2139,15 @@ mod tests {
         live.waiting_for = Some("permission prompt".to_owned());
         assert_eq!(first_read(&mut seen, "k", &live, 4_000), 4_000);
         assert_eq!(first_read(&mut seen, "k", &live, 5_000), 4_000);
+        // A resumed conversation under another process is a new reading even
+        // when its timestamp-less state has identical content. Otherwise an old
+        // wait acknowledgement or not-busy mark could apply to the new process.
+        live.pid += 1;
+        assert_eq!(first_read(&mut seen, "k", &live, 6_000), 6_000);
+        live.pid_start = ProcessStart::At(7_000);
+        assert_eq!(first_read(&mut seen, "k", &live, 7_000), 7_000);
         // Conversations are dated independently.
-        assert_eq!(first_read(&mut seen, "other", &live, 6_000), 6_000);
+        assert_eq!(first_read(&mut seen, "other", &live, 8_000), 8_000);
     }
 
     #[test]
