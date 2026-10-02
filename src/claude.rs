@@ -36,7 +36,7 @@ use crate::runtime::{AgentSessionKey, EvidenceSource, ProcessClaim, Provider};
 
 /// The basename Claude's own executable runs under; also the liveness check's
 /// guard against pid reuse.
-const EXE: &str = "claude";
+pub const EXE: &str = "claude";
 
 /// A Claude plugin rooted at its config directory (`~/.claude`), holding the
 /// transcript index across scans so only changed files are reparsed.

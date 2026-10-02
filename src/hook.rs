@@ -14,6 +14,7 @@
 use std::fs;
 use std::path::Path;
 
+use crate::process::{Liveness, ProcessInstance, ProcessStart, ProcessTable};
 use crate::runtime::Provider;
 use crate::store::{self, NormEvent, Record, Store};
 
@@ -200,7 +201,7 @@ fn map(provider: Provider, event: &str, payload: &Payload) -> Option<Mapped> {
 fn resolve_process(provider: Provider, payload: &Payload) -> Option<(u32, Option<u64>)> {
     if provider == Provider::Claude {
         let root = crate::claude::default_root().ok()?;
-        if let Some(found) = find_claude_process(&root, payload.session_id()) {
+        if let Some(found) = find_claude_process(&root, payload.session_id(), &process_table) {
             return Some(found);
         }
     }
@@ -214,11 +215,28 @@ fn resolve_process(provider: Provider, payload: &Payload) -> Option<(u32, Option
     Some((pid, start))
 }
 
+/// The live process table; `None` when `ps` cannot be read.
+fn process_table() -> Option<ProcessTable> {
+    ProcessTable::snapshot().ok()
+}
+
 /// The `(pid, pid_start)` Claude's live session file binds `session_id` to.
-fn find_claude_process(root: &Path, session_id: &str) -> Option<(u32, Option<u64>)> {
+///
+/// A process that died without cleaning up leaves its file behind, so a
+/// resumed session can be named by several. One match is taken as is - a
+/// dead pid is the fold's to reject - but among several only a live one
+/// speaks, and `table` (a `ps` spawn) is read only then. No live match, or
+/// no table to tell, resolves nothing rather than a guess.
+fn find_claude_process(
+    root: &Path,
+    session_id: &str,
+    table: &dyn Fn() -> Option<ProcessTable>,
+) -> Option<(u32, Option<u64>)> {
     let sessions = root.join("sessions");
-    let entries = fs::read_dir(&sessions).ok()?;
-    for entry in entries.flatten() {
+    let mut entries: Vec<_> = fs::read_dir(&sessions).ok()?.flatten().collect();
+    entries.sort_by_key(|e| e.path());
+    let mut found = Vec::new();
+    for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
@@ -232,17 +250,34 @@ fn find_claude_process(root: &Path, session_id: &str) -> Option<(u32, Option<u64
         if value.get("sessionId").and_then(|v| v.as_str()) != Some(session_id) {
             continue;
         }
-        let pid = value
+        // A record naming the session with no usable pid binds no process.
+        let Some(pid) = value
             .get("pid")
             .and_then(|v| v.as_u64())
-            .and_then(|p| u32::try_from(p).ok())?;
+            .and_then(|p| u32::try_from(p).ok())
+        else {
+            continue;
+        };
         let start = value
             .get("procStart")
             .and_then(|v| v.as_str())
             .and_then(crate::process::parse_utc_ctime);
-        return Some((pid, start));
+        found.push((pid, start));
     }
-    None
+    if found.len() <= 1 {
+        return found.pop();
+    }
+    let table = table()?;
+    found.into_iter().find(|&(pid, start)| {
+        let claim = ProcessInstance {
+            pid,
+            pid_start: start.map_or(ProcessStart::Unavailable, ProcessStart::At),
+        };
+        matches!(
+            table.is_live(&claim, Some(crate::claude::EXE)),
+            Liveness::Instance | Liveness::PidOnly(_)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -397,17 +432,67 @@ mod tests {
             "{\"sessionId\":\"other\",\"pid\":1}",
         )
         .unwrap();
-        assert!(find_claude_process(&dir, "s1").is_none());
+        assert!(find_claude_process(&dir, "s1", &no_table).is_none());
         fs::write(
             sessions.join("7.json"),
             "{\"sessionId\":\"s1\",\"pid\":7,\"procStart\":\"Tue Sep 22 16:18:53 2026\"}",
         )
         .unwrap();
-        let found = find_claude_process(&dir, "s1");
+        let found = find_claude_process(&dir, "s1", &no_table);
         assert_eq!(found.map(|(pid, _)| pid), Some(7));
         // A matching session with no usable pid resolves nothing.
         fs::write(sessions.join("7.json"), "{\"sessionId\":\"s2\"}").unwrap();
-        assert!(find_claude_process(&dir, "s2").is_none());
+        assert!(find_claude_process(&dir, "s2", &no_table).is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A process table that cannot be read.
+    fn no_table() -> Option<ProcessTable> {
+        None
+    }
+
+    #[test]
+    fn of_several_session_files_only_the_live_process_speaks() {
+        // A crashed process left its file behind; the resumed session has
+        // a second one. The table decides, and only when there are several.
+        let dir = tempfile_path("resumed");
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let file = |pid: u32, start: &str| {
+            fs::write(
+                sessions.join(format!("{pid}.json")),
+                format!("{{\"sessionId\":\"s1\",\"pid\":{pid},\"procStart\":\"{start}\"}}"),
+            )
+            .unwrap();
+        };
+        file(111, "Tue Sep 22 16:18:53 2026");
+        let start = crate::process::parse_utc_ctime("Tue Sep 22 17:00:00 2026").unwrap();
+        let row = |pid: u32, start: u64, exe: &str| crate::process::ProcessRow {
+            pid,
+            ppid: 1,
+            start: ProcessStart::At(start),
+            exe: Some(exe.to_owned()),
+            tty: None,
+            state: 'S',
+        };
+        let table = || Some(ProcessTable::from_rows(vec![row(222, start, "claude")]));
+        // One file: taken as is - the table, where 111 is dead, is never
+        // consulted.
+        let found = find_claude_process(&dir, "s1", &table);
+        assert_eq!(found.map(|(pid, _)| pid), Some(111));
+        // Two: the live one, whichever the directory lists first.
+        file(222, "Tue Sep 22 17:00:00 2026");
+        assert_eq!(
+            find_claude_process(&dir, "s1", &table),
+            Some((222, Some(start)))
+        );
+        // A reused pid running something else is no match, and a table
+        // that cannot be read resolves nothing rather than a guess.
+        let reused = || Some(ProcessTable::from_rows(vec![row(222, start, "zsh")]));
+        assert_eq!(find_claude_process(&dir, "s1", &reused), None);
+        assert_eq!(find_claude_process(&dir, "s1", &no_table), None);
+        // The real table: neither pid names a running claude here.
+        assert_eq!(find_claude_process(&dir, "s1", &process_table), None);
         fs::remove_dir_all(&dir).unwrap();
     }
 
