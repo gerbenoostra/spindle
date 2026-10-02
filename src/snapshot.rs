@@ -370,6 +370,10 @@ pub struct Collector {
     /// Per-conversation weak `Busy -> Idle` stabilizer state, carried
     /// across passes so confirmations accumulate between refreshes.
     idles: HashMap<String, attention::WeakIdle>,
+    /// When each live record that carries no time of its own was first read
+    /// in its current content - its stand-in `since` and observation time,
+    /// so polling the same record never moves them.
+    undated: HashMap<String, Undated>,
     /// The last-published view: every field keeps its last value until the
     /// stage that owns it lands a replacement.
     model: Model,
@@ -415,7 +419,7 @@ impl Collector {
         let remotes = RemoteCache::default();
         let model = Model::default(); // coverage: off - the unexecuted instantiation's region edge
         let workers = fanout::WORKERS; // coverage: off - same
-        Collector { claude, remotes, store: None, idles: HashMap::new(), model, workers }
+        Collector { claude, remotes, store: None, idles: HashMap::new(), undated: HashMap::new(), model, workers }
     }
 
     /// Read (and acknowledge through) the store at `dir` - the journal of
@@ -528,11 +532,20 @@ impl Collector {
                     .may_be_live()
                     .then_some((r.attachment.process.pid, pid_start))
             });
-            let published = live.and(conv.live.as_ref()).map(|l| attention::Published {
-                status: l.status,
-                waiting_for: l.waiting_for.clone(),
-                observed_ms: store::epoch_ms(l.updated_at.unwrap_or(observed_at)),
-                since_ms: l.status_updated_at.or(l.updated_at).map(store::epoch_ms),
+            let published = live.and(conv.live.as_ref()).map(|l| {
+                // A record with no time of its own is dated when first read
+                // and keeps that date while later polls read it unchanged.
+                let first = first_read(&mut self.undated, &key, l, now_ms);
+                attention::Published {
+                    status: l.status,
+                    waiting_for: l.waiting_for.clone(),
+                    observed_ms: l.updated_at.map_or(first, store::epoch_ms),
+                    since_ms: Some(
+                        l.status_updated_at
+                            .or(l.updated_at)
+                            .map_or(first, store::epoch_ms),
+                    ),
+                }
             });
             let idle = self.idles.entry(key.clone()).or_default();
             let derive = |seen: store::Seen, idle: &mut attention::WeakIdle| {
@@ -1323,13 +1336,47 @@ fn display_pane(pane: &PaneRef) -> String {
 }
 
 /// A focus acknowledgement the store refused, reported for the evidence
-/// view.
+/// view. Its own function, like `anchor_error`, so each line carries one
+/// fault path rustfmt cannot reflow away from its marker.
 fn seen_state_error(key: &str, e: std::io::Error) -> SourceError /* // coverage: off - a seen-state write failure needs a store fault mid-pass */
 {
     let source = "store".to_owned(); // coverage: off - a seen-state write failure needs a store fault mid-pass
     let detail = format!("seen-state for {key:?}: {e}"); // coverage: off - same
     SourceError { source, detail } // coverage: off - same
 } // coverage: off - same
+
+/// A live record's content as far as its stand-in date goes: a change to
+/// any of it is a new reading, dated afresh.
+#[derive(Debug, PartialEq)]
+struct Undated {
+    status: Option<String>,
+    waiting_for: Option<String>,
+    first_ms: u64,
+}
+
+/// When `live` was first read in its current content, epoch ms: `now_ms`
+/// for a new or changed record, the remembered time for the same one.
+fn first_read(
+    seen: &mut HashMap<String, Undated>,
+    key: &str,
+    live: &crate::claude::Live,
+    now_ms: u64,
+) -> u64 {
+    let same = seen
+        .get(key)
+        .is_some_and(|u| u.status == live.status_raw && u.waiting_for == live.waiting_for);
+    if !same {
+        seen.insert(
+            key.to_owned(),
+            Undated {
+                status: live.status_raw.clone(),
+                waiting_for: live.waiting_for.clone(),
+                first_ms: now_ms,
+            },
+        );
+    }
+    seen[key].first_ms
+}
 
 /// Whether `pane` is the dashboard's own: the socket qualifies the id, so
 /// the same `%N` on another server is a watched pane, not the dashboard -
@@ -2062,6 +2109,23 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         let _ = fs::set_permissions(&gitfile, fs::Permissions::from_mode(0o644));
         let _ = fs::remove_dir_all(&dead_dir);
+    }
+
+    #[test]
+    fn an_undated_record_keeps_its_first_read_time_until_it_changes() {
+        let mut seen = HashMap::new();
+        let mut live = live();
+        assert_eq!(first_read(&mut seen, "k", &live, 1_000), 1_000);
+        // The same content read again keeps its date.
+        assert_eq!(first_read(&mut seen, "k", &live, 2_000), 1_000);
+        // A new reading - another status or wait reason - is dated afresh.
+        live.status_raw = Some("waiting".to_owned());
+        assert_eq!(first_read(&mut seen, "k", &live, 3_000), 3_000);
+        live.waiting_for = Some("permission prompt".to_owned());
+        assert_eq!(first_read(&mut seen, "k", &live, 4_000), 4_000);
+        assert_eq!(first_read(&mut seen, "k", &live, 5_000), 4_000);
+        // Conversations are dated independently.
+        assert_eq!(first_read(&mut seen, "other", &live, 6_000), 6_000);
     }
 
     #[test]

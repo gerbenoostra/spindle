@@ -570,6 +570,58 @@ fn attention_flows_end_to_end() {
     let _ = client.wait();
 }
 
+/// A published wait whose record carries no time of its own is dated when
+/// the collector first reads it, and keeps that date while the record stays
+/// the same - so an acknowledgement of it holds across polls.
+#[test]
+fn an_undated_published_wait_stays_acknowledged_across_polls() {
+    if !tmux_or_skip() {
+        return;
+    }
+    let world = world();
+    let env = env(&world);
+    let sessions = world.home.join(".claude/sessions");
+    fs::write(
+        sessions.join(format!("{}.json", world.pid)),
+        format!(
+            "{{\"pid\":{},\"sessionId\":\"{LIVE_ID}\",\"status\":\"waiting\",\"waitingFor\":\"permission prompt\",\"cwd\":\"{}\",\"procStart\":\"{}\"}}",
+            world.pid,
+            world.worktree.display(),
+            proc_start(world.pid)
+        ),
+    )
+    .expect("session file writes");
+    let runtime = || Runtime::observe_over(std::slice::from_ref(&world.tmux.socket));
+    let mut collector = Collector::new(env.home.join(".claude")).with_store(store_dir(&env));
+    let conv = |snapshot: &agent_sessions::snapshot::Snapshot| {
+        snapshot
+            .conversations
+            .iter()
+            .find(|c| c.session_id == LIVE_ID)
+            .cloned()
+            .expect("the live conversation")
+    };
+    let first = conv(&collector.collect(&runtime(), None));
+    assert_eq!(first.attention, Attention::Waiting);
+    let wait = first.attention_wait_ms.expect("an acknowledgeable wait");
+    Store::open(store_dir(&env))
+        .acknowledge(
+            &agent_sessions::store::conversation_key("claude", LIVE_ID),
+            0,
+            Some(wait),
+        )
+        .expect("the acknowledgement lands");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let second = conv(&collector.collect(&runtime(), None));
+    assert_eq!(second.state, ConversationState::Waiting);
+    assert_eq!(
+        second.attention,
+        Attention::None,
+        "the same record stays seen"
+    );
+    assert_eq!(second.state_since_ms, Some(wait));
+}
+
 /// Cursor movement must never acknowledge: in the TUI only a deliberate
 /// `space` moves the store.
 #[test]
