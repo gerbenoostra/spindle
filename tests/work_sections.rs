@@ -276,6 +276,21 @@ fn world() -> World {
         .expect("the transcript")
         .set_modified(UNIX_EPOCH + Duration::from_secs(now() - 2 * 86400))
         .expect("mtime sets");
+    // `a` must win the activity ordering deterministically: the fake
+    // agent's process start is not observable on every platform, so one
+    // of `a`'s transcript turns carries a timestamp past every Git time.
+    let t = home.join(format!(".claude/projects/t/{NEEDS_ID}.jsonl"));
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(&t)
+        .expect("the transcript");
+    use std::io::Write;
+    writeln!(
+        f,
+        "{{\"type\":\"user\",\"sessionId\":\"{NEEDS_ID}\",\"cwd\":\"{}\",\"timestamp\":\"2030-01-01T00:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":\"newer\"}}}}",
+        needs.display()
+    )
+    .expect("the turn appends");
 
     World {
         home,
