@@ -152,6 +152,10 @@ pub struct App {
     /// The store `space` writes acknowledgements and not-busy marks into;
     /// `None` where no state dir could be placed, making `space` inert.
     store: Option<Store>,
+    /// A failed action's message, shown in the footer in place of the hints
+    /// until the next key - a keypress that wrote nothing must not look
+    /// like it worked.
+    notice: Option<String>,
     /// The spinner's frame index while a snapshot is still incomplete.
     /// `Cell` because a draw is `&self`: the animation ticks by rendering.
     spin: std::cell::Cell<u64>,
@@ -191,6 +195,7 @@ impl App {
             quit: false,
             collector_dead: false,
             store: None,
+            notice: None,
             spin: std::cell::Cell::new(0),
         }
     }
@@ -378,6 +383,7 @@ impl App {
     /// else is inert: an unbound key does nothing, and nothing here pretends
     /// to a behaviour a later task owns.
     pub fn key(&mut self, key: Key) {
+        self.notice = None;
         if let Some((list, buffer)) = &mut self.editing {
             match key {
                 Key::Char(c) => buffer.push(c),
@@ -432,21 +438,25 @@ impl App {
     /// `effective_since` and is superseded by any newer event or
     /// observation. A `repos` row does neither. A work row decides once
     /// for every bound conversation: one pending latch makes the keypress
-    /// acknowledgements only.
+    /// acknowledgements only. A write the store refuses is reported in the
+    /// footer.
     fn space(&mut self) {
-        let Some(store) = &self.store else {
-            return;
-        };
-        let Some(list) = self.focused_list() else {
-            return;
-        };
+        self.notice = self
+            .space_writes()
+            .map(|e| format!("space: not saved - {e}"));
+    }
+
+    /// The writes `space` performs; the first refusal, when there is one.
+    fn space_writes(&self) -> Option<std::io::Error> {
+        let store = self.store.as_ref()?;
+        let list = self.focused_list()?;
         let view = self.view();
         let cursor = self.cursor[list_index(list)];
         if cursor == 0 {
-            return;
+            return None;
         };
         let Some(row) = view.rows(list).get(cursor - 1) else {
-            return; // coverage: off - the get-miss arm is unreachable: cursors clamp before a view
+            return None; // coverage: off - the get-miss arm is unreachable: cursors clamp before a view
         };
         let convs: Vec<&ConversationRow> = match row {
             Row::Conversation(c) => vec![*c],
@@ -465,10 +475,13 @@ impl App {
         let pending =
             |c: &ConversationRow| c.attention_seq.is_some() || c.attention_wait_ms.is_some();
         let ack_only = matches!(row, Row::Work(_)) && convs.iter().any(|c| pending(c));
+        let mut refused = None;
         for c in convs {
             let key = store::conversation_key(c.provider.as_str(), &c.session_id);
-            if pending(c) {
-                let _ = store.acknowledge(&key, c.attention_seq.unwrap_or(0), c.attention_wait_ms);
+            let written = if pending(c) {
+                store
+                    .acknowledge(&key, c.attention_seq.unwrap_or(0), c.attention_wait_ms)
+                    .map(|_| ())
             } else if !ack_only
                 && c.attention == Attention::Working
                 && let Some(since_ms) = c.state_since_ms
@@ -477,9 +490,13 @@ impl App {
                 // no higher attention has nothing to acknowledge. A Busy
                 // only the provider published has no journal sequence yet;
                 // the mark sits at zero and any first event supersedes it.
-                let _ = store.mark_not_busy(&key, since_ms, c.journal_seq.unwrap_or(0));
-            }
+                store.mark_not_busy(&key, since_ms, c.journal_seq.unwrap_or(0))
+            } else {
+                Ok(())
+            };
+            refused = refused.or(written.err());
         }
+        refused
     }
 
     /// `j`/`k` on the focused list: move, clamp, and reset the cursors below
@@ -782,6 +799,8 @@ impl App {
     fn footer(&self, f: &mut Frame<'_>, area: Rect) {
         let text = if self.collector_dead {
             "collector stopped - last snapshot | q quit".to_owned()
+        } else if let Some(notice) = &self.notice {
+            notice.clone()
         } else {
             let spinner = self.spinner(area.width);
             let hints = if self.editing.is_some() {
@@ -1875,6 +1894,36 @@ mod tests {
         press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
         let loaded = crate::store::Store::open(dir.clone()).load();
         assert_eq!(loaded.marks.len(), 1, "no extra mark: {:?}", loaded.marks);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_space_write_says_so_until_the_next_key() {
+        // A seen-state file the store cannot carry refuses the rewrite;
+        // the keypress must not look like it worked.
+        let dir = std::env::temp_dir().join(format!("as-space-err-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("seen.json"), "{oops").unwrap();
+        let mut app = App::new(fixture()).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("space: not saved"), "{text}");
+        // So does a refused not-busy mark.
+        std::fs::write(dir.join("marks.json"), "{oops").unwrap();
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::Working;
+        snapshot.conversations[0].attention_seq = None;
+        snapshot.conversations[0].attention_wait_ms = None;
+        snapshot.conversations[0].state = ConversationState::Busy;
+        let mut app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("space: not saved"), "{text}");
+        // The next key clears it: the footer is hints again.
+        press(&mut app, &[Key::Char('k')]);
+        let text = render_to(&app, 200, 24);
+        assert!(!text.contains("space: not saved"), "{text}");
+        assert!(text.contains("q quit"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
