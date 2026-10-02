@@ -400,6 +400,9 @@ pub struct Loaded {
 struct JournalRead {
     records: Vec<Record>,
     compactable: bool,
+    /// Where an incomplete trailing frame begins - the end of the last
+    /// whole frame - when the file ends in one.
+    torn_at: Option<usize>,
 }
 
 /// The journal record key a conversation's events fold under.
@@ -420,17 +423,29 @@ impl Store {
 
     /// Append one record as the next commit: lock, sequence, write, fsync.
     /// Returns the assigned commit sequence.
+    ///
+    /// A previous append that died partway - out of space, or killed
+    /// between its writes - leaves an incomplete frame at the end. It was
+    /// never committed, and appending after it would misframe every later
+    /// record, so it is cut back to the last whole frame first. A complete
+    /// frame that does not parse is a different case and stays.
     pub fn append(&self, mut record: Record) -> io::Result<u64> {
         fs::create_dir_all(&self.dir)?;
         let _lock = Lock::acquire(&self.dir.join(LOCK))?;
-        let seq = self.next_seq();
+        let journal = self.dir.join(JOURNAL);
+        let tail = self.read_journal(&mut Vec::new());
+        if let Some(end) = tail.torn_at {
+            let file = fs::OpenOptions::new().write(true).open(&journal)?; // coverage: off - the journal was just read, so it opens
+            file.set_len(end as u64)?; // coverage: off - a truncate failure needs a filesystem fault
+            file.sync_all()?; // coverage: off - an fsync failure needs a broken filesystem
+        }
+        let seq = self.next_seq(&tail);
         record.seq = seq;
         record.at = now_ms();
         record.v = SCHEMA;
         record.writer = writer();
         let bytes = serde_json::to_vec(&record)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?; // coverage: off - a Record always serializes
-        let journal = self.dir.join(JOURNAL);
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -444,16 +459,10 @@ impl Store {
 
     /// The commit sequence one past the current tip: the checkpoint's
     /// `through` plus the journal tail's newest record.
-    fn next_seq(&self) -> u64 {
+    fn next_seq(&self, tail: &JournalRead) -> u64 {
         let checkpoint = self.read_checkpoint(&mut Vec::new());
         let through = checkpoint.map_or(0, |c| c.through);
-        let tail = self
-            .read_journal(&mut Vec::new())
-            .records
-            .iter()
-            .map(|r| r.seq)
-            .max()
-            .unwrap_or(0);
+        let tail = tail.records.iter().map(|r| r.seq).max().unwrap_or(0);
         through.max(tail) + 1
     }
 
@@ -663,10 +672,12 @@ impl Store {
             return JournalRead {
                 records: Vec::new(),
                 compactable: true,
+                torn_at: None,
             };
         };
         let mut records = Vec::new();
         let mut compactable = true;
+        let mut torn_at = None;
         let mut cursor = 0usize;
         while cursor + 4 <= bytes.len() {
             let len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
@@ -680,6 +691,7 @@ impl Store {
                     ),
                 });
                 compactable = false;
+                torn_at = Some(cursor - 4);
                 break;
             }
             let frame = &bytes[cursor..cursor + len];
@@ -730,8 +742,11 @@ impl Store {
             }
             cursor += len;
         }
-        if bytes.len() - cursor > 0 && cursor + 4 > bytes.len() {
+        // Fewer than four bytes past the last whole frame: a length header
+        // that never finished. A truncated payload was already reported.
+        if torn_at.is_none() && bytes.len() - cursor > 0 && cursor + 4 > bytes.len() {
             compactable = false;
+            torn_at = Some(cursor);
             errors.push(SourceError {
                 source: "journal".to_owned(),
                 detail: format!(
@@ -744,6 +759,7 @@ impl Store {
         JournalRead {
             records,
             compactable,
+            torn_at,
         }
     }
 
@@ -1032,6 +1048,64 @@ mod tests {
         let loaded = store.load();
         assert_eq!(loaded.folds.len(), 1);
         assert!(loaded.errors.iter().any(|e| e.source == "journal"));
+    }
+
+    #[test]
+    fn an_append_after_a_torn_write_lands_on_a_frame_boundary() {
+        // A write that died partway - out of space, or the hook killed
+        // between length and payload - leaves a partial frame. Appending
+        // after it would misframe every later record, so the next append
+        // cuts the uncommitted fragment off first.
+        for torn in [
+            [&100u32.to_le_bytes()[..], b"{\"v\":1,\"seq\":2"].concat(),
+            [&100u32.to_le_bytes()[..], b"{\""].concat(),
+            vec![7, 0],
+        ] {
+            let temp = TempStore::new();
+            let store = temp.store();
+            store
+                .append(record("claude", "s1", "Stop", NormEvent::End))
+                .unwrap();
+            let journal = temp.path(JOURNAL);
+            let clean = fs::read(&journal).unwrap();
+            fs::write(&journal, [clean.as_slice(), &torn].concat()).unwrap();
+            let seqs: Vec<u64> = ["s2", "s3"]
+                .iter()
+                .map(|s| {
+                    store
+                        .append(record("claude", s, "Stop", NormEvent::End))
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(seqs, [2, 3]);
+            let loaded = store.load();
+            assert_eq!(loaded.folds.len(), 3, "{:?}", loaded.folds);
+            assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+            assert_eq!(loaded.max_seq, 3);
+        }
+    }
+
+    #[test]
+    fn an_append_keeps_a_complete_frame_it_cannot_parse() {
+        // Only an incomplete trailing frame is cut: a whole frame that does
+        // not parse is retained byte for byte, and appends go after it.
+        let temp = TempStore::new();
+        let store = temp.store();
+        store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .unwrap();
+        let journal = temp.path(JOURNAL);
+        let bad = b"not json";
+        let mut bytes = fs::read(&journal).unwrap();
+        bytes.extend_from_slice(&(bad.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(bad);
+        fs::write(&journal, &bytes).unwrap();
+        store
+            .append(record("claude", "s2", "Stop", NormEvent::End))
+            .unwrap();
+        let after = fs::read(&journal).unwrap();
+        assert_eq!(&after[..bytes.len()], bytes.as_slice());
+        assert_eq!(store.load().folds.len(), 2);
     }
 
     #[test]
