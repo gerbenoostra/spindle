@@ -53,6 +53,9 @@ const LOCK: &str = "journal.lock";
 const CHECKPOINT: &str = "checkpoint.json";
 const SEEN: &str = "seen.json";
 const MARKS: &str = "marks.json";
+/// Bytes an append cut off the journal's end, set aside as
+/// `journal.cut-<epoch ms>` beside it.
+const CUT_PREFIX: &str = "journal.cut-";
 
 /// The normalized event a native hook event maps to - the event vocabulary
 /// the shared projection uses.
@@ -425,16 +428,22 @@ impl Store {
     /// Returns the assigned commit sequence.
     ///
     /// A previous append that died partway - out of space, or killed
-    /// between its writes - leaves an incomplete frame at the end. It was
-    /// never committed, and appending after it would misframe every later
-    /// record, so it is cut back to the last whole frame first. A complete
-    /// frame that does not parse is a different case and stays.
+    /// between its writes - leaves an incomplete frame at the end, and
+    /// appending after it would misframe every later record. So the
+    /// journal is cut back to the last whole frame first. A corrupt length
+    /// header mid-file reads the same way with committed records behind
+    /// it, so the cut bytes are set aside beside the journal rather than
+    /// deleted, and every read reports them. A complete frame that does
+    /// not parse keeps the framing intact and stays.
     pub fn append(&self, mut record: Record) -> io::Result<u64> {
         fs::create_dir_all(&self.dir)?;
         let _lock = Lock::acquire(&self.dir.join(LOCK))?;
         let journal = self.dir.join(JOURNAL);
         let tail = self.read_journal(&mut Vec::new());
         if let Some(end) = tail.torn_at {
+            let bytes = fs::read(&journal)?; // coverage: off - the journal was just read, so it reads again
+            let aside = self.dir.join(format!("{CUT_PREFIX}{}", now_ms()));
+            write_atomic(&aside, &bytes[end..])?; // coverage: off - a write failure needs a filesystem fault
             let file = fs::OpenOptions::new().write(true).open(&journal)?; // coverage: off - the journal was just read, so it opens
             file.set_len(end as u64)?; // coverage: off - a truncate failure needs a filesystem fault
             file.sync_all()?; // coverage: off - an fsync failure needs a broken filesystem
@@ -535,6 +544,7 @@ impl Store {
                 .or_default()
                 .apply(record);
         }
+        self.report_cuts(&mut errors);
         let seen = self.read_seen(&mut errors);
         let marks = self.read_marks(&mut errors);
         // Acknowledgement stands on both halves reading: the history a
@@ -761,6 +771,29 @@ impl Store {
             compactable,
             torn_at,
         }
+    }
+
+    /// Every journal fragment an append set aside, as an error: the bytes
+    /// are kept for repair by hand, and their records count for nothing
+    /// until then.
+    fn report_cuts(&self, errors: &mut Vec<SourceError>) {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        let mut cuts: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(CUT_PREFIX))
+            })
+            .collect();
+        cuts.sort();
+        errors.extend(cuts.into_iter().map(|path| SourceError {
+            source: "journal".to_owned(),
+            detail: format!("{}: unframed bytes set aside by an append", path.display()),
+        }));
     }
 
     /// The seen-state map: conversation key -> its acknowledgement.
@@ -1080,9 +1113,67 @@ mod tests {
             assert_eq!(seqs, [2, 3]);
             let loaded = store.load();
             assert_eq!(loaded.folds.len(), 3, "{:?}", loaded.folds);
-            assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+            // The journal reads clean; only the set-aside fragment is
+            // reported.
+            assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
+            assert!(loaded.errors[0].detail.contains(CUT_PREFIX));
             assert_eq!(loaded.max_seq, 3);
         }
+    }
+
+    #[test]
+    fn a_cut_journal_tail_is_set_aside_not_deleted() {
+        // What the reader cannot frame need not be a fresh tear: a
+        // corrupt length header mid-file, here followed by a committed
+        // record, reads the same. The append sets the cut bytes aside,
+        // byte for byte, and every later read reports where they went.
+        let temp = TempStore::new();
+        let store = temp.store();
+        store
+            .append(record("claude", "s1", "Stop", NormEvent::End))
+            .unwrap();
+        let journal = temp.path(JOURNAL);
+        let clean = fs::read(&journal).unwrap();
+        let other = TempStore::new();
+        other
+            .store()
+            .append(record("claude", "s9", "Stop", NormEvent::End))
+            .unwrap();
+        let behind = fs::read(other.path(JOURNAL)).unwrap();
+        let cut = [&100u32.to_le_bytes()[..], b"{\"v\"", &behind].concat();
+        let corrupt = [clean.as_slice(), &cut].concat();
+        fs::write(&journal, &corrupt).unwrap();
+        store
+            .append(record("claude", "s2", "Stop", NormEvent::End))
+            .unwrap();
+        let aside: Vec<PathBuf> = fs::read_dir(&temp.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(CUT_PREFIX))
+            })
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        // Where the reader lost the framing is its call; whatever it cut
+        // is set aside, so the kept journal plus the fragment is every
+        // byte that was there.
+        let fragment = fs::read(&aside[0]).unwrap();
+        let kept = corrupt.len() - fragment.len();
+        assert!(kept >= clean.len() && corrupt.ends_with(&fragment));
+        assert_eq!(&fs::read(&journal).unwrap()[..kept], &corrupt[..kept]);
+        let loaded = store.load();
+        assert_eq!(loaded.folds.len(), 2, "{:?}", loaded.folds);
+        assert!(
+            loaded
+                .errors
+                .iter()
+                .any(|e| e.source == "journal" && e.detail.contains(CUT_PREFIX)),
+            "{:?}",
+            loaded.errors
+        );
     }
 
     #[test]
