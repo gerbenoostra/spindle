@@ -10,7 +10,7 @@
 //! `schema_version`; additive fields preserve the version, while removing,
 //! renaming or changing a field's meaning requires a version increment.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,7 +21,7 @@ use crate::claude::{Claude, Conversation};
 use crate::evidence::Evidence;
 use crate::fanout;
 use crate::git::{self, Head, RemoteHead, RemoteListing, Resolved};
-use crate::process::{Liveness, ProcessStart};
+use crate::process::{Liveness, ProcessInstance, ProcessStart};
 use crate::provider::{SourceError, StateEvidence};
 use crate::runtime::{PaneSource, Placement, Provider, Runtime};
 use crate::store::{self, Exec, Store};
@@ -490,6 +490,16 @@ impl Collector {
             .map(|i| attachment_of[i].is_some_and(|slot| resolved[slot].liveness.may_be_live()))
             .collect();
 
+        // Timestamp-less dates belong to the conversation's current live
+        // instance: once a claim resolves dead - or stops claiming - the
+        // entry is dropped so an observed dead interval cannot carry its
+        // episode into a resume under another process.
+        let live_keys: HashSet<String> = (0..inventory.conversations.len())
+            .filter(|&i| running[i])
+            .map(|i| store::conversation_key("claude", &inventory.conversations[i].session_id))
+            .collect();
+        retain_live_undated(&mut self.undated, &live_keys);
+
         // Focus: a poll that observes a bound pane active, its window
         // current and its session attached proves the user saw the agent -
         // unless the pane is the dashboard's own, which cannot.
@@ -523,20 +533,23 @@ impl Collector {
             let key = store::conversation_key("claude", &conv.session_id);
             // The published claim applies only while it is bound to a live
             // attachment; a dead `(pid, pid_start)` leaves it as history.
-            let live = resolved_claim.and_then(|r| {
-                let pid_start = match r.attachment.process.pid_start {
-                    ProcessStart::At(at) => Some(at),
-                    ProcessStart::Unavailable => None,
-                };
-                r.liveness
-                    .may_be_live()
-                    .then_some((r.attachment.process.pid, pid_start))
+            let instance = resolved_claim
+                .filter(|r| r.liveness.may_be_live())
+                .map(|r| observed_instance(r, runtime.processes.as_ref()));
+            let live = instance.map(|i| {
+                (
+                    i.pid,
+                    match i.pid_start {
+                        ProcessStart::At(at) => Some(at),
+                        ProcessStart::Unavailable => None,
+                    },
+                )
             });
-            let published = live.and(conv.live.as_ref()).map(|l| {
+            let published = conv.live.as_ref().and_then(|l| {
                 // A record with no time of its own is dated when first read
                 // and keeps that date while later polls read it unchanged.
-                let first = first_read(&mut self.undated, &key, l, now_ms);
-                attention::Published {
+                let first = first_read(&mut self.undated, &key, l, instance?, now_ms);
+                Some(attention::Published {
                     status: l.status,
                     waiting_for: l.waiting_for.clone(),
                     observed_ms: l.updated_at.map_or(first, store::epoch_ms),
@@ -545,7 +558,7 @@ impl Collector {
                             .or(l.updated_at)
                             .map_or(first, store::epoch_ms),
                     ),
-                }
+                })
             });
             let idle = self.idles.entry(key.clone()).or_default();
             let derive = |seen: store::Seen, idle: &mut attention::WeakIdle| {
@@ -1356,18 +1369,43 @@ struct Undated {
     first_ms: u64,
 }
 
-/// When `live` was first read in its current process instance and content,
+/// The attachment's process instance, dated. The provider's own `pid_start`
+/// wins when it carries one; otherwise the already-collected OS process row
+/// dates the same pid without another system call. When neither can date
+/// it, the pid-only limitation stands.
+fn observed_instance(
+    resolved: &crate::runtime::ResolvedAttachment,
+    processes: Option<&crate::process::ProcessTable>,
+) -> ProcessInstance {
+    let mut instance = resolved.attachment.process;
+    if instance.pid_start == ProcessStart::Unavailable
+        && let Some(row) = processes.and_then(|table| table.get(instance.pid))
+    {
+        instance.pid_start = row.start;
+    }
+    instance
+}
+
+/// Forget timestamp-less dates whose conversation is not live this pass: a
+/// dead interval observed between polls cannot carry the episode into a
+/// resume.
+fn retain_live_undated(undated: &mut HashMap<String, Undated>, live_keys: &HashSet<String>) {
+    undated.retain(|key, _| live_keys.contains(key));
+}
+
+/// When `live` was first read under `instance` with its current content,
 /// epoch ms: `now_ms` for a new or changed record, the remembered time for
 /// the same one.
 fn first_read(
     seen: &mut HashMap<String, Undated>,
     key: &str,
     live: &crate::claude::Live,
+    instance: ProcessInstance,
     now_ms: u64,
 ) -> u64 {
     let same = seen.get(key).is_some_and(|u| {
-        u.pid == live.pid
-            && u.pid_start == live.pid_start
+        u.pid == instance.pid
+            && u.pid_start == instance.pid_start
             && u.status == live.status_raw
             && u.waiting_for == live.waiting_for
     });
@@ -1375,8 +1413,8 @@ fn first_read(
         seen.insert(
             key.to_owned(),
             Undated {
-                pid: live.pid,
-                pid_start: live.pid_start,
+                pid: instance.pid,
+                pid_start: instance.pid_start,
                 status: live.status_raw.clone(),
                 waiting_for: live.waiting_for.clone(),
                 first_ms: now_ms,
@@ -1531,7 +1569,7 @@ pub fn to_json(snapshot: &Snapshot) -> serde_json::Result<String> {
 mod tests {
     use super::*;
     use crate::claude::{Live, Transcript}; // coverage: off - the unexecuted instantiation's region edge
-    use crate::process::ProcessInstance;
+    use crate::process::{ProcessInstance, ProcessRow, ProcessTable};
     use crate::provider::PublishedStatus;
     use crate::runtime::{EvidenceSource, LiveAttachment, ResolvedAttachment}; // coverage: off - the unexecuted instantiation's region edge
     use crate::tmux::PaneId;
@@ -2130,24 +2168,172 @@ mod tests {
     fn an_undated_record_keeps_its_first_read_time_until_content_or_process_changes() {
         let mut seen = HashMap::new();
         let mut live = live();
-        assert_eq!(first_read(&mut seen, "k", &live, 1_000), 1_000);
+        let mut instance = ProcessInstance {
+            pid: live.pid,
+            pid_start: live.pid_start,
+        };
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 1_000), 1_000);
         // The same content read again keeps its date.
-        assert_eq!(first_read(&mut seen, "k", &live, 2_000), 1_000);
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 2_000), 1_000);
         // A new reading - another status or wait reason - is dated afresh.
         live.status_raw = Some("waiting".to_owned());
-        assert_eq!(first_read(&mut seen, "k", &live, 3_000), 3_000);
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 3_000), 3_000);
         live.waiting_for = Some("permission prompt".to_owned());
-        assert_eq!(first_read(&mut seen, "k", &live, 4_000), 4_000);
-        assert_eq!(first_read(&mut seen, "k", &live, 5_000), 4_000);
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 4_000), 4_000);
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 5_000), 4_000);
         // A resumed conversation under another process is a new reading even
         // when its timestamp-less state has identical content. Otherwise an old
         // wait acknowledgement or not-busy mark could apply to the new process.
-        live.pid += 1;
-        assert_eq!(first_read(&mut seen, "k", &live, 6_000), 6_000);
-        live.pid_start = ProcessStart::At(7_000);
-        assert_eq!(first_read(&mut seen, "k", &live, 7_000), 7_000);
+        instance.pid += 1;
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 6_000), 6_000);
+        instance.pid_start = ProcessStart::At(7_000);
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 7_000), 7_000);
         // Conversations are dated independently.
-        assert_eq!(first_read(&mut seen, "other", &live, 8_000), 8_000);
+        assert_eq!(
+            first_read(&mut seen, "other", &live, instance, 8_000),
+            8_000
+        );
+    }
+
+    #[test]
+    fn observed_process_identity_uses_the_provider_then_the_os_fallback() {
+        let row = |start| ProcessRow {
+            pid: 42,
+            ppid: 1,
+            start,
+            exe: Some("claude".to_owned()),
+            tty: None,
+            state: 'S',
+        };
+        // The provider's own start date wins over the OS snapshot's row.
+        let resolved = attachment(Liveness::Instance, Placement::Superseded, false);
+        let table = ProcessTable::from_rows(vec![row(ProcessStart::At(999))]);
+        assert_eq!(
+            observed_instance(&resolved, Some(&table)),
+            ProcessInstance {
+                pid: 42,
+                pid_start: ProcessStart::At(1_800_000_000),
+            }
+        );
+        // Provider silent: the already-collected process row dates the
+        // instance without another system call.
+        let mut resolved = attachment(
+            Liveness::PidOnly("no start".to_owned()),
+            Placement::Superseded,
+            false,
+        );
+        resolved.attachment.process.pid_start = ProcessStart::Unavailable;
+        assert_eq!(
+            observed_instance(&resolved, Some(&table)).pid_start,
+            ProcessStart::At(999)
+        );
+        // Both silent - no row, or a row without a date - and the pid-only
+        // limitation stands.
+        let undated = ProcessTable::from_rows(vec![row(ProcessStart::Unavailable)]);
+        assert_eq!(
+            observed_instance(&resolved, Some(&undated)).pid_start,
+            ProcessStart::Unavailable
+        );
+        assert_eq!(
+            observed_instance(&resolved, None).pid_start,
+            ProcessStart::Unavailable
+        );
+    }
+
+    #[test]
+    fn undated_state_is_retained_only_for_live_conversations() {
+        let undated = |first_ms| Undated {
+            pid: 1,
+            pid_start: ProcessStart::Unavailable,
+            status: Some("busy".to_owned()),
+            waiting_for: None,
+            first_ms,
+        };
+        let mut seen = HashMap::new();
+        seen.insert("claude\0live".to_owned(), undated(5_000));
+        seen.insert("claude\0dead".to_owned(), undated(6_000));
+        // A conversation whose process was observed dead loses its
+        // timestamp-less date; a live one keeps it.
+        let live_keys: HashSet<String> = ["claude\0live".to_owned()].into_iter().collect();
+        retain_live_undated(&mut seen, &live_keys);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen["claude\0live"].first_ms, 5_000);
+    }
+
+    #[test]
+    fn a_replacement_process_reopens_an_undated_wait_and_busy_mark() {
+        // A resumed process publishing the same timestamp-less record must
+        // not inherit the previous process's first-read date: that date is
+        // what authored seen-state and marks are judged against.
+        let mut undated = HashMap::new();
+        let mut live = live();
+        live.status = Some(PublishedStatus::Waiting);
+        live.status_raw = Some("waiting".to_owned());
+        live.waiting_for = Some("permission prompt".to_owned());
+        let old_instance = ProcessInstance {
+            pid: 7,
+            pid_start: ProcessStart::At(1_000),
+        };
+        let new_instance = ProcessInstance {
+            pid: 9,
+            pid_start: ProcessStart::At(2_000),
+        };
+        // The old process's wait was read and acknowledged; the same
+        // record reopens under the replacement.
+        let old_first = first_read(&mut undated, "k", &live, old_instance, 10_000);
+        let new_first = first_read(&mut undated, "k", &live, new_instance, 20_000);
+        let mut idle = attention::WeakIdle::default();
+        let derived = attention::derive(attention::Inputs {
+            fold: None,
+            seen: store::Seen {
+                seq: 0,
+                wait_ms: Some(old_first),
+            },
+            mark: None,
+            published: Some(attention::Published {
+                status: live.status,
+                waiting_for: live.waiting_for.clone(),
+                observed_ms: new_first,
+                since_ms: Some(new_first),
+            }),
+            live: Some((new_instance.pid, Some(2_000))),
+            now_ms: 20_000,
+            ack_ok: true,
+            idle: &mut idle,
+        });
+        assert_eq!(derived.attention, Attention::Waiting);
+        assert_eq!(derived.wait_ms, Some(new_first));
+        // The same resume under a `busy` record: the mark written against
+        // the old process's date cannot suppress the replacement's Busy.
+        live.status = Some(PublishedStatus::Busy);
+        live.status_raw = Some("busy".to_owned());
+        live.waiting_for = None;
+        let old_first = first_read(&mut undated, "b", &live, old_instance, 10_000);
+        let mark = store::Mark {
+            since_ms: old_first,
+            seq: 0,
+            at_ms: old_first + 1,
+        };
+        let new_first = first_read(&mut undated, "b", &live, new_instance, 30_000);
+        let mut idle = attention::WeakIdle::default();
+        let derived = attention::derive(attention::Inputs {
+            fold: None,
+            seen: store::Seen::default(),
+            mark: Some(&mark),
+            published: Some(attention::Published {
+                status: live.status,
+                waiting_for: live.waiting_for.clone(),
+                observed_ms: new_first,
+                since_ms: Some(new_first),
+            }),
+            live: Some((new_instance.pid, Some(2_000))),
+            now_ms: 30_000,
+            ack_ok: true,
+            idle: &mut idle,
+        });
+        assert_eq!(derived.exec, Exec::Busy);
+        assert_eq!(derived.attention, Attention::Working);
+        assert!(!derived.marked);
     }
 
     #[test]
