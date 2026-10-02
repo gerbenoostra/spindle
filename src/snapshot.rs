@@ -1067,14 +1067,7 @@ impl Collector {
             row.roll_up(&work);
             repos.push(row);
         }
-        // Repos order by latest meaningful activity, unknown last, then a
-        // stable name/id.
-        repos.sort_by(|a, b| {
-            b.last_activity
-                .cmp(&a.last_activity)
-                .then_with(|| a.name.cmp(&b.name))
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        sort_repos(&mut repos);
         let mut conversations = self.model.conversations.clone();
         sort_conversations(&mut conversations, runtime.observed_at);
         publish(Snapshot {
@@ -1786,6 +1779,17 @@ fn work_facts(row: &WorkRow) -> Vec<String> {
         }
     }
     parts
+}
+
+/// Repos order by latest meaningful activity, unknown last, then a
+/// stable name/id.
+fn sort_repos(repos: &mut [RepoRow]) {
+    repos.sort_by(|a, b| {
+        b.last_activity
+            .cmp(&a.last_activity)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 /// The section's sort slot, in the enum's declared order.
@@ -2680,6 +2684,31 @@ mod tests {
         classify_work(&mut row, &[], Duration::from_secs(10), now);
         assert_eq!(row.section, WorkSection::FollowUp, "{row:?}");
         assert!(row.summary.starts_with("open"), "{}", row.summary);
+    }
+
+    #[test]
+    fn repos_order_activity_then_name_then_id() {
+        let row = |name: &str, id: &str, last: Option<u64>| RepoRow {
+            name: name.to_owned(),
+            id: id.to_owned(),
+            path: PathBuf::from("/s"),
+            git: true,
+            work: 0,
+            live: 0,
+            attention: Attention::None,
+            open: 0,
+            clean: 0,
+            last_activity: last,
+        };
+        let mut repos = vec![
+            row("b", "/z", Some(2)),
+            row("a", "/b", Some(1)),
+            row("a", "/a", Some(1)),
+            row("a", "/c", None),
+        ];
+        sort_repos(&mut repos);
+        let ids: Vec<&str> = repos.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["/z", "/a", "/b", "/c"], "{repos:?}");
     }
 
     #[test]
