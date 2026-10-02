@@ -18,8 +18,10 @@ use serde::Serialize;
 
 use crate::attention::{self, Attention};
 use crate::claude::{Claude, Conversation};
+use crate::config;
 use crate::evidence::Evidence;
 use crate::fanout;
+use crate::forge::{self, ForgeStatus, Pipeline, WorkItem};
 use crate::git::{self, Head, RemoteHead, RemoteListing, Resolved};
 use crate::process::{Liveness, ProcessInstance, ProcessStart};
 use crate::provider::{SourceError, StateEvidence};
@@ -29,6 +31,7 @@ use crate::tmux::PaneRef;
 use crate::vector::{
     self, Anchor, Landed as LandedVerdict, RemoteCache, RuntimeFacts, UpstreamState, WindowCount,
 };
+use crate::verdict::{self, Verdict};
 
 /// The JSON contract version. Additive changes keep it; a field's removal,
 /// rename or change of meaning bumps it.
@@ -96,8 +99,28 @@ pub struct RepoRow {
     /// Work rows and live conversations in scope of this entry.
     pub work: usize,
     pub live: usize,
+    /// The work rows' rolled-up attention: the glyph [1] renders.
+    pub attention: Attention,
+    /// Rows asking for work - NeedsYou, Active, FollowUp, Forgotten.
+    pub open: usize,
+    /// Rows provably done - ReadyToClean and CleanupReview.
+    pub clean: usize,
     /// Latest meaningful activity across its work rows; `None` renders `?`.
     pub last_activity: Option<u64>,
+}
+
+impl RepoRow {
+    /// Recompute the rollup from the repo's rows in `work` - attention,
+    /// the `N open · M clean` counts and the latest activity. The emit
+    /// path and a `p` reclassification share it, so both read the same way.
+    pub fn roll_up(&mut self, work: &[WorkRow]) {
+        let rows: Vec<&WorkRow> = work.iter().filter(|w| w.repo == self.id).collect();
+        self.work = rows.len();
+        self.attention = attention::rollup(rows.iter().map(|w| &w.attention));
+        self.open = rows.iter().filter(|w| w.section.open()).count();
+        self.clean = rows.len() - self.open;
+        self.last_activity = rows.iter().filter_map(|w| w.last_activity).max();
+    }
 }
 
 /// `WorkRow.kind`: which anchor shape the row is.
@@ -193,6 +216,16 @@ pub enum WorkSection {
     /// A live busy process with no higher attention and no authored
     /// not-busy mark.
     Active,
+    /// Resumable idle work, pending or failed delivery, dirty or unpushed
+    /// work, a blocked cleanup verdict - or simply open work.
+    FollowUp,
+    /// Unfinished work with no live process and no meaningful activity in
+    /// `forgotten_after`; `parked` suppresses only this placement.
+    Forgotten,
+    /// Every applicable cleanup action proved safe.
+    ReadyToClean,
+    /// An applicable action needs an explicit human review.
+    CleanupReview,
 }
 
 impl WorkSection {
@@ -201,7 +234,17 @@ impl WorkSection {
         match self {
             WorkSection::NeedsYou => "Needs you",
             WorkSection::Active => "Active",
+            WorkSection::FollowUp => "Follow up",
+            WorkSection::Forgotten => "Forgotten",
+            WorkSection::ReadyToClean => "Ready to clean",
+            WorkSection::CleanupReview => "Cleanup review",
         }
+    }
+
+    /// Whether the section counts as `open` in a repo rollup's
+    /// `N open · M clean` - the cleanup sections count as `clean`.
+    pub fn open(self) -> bool {
+        !matches!(self, WorkSection::ReadyToClean | WorkSection::CleanupReview)
     }
 }
 
@@ -218,8 +261,7 @@ impl ConversationState {
 }
 
 /// One Work row: a checkout on a branch, a detached checkout, a local branch
-/// without one, or a non-git project space. Incarnation identity and
-/// lifecycle sections are not modelled yet - rows are the on-disk anchors.
+/// without one, or a non-git project space.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkRow {
     /// The owning repo's (or project space's) identity.
@@ -251,15 +293,36 @@ pub struct WorkRow {
     pub live_sessions: usize,
     /// Conversations ever recorded against the row's path.
     pub past_sessions: usize,
-    /// Newest of the HEAD reflog's last entry and its mtime; `None` is `?`.
+    /// Newest of the HEAD reflog's last entry and its mtime, folded with
+    /// the authored record's transition time and bound conversations'
+    /// activity; `None` is `?`.
     pub last_activity: Option<u64>,
     /// The rolled-up attention of the conversations bound to the row.
     pub attention: Attention,
-    /// The first-match section the row sits in; `None` is the flat
-    /// remainder until the lifecycle sections arrive.
-    pub section: Option<WorkSection>,
-    /// Why the row reads the way it does (`↑3 ~2`, `no remote`, `no wt`,
-    /// `error · working`).
+    /// The row's work identity: the active branch incarnation's id for
+    /// branch rows, the canonical path for a detached worktree or a
+    /// project space. `None` for a branch that has no record yet.
+    pub identity: Option<String>,
+    /// The authored parked flag from `work.json`; suppresses only the
+    /// `Forgotten` placement and reads back in the summary as `· parked`.
+    pub parked: bool,
+    /// The forge's work-item state for the branch.
+    pub forge: WorkItem,
+    /// Pipeline state of an open work item.
+    pub pipeline: Pipeline,
+    /// `PR #191`/`MR !7`-style label when the forge named one.
+    pub forge_label: Option<String>,
+    /// The work item's URL when known.
+    pub forge_url: Option<String>,
+    /// `git worktree remove` verdict and reasons; `None` for project
+    /// spaces, which carry no cleanup verdicts at all.
+    pub worktree_removal: Option<verdict::ActionVerdict>,
+    /// `git branch -d/-D` verdict and reasons.
+    pub branch_deletion: Option<verdict::ActionVerdict>,
+    /// The first-match section the row sits in.
+    pub section: WorkSection,
+    /// The section reason followed by the compact evidence tail (`↑3`,
+    /// `~dirty`, `no remote`, `no wt`, `merged`, a PR/MR label).
     pub summary: String,
 }
 
@@ -364,6 +427,15 @@ impl ConversationRow {
 pub struct Collector {
     claude: Claude,
     remotes: RemoteCache,
+    /// The forge CLI handle and its five-minute answer cache; stage 4
+    /// serves every branch ask through them.
+    forge: forge::Forge,
+    forge_cache: forge::ForgeCache,
+    /// The configured `forgotten_after`: how old a quiet unfinished row
+    /// must be before it sinks into `Forgotten`.
+    forgotten_after: Duration,
+    /// Config-load warnings, retained in `errors` like any read failure.
+    warnings: Vec<SourceError>,
     /// The event journal and authored records; `None` where no state dir
     /// could be placed (no `$HOME`, no `$XDG_STATE_HOME`).
     store: Option<Store>,
@@ -389,6 +461,9 @@ pub struct Collector {
 struct Model {
     conversations: Vec<ConversationRow>,
     repos: BTreeMap<String, RepoModel>,
+    /// The authored Work state - incarnation ids, parked flags, lifecycle
+    /// fingerprints - loaded at stage 1 and refreshed by the pass's sync.
+    work: store::Work,
     errors: Vec<SourceError>,
     skipped: Vec<String>,
     stale_sockets: usize,
@@ -408,7 +483,7 @@ enum RepoData {
     /// The anchors with their local facts and merged vector state.
     Git(vector::RepoLocal),
     /// The one row a non-git space carries.
-    Space(WorkRow),
+    Space(Box<WorkRow>),
 }
 
 impl Collector {
@@ -417,9 +492,12 @@ impl Collector {
     pub fn new(claude_root: PathBuf) -> Collector {
         let claude = Claude::new(claude_root);
         let remotes = RemoteCache::default();
+        let forge = forge::Forge::from_env();
+        let forge_cache = forge::ForgeCache::new(vector::REMOTE_DEADLINE); // coverage: off - the unexecuted instantiation's region edge
+        let forgotten_after = config::DEFAULT_FORGOTTEN_AFTER;
         let model = Model::default(); // coverage: off - the unexecuted instantiation's region edge
         let workers = fanout::WORKERS; // coverage: off - same
-        Collector { claude, remotes, store: None, idles: HashMap::new(), undated: HashMap::new(), model, workers }
+        Collector { claude, remotes, forge, forge_cache, forgotten_after, warnings: Vec::new(), store: None, idles: HashMap::new(), undated: HashMap::new(), model, workers }
     }
 
     /// Read (and acknowledge through) the store at `dir` - the journal of
@@ -427,6 +505,29 @@ impl Collector {
     /// published evidence only.
     pub fn with_store(mut self, dir: PathBuf) -> Collector {
         self.store = Some(Store::open(dir));
+        self
+    }
+
+    /// The resolved configuration's collector-relevant fields: today the
+    /// `forgotten_after` threshold; load warnings are retained in the
+    /// snapshot's `errors` like every other read failure.
+    pub fn with_config(mut self, loaded: config::Loaded) -> Collector {
+        self.forgotten_after = loaded.config.forgotten_after;
+        self.warnings = loaded
+            .warnings
+            .into_iter()
+            .map(|detail| SourceError {
+                source: "config".to_owned(),
+                detail,
+            })
+            .collect();
+        self
+    }
+
+    /// The forge handle the collector asks - `Forge::with_path` in tests
+    /// routes stage 4's lookups at a stub `gh`/`glab` directory.
+    pub fn with_forge(mut self, forge: forge::Forge) -> Collector {
+        self.forge = forge;
         self
     }
 
@@ -460,6 +561,8 @@ impl Collector {
         self.model.errors = inventory.errors;
         let mut loaded = self.store.as_ref().map(Store::load).unwrap_or_default();
         self.model.errors.append(&mut loaded.errors);
+        self.model.errors.extend(self.warnings.iter().cloned());
+        self.model.work = std::mem::take(&mut loaded.work);
         self.model.skipped = inventory
             .skipped
             .iter()
@@ -638,7 +741,7 @@ impl Collector {
                         repo: None,
                         name: display_name(path),
                         path: path.clone(),
-                        data: RepoData::Space(space_row(&id, path)),
+                        data: RepoData::Space(Box::new(space_row(&id, path))),
                     });
             }
         }
@@ -754,11 +857,147 @@ impl Collector {
             }
         }
 
-        // Stage 4 - forge enrichment. No producer ships yet (the work-item
-        // overlay arrives with the cleanup tasks); `gh`/`glab` collectors
-        // plug into the pipeline here rather than being retrofitted.
+        // Stage 4 - forge enrichment: one status lookup per branch whose
+        // remote parses as a forge remote, through the five-minute cache,
+        // fanned out like the remote evidence before it.
+        self.collect_forge();
+        // Authored work state syncs once the pass's evidence is final:
+        // incarnation records, parked flags and the lifecycle fingerprints
+        // transitions date from. Best-effort - a refused write reports and
+        // the rows keep their last-known authored values.
+        if let Some(store) = self.store.clone() {
+            self.sync_work(&store, now_ms);
+        }
         self.model.complete = true;
         self.emit(runtime, own_pane, publish);
+    }
+
+    /// The forge fan-out: enumerate every branch anchor's `(remote_url,
+    /// branch)` ask, skip what the cache still holds, fetch the rest in
+    /// parallel, then apply a cached status to every anchor that asked.
+    /// Anchors without a forge remote get their `Unknown` reason here.
+    fn collect_forge(&mut self) {
+        let now = std::time::Instant::now();
+        let mut asks: Vec<(String, String)> = Vec::new();
+        let mut settled: Vec<(String, usize, ForgeStatus)> = Vec::new();
+        for (repo_id, model) in &self.model.repos {
+            let RepoData::Git(local) = &model.data else {
+                continue;
+            };
+            for (i, work) in local.anchors.iter().enumerate() {
+                let Some(branch) = work.state.anchor.branch().map(str::to_owned) else {
+                    settled.push((repo_id.clone(), i, unknown_forge("no branch")));
+                    continue;
+                };
+                match &work.state.remote_url {
+                    Some(url) if forge::parse_remote(url).is_some() => {
+                        if !self.forge_cache.fresh(url, &branch, now) {
+                            asks.push((url.clone(), branch));
+                        }
+                    }
+                    Some(_) => {
+                        settled.push((repo_id.clone(), i, unknown_forge("not a forge remote")))
+                    }
+                    None => settled.push((repo_id.clone(), i, unknown_forge("no upstream remote"))),
+                }
+            }
+        }
+        asks.sort();
+        asks.dedup();
+        let mut answers: Vec<Option<ForgeStatus>> = vec![None; asks.len()];
+        fanout::fan_out(
+            &asks,
+            self.workers,
+            |(url, branch)| self.forge.status(url, branch),
+            |i, status| answers[i] = Some(status), // coverage: off - the closure edge of the unexecuted instantiation
+        );
+        for ((url, branch), status) in asks.iter().zip(answers) {
+            let Some(status) = status else {
+                continue; // coverage: off - fan_out delivers every index
+            };
+            self.forge_cache.seed(url, branch, status, now);
+        }
+        for (repo_id, i, status) in settled {
+            let Some(RepoModel {
+                data: RepoData::Git(local),
+                ..
+            }) = self.model.repos.get_mut(&repo_id)
+            else {
+                continue; // coverage: off - the model cannot change underneath one pass
+            };
+            if let Some(work) = local.anchors.get_mut(i) {
+                work.state.forge = status;
+            } // coverage: off - the get-miss edge is unreachable: `i` indexes this same vec
+        }
+        for model in self.model.repos.values_mut() {
+            let RepoData::Git(local) = &mut model.data else {
+                continue;
+            };
+            for work in &mut local.anchors {
+                let (Some(url), Some(branch)) =
+                    (&work.state.remote_url, work.state.anchor.branch())
+                else {
+                    continue;
+                };
+                if let Some(status) = self.forge_cache.peek(url, branch) {
+                    work.state.forge = status.clone();
+                }
+            }
+        }
+    }
+
+    /// Sync `work.json` with what the pass observed: one ref sync per Git
+    /// repo (which closes records for vanished refs and opens new
+    /// incarnations), one path sync per detached anchor and project space.
+    /// Then `model.work` re-reads so the published snapshot's identities
+    /// and parked flags are this pass's, not the stage-1 load's.
+    fn sync_work(&mut self, store: &Store, observed_ms: u64) {
+        for (repo_id, model) in &self.model.repos {
+            match &model.data {
+                RepoData::Git(local) => {
+                    let mut seen = HashSet::new();
+                    let refs: Vec<store::ObservedRef> = local
+                        .anchors
+                        .iter()
+                        .filter_map(|w| {
+                            let name = w.state.anchor.branch()?;
+                            seen.insert(name.to_owned()).then(|| store::ObservedRef {
+                                name: name.to_owned(),
+                                inputs: lifecycle_inputs(&w.state),
+                            })
+                        })
+                        .collect();
+                    if let Err(e) = store.sync_repo(repo_id, &refs, observed_ms) {
+                        self.model.errors.push(work_state_error(repo_id, e));
+                    }
+                    for w in &local.anchors {
+                        if let Anchor::Worktree {
+                            path,
+                            head: Head::Detached(_),
+                            ..
+                        } = &w.state.anchor
+                            && let Err(e) = store.sync_path(
+                                &path.display().to_string(),
+                                &lifecycle_inputs(&w.state),
+                                observed_ms,
+                            )
+                        {
+                            self.model.errors.push(work_state_error(repo_id, e));
+                        }
+                    }
+                }
+                RepoData::Space(row) => {
+                    if let Err(e) =
+                        store.sync_path(&row.repo, &store::LifecycleInputs::default(), observed_ms)
+                    {
+                        self.model.errors.push(work_state_error(repo_id, e));
+                    }
+                }
+            }
+        }
+        let (work, mut errors) = store.work();
+        self.model.work = work;
+        self.model.errors.append(&mut errors);
     }
 
     /// One pass run to completion: the staged collect's final snapshot,
@@ -782,48 +1021,59 @@ impl Collector {
         own_pane: Option<&PaneRef>,
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) -> bool {
+        let now = epoch(runtime.observed_at);
         let mut work = Vec::new();
-        let mut repos = Vec::new();
         for (id, model) in &self.model.repos {
-            let mut last_activity = None;
             match &model.data {
                 RepoData::Git(local) => {
                     for anchor in &local.anchors {
-                        let row = work_row(id, &model.name, &anchor.state);
-                        last_activity = last_activity.max(row.last_activity);
-                        work.push(row);
+                        work.push(work_row(id, &model.name, &anchor.state, &self.model.work));
                     }
                 }
-                RepoData::Space(row) => work.push(row.clone()),
+                RepoData::Space(row) => {
+                    let mut row = (**row).clone();
+                    apply_path_record(&mut row, &self.model.work);
+                    work.push(row);
+                }
             }
-            let work_count = work.iter().filter(|w| w.repo == *id).count();
+        }
+        // Attention, section and summary are derived per publish from the
+        // conversations bound to the row; sections order first, newest
+        // activity inside a section, a stable identity last.
+        for w in &mut work {
+            classify_work(w, &self.model.conversations, self.forgotten_after, now);
+        }
+        sort_work(&mut work);
+        let mut repos = Vec::new();
+        for (id, model) in &self.model.repos {
             let live = self
                 .model
                 .conversations
                 .iter()
                 .filter(|c| c.running() && c.repo.as_deref() == Some(id.as_str()))
                 .count();
-            repos.push(RepoRow {
+            let mut row = RepoRow {
                 id: id.clone(),
                 name: model.name.clone(),
                 path: model.path.clone(),
                 git: model.repo.is_some(),
-                work: work_count,
+                work: 0,
                 live,
-                last_activity,
-            });
+                attention: Attention::None,
+                open: 0,
+                clean: 0,
+                last_activity: None,
+            };
+            row.roll_up(&work);
+            repos.push(row);
         }
-        // Attention and the first-match section are derived per publish
-        // from the conversations bound to the row; sections order first,
-        // newest activity inside a section.
-        for w in &mut work {
-            classify_work(w, &self.model.conversations);
-        }
-        work.sort_by(|a, b| {
-            section_order(a)
-                .cmp(&section_order(b))
-                .then_with(|| b.last_activity.cmp(&a.last_activity))
+        // Repos order by latest meaningful activity, unknown last, then a
+        // stable name/id.
+        repos.sort_by(|a, b| {
+            b.last_activity
+                .cmp(&a.last_activity)
                 .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.id.cmp(&b.id))
         });
         let mut conversations = self.model.conversations.clone();
         sort_conversations(&mut conversations, runtime.observed_at);
@@ -1073,8 +1323,15 @@ fn runtime_facts(
 
 /// The `vector::WorkState` collapsed into the row's display contract.
 /// Fields whose stage has not landed read `Unknown` and render `?`, like
-/// any other unknown.
-fn work_row(repo_id: &str, repo_name: &str, state: &vector::WorkState) -> WorkRow {
+/// any other unknown. `authored` carries the persisted record: a branch
+/// row's work identity is its active incarnation's id, a detached row's
+/// its canonical path.
+fn work_row(
+    repo_id: &str,
+    repo_name: &str,
+    state: &vector::WorkState,
+    authored: &store::Work,
+) -> WorkRow {
     let anchor = &state.anchor;
     let v = &state.vector;
     let (kind, name, branch) = match anchor {
@@ -1109,6 +1366,27 @@ fn work_row(repo_id: &str, repo_name: &str, state: &vector::WorkState) -> WorkRo
         UpstreamState::Unknown(reason) => Some(reason.clone()),
         _ => None,
     };
+    // Work identity: an active incarnation's id for a branch row, the
+    // canonical path for a detached one. A branch whose record the sync
+    // has not written yet carries no identity rather than a guess.
+    let (identity, parked, authored_ms) = match &branch {
+        Some(name) => match authored.branch(repo_id, name) {
+            Some(r) => (Some(r.id.clone()), r.parked, r.activity_at),
+            None => (None, false, None),
+        },
+        None => {
+            let path = v.worktree.as_ref().map(|p| p.display().to_string());
+            match path.and_then(|p| authored.path(&p).map(|r| (p, r))) {
+                Some((p, r)) => (Some(p), r.parked, r.activity_at),
+                None => (
+                    v.worktree.as_ref().map(|p| p.display().to_string()),
+                    false,
+                    None,
+                ),
+            }
+        }
+    };
+    let (removal, deletion) = verdict::cleanup(state, &state.forge);
     WorkRow {
         repo: repo_id.to_owned(),
         repo_name: repo_name.to_owned(),
@@ -1131,10 +1409,113 @@ fn work_row(repo_id: &str, repo_name: &str, state: &vector::WorkState) -> WorkRo
         live_pids: v.live_pids,
         live_sessions: v.live_agent_sessions,
         past_sessions: v.past_agent_sessions,
-        last_activity: v.last_git_activity.map(epoch),
+        // Meaningful activity: the Git time the pass observed, folded with
+        // the persisted transition time. Bound conversations' activity
+        // joins in `classify_work`.
+        last_activity: v
+            .last_git_activity
+            .map(epoch)
+            .into_iter()
+            .chain(authored_ms.map(|ms| ms / 1000))
+            .max(),
         attention: Attention::None,
-        section: None,
-        summary: work_summary(v),
+        identity,
+        parked,
+        forge: state.forge.item,
+        pipeline: state.forge.pipeline,
+        forge_label: state.forge.label.clone(),
+        forge_url: state.forge.url.clone(),
+        worktree_removal: Some(removal),
+        branch_deletion: Some(deletion),
+        section: WorkSection::FollowUp,
+        summary: String::new(),
+    }
+}
+
+/// The lifecycle fingerprint one anchor's state produces for the authored
+/// record: every field a `work.json` record compares next pass to date a
+/// transition at its observation.
+fn lifecycle_inputs(state: &vector::WorkState) -> store::LifecycleInputs {
+    let v = &state.vector;
+    store::LifecycleInputs {
+        dirty: v.dirty.known().copied(),
+        worktree: v.worktree.is_some(),
+        worktree_path: v.worktree.as_ref().map(|p| p.display().to_string()),
+        ahead: v.commits_ahead_of_base.known().copied(),
+        unpushed: v.unpushed_commits.known().copied(),
+        upstream: Some(match &v.upstream_state {
+            UpstreamState::NeverPushed => "never_pushed".to_owned(),
+            UpstreamState::Tracked { remote, merge_ref } => {
+                format!("tracked {remote}/{merge_ref}")
+            }
+            UpstreamState::RemoteGone { remote, merge_ref } => {
+                format!("remote_gone {remote}/{merge_ref}")
+            }
+            UpstreamState::Unknown(reason) => format!("unknown {reason}"),
+            UpstreamState::NotApplicable => "not_applicable".to_owned(),
+        }),
+        landed: v.landed.known().map(|l| {
+            match l {
+                LandedVerdict::AncestorMerged => "ancestor",
+                LandedVerdict::ContentMerged => "content",
+                LandedVerdict::No => "no",
+            }
+            .to_owned()
+        }),
+        forge: Some(
+            match state.forge.item {
+                WorkItem::Unknown => "unknown",
+                WorkItem::NotExisting => "not_existing",
+                WorkItem::Open => "open",
+                WorkItem::Closed => "closed",
+            }
+            .to_owned(),
+        ),
+        pipeline: Some(
+            match state.forge.pipeline {
+                Pipeline::Busy => "busy",
+                Pipeline::Succeeded => "succeeded",
+                Pipeline::Failed => "failed",
+                Pipeline::Unknown => "unknown",
+            }
+            .to_owned(),
+        ),
+    }
+}
+
+/// The `Unknown` forge status anchors without a forge remote settle to.
+fn unknown_forge(reason: &str) -> ForgeStatus {
+    ForgeStatus {
+        item: WorkItem::Unknown,
+        pipeline: Pipeline::Unknown,
+        label: None,
+        url: None,
+        reason: Some(reason.to_owned()),
+    }
+}
+
+/// The error a failed `work.json` write records: it lands in the
+/// snapshot's `errors`, never silently.
+fn work_state_error(repo_id: &str, e: std::io::Error) -> SourceError {
+    SourceError {
+        source: "work.json".to_owned(),
+        detail: format!("{repo_id}: {e}"),
+    }
+}
+
+/// Refresh a path-keyed row's authored fields - a project space's row is
+/// stored in the model, so parked and transition dates apply per publish.
+fn apply_path_record(row: &mut WorkRow, authored: &store::Work) {
+    let Some(identity) = &row.identity else {
+        return; // coverage: off - a space row's identity is its path, always present
+    };
+    if let Some(record) = authored.path(identity) {
+        row.parked = record.parked;
+        row.last_activity = row
+            .last_activity
+            .into_iter()
+            .chain(record.activity_at.map(|ms| ms / 1000))
+            .max();
     }
 }
 
@@ -1156,26 +1537,163 @@ pub fn binds(row: &WorkRow, c: &ConversationRow) -> bool {
     }
 }
 
-/// Fold the bound conversations' attention into the row's rollup, section
-/// and summary. First match wins: `Needs you` for waiting/failed-unseen/
-/// completed-unseen, `Active` for a live busy process with nothing higher.
-fn classify_work(row: &mut WorkRow, conversations: &[ConversationRow]) {
+/// Fold the bound conversations' attention into the row's rollup, merge
+/// their activity into the row's, then place the row in its first-match
+/// section and compose its summary. The same call the pass applies is
+/// what a `p` toggle re-runs on the in-memory snapshot, so a parked row
+/// moves without waiting for a refresh.
+pub fn classify_work(
+    row: &mut WorkRow,
+    conversations: &[ConversationRow],
+    forgotten_after: Duration,
+    now: u64,
+) {
     let bound: Vec<&ConversationRow> = conversations.iter().filter(|c| binds(row, c)).collect();
     row.attention = attention::rollup(bound.iter().map(|c| &c.attention));
-    row.section = match row.attention {
-        Attention::Waiting | Attention::Error | Attention::CompletedUnseen => {
-            Some(WorkSection::NeedsYou)
-        }
-        Attention::Working => Some(WorkSection::Active),
-        _ => None,
-    };
-    if row.section.is_none() {
-        return;
+    for c in &bound {
+        row.last_activity = row.last_activity.max(c.last_activity);
     }
-    // The summary states why the row sits in its section: the attention
-    // and its reason first (`waiting: permission prompt`, `error:
-    // StopFailure`, `done`), `working` beside a retained latch while the
-    // agent grinds on, then the Git shape when it has something to say.
+    let (section, reason) = section_reason(row, &bound, forgotten_after, now);
+    row.section = section;
+    row.summary = summarize(row, reason);
+}
+
+/// Order the work rows as [2] renders them: section first, newest
+/// meaningful activity inside it (unknown last), then a stable identity.
+pub fn sort_work(work: &mut [WorkRow]) {
+    work.sort_by(|a, b| {
+        section_order(a)
+            .cmp(&section_order(b))
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+            .then_with(|| a.identity.cmp(&b.identity))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+/// First match in section order: attention, working, the FollowUp
+/// triggers, `Forgotten`, then the cleanup verdicts.
+fn section_reason(
+    row: &WorkRow,
+    bound: &[&ConversationRow],
+    forgotten_after: Duration,
+    now: u64,
+) -> (WorkSection, String) {
+    match row.attention {
+        Attention::Waiting | Attention::Error | Attention::CompletedUnseen => {
+            return (WorkSection::NeedsYou, attention_reason(row, bound));
+        }
+        Attention::Working => return (WorkSection::Active, attention_reason(row, bound)),
+        Attention::Unknown | Attention::None => {}
+    }
+    if let Some(reason) = follow_up(row, bound) {
+        return (WorkSection::FollowUp, reason);
+    }
+    // Forgotten: unfinished, nothing running, quiet strictly beyond the
+    // configured threshold - and parked suppresses only this.
+    let finished = matches!(row.landed, Some(Landed::Ancestor | Landed::Content));
+    let quiet_beyond = row
+        .last_activity
+        .is_some_and(|a| now.saturating_sub(a) > forgotten_after.as_secs());
+    if row.kind != WorkKind::ProjectSpace
+        && !row.parked
+        && !finished
+        && row.live_pids == 0
+        && quiet_beyond
+    {
+        let age = age_at(now, row.last_activity.unwrap_or(now));
+        return (WorkSection::Forgotten, format!("idle {age}"));
+    }
+    if let Some(pair) = cleanup_section(row) {
+        return pair;
+    }
+    match row.kind {
+        // A non-actionable space is never forgotten or cleaned: it either
+        // holds a resumable conversation or it is simply there.
+        WorkKind::ProjectSpace => (WorkSection::FollowUp, "idle project".to_owned()),
+        _ => (WorkSection::FollowUp, "open".to_owned()),
+    }
+}
+
+/// The FollowUp triggers in order: known failed or pending checks, a dirty
+/// tree, unpushed commits, a resumable idle conversation, or a blocked
+/// cleanup verdict. Unknown forge state triggers nothing by itself.
+fn follow_up(row: &WorkRow, bound: &[&ConversationRow]) -> Option<String> {
+    if row.forge == WorkItem::Open {
+        match row.pipeline {
+            Pipeline::Failed => return Some("checks failed".to_owned()),
+            Pipeline::Busy => return Some("checks pending".to_owned()),
+            Pipeline::Succeeded | Pipeline::Unknown => {}
+        }
+    }
+    if row.dirty == Some(true) {
+        return Some("dirty".to_owned());
+    }
+    if let Some(n) = row.unpushed.filter(|n| *n > 0) {
+        return Some(format!("unpushed {n}"));
+    }
+    if bound
+        .iter()
+        .any(|c| !c.running() && !c.resume_argv.is_empty())
+    {
+        return Some("resumable idle".to_owned());
+    }
+    let blocked = [row.worktree_removal.as_ref(), row.branch_deletion.as_ref()]
+        .into_iter()
+        .flatten()
+        .find(|a| a.verdict == Verdict::Blocked);
+    if let Some(blocked) = blocked {
+        // Landed work whose cleanup is blocked names both facts; anything
+        // else names its first concrete blocker.
+        if matches!(row.landed, Some(Landed::Ancestor | Landed::Content)) {
+            return Some("merged · blocked".to_owned());
+        }
+        let first = blocked.reasons.first().map(String::as_str).unwrap_or("?");
+        return Some(format!("blocked: {first}"));
+    }
+    None
+}
+
+/// The cleanup sections: every applicable action provably safe is `Ready
+/// to clean` and names what goes; an applicable `Review` is `Cleanup
+/// review` and names its first reason. Blocked actions never land here -
+/// they are FollowUp.
+fn cleanup_section(row: &WorkRow) -> Option<(WorkSection, String)> {
+    let removal = row.worktree_removal.as_ref();
+    let deletion = row.branch_deletion.as_ref();
+    let applicable: Vec<&verdict::ActionVerdict> = [removal, deletion]
+        .into_iter()
+        .flatten()
+        .filter(|a| a.verdict != Verdict::NotApplicable)
+        .collect();
+    if applicable.is_empty() {
+        return None;
+    }
+    if applicable
+        .iter()
+        .all(|a| matches!(a.verdict, Verdict::Safe | Verdict::SafeAfterWorktreeRemoval))
+    {
+        let what = match (
+            removal.is_some_and(|a| a.verdict != Verdict::NotApplicable),
+            deletion.is_some_and(|a| a.verdict != Verdict::NotApplicable),
+        ) {
+            (true, true) => "wt + branch",
+            (true, false) => "worktree only",
+            (false, true) => "branch only",
+            (false, false) => "?", // coverage: off - `applicable` was proven non-empty above
+        };
+        return Some((WorkSection::ReadyToClean, what.to_owned()));
+    }
+    if let Some(review) = applicable.iter().find(|a| a.verdict == Verdict::Review) {
+        let first = review.reasons.first().map(String::as_str).unwrap_or("?");
+        return Some((WorkSection::CleanupReview, format!("review: {first}")));
+    } // coverage: off - the find-miss edge: `Blocked` verdicts exit at `FollowUp`, so a `Review` is always found
+    None // coverage: off - the same edge
+}
+
+/// The attention sections' reason: `waiting: permission prompt`,
+/// `error: StopFailure`, `done` - with `working` beside a retained latch
+/// while the agent grinds on.
+fn attention_reason(row: &WorkRow, bound: &[&ConversationRow]) -> String {
     let mut parts = Vec::new();
     let detail = bound
         .iter()
@@ -1185,56 +1703,118 @@ fn classify_work(row: &mut WorkRow, conversations: &[ConversationRow]) {
         Some(d) => format!("{}: {d}", row.attention.label()),
         None => row.attention.label().to_owned(),
     });
-    if row.section == Some(WorkSection::NeedsYou)
+    if row.attention != Attention::Working
         && bound.iter().any(|c| c.state == ConversationState::Busy)
     {
         parts.push("working".to_owned());
     }
-    if row.summary != "clean" {
-        parts.push(row.summary.clone());
-    }
-    row.summary = parts.join(" · ");
+    parts.join(" · ")
 }
 
-/// The section's sort slot: `Needs you`, then `Active`, then the flat
-/// remainder.
-fn section_order(row: &WorkRow) -> u8 {
-    match row.section {
-        Some(WorkSection::NeedsYou) => 0,
-        Some(WorkSection::Active) => 1,
-        None => 2,
+/// The row's final summary: the section reason, then the compact evidence
+/// tail with any phrase the reason already made dropped, then `parked`.
+fn summarize(row: &WorkRow, reason: String) -> String {
+    let mut parts = vec![reason.clone()];
+    let reason_norm = normalized(&reason);
+    let facts: Vec<String> = work_facts(row)
+        .into_iter()
+        .filter(|f| {
+            // Only a pure-word fact can duplicate the reason (`~dirty`
+            // beside `dirty`); `?`/`↑?` normalize to nothing and counts
+            // like `↑2` may disagree with the reason's own count - both
+            // always stay.
+            let f = normalized(f);
+            f.is_empty() || f.bytes().any(|b| b.is_ascii_digit()) || !reason_norm.contains(&f)
+        })
+        .collect();
+    if !facts.is_empty() {
+        parts.push(facts.join(" "));
     }
+    if row.parked {
+        parts.push("parked".to_owned());
+    }
+    parts.join(" · ")
 }
 
-/// The compact `↑3 ~2`-style field: what the row's Git evidence says about
-/// its shape, with `?` and `no remote`/`no wt` as first-class readings.
-fn work_summary(v: &vector::StateVector) -> String {
+/// `a` contains `b` as a phrase, compared on lowercase alphanumerics only,
+/// so `~dirty` dedupes against the `dirty` reason and `PR #191` against
+/// `open PR #191`.
+fn normalized(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ')
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// The compact evidence tail: `no wt`, `no remote`/`remote gone`/`?`,
+/// `↑n`, `~dirty`, `merged`, the PR/MR label and the pipeline read-out.
+/// A project space says `no git` and nothing else.
+fn work_facts(row: &WorkRow) -> Vec<String> {
+    if row.kind == WorkKind::ProjectSpace {
+        return vec!["no git".to_owned()];
+    }
     let mut parts = Vec::new();
-    if v.worktree.is_none() {
+    if row.worktree.is_none() {
         parts.push("no wt".to_owned());
     }
-    match &v.upstream_state {
-        UpstreamState::NeverPushed => parts.push("no remote".to_owned()),
-        UpstreamState::RemoteGone { .. } => parts.push("remote gone".to_owned()),
-        UpstreamState::Unknown(_) => parts.push("?".to_owned()),
+    match row.upstream {
+        Upstream::NeverPushed => parts.push("no remote".to_owned()),
+        Upstream::RemoteGone => parts.push("remote gone".to_owned()),
+        Upstream::Unknown => parts.push("?".to_owned()),
+        Upstream::Tracked | Upstream::NotApplicable => {}
+    }
+    match row.commits_ahead {
+        Some(n) if n > 0 => parts.push(format!("↑{n}")),
+        None => parts.push("↑?".to_owned()),
         _ => {}
     }
-    match &v.commits_ahead_of_base {
-        Evidence::Known(n) if *n > 0 => parts.push(format!("↑{n}")),
-        Evidence::Unknown(_) => parts.push("↑?".to_owned()),
-        _ => {}
-    }
-    if let Evidence::Known(true) = v.dirty {
+    if row.dirty == Some(true) {
         parts.push("~dirty".to_owned());
     }
-    if parts.is_empty() {
-        parts.push("clean".to_owned());
+    if matches!(row.landed, Some(Landed::Ancestor | Landed::Content)) {
+        parts.push("merged".to_owned());
     }
-    parts.join(" ")
+    if let Some(label) = &row.forge_label {
+        parts.push(label.clone());
+    }
+    if row.forge == WorkItem::Open {
+        match row.pipeline {
+            Pipeline::Failed => parts.push("checks failed".to_owned()),
+            Pipeline::Busy => parts.push("checks pending".to_owned()),
+            Pipeline::Succeeded => parts.push("checks ok".to_owned()),
+            Pipeline::Unknown => {}
+        }
+    }
+    parts
+}
+
+/// The section's sort slot, in the enum's declared order.
+fn section_order(row: &WorkRow) -> u8 {
+    match row.section {
+        WorkSection::NeedsYou => 0,
+        WorkSection::Active => 1,
+        WorkSection::FollowUp => 2,
+        WorkSection::Forgotten => 3,
+        WorkSection::ReadyToClean => 4,
+        WorkSection::CleanupReview => 5,
+    }
+}
+
+/// How long ago `then` was at `now`, in the TUI's age buckets.
+fn age_at(now: u64, then: u64) -> String {
+    let secs = now.saturating_sub(then);
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
 }
 
 /// A non-git space's single row: the space anchors conversations but has
-/// no Git evidence, so every Git cell is a plain unknown or n/a.
+/// no Git evidence, so every Git cell is a plain unknown or n/a. Its work
+/// identity is its canonical path; parked and transition dates apply per
+/// publish through `apply_path_record`.
 fn space_row(repo_id: &str, path: &Path) -> WorkRow {
     WorkRow {
         repo: repo_id.to_owned(),
@@ -1258,8 +1838,16 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         past_sessions: 0,
         last_activity: None,
         attention: Attention::None,
-        section: None,
-        summary: "no git".to_owned(),
+        identity: Some(path.display().to_string()),
+        parked: false,
+        forge: WorkItem::Unknown,
+        pipeline: Pipeline::Unknown,
+        forge_label: None,
+        forge_url: None,
+        worktree_removal: None,
+        branch_deletion: None,
+        section: WorkSection::FollowUp,
+        summary: String::new(),
     }
 }
 
@@ -1295,6 +1883,11 @@ fn carry_remote(new: &mut vector::WorkState, old: &vector::WorkState) {
     if pending(&new.vector.unpushed_commits) {
         new.vector.unpushed_commits = old.vector.unpushed_commits.clone();
     }
+    // The forge overlay is stage-4-owned: it keeps its last answer until
+    // stage 4 lands this pass's.
+    if new.forge.reason.as_deref() == Some(vector::PENDING) {
+        new.forge = old.forge.clone();
+    } // coverage: off - the else edge: a fresh stage-3 state is always `collection pending`
 }
 
 /// Whether an `Evidence` is the not-yet-landed placeholder.
@@ -1804,39 +2397,15 @@ mod tests {
         let _ = undated;
     }
 
-    /// A `StateVector` that reports nothing - the base case every arm
-    /// overrides on.
-    fn empty_vector() -> vector::StateVector {
-        vector::StateVector {
-            worktree: None,
-            windows: WindowCount::default(),
-            live_pids: 0,
-            live_agent_sessions: 0,
-            past_agent_sessions: 0,
-            dirty: Evidence::Unknown("no checkout".to_owned()),
-            commits_ahead_of_base: Evidence::Unknown("no base".to_owned()),
-            upstream_state: UpstreamState::NotApplicable,
-            unpushed_commits: Evidence::Unknown("no base".to_owned()),
-            landed: Evidence::Unknown("no base".to_owned()),
-            last_git_activity: None,
-        }
-    }
-
     #[test]
     fn classification_rolls_attention_up_to_first_match_sections() {
         // A work row's section is the bound conversations' best rank:
-        // waiting/error/done -> `Needs you`, working -> `Active`, anything
-        // else stays flat.
-        // A branch-only row, fabricated: no checkout, a Git summary to its
-        // name.
-        let mut row = WorkRow {
-            kind: WorkKind::Branch,
-            worktree: None,
-            branch: Some("feat".to_owned()),
-            summary: "no wt ↑?".to_owned(),
-            ..space_row("r", Path::new("/r"))
-        };
-        row.repo = "/r/.git".to_owned();
+        // waiting/error/done -> `Needs you`, working -> `Active`, and
+        // anything else goes on to the FollowUp and cleanup sections.
+        // A branch-only row, fabricated: no checkout, its Git evidence
+        // unread (`no wt ↑?` in the facts tail).
+        let threshold = Duration::from_secs(14 * 24 * 3600);
+        let now = 2_000_000_000;
         let conv = |attention, state| {
             let mut c = conversation_row(
                 &conversation(None, None),
@@ -1852,58 +2421,69 @@ mod tests {
         // `classify_work` composes the summary once per publish; the test
         // rebuilds the row between classifications to keep it honest.
         let fresh = || WorkRow {
+            repo: "/r/.git".to_owned(),
             kind: WorkKind::Branch,
             worktree: None,
             branch: Some("feat".to_owned()),
-            summary: "no wt ↑?".to_owned(),
             ..space_row("r", Path::new("/r"))
         };
         let mut row = fresh();
-        row.repo = "/r/.git".to_owned();
         classify_work(
             &mut row,
             &[conv(Attention::Working, ConversationState::Busy)],
+            threshold,
+            now,
         );
-        assert_eq!(row.section, Some(WorkSection::Active));
+        assert_eq!(row.section, WorkSection::Active);
         assert_eq!(row.attention, Attention::Working);
         assert_eq!(row.summary, "working · no wt ↑?");
 
         // A retained error with the agent back at work: `error · working`.
         let mut row = fresh();
-        row.repo = "/r/.git".to_owned();
         let mut err = conv(Attention::Error, ConversationState::Busy);
         err.attention_detail = Some("StopFailure".to_owned());
-        classify_work(&mut row, &[err]);
-        assert_eq!(row.section, Some(WorkSection::NeedsYou));
+        classify_work(&mut row, &[err], threshold, now);
+        assert_eq!(row.section, WorkSection::NeedsYou);
         assert_eq!(row.summary, "error: StopFailure · working · no wt ↑?");
 
-        // A clean Git shape adds nothing beside the attention.
+        // A quiet, clean tree adds no facts beside the attention; the row
+        // has a checkout, so the conversation binds by its path.
         let mut row = fresh();
-        row.repo = "/r/.git".to_owned();
-        row.summary = "clean".to_owned();
-        classify_work(
-            &mut row,
-            &[conv(Attention::CompletedUnseen, ConversationState::Idle)],
-        );
+        row.worktree = Some(PathBuf::from("/r/wt"));
+        row.dirty = Some(false);
+        row.commits_ahead = Some(0);
+        let mut done = conv(Attention::CompletedUnseen, ConversationState::Idle);
+        done.worktree = Some(PathBuf::from("/r/wt"));
+        classify_work(&mut row, &[done], threshold, now);
         assert_eq!(row.summary, "done");
 
+        // No attention and nothing actionable: `Follow up`, resumable
+        // when a bound conversation can be resumed, plain `open` when not.
         let mut row = fresh();
-        row.repo = "/r/.git".to_owned();
-        classify_work(&mut row, &[conv(Attention::None, ConversationState::Idle)]);
-        assert_eq!(row.section, None);
+        classify_work(
+            &mut row,
+            &[conv(Attention::None, ConversationState::Idle)],
+            threshold,
+            now,
+        );
+        assert_eq!(row.section, WorkSection::FollowUp);
+        assert_eq!(row.summary, "resumable idle · no wt ↑?");
+        let mut row = fresh();
+        classify_work(&mut row, &[], threshold, now);
+        assert_eq!(row.summary, "open · no wt ↑?");
         // A conversation on another branch does not bind.
         let mut other = conv(Attention::Waiting, ConversationState::Waiting);
         other.branch = Some("elsewhere".to_owned());
-        classify_work(&mut row, &[other]);
-        assert_eq!(row.section, None);
+        classify_work(&mut row, &[other], threshold, now);
+        assert_eq!(row.section, WorkSection::FollowUp);
         assert_eq!(row.attention, Attention::None);
         // And the ordering puts Needs you first.
         assert!(
             section_order(&WorkRow {
-                section: Some(WorkSection::NeedsYou),
+                section: WorkSection::NeedsYou,
                 ..space_row("s", Path::new("/s"))
             }) < section_order(&WorkRow {
-                section: Some(WorkSection::Active),
+                section: WorkSection::Active,
                 ..space_row("s", Path::new("/s"))
             })
         );
@@ -1911,43 +2491,195 @@ mod tests {
 
     #[test]
     fn summaries_spell_git_shape_and_unknowns() {
-        let v = empty_vector();
-        assert_eq!(work_summary(&v), "no wt ↑?");
-
-        let mut v = empty_vector();
-        v.worktree = Some(PathBuf::from("/w"));
-        v.dirty = Evidence::Known(true);
-        v.commits_ahead_of_base = Evidence::Known(3);
-        v.upstream_state = UpstreamState::NeverPushed;
-        v.unpushed_commits = Evidence::Known(3);
-        assert_eq!(work_summary(&v), "no remote ↑3 ~dirty");
-
-        v.upstream_state = UpstreamState::Tracked {
-            remote: "origin".to_owned(),
-            merge_ref: "refs/heads/main".to_owned(),
+        // The evidence tail a WorkRow's fields produce, independent of the
+        // section reason that prefixes it.
+        let row = |f: &dyn Fn(&mut WorkRow)| {
+            let mut row = WorkRow {
+                kind: WorkKind::Branch,
+                worktree: Some(PathBuf::from("/w")),
+                branch: Some("b".to_owned()),
+                dirty: Some(false),
+                commits_ahead: Some(0),
+                unpushed: Some(0),
+                upstream: Upstream::Tracked,
+                landed: Some(Landed::No),
+                ..space_row("r", Path::new("/r"))
+            };
+            f(&mut row);
+            row
         };
-        assert_eq!(work_summary(&v), "↑3 ~dirty");
+        let facts = |row: &WorkRow| work_facts(row).join(" ");
 
-        v.upstream_state = UpstreamState::RemoteGone {
-            remote: "origin".to_owned(),
-            merge_ref: "refs/heads/main".to_owned(),
+        assert_eq!(facts(&row(&|_| {})), "");
+
+        let r = row(&|r| {
+            r.worktree = None;
+            r.commits_ahead = None;
+            r.upstream = Upstream::NotApplicable;
+        });
+        assert_eq!(facts(&r), "no wt ↑?");
+
+        let r = row(&|r| {
+            r.dirty = Some(true);
+            r.commits_ahead = Some(3);
+            r.upstream = Upstream::NeverPushed;
+        });
+        assert_eq!(facts(&r), "no remote ↑3 ~dirty");
+
+        let r = row(&|r| {
+            r.dirty = Some(true);
+            r.commits_ahead = Some(3);
+        });
+        assert_eq!(facts(&r), "↑3 ~dirty");
+
+        let r = row(&|r| {
+            r.dirty = Some(true);
+            r.commits_ahead = Some(3);
+            r.upstream = Upstream::RemoteGone;
+        });
+        assert_eq!(facts(&r), "remote gone ↑3 ~dirty");
+
+        let r = row(&|r| {
+            r.dirty = Some(true);
+            r.commits_ahead = Some(3);
+            r.upstream = Upstream::Unknown;
+        });
+        assert_eq!(facts(&r), "? ↑3 ~dirty");
+
+        // Delivery and forge facts join the tail.
+        let r = row(&|r| {
+            r.landed = Some(Landed::Ancestor);
+            r.forge = WorkItem::Open;
+            r.forge_label = Some("PR #191".to_owned());
+            r.pipeline = Pipeline::Busy;
+        });
+        assert_eq!(facts(&r), "merged PR #191 checks pending");
+
+        // A project space says `no git` and nothing else.
+        assert_eq!(
+            work_facts(&space_row("s", Path::new("/s"))).join(" "),
+            "no git"
+        );
+
+        // The summary keeps every fact the reason did not already say.
+        let mut r = row(&|r| {
+            r.dirty = Some(true);
+            r.commits_ahead = Some(3);
+        });
+        r.summary = summarize(&r, "dirty".to_owned());
+        assert_eq!(r.summary, "dirty · ↑3");
+        r.summary = summarize(&r, "merged · blocked".to_owned());
+        assert_eq!(r.summary, "merged · blocked · ↑3 ~dirty");
+        r.landed = Some(Landed::Ancestor);
+        r.summary = summarize(&r, "merged · blocked".to_owned());
+        assert_eq!(r.summary, "merged · blocked · ↑3 ~dirty");
+        r.parked = true;
+        r.summary = summarize(&r, "merged · blocked".to_owned());
+        assert_eq!(r.summary, "merged · blocked · ↑3 ~dirty · parked");
+    }
+
+    #[test]
+    fn forgotten_idle_project_and_cleanup_reasons_cover_their_arms() {
+        let now = 2_000_000_000u64;
+        // The age buckets a `Forgotten` reason reads - one per width.
+        for (threshold, age, want) in [
+            (Duration::from_secs(10), 30u64, "idle 30s"),
+            (Duration::from_secs(10), 300, "idle 5m"),
+            (Duration::from_secs(10), 7_200, "idle 2h"),
+            (Duration::from_secs(10), 100_000, "idle 1d"),
+        ] {
+            let mut row = WorkRow {
+                kind: WorkKind::Branch,
+                branch: Some("b".to_owned()),
+                dirty: Some(false),
+                commits_ahead: Some(1),
+                unpushed: Some(0),
+                upstream: Upstream::Tracked,
+                landed: Some(Landed::No),
+                last_activity: Some(now - age),
+                // Verdicts that would otherwise claim the row for review:
+                // not applicable here, so `Forgotten` proves it ran first.
+                worktree_removal: None,
+                branch_deletion: None,
+                ..space_row("r", Path::new("/r"))
+            };
+            classify_work(&mut row, &[], threshold, now);
+            assert_eq!(row.section, WorkSection::Forgotten, "{row:?}");
+            assert!(
+                row.summary.starts_with(want),
+                "{want:?} vs {:?}",
+                row.summary
+            );
+        }
+        // A parked row of the same age cannot be forgotten.
+        let mut row = WorkRow {
+            kind: WorkKind::Branch,
+            branch: Some("b".to_owned()),
+            dirty: Some(false),
+            commits_ahead: Some(1),
+            unpushed: Some(0),
+            upstream: Upstream::Tracked,
+            landed: Some(Landed::No),
+            last_activity: Some(now - 100_000),
+            parked: true,
+            ..space_row("r", Path::new("/r"))
         };
-        assert_eq!(work_summary(&v), "remote gone ↑3 ~dirty");
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.section, WorkSection::FollowUp, "{row:?}");
+        assert!(row.summary.ends_with("· parked"), "{}", row.summary);
 
-        v.upstream_state = UpstreamState::Unknown("unreachable".to_owned());
-        assert_eq!(work_summary(&v), "? ↑3 ~dirty");
+        // A project space with nothing resumable is `idle project`.
+        let mut row = space_row("s", Path::new("/s"));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.section, WorkSection::FollowUp);
+        assert_eq!(row.summary, "idle project · no git");
 
-        v.dirty = Evidence::Unknown("huh".to_owned());
-        v.commits_ahead_of_base = Evidence::Known(0);
-        assert_eq!(work_summary(&v), "?");
-
-        // Nothing to say at all reads `clean`.
-        let mut v = empty_vector();
-        v.worktree = Some(PathBuf::from("/w"));
-        v.dirty = Evidence::Known(false);
-        v.commits_ahead_of_base = Evidence::Known(0);
-        v.unpushed_commits = Evidence::Known(0);
-        assert_eq!(work_summary(&v), "clean");
+        // The cleanup sections' reason names what the verdicts allow:
+        // only a worktree, only a branch, both, and a review's first
+        // reason.
+        let verdict = |v, rs: &[&str]| crate::verdict::ActionVerdict {
+            verdict: v,
+            reasons: rs.iter().map(|&s| s.to_owned()).collect(),
+        };
+        let mut row = WorkRow {
+            kind: WorkKind::Worktree,
+            worktree: Some(PathBuf::from("/r/wt")),
+            branch: Some("b".to_owned()),
+            dirty: Some(false),
+            commits_ahead: Some(0),
+            unpushed: Some(0),
+            upstream: Upstream::Tracked,
+            landed: Some(Landed::Ancestor),
+            worktree_removal: Some(verdict(Verdict::Safe, &["clean"])),
+            branch_deletion: Some(verdict(Verdict::NotApplicable, &[])),
+            ..space_row("r", Path::new("/r"))
+        };
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.section, WorkSection::ReadyToClean);
+        assert_eq!(row.summary, "worktree only · merged");
+        row.branch_deletion = Some(verdict(Verdict::SafeAfterWorktreeRemoval, &[]));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.summary, "wt + branch · merged");
+        row.worktree_removal = Some(verdict(Verdict::NotApplicable, &[]));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.summary, "branch only · merged");
+        row.branch_deletion = Some(verdict(Verdict::Review, &["needs -D"]));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.section, WorkSection::CleanupReview);
+        assert!(
+            row.summary.starts_with("review: needs -D"),
+            "{}",
+            row.summary
+        );
+        row.branch_deletion = Some(verdict(Verdict::Review, &[]));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert!(row.summary.starts_with("review: ?"), "{}", row.summary);
+        // Nothing applicable at all is neither section.
+        row.worktree_removal = Some(verdict(Verdict::NotApplicable, &[]));
+        row.branch_deletion = Some(verdict(Verdict::NotApplicable, &[]));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.section, WorkSection::FollowUp, "{row:?}");
+        assert!(row.summary.starts_with("open"), "{}", row.summary);
     }
 
     #[test]

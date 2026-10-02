@@ -10,13 +10,16 @@
 
 use std::path::PathBuf;
 
+use serde::Serialize;
+
 use crate::evidence::Evidence;
 use crate::forge::{ForgeStatus, WorkItem};
 use crate::git::Head;
 use crate::vector::{Anchor, Landed, UpstreamState, WorkState};
 
 /// The verdict on one cleanup action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// The action is provably lossless.
     Safe,
@@ -33,7 +36,7 @@ pub enum Verdict {
     NotApplicable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActionVerdict {
     pub verdict: Verdict,
     pub reasons: Vec<String>,

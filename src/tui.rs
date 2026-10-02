@@ -25,7 +25,7 @@ use ratatui::{Frame, Terminal};
 use crate::attention::Attention;
 use crate::config;
 use crate::snapshot::{
-    ConversationRow, ConversationState, RepoRow, Snapshot, WorkKind, WorkRow, to_json,
+    ConversationRow, ConversationState, RepoRow, Snapshot, WorkKind, WorkRow, WorkSection, to_json,
 };
 use crate::store::{self, Store};
 use crate::tmux::{self, PaneRef};
@@ -149,9 +149,13 @@ pub struct App {
     /// The collector thread died: the last snapshot stays on screen and the
     /// footer says so instead of letting the dashboard look live.
     collector_dead: bool,
-    /// The store `space` writes acknowledgements and not-busy marks into;
-    /// `None` where no state dir could be placed, making `space` inert.
+    /// The store `space` writes acknowledgements and not-busy marks into
+    /// and `p` toggles `parked` in; `None` where no state dir could be
+    /// placed, making both inert.
     store: Option<Store>,
+    /// The configured `forgotten_after` - what a `p` reclassification
+    /// judges `Forgotten` against.
+    forgotten_after: Duration,
     /// A failed action's message, shown in the footer in place of the hints
     /// until the next key - a keypress that wrote nothing must not look
     /// like it worked.
@@ -195,15 +199,23 @@ impl App {
             quit: false,
             collector_dead: false,
             store: None,
+            forgotten_after: config::DEFAULT_FORGOTTEN_AFTER,
             notice: None,
             spin: std::cell::Cell::new(0),
         }
     }
 
-    /// The store `space` writes to: `acknowledge` and the not-busy mark
-    /// land here.
+    /// The store `space` and `p` write to: `acknowledge`, the not-busy
+    /// mark and the parked flag land here.
     pub fn with_store(mut self, store: Store) -> App {
         self.store = Some(store);
+        self
+    }
+
+    /// The `forgotten_after` the collector classified with, so `p`'s
+    /// in-place reclassification judges the same threshold.
+    pub fn with_forgotten_after(mut self, forgotten_after: Duration) -> App {
+        self.forgotten_after = forgotten_after;
         self
     }
 
@@ -213,21 +225,30 @@ impl App {
     /// when that record vanished - widening scope rather than retargeting
     /// it to a different row.
     pub fn refresh(&mut self, snapshot: Snapshot) {
-        let before = self.view();
-        let keys: [Option<String>; 3] =
-            [List::Repos, List::Work, List::Conversations].map(|list| {
-                let cursor = self.cursor[list_index(list)];
-                if cursor == 0 {
-                    None
-                } else {
-                    before.rows(list).get(cursor - 1).map(selection_key)
-                }
-            });
+        let keys = self.selection_keys();
         self.snapshot = snapshot;
-        // Resolve parent to child: a list's rows are scoped by the cursor
-        // above it, so each cursor update rebuilds the view before the next
-        // selection is searched - otherwise a re-sorted repo row would look
-        // up work and conversation keys under the stale parent scope.
+        self.reseat(keys);
+    }
+
+    /// Each list cursor's selected row key, `None` on `all`.
+    fn selection_keys(&self) -> [Option<String>; 3] {
+        let before = self.view();
+        [List::Repos, List::Work, List::Conversations].map(|list| {
+            let cursor = self.cursor[list_index(list)];
+            if cursor == 0 {
+                None
+            } else {
+                before.rows(list).get(cursor - 1).map(selection_key)
+            }
+        })
+    }
+
+    /// Point every cursor back at the row its key still names. Resolve
+    /// parent to child: a list's rows are scoped by the cursor above it,
+    /// so each cursor update rebuilds the view before the next selection
+    /// is searched - otherwise a re-sorted repo row would look up work
+    /// and conversation keys under the stale parent scope.
+    fn reseat(&mut self, keys: [Option<String>; 3]) {
         for (list, key) in [List::Repos, List::Work, List::Conversations]
             .into_iter()
             .zip(keys)
@@ -298,7 +319,7 @@ impl App {
                 _ => String::new(), // coverage: off - repos holds Repo rows only
             }),
         };
-        let work = self
+        let work_rows = self
             .snapshot
             .work
             .iter()
@@ -311,8 +332,27 @@ impl App {
                     &mut lower,
                 )
             })
-            .map(Row::Work)
             .collect::<Vec<_>>();
+        // The `all` row's counts cover the whole scope, collapsed or not.
+        let work_open = work_rows.iter().filter(|w| w.section.open()).count();
+        let work_clean = work_rows.len() - work_open;
+        // Under `all`, the cleanup sections collapse into one summary line;
+        // under a repo they list their rows like any section.
+        let (work, cleanup) = if repo_scope.is_some() {
+            (work_rows.into_iter().map(Row::Work).collect(), None)
+        } else {
+            let mut work = Vec::new();
+            let mut safe = 0usize;
+            let mut review = 0usize;
+            for w in work_rows {
+                match w.section {
+                    WorkSection::ReadyToClean => safe += 1,
+                    WorkSection::CleanupReview => review += 1,
+                    _ => work.push(Row::Work(w)),
+                }
+            }
+            (work, (safe + review > 0).then_some((safe, review)))
+        };
         let work_scope = match self.cursor[list_index(List::Work)] /* // coverage: off - the get-miss arm is unreachable: cursors clamp before a view */ {
             0 => None, // coverage: off - the unreachable arm's match edge lands here
             cursor => work // coverage: off - same
@@ -371,6 +411,9 @@ impl App {
             conversations,
             repo_scope,
             work_scope,
+            work_open,
+            work_clean,
+            cleanup,
         }
     }
 
@@ -378,7 +421,8 @@ impl App {
     ///
     /// The handled set is exactly the shipped one: `1`-`4` focus, `Tab`
     /// cycles, `j`/`k` move the cursor, `/` filters the focused list,
-    /// `space` acknowledges attention or marks a Busy row not-busy, `?`
+    /// `space` acknowledges attention or marks a Busy row not-busy, `p`
+    /// parks a Work row (suppressing only its `Forgotten` placement), `?`
     /// toggles help, `q` quits, `Esc` closes help or a filter. Everything
     /// else is inert: an unbound key does nothing, and nothing here pretends
     /// to a behaviour a later task owns.
@@ -423,6 +467,7 @@ impl App {
                 }
             }
             Key::Char(' ') => self.space(),
+            Key::Char('p') => self.park(),
             _ => {}
         }
     }
@@ -509,6 +554,63 @@ impl App {
         store.mark_not_busy_many(&marks).err()
     }
 
+    /// `p` on a concrete Work row: flip the authored `parked` on its exact
+    /// work identity - the branch incarnation's id, or the canonical path
+    /// for a detached worktree or project space - then reclassify the row
+    /// in place so it leaves or enters `Forgotten` without waiting for the
+    /// next collect. Every other row and list is inert; a write the store
+    /// refuses surfaces as `park: not saved: ...`.
+    fn park(&mut self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        if self.focused_list() != Some(List::Work) {
+            return;
+        }
+        let cursor = self.cursor[list_index(List::Work)];
+        if cursor == 0 {
+            return;
+        }
+        let view = self.view();
+        let Some(Row::Work(w)) = view.work.get(cursor - 1) else {
+            return; // coverage: off - the get-miss arm is unreachable: cursors clamp before a view
+        };
+        let Some(id) = w.identity.clone() else {
+            return;
+        };
+        let identity = match w.branch {
+            Some(_) => store::WorkIdentity::Branch(id),
+            None => store::WorkIdentity::Path(id),
+        };
+        let selected = work_key(w);
+        let repo_id = w.repo.clone();
+        let keys = self.selection_keys();
+        match store.toggle_parked(&identity) {
+            Ok(parked) => {
+                if let Some(row) = self
+                    .snapshot
+                    .work
+                    .iter_mut()
+                    .find(|r| work_key(r) == selected)
+                {
+                    row.parked = parked;
+                    crate::snapshot::classify_work(
+                        row,
+                        &self.snapshot.conversations,
+                        self.forgotten_after,
+                        self.snapshot.observed_at,
+                    );
+                } // coverage: off - the row the cursor names is in this list
+                crate::snapshot::sort_work(&mut self.snapshot.work);
+                if let Some(repo) = self.snapshot.repos.iter_mut().find(|r| r.id == repo_id) {
+                    repo.roll_up(&self.snapshot.work);
+                } // coverage: off - the row's repo is one of the snapshot's repos
+                self.reseat(keys);
+            }
+            Err(e) => self.notice = Some(format!("park: not saved: {e}")),
+        }
+    }
+
     /// `j`/`k` on the focused list: move, clamp, and reset the cursors below
     /// when the scope itself changed - the scoped list's cursor has no
     /// meaning carried over from the previous scope.
@@ -591,22 +693,33 @@ impl App {
         let cursor = self.cursor[list_index(list)];
         let visible = inner.height as usize;
         let mut display: Vec<Line<'_>> = Vec::new();
-        display.push(self.all_row(list, rows, inner.width, cursor == 0));
+        display.push(self.all_row(list, rows, view, inner.width, cursor == 0));
         let mut cursor_line = 0usize;
         let mut last_section = None;
         for (i, row) in rows.iter().enumerate() {
             if let Row::Work(w) = row
-                && w.section != last_section
+                && last_section != Some(w.section)
             {
-                if let Some(section) = w.section {
-                    display.push(section_header(section));
-                }
-                last_section = w.section;
+                display.push(section_header(w.section));
+                last_section = Some(w.section);
             }
             if cursor == i + 1 {
                 cursor_line = display.len();
             }
-            display.push(self.row(list, row, inner.width, cursor == i + 1));
+            display.push(self.row(list, row, view, inner.width, cursor == i + 1));
+        }
+        // The `all`-scoped Work list ends on one collapsed cleanup line
+        // instead of listing the Ready to clean / Cleanup review rows.
+        if list == List::Work
+            && let Some((safe, review)) = view.cleanup
+        {
+            display.push(Line::from(Span::styled(
+                fit(
+                    &format!("Cleanup {safe} safe · {review} review"),
+                    inner.width as usize,
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         let scroll = cursor_line.saturating_sub(visible.saturating_sub(1));
         let lines: Vec<Line<'_>> = display.into_iter().skip(scroll).take(visible).collect();
@@ -614,10 +727,33 @@ impl App {
     }
 
     /// The `all` row of a list.
-    fn all_row(&self, list: List, rows: &[Row<'_>], width: u16, selected: bool) -> Line<'static> {
+    fn all_row(
+        &self,
+        list: List,
+        rows: &[Row<'_>],
+        view: &View<'_>,
+        width: u16,
+        selected: bool,
+    ) -> Line<'static> {
         let counts = match list {
-            List::Repos => format!("{} shown", rows.len()),
-            List::Work => format!("{} open", rows.len()),
+            List::Repos => {
+                let open: usize = rows
+                    .iter()
+                    .filter_map(|r| match r {
+                        Row::Repo(r) => Some(r.open),
+                        _ => None, // coverage: off - repos holds Repo rows only
+                    })
+                    .sum();
+                let clean: usize = rows
+                    .iter()
+                    .filter_map(|r| match r {
+                        Row::Repo(r) => Some(r.clean),
+                        _ => None, // coverage: off - repos holds Repo rows only
+                    })
+                    .sum();
+                format!("{open} open · {clean} clean")
+            }
+            List::Work => format!("{} open · {} clean", view.work_open, view.work_clean),
             List::Conversations => {
                 let live = rows
                     .iter()
@@ -640,7 +776,14 @@ impl App {
     }
 
     /// One data row, formatted to `width`.
-    fn row(&self, _list: List, row: &Row<'_>, width: u16, selected: bool) -> Line<'static> {
+    fn row(
+        &self,
+        list: List,
+        row: &Row<'_>,
+        view: &View<'_>,
+        width: u16,
+        selected: bool,
+    ) -> Line<'static> {
         let cells = match row {
             Row::Repo(r) => RowCells {
                 glyph: repo_glyph(r),
@@ -652,7 +795,9 @@ impl App {
             },
             Row::Work(w) => RowCells {
                 glyph: work_glyph(w),
-                label: &work_name(w),
+                // Under `all` the label carries the repo; scoped, it is
+                // the branch alone.
+                label: &work_name(w, list == List::Work && view.repo_scope.is_none()),
                 middle: &w.summary,
                 age: &age(self.now(), w.last_activity),
                 selected,
@@ -817,12 +962,18 @@ impl App {
                 "filter: enter apply | esc cancel".to_owned()
             } else if area.width < 60 {
                 match self.focused_list() {
+                    Some(List::Work) => {
+                        "1-4 | tab | j/k | p park | / filter | ? | q quit".to_owned()
+                    }
                     Some(_) => "1-4 | tab | j/k | / filter | ? | q quit".to_owned(),
                     None => "1-4 | tab | j/k | ? | q quit".to_owned(),
                 }
             } else {
                 let hints = match self.focused_list() {
                     Some(List::Repos) => "1-4 focus | tab next | j/k move | / filter",
+                    Some(List::Work) => {
+                        "1-4 focus | tab next | j/k move | / filter | space ack | p park"
+                    }
                     Some(_) => "1-4 focus | tab next | j/k move | / filter | space ack",
                     None => "1-4 focus | tab next | j/k move",
                 };
@@ -864,7 +1015,12 @@ impl App {
                     List::Conversations => "[3] Conversations - what needs me right now",
                 }),
                 Line::from(""),
-                Line::from("j/k move   / filter   space ack/mark   enter/jump (later)"),
+                Line::from(match list {
+                    List::Work => {
+                        "j/k move   / filter   space ack/mark   p park   enter/jump (later)"
+                    }
+                    _ => "j/k move   / filter   space ack/mark   enter/jump (later)",
+                }),
             ],
             None => vec![Line::from("[4] Detail - follows the focused list")],
         };
@@ -934,6 +1090,12 @@ struct View<'a> {
     repo_scope: Option<String>,
     /// The work row the [2] cursor names; `None` on `all`.
     work_scope: Option<WorkScope>,
+    /// `N open · M clean` across the scoped work rows - collapsed or not.
+    work_open: usize,
+    work_clean: usize,
+    /// `(safe, review)` counts when the cleanup sections are collapsed
+    /// under `all`; `None` under a repo, where the rows list.
+    cleanup: Option<(usize, usize)>,
 }
 
 impl View<'_> {
@@ -952,9 +1114,14 @@ impl View<'_> {
 fn selection_key(row: &Row<'_>) -> String {
     match row {
         Row::Repo(r) => r.id.clone(),
-        Row::Work(w) => format!("{}\u{0}{}\u{0}{}", w.repo, w.kind.as_str(), w.name),
+        Row::Work(w) => work_key(w),
         Row::Conversation(c) => format!("{}\u{0}{}", c.provider.as_str(), c.session_id),
     }
+}
+
+/// The selection key a Work row carries.
+fn work_key(w: &WorkRow) -> String {
+    format!("{}\u{0}{}\u{0}{}", w.repo, w.kind.as_str(), w.name)
 }
 
 /// The scope a work row selects in [3].
@@ -1059,15 +1226,15 @@ fn glyph_style(glyph: &str) -> Style {
     }
 }
 
-/// A repo row's glyph: `!`/`●`/`?`/blank rolled up from its conversations.
+/// A repo row's glyph: the rolled-up attention of its work rows.
 fn repo_glyph(repo: &RepoRow) -> &'static str {
-    if repo.live > 0 { "●" } else { "" }
+    repo.attention.glyph()
 }
 
 /// `N open · M clean` for repos with Git evidence, `no git` otherwise.
 fn repo_counts(repo: &RepoRow) -> String {
     if repo.git {
-        format!("{} open", repo.work)
+        format!("{} open · {} clean", repo.open, repo.clean)
     } else {
         "no git".to_owned()
     }
@@ -1080,9 +1247,10 @@ fn work_glyph(w: &WorkRow) -> &'static str {
     w.attention.glyph()
 }
 
-/// The work row's label: `name ⌂worktree`; a project space's workspace is
-/// its name already, so it carries no suffix.
-fn work_name(w: &WorkRow) -> String {
+/// The work row's label: `name ⌂worktree`, prefixed with the repo's name
+/// under the global `all` scope; a project space's workspace is its name
+/// already, so it carries no suffix.
+fn work_name(w: &WorkRow, global: bool) -> String {
     if w.kind == WorkKind::ProjectSpace {
         return w.name.clone();
     }
@@ -1092,7 +1260,11 @@ fn work_name(w: &WorkRow) -> String {
         .and_then(|p| p.file_name())
         .map(|n| format!(" ⌂{}", n.to_string_lossy()))
         .unwrap_or_default();
-    format!("{}{}", w.name, wt)
+    if global {
+        format!("{}/{}{}", w.repo_name, w.name, wt)
+    } else {
+        format!("{}{}", w.name, wt)
+    }
 }
 
 /// The conversation row's middle field: the provider, plus `working`
@@ -1352,12 +1524,12 @@ pub fn own_pane() -> Option<PaneRef> {
     )
 }
 
-/// The collector for the configured root and store: `~/.claude` (or
-/// `$CLAUDE_CONFIG_DIR`) plus `$XDG_STATE_HOME/agent-sessions` when the
-/// environment places one.
+/// The collector for the configured root, store and config: `~/.claude`
+/// (or `$CLAUDE_CONFIG_DIR`), `$XDG_STATE_HOME/agent-sessions` and the
+/// resolved `config.toml`/env when the environment places them.
 fn collector() -> Result<crate::snapshot::Collector, String> {
     let claude = crate::claude::default_root()?;
-    let collector = crate::snapshot::Collector::new(claude);
+    let collector = crate::snapshot::Collector::new(claude).with_config(config::Config::load());
     Ok(
         match config::Config::state_dir(&|name| std::env::var(name).ok()) {
             Some(dir) => collector.with_store(dir),
@@ -1384,9 +1556,11 @@ pub fn tui() -> Result<(), String> {
     };
     // The event loop starts before stage 1 lands: an empty, incomplete
     // snapshot paints the frame while collection fills it in.
+    let app = App::new(Snapshot::empty())
+        .with_forgotten_after(config::Config::load().config.forgotten_after);
     let app = match app_store() {
-        Some(store) => App::new(Snapshot::empty()).with_store(store),
-        None => App::new(Snapshot::empty()), // coverage: off - needs neither XDG_STATE_HOME nor HOME, which the passing path keeps
+        Some(store) => app.with_store(store),
+        None => app, // coverage: off - needs neither XDG_STATE_HOME nor HOME, which the passing path keeps
     };
     run(app, collect).map_err(|e| e.to_string()) // coverage: off - `map_err` needs a failing terminal
 }
@@ -1426,6 +1600,9 @@ mod tests {
                     git: true,
                     work: 2,
                     live: 1,
+                    attention: Attention::Waiting,
+                    open: 2,
+                    clean: 0,
                     last_activity: Some(1_800_000_000 - 120),
                 },
                 RepoRow {
@@ -1435,6 +1612,9 @@ mod tests {
                     git: false,
                     work: 1,
                     live: 0,
+                    attention: Attention::None,
+                    open: 1,
+                    clean: 0,
                     last_activity: None,
                 },
             ],
@@ -1459,8 +1639,22 @@ mod tests {
                     past_sessions: 2,
                     last_activity: Some(1_800_000_000 - 120),
                     attention: Attention::Waiting,
-                    section: Some(crate::snapshot::WorkSection::NeedsYou),
-                    summary: "waiting: permission prompt · ↑3 ~dirty".to_owned(),
+                    identity: Some("i111".to_owned()),
+                    parked: false,
+                    forge: crate::forge::WorkItem::Open,
+                    pipeline: crate::forge::Pipeline::Unknown,
+                    forge_label: Some("PR #191".to_owned()),
+                    forge_url: Some("https://github.com/o/r/pull/191".to_owned()),
+                    worktree_removal: Some(crate::verdict::ActionVerdict {
+                        verdict: crate::verdict::Verdict::Blocked,
+                        reasons: vec!["uncommitted changes".to_owned()],
+                    }),
+                    branch_deletion: Some(crate::verdict::ActionVerdict {
+                        verdict: crate::verdict::Verdict::Blocked,
+                        reasons: vec!["3 unpushed commits".to_owned()],
+                    }),
+                    section: crate::snapshot::WorkSection::NeedsYou,
+                    summary: "waiting: permission prompt · ↑3 ~dirty PR #191".to_owned(),
                 },
                 WorkRow {
                     repo: "/repos/a/.git".to_owned(),
@@ -1482,8 +1676,22 @@ mod tests {
                     past_sessions: 0,
                     last_activity: Some(1_800_000_000 - 9 * 86400),
                     attention: Attention::None,
-                    section: None,
-                    summary: "no wt · no remote".to_owned(),
+                    identity: Some("i222".to_owned()),
+                    parked: false,
+                    forge: crate::forge::WorkItem::Unknown,
+                    pipeline: crate::forge::Pipeline::Unknown,
+                    forge_label: None,
+                    forge_url: None,
+                    worktree_removal: Some(crate::verdict::ActionVerdict {
+                        verdict: crate::verdict::Verdict::NotApplicable,
+                        reasons: vec![],
+                    }),
+                    branch_deletion: Some(crate::verdict::ActionVerdict {
+                        verdict: crate::verdict::Verdict::Blocked,
+                        reasons: vec!["7 unpushed commits".to_owned()],
+                    }),
+                    section: crate::snapshot::WorkSection::FollowUp,
+                    summary: "unpushed 7 · no wt no remote ↑7".to_owned(),
                 },
                 WorkRow {
                     repo: "/spaces/notes".to_owned(),
@@ -1505,8 +1713,16 @@ mod tests {
                     past_sessions: 0,
                     last_activity: None,
                     attention: Attention::None,
-                    section: None,
-                    summary: "no git".to_owned(),
+                    identity: Some("/spaces/notes".to_owned()),
+                    parked: false,
+                    forge: crate::forge::WorkItem::Unknown,
+                    pipeline: crate::forge::Pipeline::Unknown,
+                    forge_label: None,
+                    forge_url: None,
+                    worktree_removal: None,
+                    branch_deletion: None,
+                    section: crate::snapshot::WorkSection::FollowUp,
+                    summary: "idle project · no git".to_owned(),
                 },
             ],
             conversations: vec![
@@ -1721,7 +1937,7 @@ mod tests {
         // The medium tier carries the compact summary and the age too, not
         // just the label: at 90 columns the left lists are ~34 cells wide.
         let text = render_to(&app, 90, 24);
-        assert!(text.contains("no wt · no remote"), "{text}");
+        assert!(text.contains("unpushed 7"), "{text}");
         assert!(text.contains("2m"), "{text}");
     }
 
@@ -1734,7 +1950,7 @@ mod tests {
             let app = App::new(fixture());
             let text = render_to(&app, width, 24);
             assert!(text.contains("Needs you"), "{text}");
-            assert!(text.contains("! feat/lo"), "{text}");
+            assert!(text.contains("! a/feat/lo"), "{text}");
             assert!(text.contains("! 8f423bbb"), "{text}");
             let waiting = text
                 .lines()
@@ -1763,7 +1979,7 @@ mod tests {
         let app = App::new(snapshot);
         for width in [55u16, 200] {
             let text = render_to(&app, width, 24);
-            assert!(text.contains("✗ feat/lo"), "{text}");
+            assert!(text.contains("✗ a/feat/lo"), "{text}");
             assert!(text.contains("✗ 8f423bbb"), "{text}");
         }
         let text = render_to(&app, 200, 24);
@@ -1778,7 +1994,7 @@ mod tests {
         snapshot.work[0].summary = "done · ↑3 ~dirty".to_owned();
         let app = App::new(snapshot);
         let text = render_to(&app, 55, 24);
-        assert!(text.contains("✓ feat/lo"), "{text}");
+        assert!(text.contains("✓ a/feat/lo"), "{text}");
         assert!(text.contains("✓ 8f423bbb"), "{text}");
         // An `Active` row: ● under its own header.
         let mut snapshot = fixture();
@@ -1786,12 +2002,12 @@ mod tests {
         snapshot.conversations[0].attention_detail = None;
         snapshot.conversations[0].state = ConversationState::Busy;
         snapshot.work[0].attention = Attention::Working;
-        snapshot.work[0].section = Some(crate::snapshot::WorkSection::Active);
+        snapshot.work[0].section = crate::snapshot::WorkSection::Active;
         snapshot.work[0].summary = "working · ↑3 ~dirty".to_owned();
         let mut app = App::new(snapshot);
         let text = render_to(&app, 200, 24);
         assert!(text.contains("Active"), "{text}");
-        assert!(text.contains("● feat/login"), "{text}");
+        assert!(text.contains("● a/feat/login"), "{text}");
         assert!(text.contains("working · ↑3 ~dirty"), "{text}");
         assert!(text.contains("● 8f423bbb"), "{text}");
         // The detail header reads `working` for a Working latch, and the
@@ -2574,20 +2790,22 @@ mod tests {
         assert_eq!(glyph_style("✗").fg, Some(Color::LightRed));
         assert_eq!(glyph_style("✓").fg, Some(Color::LightGreen));
         assert_eq!(glyph_style("?").fg, Some(Color::DarkGray));
-        // A repo with no live conversations carries no dot.
+        // A repo whose work rows carry no attention shows no glyph.
         let dead = RepoRow {
-            live: 0,
+            attention: Attention::None,
             ..fixture().repos[0].clone()
         };
         assert_eq!(repo_glyph(&dead), "");
         // fit() never overshoots and zero-width collapses to empty.
         assert_eq!(fit("abc", 0), "");
-        // A work row with no checkout names itself plainly.
+        // A work row with no checkout names itself plainly; under `all` the
+        // label carries the repo, scoped it does not.
         let bare = WorkRow {
             worktree: None,
             ..fixture().work[1].clone()
         };
-        assert_eq!(work_name(&bare), "feat/old");
+        assert_eq!(work_name(&bare, false), "feat/old");
+        assert_eq!(work_name(&bare, true), "a/feat/old");
         // Key events map; unbound codes are None.
         use crossterm::event::KeyCode;
         assert_eq!(map_key(KeyCode::Tab), Some(Key::Tab));

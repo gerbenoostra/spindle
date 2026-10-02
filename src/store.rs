@@ -11,8 +11,10 @@
 //! - `checkpoint.json` - the journal's reduction compacted through a commit
 //!   sequence, written sibling-temp + fsync + rename; the journal then
 //!   rewrites to only the tail past that sequence.
-//! - `seen.json`, `marks.json` - authored records (acknowledgement and the
-//!   not-busy mark) as whole-file atomic renames.
+//! - `seen.json`, `marks.json`, `work.json` - authored records
+//!   (acknowledgement, the not-busy mark and the work rows' parked flags,
+//!   branch-incarnation identity and lifecycle fingerprints) as whole-file
+//!   atomic renames.
 //!
 //! `journal.lock` is the one mutation lock: appends, compaction and the
 //! authored files' read-modify-writes all hold it, so a rewrite can never
@@ -53,6 +55,7 @@ const LOCK: &str = "journal.lock";
 const CHECKPOINT: &str = "checkpoint.json";
 const SEEN: &str = "seen.json";
 const MARKS: &str = "marks.json";
+const WORK: &str = "work.json";
 /// Bytes an append cut off the journal's end, set aside as
 /// `journal.cut-<epoch ms>` beside it.
 const CUT_PREFIX: &str = "journal.cut-";
@@ -363,6 +366,156 @@ pub struct Mark {
     pub at_ms: u64,
 }
 
+/// The observable lifecycle facts whose *change* is meaningful work
+/// activity: dirty flag and tree shape, delivery evidence, forge state.
+/// Persisted as the record's last reading so a restart does not redate an
+/// unchanged state, and a changed input dates at its observation time.
+/// Every field is optional so unproven evidence stays distinct from a
+/// proven value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleInputs {
+    /// The worktree's dirty flag; `None` when unproven or not applicable.
+    #[serde(default)]
+    pub dirty: Option<bool>,
+    /// Whether the anchor's checkout exists at all this pass.
+    #[serde(default)]
+    pub worktree: bool,
+    /// The checkout path, when one exists - a move is a tree transition.
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    /// Commits on the tip not on the proven base.
+    #[serde(default)]
+    pub ahead: Option<u64>,
+    /// Commits the configured upstream does not have.
+    #[serde(default)]
+    pub unpushed: Option<u64>,
+    /// The upstream state's wire spelling plus its detail.
+    #[serde(default)]
+    pub upstream: Option<String>,
+    /// The landed verdict's wire spelling.
+    #[serde(default)]
+    pub landed: Option<String>,
+    /// The forge work-item state's wire spelling.
+    #[serde(default)]
+    pub forge: Option<String>,
+    /// The open item's pipeline state.
+    #[serde(default)]
+    pub pipeline: Option<String>,
+}
+
+/// One local ref a pass observed in a repository, with the facts the
+/// record fingerprints.
+#[derive(Debug, Clone)]
+pub struct ObservedRef {
+    /// The short branch name (`refs/heads/<name>`).
+    pub name: String,
+    pub inputs: LifecycleInputs,
+}
+
+/// One branch incarnation: a single observed lifetime of `ref_name` inside
+/// `repo`. A deleted ref closes the record (`ended_at`); a ref that
+/// reappears opens a fresh record with a new `id` and `parked: false` - a
+/// name is a label, not an identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchRecord {
+    /// Opaque stable identity of this incarnation.
+    pub id: String,
+    /// The canonical repository id (`$GIT_COMMON_DIR`).
+    pub repo: String,
+    /// The short ref name.
+    pub ref_name: String,
+    /// First and latest pass that observed the ref, epoch milliseconds.
+    pub first_observed_at: u64,
+    pub last_observed_at: u64,
+    /// When the ref was observed gone, epoch ms; `None` while active.
+    #[serde(default)]
+    pub ended_at: Option<u64>,
+    /// The authored parked flag; suppresses only the `Forgotten` section.
+    #[serde(default)]
+    pub parked: bool,
+    /// When the last lifecycle transition was observed, epoch ms. Source
+    /// timestamps (commit, reflog) are re-derived each pass and never
+    /// stored; first observation fingerprints without dating anything.
+    #[serde(default)]
+    pub activity_at: Option<u64>,
+    /// The inputs `activity_at` was judged against.
+    #[serde(default)]
+    pub inputs: LifecycleInputs,
+}
+
+/// A path-anchored record: a detached worktree or a non-Git project space,
+/// keyed by its canonical path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PathRecord {
+    #[serde(default)]
+    pub parked: bool,
+    #[serde(default)]
+    pub activity_at: Option<u64>,
+    #[serde(default)]
+    pub inputs: LifecycleInputs,
+}
+
+/// The `work.json` payload: the authored Work state.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Work {
+    /// `(repo, ref_name)` -> the incarnation record - active, or the most
+    /// recent closed one until a reappearance replaces it.
+    #[serde(default)]
+    pub branches: std::collections::BTreeMap<String, BranchRecord>,
+    /// Canonical path -> the detached worktree or project space record.
+    #[serde(default)]
+    pub paths: std::collections::BTreeMap<String, PathRecord>,
+}
+
+impl Work {
+    /// The active incarnation record for `(repo, ref_name)`, if one is.
+    /// A closed record answers `None`: a reappeared ref gets its identity
+    /// from the record a sync creates, never from the closed past.
+    pub fn branch(&self, repo: &str, ref_name: &str) -> Option<&BranchRecord> {
+        self.branches
+            .get(&branch_key(repo, ref_name))
+            .filter(|r| r.ended_at.is_none())
+    }
+
+    /// The path record for `path`, if one exists.
+    pub fn path(&self, path: &str) -> Option<&PathRecord> {
+        self.paths.get(path)
+    }
+}
+
+/// The exact identity `p` toggles `parked` on: a branch incarnation's id,
+/// or a canonical path for rows with no ref.
+#[derive(Debug)]
+pub enum WorkIdentity {
+    /// `BranchRecord.id` of an active incarnation.
+    Branch(String),
+    /// Canonical path of a detached worktree or project space.
+    Path(String),
+}
+
+/// The `branches` map key: repo and ref joined like `conversation_key`.
+fn branch_key(repo: &str, ref_name: &str) -> String {
+    format!("{repo}\u{0}{ref_name}")
+}
+
+/// An opaque incarnation id: unique per creation without a central
+/// counter surviving across processes - observation time, process and a
+/// per-process sequence name it.
+fn incarnation_id(repo: &str, ref_name: &str, at_ms: u64) -> String {
+    use std::hash::{Hash, Hasher};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (
+        repo,
+        ref_name,
+        at_ms,
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    )
+        .hash(&mut h);
+    format!("i{:016x}", h.finish())
+}
+
 /// The checkpoint file: the reduction at `through` commit sequence.
 #[derive(Debug, Serialize, Deserialize)]
 struct Checkpoint {
@@ -382,6 +535,8 @@ pub struct Loaded {
     pub seen: HashMap<String, Seen>,
     /// Conversation key -> the authored not-busy mark.
     pub marks: HashMap<String, Mark>,
+    /// The authored Work state: incarnation records and parked flags.
+    pub work: Work,
     /// Records excluded or files unreadable - isolated, never fatal.
     pub errors: Vec<SourceError>,
     /// The highest committed sequence the store knows.
@@ -415,6 +570,7 @@ pub fn conversation_key(provider: &str, session_id: &str) -> String {
 
 /// A store rooted at `dir` (`$XDG_STATE_HOME/agent-sessions/`). Every
 /// method tolerates a missing directory: a first run has no store.
+#[derive(Clone)]
 pub struct Store {
     dir: PathBuf,
 }
@@ -547,6 +703,7 @@ impl Store {
         self.report_cuts(&mut errors);
         let seen = self.read_seen(&mut errors);
         let marks = self.read_marks(&mut errors);
+        let work = self.read_work(&mut errors);
         // Acknowledgement stands on both halves reading: the history a
         // `seen` sequence indexes into, and `seen.json` itself - absent is
         // a first run, malformed is a guess refused.
@@ -556,6 +713,7 @@ impl Store {
                 folds,
                 seen,
                 marks,
+                work,
                 errors,
                 max_seq,
                 ack_readable,
@@ -650,6 +808,173 @@ impl Store {
     /// [`Self::mark_not_busy_many`].
     pub fn mark_not_busy(&self, key: &str, since_ms: u64, seq: u64) -> io::Result<()> {
         self.mark_not_busy_many(&[(key, since_ms, seq)])
+    }
+
+    /// Synchronize `repo`'s records with the refs one pass observed at
+    /// `observed_ms` (epoch milliseconds): a ref that keeps its record
+    /// updates it, a ref absent from the observation closes its active
+    /// record (`ended_at`), and a ref with no active record opens a new
+    /// incarnation - new id, `parked: false`, the current inputs
+    /// fingerprinted without dating activity. A changed fingerprint on a
+    /// live record is a lifecycle transition dated `observed_ms`.
+    ///
+    /// One lock and at most one rewrite; a sync that changes nothing -
+    /// no refs to record and none to close - touches no file.
+    pub fn sync_repo(&self, repo: &str, refs: &[ObservedRef], observed_ms: u64) -> io::Result<()> {
+        // No refs to record and no file to close records in: the sync
+        // touches nothing.
+        if refs.is_empty() && !self.dir.join(WORK).exists() {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
+        let _lock = Lock::acquire(&self.dir.join(LOCK))?;
+        let mut work = self.read_work_for_update()?;
+        let mut changed = false;
+        // Refs the pass did not observe close their active record.
+        let observed: std::collections::HashSet<&str> =
+            refs.iter().map(|r| r.name.as_str()).collect();
+        for record in work
+            .branches
+            .values_mut()
+            .filter(|r| r.repo == repo && r.ended_at.is_none())
+        {
+            if !observed.contains(record.ref_name.as_str()) {
+                record.ended_at = Some(observed_ms);
+                changed = true;
+            }
+        }
+        for obs in refs {
+            let key = branch_key(repo, &obs.name);
+            match work.branches.get_mut(&key) {
+                Some(record) if record.ended_at.is_none() => {
+                    if record.inputs != obs.inputs {
+                        // A changed fingerprint is a transition; first
+                        // observation never lands here.
+                        record.activity_at = Some(observed_ms);
+                        record.inputs = obs.inputs.clone();
+                        changed = true;
+                    }
+                    if record.last_observed_at != observed_ms {
+                        record.last_observed_at = observed_ms;
+                        changed = true;
+                    }
+                }
+                _ => {
+                    work.branches.insert(
+                        key,
+                        BranchRecord {
+                            id: incarnation_id(repo, &obs.name, observed_ms),
+                            repo: repo.to_owned(),
+                            ref_name: obs.name.clone(),
+                            first_observed_at: observed_ms,
+                            last_observed_at: observed_ms,
+                            ended_at: None,
+                            parked: false,
+                            activity_at: None,
+                            inputs: obs.inputs.clone(),
+                        },
+                    );
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.write_work(&work)?; // coverage: off - the error edge needs the atomic write to fail
+        }
+        Ok(())
+    }
+
+    /// Synchronize the record for `path` - a detached worktree or a
+    /// project space - with the fingerprint a pass observed at
+    /// `observed_ms`. Creates it absent, dates a changed fingerprint as a
+    /// transition, and writes nothing when nothing changed.
+    pub fn sync_path(
+        &self,
+        path: &str,
+        inputs: &LifecycleInputs,
+        observed_ms: u64,
+    ) -> io::Result<()> {
+        fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
+        let _lock = Lock::acquire(&self.dir.join(LOCK))?;
+        let mut work = self.read_work_for_update()?;
+        let mut changed = false;
+        match work.paths.get_mut(path) {
+            Some(record) => {
+                if record.inputs != *inputs {
+                    record.activity_at = Some(observed_ms);
+                    record.inputs = inputs.clone();
+                    changed = true;
+                }
+            }
+            None => {
+                work.paths.insert(
+                    path.to_owned(),
+                    PathRecord {
+                        parked: false,
+                        activity_at: None,
+                        inputs: inputs.clone(),
+                    },
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            self.write_work(&work)?; // coverage: off - the error edge needs the atomic write to fail
+        }
+        Ok(())
+    }
+
+    /// Flip `parked` on the record `identity` names exactly - an active
+    /// incarnation by id, or a path record by canonical path. A missing
+    /// record is `NotFound`: the toggle never fabricates a row's state.
+    /// Returns the stored flag after the flip.
+    pub fn toggle_parked(&self, identity: &WorkIdentity) -> io::Result<bool> {
+        // No file, no record: the toggle names nothing and writes nothing.
+        if !self.dir.join(WORK).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no work.json - nothing is parked",
+            ));
+        }
+        fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
+        let _lock = Lock::acquire(&self.dir.join(LOCK))?;
+        let mut work = self.read_work_for_update()?;
+        let parked = match identity {
+            WorkIdentity::Branch(id) => {
+                let record = work
+                    .branches
+                    .values_mut()
+                    .find(|r| r.id == *id && r.ended_at.is_none())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("no active branch incarnation {id}"),
+                        )
+                    })?;
+                record.parked = !record.parked;
+                record.parked
+            }
+            WorkIdentity::Path(path) => {
+                let record = work.paths.get_mut(path).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("no work record for {path}"),
+                    )
+                })?;
+                record.parked = !record.parked;
+                record.parked
+            }
+        };
+        self.write_work(&work)?; // coverage: off - the error edge needs the atomic write to fail
+        Ok(parked)
+    }
+
+    /// The authored work state as the file reads today, plus any read
+    /// errors - absent is an empty state, malformed or future reports.
+    pub fn work(&self) -> (Work, Vec<SourceError>) {
+        let mut errors = Vec::new();
+        let work = self.read_work(&mut errors);
+        (work, errors)
     }
 
     /// Write the checkpoint for `folds` at `through` and rewrite the
@@ -875,6 +1200,28 @@ impl Store {
 
     fn write_marks(&self, marks: &HashMap<String, Mark>) -> io::Result<()> {
         self.write_authored(MARKS, marks)
+    }
+
+    /// The work-state file: incarnation and path records. Malformed or
+    /// future content reports and reads as absent - never guessed.
+    fn read_work(&self, errors: &mut Vec<SourceError>) -> Work {
+        self.read_authored(WORK, errors)
+            .map(|authored: Authored<Work>| authored.data)
+            .unwrap_or_default()
+    }
+
+    /// The work state under the same update precondition as seen-state: a
+    /// file that did not read clean refuses the read-modify-write, so a
+    /// rewrite can never erase bytes it could not carry.
+    fn read_work_for_update(&self) -> io::Result<Work> {
+        let mut errors = Vec::new();
+        let work = self.read_work(&mut errors);
+        update_read(errors)?;
+        Ok(work)
+    }
+
+    fn write_work(&self, work: &Work) -> io::Result<()> {
+        self.write_authored(WORK, work)
     }
 
     /// One authored file read: future or malformed content is reported and
@@ -1975,5 +2322,268 @@ mod tests {
                 .iter()
                 .any(|e| e.detail.contains("does not parse"))
         );
+    }
+
+    /// A ref observation to sync: `name` with a dirty flag, so a single
+    /// field's change stands in for a fingerprint transition.
+    fn obs(name: &str, dirty: bool) -> ObservedRef {
+        ObservedRef {
+            name: name.to_owned(),
+            inputs: LifecycleInputs {
+                dirty: Some(dirty),
+                ..LifecycleInputs::default()
+            },
+        }
+    }
+
+    #[test]
+    fn work_records_sync_close_and_reopen_incarnations() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        // First sync: two incarnations open, each with its own stable id.
+        store
+            .sync_repo(repo, &[obs("main", false), obs("feat", false)], 1_000)
+            .unwrap();
+        let work = store.load().work;
+        let main = work.branch(repo, "main").expect("main is active");
+        let feat = work.branch(repo, "feat").expect("feat is active");
+        assert_ne!(main.id, feat.id);
+        assert_eq!(main.first_observed_at, 1_000);
+        assert_eq!(main.last_observed_at, 1_000);
+        assert_eq!(main.activity_at, None, "first observation dates nothing");
+        assert!(!main.parked);
+        // The same observation again is a no-op: the file does not move.
+        let bytes = fs::read(temp.path(WORK)).unwrap();
+        store
+            .sync_repo(repo, &[obs("main", false), obs("feat", false)], 1_000)
+            .unwrap();
+        assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes);
+        // A fingerprint change dates the transition at its observation.
+        store
+            .sync_repo(repo, &[obs("main", false), obs("feat", true)], 2_000)
+            .unwrap();
+        let work = store.load().work;
+        let feat = work.branch(repo, "feat").unwrap();
+        assert_eq!(feat.activity_at, Some(2_000));
+        assert_eq!(feat.inputs.dirty, Some(true));
+        assert_eq!(feat.last_observed_at, 2_000);
+        // `feat` gone from the observation: the record closes.
+        store.sync_repo(repo, &[obs("main", false)], 3_000).unwrap();
+        let work = store.load().work;
+        assert!(work.branch(repo, "feat").is_none());
+        let closed = &work.branches[&branch_key(repo, "feat")];
+        assert_eq!(closed.ended_at, Some(3_000));
+        // Reappearance opens a new incarnation: new id, unparked, the
+        // closed record replaced.
+        let old_id = closed.id.clone();
+        store
+            .sync_repo(repo, &[obs("main", false), obs("feat", false)], 4_000)
+            .unwrap();
+        let work = store.load().work;
+        let feat = work.branch(repo, "feat").expect("feat reincarnated");
+        assert_ne!(feat.id, old_id);
+        assert_eq!(feat.first_observed_at, 4_000);
+        assert_eq!(feat.ended_at, None);
+        // Another repo's records are not touched by this repo's sync.
+        assert_eq!(work.branch(repo, "main").unwrap().id, main.id);
+        let other = store.load().work;
+        store.sync_repo("/other/.git", &[], 5_000).unwrap();
+        let work = store.load().work;
+        assert_eq!(work.branches.len(), 2, "{:?}", work.branches);
+        assert!(other.branch(repo, "main").is_some());
+    }
+
+    #[test]
+    fn a_sync_that_records_nothing_writes_nothing() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        // No refs observed and none on record: not even the directory is
+        // created - a no-op touches nothing.
+        store.sync_repo("/r/.git", &[], 1_000).unwrap();
+        assert!(!temp.0.exists());
+        // Identical fingerprints likewise: the file stays byte-identical.
+        store
+            .sync_path("/space", &LifecycleInputs::default(), 1_000)
+            .unwrap();
+        let bytes = fs::read(temp.path(WORK)).unwrap();
+        store
+            .sync_path("/space", &LifecycleInputs::default(), 2_000)
+            .unwrap();
+        assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes);
+        // A changed fingerprint is a transition: it lands `activity_at`
+        // and rewrites once.
+        let inputs = LifecycleInputs {
+            dirty: Some(true),
+            ..LifecycleInputs::default()
+        };
+        store.sync_path("/space", &inputs, 3_000).unwrap();
+        let work = store.load().work;
+        assert_eq!(work.path("/space").unwrap().activity_at, Some(3_000));
+        // Toggling an identity no file can name is NotFound before a
+        // single byte is written.
+        let empty = TempStore::new();
+        let err = Store::open(empty.0.clone())
+            .toggle_parked(&WorkIdentity::Path("/space".to_owned()))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn parked_toggles_by_exact_identity_and_survives_restart() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        store
+            .sync_repo(repo, &[obs("main", false), obs("feat", true)], 1_000)
+            .unwrap();
+        store
+            .sync_path("/space", &LifecycleInputs::default(), 1_000)
+            .unwrap();
+        let work = store.load().work;
+        let id = work.branch(repo, "feat").unwrap().id.clone();
+        // Branch by id, path by its canonical spelling.
+        assert!(
+            store
+                .toggle_parked(&WorkIdentity::Branch(id.clone()))
+                .unwrap()
+        );
+        assert!(
+            store
+                .toggle_parked(&WorkIdentity::Path("/space".to_owned()))
+                .unwrap()
+        );
+        // A fresh Store over the same dir - the "restart" - reads them back.
+        let reloaded = Store::open(temp.0.clone()).load().work;
+        assert!(reloaded.branch(repo, "feat").unwrap().parked);
+        assert!(!reloaded.branch(repo, "main").unwrap().parked);
+        assert!(reloaded.path("/space").unwrap().parked);
+        // Toggling back clears it.
+        assert!(
+            !store
+                .toggle_parked(&WorkIdentity::Branch(id.clone()))
+                .unwrap()
+        );
+        // Unknown identities are refused, not fabricated.
+        let err = store
+            .toggle_parked(&WorkIdentity::Branch("inonesuch".to_owned()))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let err = store
+            .toggle_parked(&WorkIdentity::Path("/nowhere".to_owned()))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        // And a closed incarnation cannot be parked by its old id.
+        store.sync_repo(repo, &[obs("main", false)], 2_000).unwrap();
+        let err = store.toggle_parked(&WorkIdentity::Branch(id)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn work_mutations_hold_the_lock_and_refuse_an_unreadable_file() {
+        let temp = TempStore::new();
+        fs::create_dir_all(&temp.0).unwrap();
+        let store = temp.store();
+        // A record exists so the toggle reaches the lock rather than
+        // answering NotFound off the missing file.
+        store
+            .sync_path("/p", &LifecycleInputs::default(), 1_000)
+            .unwrap();
+        // A held lock fails every work mutation rather than clobbering.
+        let held = Lock::acquire(&temp.path(LOCK)).unwrap();
+        assert_eq!(
+            store
+                .sync_repo("/r", &[obs("a", false)], 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            store
+                .sync_path("/p", &LifecycleInputs::default(), 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            store
+                .toggle_parked(&WorkIdentity::Path("/p".to_owned()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(held);
+        // Malformed and future-schema files refuse the read-modify-write
+        // and keep their bytes.
+        for bytes in [
+            "{oops".to_owned(),
+            serde_json::json!({"v": 99, "data": {}}).to_string(),
+        ] {
+            fs::write(temp.path(WORK), &bytes).unwrap();
+            let err = store
+                .sync_repo("/r", &[obs("a", false)], 1_000)
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            let err = store
+                .sync_path("/p", &LifecycleInputs::default(), 1_000)
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            let err = store
+                .toggle_parked(&WorkIdentity::Path("/p".to_owned()))
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes.as_bytes());
+            // The best-effort read reports and answers an empty state.
+            let loaded = store.load();
+            assert!(loaded.work.branches.is_empty());
+            assert!(loaded.errors.iter().any(|e| e.source == WORK));
+        }
+    }
+
+    #[test]
+    fn concurrent_work_updates_never_lose_a_record() {
+        let temp = TempStore::new();
+        fs::create_dir_all(&temp.0).unwrap();
+        let store = temp.store();
+        // Two repos syncing and two parked toggles racing: every write
+        // lands whole under the one lock.
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let store = Store::open(temp.0.clone());
+            handles.push(std::thread::spawn(move || {
+                store
+                    .sync_repo(&format!("/r{i}"), &[obs("main", i % 2 == 0)], 1_000)
+                    .expect("sync")
+            }));
+        }
+        for h in handles {
+            h.join().expect("sync joins");
+        }
+        let ids: Vec<String> = (0..4)
+            .map(|i| {
+                store
+                    .load()
+                    .work
+                    .branch(&format!("/r{i}"), "main")
+                    .unwrap()
+                    .id
+                    .clone()
+            })
+            .collect();
+        let mut handles = Vec::new();
+        for id in ids {
+            let store = Store::open(temp.0.clone());
+            handles.push(std::thread::spawn(move || {
+                store
+                    .toggle_parked(&WorkIdentity::Branch(id))
+                    .expect("toggle")
+            }));
+        }
+        for h in handles {
+            assert!(h.join().expect("toggle joins"));
+        }
+        let work = store.load().work;
+        assert_eq!(work.branches.len(), 4);
+        assert!(work.branches.values().all(|r| r.parked));
     }
 }

@@ -14,8 +14,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
 /// State of the pull request or merge request a branch feeds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkItem {
     /// Not asked, not asked successfully, or no CLI can ask this host.
     Unknown,
@@ -27,7 +30,8 @@ pub enum WorkItem {
 }
 
 /// Pipeline state of an open work item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Pipeline {
     Busy,
     Succeeded,
@@ -412,7 +416,9 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Keeps network facts off the render path: a cached answer is served until
-/// `ttl` old, and only an explicit collection asks the CLI again.
+/// `ttl` old, and only an explicit collection asks the CLI again. `fresh`,
+/// `seed` and `peek` are the split a fanned-out collector uses: enumerate
+/// stale asks, fetch them in parallel, seed the answers back, then read.
 pub struct ForgeCache {
     ttl: Duration,
     entries: HashMap<(String, String), (Instant, ForgeStatus)>,
@@ -426,6 +432,27 @@ impl ForgeCache {
         }
     }
 
+    /// Whether the stored answer for `(remote_url, branch)` still stands.
+    pub fn fresh(&self, remote_url: &str, branch: &str, now: Instant) -> bool {
+        let key = (remote_url.to_owned(), branch.to_owned());
+        self.entries
+            .get(&key)
+            .is_some_and(|(at, _)| now.duration_since(*at) < self.ttl)
+    }
+
+    /// Store a freshly asked status.
+    pub fn seed(&mut self, remote_url: &str, branch: &str, status: ForgeStatus, now: Instant) {
+        let key = (remote_url.to_owned(), branch.to_owned());
+        self.entries.insert(key, (now, status));
+    }
+
+    /// The stored status, without asking. `None` only when the pair was
+    /// never asked - callers that enumerate their asks first never miss.
+    pub fn peek(&self, remote_url: &str, branch: &str) -> Option<&ForgeStatus> {
+        let key = (remote_url.to_owned(), branch.to_owned());
+        self.entries.get(&key).map(|(_, status)| status)
+    }
+
     /// `now` is a parameter so tests drive expiry without sleeping.
     pub fn status(
         &mut self,
@@ -434,14 +461,14 @@ impl ForgeCache {
         branch: &str,
         now: Instant,
     ) -> ForgeStatus {
-        let key = (remote_url.to_owned(), branch.to_owned());
-        if let Some((at, status)) = self.entries.get(&key)
-            && now.duration_since(*at) < self.ttl
-        {
-            return status.clone();
+        if self.fresh(remote_url, branch, now) {
+            return self
+                .peek(remote_url, branch)
+                .cloned()
+                .unwrap_or_else(|| ForgeStatus::unknown("cache entry vanished")); // coverage: off - the peek miss arm is unreachable: fresh just proved the entry
         }
         let status = forge.status(remote_url, branch);
-        self.entries.insert(key, (now, status.clone()));
+        self.seed(remote_url, branch, status.clone(), now);
         status
     }
 }

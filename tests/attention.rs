@@ -396,7 +396,7 @@ fn attention_flows_end_to_end() {
         .iter()
         .find(|w| w.name == "feat-login")
         .expect("the work row");
-    assert_eq!(work.section, Some(WorkSection::Active));
+    assert_eq!(work.section, WorkSection::Active);
     assert_eq!(work.attention, Attention::Working);
 
     // Waiting: a permission prompt latches `waiting`, the row moves to
@@ -416,7 +416,7 @@ fn attention_flows_end_to_end() {
         .iter()
         .find(|w| w.name == "feat-login")
         .unwrap();
-    assert_eq!(work.section, Some(WorkSection::NeedsYou));
+    assert_eq!(work.section, WorkSection::NeedsYou);
     assert!(work.summary.contains("waiting"), "{}", work.summary);
 
     // `list --json` carries the same reading - the contract surface.
@@ -532,7 +532,7 @@ fn attention_flows_end_to_end() {
         .iter()
         .find(|w| w.name == "feat-login")
         .unwrap();
-    assert_eq!(work.section, None);
+    assert_eq!(work.section, WorkSection::FollowUp);
 
     // Kill the agent: within one refresh the process claim is dead, the
     // latch is acknowledged already - nothing ghost-busy, nothing lost.
@@ -565,7 +565,7 @@ fn attention_flows_end_to_end() {
         .iter()
         .find(|w| w.name == "feat-login")
         .unwrap();
-    assert_eq!(work.section, Some(WorkSection::NeedsYou));
+    assert_eq!(work.section, WorkSection::NeedsYou);
     let _ = client.kill();
     let _ = client.wait();
 }

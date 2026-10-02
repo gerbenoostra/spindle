@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::evidence::Evidence;
-use crate::forge;
+use crate::forge::{self, ForgeStatus, Pipeline, WorkItem};
 use crate::git::{self, Head, RemoteHead, RemoteListing, Repo, Track, UpstreamConfig};
 
 /// What a Work row is anchored on. Branch incarnations and detached
@@ -153,6 +153,9 @@ pub struct WorkState {
     /// URL of the upstream remote, when the branch has one.
     pub remote_url: Option<String>,
     pub base: Evidence<Base>,
+    /// The forge work-item overlay: `Unknown(PENDING)` until the forge
+    /// stage lands an answer, like every remote-owned field.
+    pub forge: ForgeStatus,
     pub vector: StateVector,
 }
 
@@ -489,6 +492,13 @@ fn anchor_work(
         anchor: anchor.clone(),
         remote_url: local.remote_url.clone(),
         base: Evidence::Unknown(PENDING.to_owned()),
+        forge: ForgeStatus {
+            item: WorkItem::Unknown,
+            pipeline: Pipeline::Unknown,
+            label: None,
+            url: None,
+            reason: Some(PENDING.to_owned()),
+        },
         vector: StateVector {
             worktree: match &anchor {
                 Anchor::Worktree { path, .. } => Some(path.clone()),
