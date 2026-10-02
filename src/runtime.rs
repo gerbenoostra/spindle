@@ -212,7 +212,7 @@ impl Runtime {
         }
     }
 
-    /// L3 pane resolution for one pid: published handle, parent ancestry
+    /// Pane resolution for one pid, in order: published handle, parent ancestry
     /// to a `pane_pid`, controlling tty, then `Unknown`. A published handle
     /// that names one live pane binds - unless derived evidence names a
     /// different one, which is a contradiction and fails closed.

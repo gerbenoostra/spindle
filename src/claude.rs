@@ -937,7 +937,8 @@ mod tests {
                 "\"status\":\"waiting\",\"waitingFor\":\"permission prompt\"",
             ),
         );
-        // Unknown keys drift in without breaking anything (F1 shape).
+        // Unknown keys drift in without breaking anything: Claude adds
+        // session-file keys between releases.
         root.write("sessions/4300.json", &live_json(4300, ID_B, "busy"));
         // Malformed JSON and a missing sessionId are each one excluded record.
         root.write("sessions/4400.json", "{not json");
