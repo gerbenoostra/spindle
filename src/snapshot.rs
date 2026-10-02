@@ -536,15 +536,7 @@ impl Collector {
             let instance = resolved_claim
                 .filter(|r| r.liveness.may_be_live())
                 .map(|r| observed_instance(r, runtime.processes.as_ref()));
-            let live = instance.map(|i| {
-                (
-                    i.pid,
-                    match i.pid_start {
-                        ProcessStart::At(at) => Some(at),
-                        ProcessStart::Unavailable => None,
-                    },
-                )
-            });
+            let live = instance.map(|i| (i.pid, process_start(i.pid_start)));
             let published = conv.live.as_ref().and_then(|l| {
                 // A record with no time of its own is dated when first read
                 // and keeps that date while later polls read it unchanged.
@@ -1315,6 +1307,14 @@ fn pending<T>(evidence: &Evidence<T>) -> bool {
 #[rustfmt::skip]
 fn unprobed_listing(remote: &str) -> RemoteListing { RemoteListing { head: RemoteHead::Unreachable(format!("remote {remote} was not probed")), refs: Evidence::Unknown(format!("remote {remote} was not probed")) } } // coverage: off - apply only consults remotes the asks enumeration seeded
 
+/// A process start as its known epoch seconds; `None` when undated.
+fn process_start(start: ProcessStart) -> Option<u64> {
+    match start {
+        ProcessStart::At(at) => Some(at),
+        ProcessStart::Unavailable => None,
+    }
+}
+
 /// `resolved` -> the row's attachment view.
 fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
     let (liveness, liveness_detail) = match &r.liveness {
@@ -1330,10 +1330,7 @@ fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
     };
     AttachmentRow {
         pid: r.attachment.process.pid,
-        pid_start: match r.attachment.process.pid_start {
-            ProcessStart::At(at) => Some(at),
-            ProcessStart::Unavailable => None,
-        },
+        pid_start: process_start(r.attachment.process.pid_start),
         liveness,
         liveness_detail,
         pane: r.attachment.pane.as_ref().map(display_pane),
