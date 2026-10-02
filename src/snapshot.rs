@@ -1380,9 +1380,16 @@ fn first_read(
 
 /// Whether `pane` is the dashboard's own: the socket qualifies the id, so
 /// the same `%N` on another server is a watched pane, not the dashboard -
-/// and still acknowledges.
+/// and still acknowledges. Sockets compare as files: `$TMUX` carries
+/// tmux's resolved path, discovery the spelling it listed, and the two
+/// differ under a symlinked socket directory.
 fn is_own_pane(own_pane: Option<&PaneRef>, pane: &PaneRef) -> bool {
-    own_pane == Some(pane)
+    let Some(own) = own_pane else {
+        return false;
+    };
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_owned());
+    own.pane == pane.pane
+        && (own.socket == pane.socket || canonical(&own.socket) == canonical(&pane.socket))
 }
 
 fn conversation_row(
@@ -2146,5 +2153,27 @@ mod tests {
                 pane: PaneId::parse("%2").unwrap(),
             }
         ));
+    }
+
+    #[test]
+    fn own_pane_matches_one_server_under_two_spellings() {
+        // `$TMUX` carries tmux's resolved socket path while discovery may
+        // keep a symlinked spelling of the same server: still the
+        // dashboard's own pane.
+        let root = std::env::temp_dir().join(format!("agent-sessions-own-{}", std::process::id()));
+        let real = root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("default"), "").unwrap();
+        let link = root.join("link");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let pref = |socket: PathBuf| PaneRef {
+            socket,
+            pane: PaneId::parse("%1").unwrap(),
+        };
+        let own = pref(real.join("default"));
+        assert!(is_own_pane(Some(&own), &pref(link.join("default"))));
+        assert!(!is_own_pane(Some(&own), &pref(link.join("other"))));
+        fs::remove_dir_all(&root).unwrap();
     }
 }
