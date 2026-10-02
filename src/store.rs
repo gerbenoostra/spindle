@@ -566,49 +566,90 @@ impl Store {
         )
     }
 
-    /// Acknowledge every retained event on `key` through `through_seq`,
-    /// and the live wait episode `wait_ms` names when one shows. The whole
-    /// `seen.json` map is rewritten atomically under the store lock, so
-    /// two acknowledgements cannot lose one another; the sequence never
-    /// moves backwards. `space` and the focus observation both land here.
-    /// Returns the conversation's acknowledgement as stored.
+    /// Acknowledge every retained event on each `key` through its
+    /// `through_seq`, and the live wait episode `wait_ms` names when one
+    /// shows - `(key, through_seq, wait_ms)` per entry. The batch takes
+    /// the store lock once, reads `seen.json` once, and rewrites the map
+    /// atomically at most once, only when an update changed it, so two
+    /// acknowledgements cannot lose one another and one keypress cannot
+    /// queue behind a lock per conversation. Updates merge monotonically,
+    /// later entries seeing earlier ones under the same key, and the
+    /// sequence never moves backwards. `space` and the focus observation
+    /// both land here. Returns each entry's acknowledgement as stored, in
+    /// input order. An empty batch is a no-op that touches nothing.
+    pub fn acknowledge_many(&self, updates: &[(&str, u64, Option<u64>)]) -> io::Result<Vec<Seen>> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
+        let _lock = Lock::acquire(&self.dir.join(LOCK))?;
+        let mut seen = self.read_seen_for_update()?;
+        let mut changed = false;
+        let mut stored = Vec::with_capacity(updates.len());
+        for &(key, through_seq, wait_ms) in updates {
+            let old = seen.get(key).copied().unwrap_or_default();
+            let new = Seen {
+                seq: old.seq.max(through_seq),
+                wait_ms: wait_ms.max(old.wait_ms),
+            };
+            if new != old {
+                seen.insert(key.to_owned(), new);
+                changed = true;
+            }
+            stored.push(new);
+        }
+        if changed {
+            self.write_seen(&seen)?; // coverage: off - a seen-state write failure needs a filesystem fault
+        }
+        Ok(stored)
+    }
+
+    /// Acknowledge one conversation; delegates to
+    /// [`Self::acknowledge_many`]. Returns its acknowledgement as stored.
     pub fn acknowledge(
         &self,
         key: &str,
         through_seq: u64,
         wait_ms: Option<u64>,
     ) -> io::Result<Seen> {
-        fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
-        let _lock = Lock::acquire(&self.dir.join(LOCK))?;
-        let mut seen = self.read_seen_for_update()?;
-        let old = seen.get(key).copied().unwrap_or_default();
-        let new = Seen {
-            seq: old.seq.max(through_seq),
-            wait_ms: wait_ms.max(old.wait_ms),
-        };
-        if new == old {
-            return Ok(old);
-        }
-        seen.insert(key.to_owned(), new);
-        self.write_seen(&seen)?; // coverage: off - a seen-state write failure needs a filesystem fault
-        Ok(new)
+        Ok(self
+            .acknowledge_many(&[(key, through_seq, wait_ms)])?
+            .into_iter()
+            .next()
+            .expect("a one-entry batch returns one acknowledgement"))
     }
 
-    /// Record the authored not-busy mark: `since_ms` names the `Busy`'s
-    /// `effective_since`, `seq` the commit sequence it was written at.
-    pub fn mark_not_busy(&self, key: &str, since_ms: u64, seq: u64) -> io::Result<()> {
+    /// Record authored not-busy marks - `(key, since_ms, seq)` per entry:
+    /// `since_ms` names the dismissed `Busy`'s `effective_since`, `seq`
+    /// the commit sequence at write time. The batch takes the store lock
+    /// once, reads `marks.json` once, and rewrites it once, every mark
+    /// sharing the one `at_ms` so the keypress lands as a single authored
+    /// action. An empty batch is a no-op that touches nothing.
+    pub fn mark_not_busy_many(&self, updates: &[(&str, u64, u64)]) -> io::Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
         fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
         let _lock = Lock::acquire(&self.dir.join(LOCK))?;
         let mut marks = self.read_marks_for_update()?;
-        marks.insert(
-            key.to_owned(),
-            Mark {
-                since_ms,
-                seq,
-                at_ms: now_ms(),
-            },
-        );
+        let at_ms = now_ms();
+        for &(key, since_ms, seq) in updates {
+            marks.insert(
+                key.to_owned(),
+                Mark {
+                    since_ms,
+                    seq,
+                    at_ms,
+                },
+            );
+        }
         self.write_marks(&marks)
+    }
+
+    /// Mark one conversation not-busy; delegates to
+    /// [`Self::mark_not_busy_many`].
+    pub fn mark_not_busy(&self, key: &str, since_ms: u64, seq: u64) -> io::Result<()> {
+        self.mark_not_busy_many(&[(key, since_ms, seq)])
     }
 
     /// Write the checkpoint for `folds` at `through` and rewrite the
@@ -1417,6 +1458,70 @@ mod tests {
         let loaded = store.load();
         assert!(loaded.marks.is_empty());
         assert!(loaded.errors.iter().any(|e| e.source == MARKS));
+    }
+
+    #[test]
+    fn authored_batches_merge_every_update_in_one_operation() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        // Empty batches touch nothing: no directory, no lock, no file.
+        assert!(store.acknowledge_many(&[]).unwrap().is_empty());
+        store.mark_not_busy_many(&[]).unwrap();
+        assert!(!temp.0.exists(), "an empty batch creates nothing");
+        let a = conversation_key("claude", "a");
+        let b = conversation_key("claude", "b");
+        // Two keys in one batch, the first repeated later: later entries
+        // see earlier ones, so the merge stays monotonic within the batch
+        // and every update answers its stored value in input order.
+        let stored = store
+            .acknowledge_many(&[
+                (a.as_str(), 7, Some(42_000)),
+                (b.as_str(), 3, None),
+                (a.as_str(), 5, Some(50_000)),
+            ])
+            .unwrap();
+        assert_eq!(
+            stored,
+            vec![
+                Seen {
+                    seq: 7,
+                    wait_ms: Some(42_000)
+                },
+                Seen {
+                    seq: 3,
+                    wait_ms: None
+                },
+                Seen {
+                    seq: 7,
+                    wait_ms: Some(50_000)
+                },
+            ]
+        );
+        let loaded = store.load();
+        assert_eq!(
+            loaded.seen[&a],
+            Seen {
+                seq: 7,
+                wait_ms: Some(50_000)
+            }
+        );
+        assert_eq!(
+            loaded.seen[&b],
+            Seen {
+                seq: 3,
+                wait_ms: None
+            }
+        );
+        // Two marks land in one operation sharing the authored `at_ms`.
+        store
+            .mark_not_busy_many(&[(a.as_str(), 100_000, 7), (b.as_str(), 200_000, 3)])
+            .unwrap();
+        let marks = store.load().marks;
+        assert_eq!(marks[&a].since_ms, 100_000);
+        assert_eq!(marks[&a].seq, 7);
+        assert_eq!(marks[&b].since_ms, 200_000);
+        assert_eq!(marks[&b].seq, 3);
+        assert_eq!(marks[&a].at_ms, marks[&b].at_ms);
     }
 
     #[test]

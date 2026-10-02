@@ -471,17 +471,19 @@ impl App {
         // A work row decides once for all its bound conversations: a single
         // pending latch turns the whole keypress into acknowledgements -
         // a not-busy mark written beside unacknowledged attention would
-        // contradict it.
+        // contradict it. The two authored kinds are exclusive - a work row
+        // by that rule, a conversation row by producing one action - so
+        // the keypress runs at most one acknowledgement batch and at most
+        // one mark batch, each a single store transaction.
         let pending =
             |c: &ConversationRow| c.attention_seq.is_some() || c.attention_wait_ms.is_some();
         let ack_only = matches!(row, Row::Work(_)) && convs.iter().any(|c| pending(c));
-        let mut refused = None;
+        let mut acks: Vec<(String, u64, Option<u64>)> = Vec::new();
+        let mut marks: Vec<(String, u64, u64)> = Vec::new();
         for c in convs {
             let key = store::conversation_key(c.provider.as_str(), &c.session_id);
-            let written = if pending(c) {
-                store
-                    .acknowledge(&key, c.attention_seq.unwrap_or(0), c.attention_wait_ms)
-                    .map(|_| ())
+            if pending(c) {
+                acks.push((key, c.attention_seq.unwrap_or(0), c.attention_wait_ms));
             } else if !ack_only
                 && c.attention == Attention::Working
                 && let Some(since_ms) = c.state_since_ms
@@ -490,13 +492,21 @@ impl App {
                 // no higher attention has nothing to acknowledge. A Busy
                 // only the provider published has no journal sequence yet;
                 // the mark sits at zero and any first event supersedes it.
-                store.mark_not_busy(&key, since_ms, c.journal_seq.unwrap_or(0))
-            } else {
-                Ok(())
-            };
-            refused = refused.or(written.err());
+                marks.push((key, since_ms, c.journal_seq.unwrap_or(0)));
+            }
         }
-        refused
+        let acks: Vec<(&str, u64, Option<u64>)> = acks
+            .iter()
+            .map(|(key, seq, wait)| (key.as_str(), *seq, *wait))
+            .collect();
+        let marks: Vec<(&str, u64, u64)> = marks
+            .iter()
+            .map(|(key, since, seq)| (key.as_str(), *since, *seq))
+            .collect();
+        if let Err(e) = store.acknowledge_many(&acks) {
+            return Some(e);
+        }
+        store.mark_not_busy_many(&marks).err()
     }
 
     /// `j`/`k` on the focused list: move, clamp, and reset the cursors below
@@ -1928,27 +1938,68 @@ mod tests {
     }
 
     #[test]
-    fn a_work_row_space_acknowledges_and_never_marks_beside_attention() {
-        let dir = std::env::temp_dir().join(format!("as-space-wr-{}", std::process::id()));
+    fn a_work_row_space_batches_one_kind_of_authored_action() {
+        // Both conversations bound to the work row carry pending
+        // attention: one `space` acknowledges every bound key, and the
+        // pending latch keeps the keypress acknowledgements only.
+        let dir = std::env::temp_dir().join(format!("as-space-wa-{}", std::process::id()));
         let mut snapshot = fixture();
-        // One bound conversation carries a latch; another bound to the
-        // same work row is Working with a mark pair to its name.
-        snapshot.conversations[1].attention = Attention::Working;
-        snapshot.conversations[1].state = ConversationState::Busy;
-        snapshot.conversations[1].state_since_ms = Some((1_800_000_000 - 300) * 1000);
-        snapshot.conversations[1].journal_seq = Some(9);
+        snapshot.conversations[1].attention = Attention::Waiting;
+        snapshot.conversations[1].attention_detail = Some("permission prompt".to_owned());
+        snapshot.conversations[1].attention_seq = Some(6);
+        snapshot.conversations[1].attention_wait_ms = Some((1_800_000_000 - 3600) * 1000);
         let mut app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
         press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char(' ')]);
         let loaded = crate::store::Store::open(dir.clone()).load();
-        let waiting = store::conversation_key("claude", "8f423bbb-1111-2222-3333-444444444444");
+        let first = store::conversation_key("claude", "8f423bbb-1111-2222-3333-444444444444");
+        let second = store::conversation_key("claude", "02aa0bbb-1111-2222-3333-444444444444");
         assert_eq!(
-            loaded.seen.get(&waiting).map(|s| s.seq),
-            Some(4),
+            loaded.seen.get(&first).copied(),
+            Some(store::Seen {
+                seq: 4,
+                wait_ms: Some((1_800_000_000 - 120) * 1000)
+            }),
             "{:?}",
             loaded.seen
         );
-        // The Working conversation earns no mark this keypress.
+        assert_eq!(
+            loaded.seen.get(&second).copied(),
+            Some(store::Seen {
+                seq: 6,
+                wait_ms: Some((1_800_000_000 - 3600) * 1000)
+            }),
+            "{:?}",
+            loaded.seen
+        );
         assert!(loaded.marks.is_empty(), "{:?}", loaded.marks);
+        let _ = std::fs::remove_dir_all(&dir);
+        // A fresh store and snapshot: both bound conversations Working
+        // with nothing to acknowledge - the same keypress marks both.
+        let dir = std::env::temp_dir().join(format!("as-space-wm-{}", std::process::id()));
+        let mut snapshot = fixture();
+        for c in &mut snapshot.conversations[..2] {
+            c.attention = Attention::Working;
+            c.attention_detail = None;
+            c.attention_seq = None;
+            c.attention_wait_ms = None;
+            c.state = ConversationState::Busy;
+        }
+        let mut app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char(' ')]);
+        let loaded = crate::store::Store::open(dir.clone()).load();
+        assert!(loaded.seen.is_empty(), "{:?}", loaded.seen);
+        assert_eq!(
+            loaded.marks.get(&first).map(|m| (m.since_ms, m.seq)),
+            Some(((1_800_000_000 - 120) * 1000, 7)),
+            "{:?}",
+            loaded.marks
+        );
+        assert_eq!(
+            loaded.marks.get(&second).map(|m| (m.since_ms, m.seq)),
+            Some(((1_800_000_000 - 3600) * 1000, 0)),
+            "{:?}",
+            loaded.marks
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
