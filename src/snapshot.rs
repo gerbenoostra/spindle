@@ -10,20 +10,22 @@
 //! `schema_version`; additive fields preserve the version, while removing,
 //! renaming or changing a field's meaning requires a version increment.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::attention::{self, Attention};
 use crate::claude::{Claude, Conversation};
 use crate::evidence::Evidence;
 use crate::fanout;
 use crate::git::{self, Head, RemoteHead, RemoteListing, Resolved};
-use crate::process::{Liveness, ProcessStart};
-use crate::provider::{PublishedStatus, SourceError, StateEvidence};
+use crate::process::{Liveness, ProcessInstance, ProcessStart};
+use crate::provider::{SourceError, StateEvidence};
 use crate::runtime::{PaneSource, Placement, Provider, Runtime};
-use crate::tmux::{PaneId, PaneRef};
+use crate::store::{self, Exec, Store};
+use crate::tmux::PaneRef;
 use crate::vector::{
     self, Anchor, Landed as LandedVerdict, RemoteCache, RuntimeFacts, UpstreamState, WindowCount,
 };
@@ -168,15 +170,39 @@ pub enum AttachmentLiveness {
     Unverifiable,
 }
 
-/// `ConversationRow.state`: the provider's published execution state.
+/// `ConversationRow.state`: the arbitrated effective execution state -
+/// published state fused with the journal's events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationState {
     Busy,
     Idle,
     Waiting,
-    /// No published state, or one the mapping does not know.
+    /// No applicable evidence, or one the mapping does not know.
     Unknown,
+}
+
+/// `WorkRow.section`: the first-match next-action section. Attention wins
+/// over delivery and cleanup state; the losing evidence still shows in the
+/// row's summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkSection {
+    /// Waiting, failed unseen or completed unseen.
+    NeedsYou,
+    /// A live busy process with no higher attention and no authored
+    /// not-busy mark.
+    Active,
+}
+
+impl WorkSection {
+    /// The section header as [2] renders it.
+    pub fn title(self) -> &'static str {
+        match self {
+            WorkSection::NeedsYou => "Needs you",
+            WorkSection::Active => "Active",
+        }
+    }
 }
 
 impl ConversationState {
@@ -227,7 +253,13 @@ pub struct WorkRow {
     pub past_sessions: usize,
     /// Newest of the HEAD reflog's last entry and its mtime; `None` is `?`.
     pub last_activity: Option<u64>,
-    /// Why the row reads the way it does (`↑3 ~2`, `no remote`, `no wt`).
+    /// The rolled-up attention of the conversations bound to the row.
+    pub attention: Attention,
+    /// The first-match section the row sits in; `None` is the flat
+    /// remainder until the lifecycle sections arrive.
+    pub section: Option<WorkSection>,
+    /// Why the row reads the way it does (`↑3 ~2`, `no remote`, `no wt`,
+    /// `error · working`).
     pub summary: String,
 }
 
@@ -259,15 +291,35 @@ pub struct ConversationRow {
     pub short_id: String,
     /// Provider title, or `None` -> `?`.
     pub title: Option<String>,
-    /// The provider's published reading, not yet arbitrated against hooks
-    /// (there are none yet).
+    /// The arbitrated effective reading: published state fused with the
+    /// journal's events, marks and liveness.
     pub state: ConversationState,
     /// The provider's raw status string, kept for the evidence view.
     pub state_raw: Option<String>,
-    /// The provider's own wait reason, verbatim.
+    /// The wait reason while waiting - the provider's `waitingFor` or the
+    /// `awaiting` event's, verbatim.
     pub waiting_for: Option<String>,
-    /// When the effective state began, epoch seconds.
+    /// When the effective state began, epoch seconds; without a live claim,
+    /// the provider's status time or the transcript's newest record.
     pub state_since: Option<u64>,
+    /// The same instant in epoch milliseconds - what the not-busy mark
+    /// names.
+    pub state_since_ms: Option<u64>,
+    /// The row's attention: the precedence winner among unacknowledged
+    /// latches and the live claim.
+    pub attention: Attention,
+    /// The winning attention's reason (`permission prompt`,
+    /// `StopFailure`), for the detail pane.
+    pub attention_detail: Option<String>,
+    /// The journal sequence an acknowledgement would write through: the
+    /// highest unacknowledged latch. `None` when nothing awaits.
+    pub attention_seq: Option<u64>,
+    /// The live wait episode an acknowledgement records: the `since` of a
+    /// `waiting` the user has not seen, epoch milliseconds.
+    pub attention_wait_ms: Option<u64>,
+    /// The newest event sequence the conversation has; a not-busy mark
+    /// written at it is superseded by anything newer.
+    pub journal_seq: Option<u64>,
     /// Most recent evidence of the conversation at all.
     pub last_activity: Option<u64>,
     /// Whether a live session record exists.
@@ -305,12 +357,23 @@ impl ConversationRow {
 }
 
 /// The collector: owns the plugins (and so their incremental indexes), the
-/// caches reused across passes until their freshness deadline, and the
-/// retained view every stage merges into. A collect is reads only -
-/// everything writes-averse in the boundary stays averse here.
+/// caches reused across passes until their freshness deadline, the store
+/// the journal lives in, and the retained view every stage merges into. A
+/// collect's only write is seen-state into our own store: the focus
+/// observation acknowledges a watched conversation.
 pub struct Collector {
     claude: Claude,
     remotes: RemoteCache,
+    /// The event journal and authored records; `None` where no state dir
+    /// could be placed (no `$HOME`, no `$XDG_STATE_HOME`).
+    store: Option<Store>,
+    /// Per-conversation weak `Busy -> Idle` stabilizer state, carried
+    /// across passes so confirmations accumulate between refreshes.
+    idles: HashMap<String, attention::WeakIdle>,
+    /// When each live record that carries no time of its own was first read
+    /// in its current content - its stand-in `since` and observation time,
+    /// so polling the same record never moves them.
+    undated: HashMap<String, Undated>,
     /// The last-published view: every field keeps its last value until the
     /// stage that owns it lands a replacement.
     model: Model,
@@ -356,7 +419,15 @@ impl Collector {
         let remotes = RemoteCache::default();
         let model = Model::default(); // coverage: off - the unexecuted instantiation's region edge
         let workers = fanout::WORKERS; // coverage: off - same
-        Collector { claude, remotes, model, workers } // coverage: off - same
+        Collector { claude, remotes, store: None, idles: HashMap::new(), undated: HashMap::new(), model, workers }
+    }
+
+    /// Read (and acknowledge through) the store at `dir` - the journal of
+    /// hook events and the authored records. Without it the snapshot holds
+    /// published evidence only.
+    pub fn with_store(mut self, dir: PathBuf) -> Collector {
+        self.store = Some(Store::open(dir));
+        self
     }
 
     /// The pool width the staged stages fan out at; `1` makes the pass
@@ -377,15 +448,18 @@ impl Collector {
     pub fn collect_staged(
         &mut self,
         runtime: &Runtime,
-        own_pane: Option<&PaneId>,
+        own_pane: Option<&PaneRef>,
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) {
         // Stage 1 - runtime and provider inventory: conversations with
         // their published state, attachments and runtime evidence, before
-        // any Git subprocess runs.
+        // any Git subprocess runs. The store loads here too - the journal
+        // and authored records are stage-1 evidence.
         let observed_at = runtime.observed_at;
         let inventory = self.claude.scan();
         self.model.errors = inventory.errors;
+        let mut loaded = self.store.as_ref().map(Store::load).unwrap_or_default();
+        self.model.errors.append(&mut loaded.errors);
         self.model.skipped = inventory
             .skipped
             .iter()
@@ -416,14 +490,97 @@ impl Collector {
             .map(|i| attachment_of[i].is_some_and(|slot| resolved[slot].liveness.may_be_live()))
             .collect();
 
+        // Timestamp-less dates belong to the conversation's current live
+        // instance: once a claim resolves dead - or stops claiming - the
+        // entry is dropped so an observed dead interval cannot carry its
+        // episode into a resume under another process.
+        let live_keys: HashSet<String> = (0..inventory.conversations.len())
+            .filter(|&i| running[i])
+            .map(|i| store::conversation_key("claude", &inventory.conversations[i].session_id))
+            .collect();
+        retain_live_undated(&mut self.undated, &live_keys);
+
+        // Focus: a poll that observes a bound pane active, its window
+        // current and its session attached proves the user saw the agent -
+        // unless the pane is the dashboard's own, which cannot.
+        let watched: Vec<bool> = (0..inventory.conversations.len())
+            .map(|i| {
+                attachment_of[i]
+                    .and_then(|slot| resolved[slot].attachment.pane.as_ref())
+                    .is_some_and(|pref| {
+                        !is_own_pane(own_pane, pref)
+                            && runtime.panes.panes.iter().any(|p| {
+                                p.id == pref.pane
+                                    && p.socket == pref.socket
+                                    && p.active
+                                    && p.window_active
+                                    && p.session_attached > 0
+                            })
+                    })
+            })
+            .collect();
+
         // The conversation rows keep their previous Work placement until
         // stage 2 resolves this pass's cwds - a moved checkout shows its
         // last proven anchor rather than flickering to `?` every refresh.
         // The model keeps inventory order so `placements[i]` stays aligned;
         // the attention sort happens per publish.
+        let now_ms = store::epoch_ms(observed_at);
         let mut conversations: Vec<ConversationRow> = Vec::new();
         for (i, conv) in inventory.conversations.iter().enumerate() {
-            let attachment = attachment_of[i].map(|slot| attachment_row(&resolved[slot]));
+            let resolved_claim = attachment_of[i].map(|slot| &resolved[slot]);
+            let attachment = resolved_claim.map(attachment_row);
+            let key = store::conversation_key("claude", &conv.session_id);
+            // The published claim applies only while it is bound to a live
+            // attachment; a dead `(pid, pid_start)` leaves it as history.
+            let instance = resolved_claim
+                .filter(|r| r.liveness.may_be_live())
+                .map(|r| observed_instance(r, runtime.processes.as_ref()));
+            let live = instance.map(|i| (i.pid, process_start(i.pid_start)));
+            let published = conv.live.as_ref().and_then(|l| {
+                // A record with no time of its own is dated when first read
+                // and keeps that date while later polls read it unchanged.
+                let first = first_read(&mut self.undated, &key, l, instance?, now_ms);
+                Some(attention::Published {
+                    status: l.status,
+                    waiting_for: l.waiting_for.clone(),
+                    observed_ms: l.updated_at.map_or(first, store::epoch_ms),
+                    since_ms: Some(
+                        l.status_updated_at
+                            .or(l.updated_at)
+                            .map_or(first, store::epoch_ms),
+                    ),
+                })
+            });
+            let idle = self.idles.entry(key.clone()).or_default();
+            let derive = |seen: store::Seen, idle: &mut attention::WeakIdle| {
+                attention::derive(attention::Inputs {
+                    fold: loaded.folds.get(&key),
+                    seen,
+                    mark: loaded.marks.get(&key),
+                    published: published.clone(),
+                    live,
+                    now_ms,
+                    ack_ok: loaded.ack_readable,
+                    idle,
+                })
+            };
+            let mut derived = derive(loaded.seen.get(&key).copied().unwrap_or_default(), idle);
+            // A watched conversation's pending attention is acknowledged on
+            // the spot - every unseen latch and the live wait - and the row
+            // derives again on what was stored.
+            if watched[i]
+                && (derived.ack_through > 0 || derived.wait_ms.is_some())
+                && let Some(store) = &self.store
+            {
+                match store.acknowledge(&key, derived.ack_through, derived.wait_ms) {
+                    Ok(seen) => {
+                        loaded.seen.insert(key.clone(), seen);
+                        derived = derive(seen, idle);
+                    }
+                    Err(e) => self.model.errors.push(seen_state_error(&key, e)), // coverage: off - a seen-state write failure needs a store fault mid-pass; the attention shows again next pass
+                }
+            }
             let carried = self
                 .model
                 .conversations
@@ -432,7 +589,9 @@ impl Collector {
             let (repo, worktree, branch) = carried
                 .map(|c| (c.repo.clone(), c.worktree.clone(), c.branch.clone()))
                 .unwrap_or_default();
-            conversations.push(conversation_row(conv, attachment, repo, worktree, branch));
+            conversations.push(conversation_row(
+                conv, attachment, derived, repo, worktree, branch,
+            ));
         }
         self.model.conversations = conversations;
         if !self.emit(runtime, own_pane, publish) {
@@ -528,7 +687,6 @@ impl Collector {
                 return;
             }
         }
-
         // Stage 3 - remote evidence, one `ls-remote --symref` per repo and
         // remote per deadline, fanned out; then the local probes each
         // remote answer unlocks (bases, ahead/behind, landed, unpushed).
@@ -606,7 +764,7 @@ impl Collector {
     /// One pass run to completion: the staged collect's final snapshot,
     /// identical in classification to an unstaged collect because it is the
     /// same collection streamed rather than buffered.
-    pub fn collect(&mut self, runtime: &Runtime, own_pane: Option<&PaneId>) -> Snapshot {
+    pub fn collect(&mut self, runtime: &Runtime, own_pane: Option<&PaneRef>) -> Snapshot {
         let mut last = None;
         self.collect_staged(runtime, own_pane, &mut |snapshot| {
             last = Some(snapshot);
@@ -621,7 +779,7 @@ impl Collector {
     fn emit(
         &self,
         runtime: &Runtime,
-        own_pane: Option<&PaneId>,
+        own_pane: Option<&PaneRef>,
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) -> bool {
         let mut work = Vec::new();
@@ -655,13 +813,24 @@ impl Collector {
                 last_activity,
             });
         }
-        work.sort_by_key(|w| std::cmp::Reverse(w.last_activity));
+        // Attention and the first-match section are derived per publish
+        // from the conversations bound to the row; sections order first,
+        // newest activity inside a section.
+        for w in &mut work {
+            classify_work(w, &self.model.conversations);
+        }
+        work.sort_by(|a, b| {
+            section_order(a)
+                .cmp(&section_order(b))
+                .then_with(|| b.last_activity.cmp(&a.last_activity))
+                .then_with(|| a.name.cmp(&b.name))
+        });
         let mut conversations = self.model.conversations.clone();
         sort_conversations(&mut conversations, runtime.observed_at);
         publish(Snapshot {
             schema_version: SCHEMA_VERSION,
             observed_at: epoch(runtime.observed_at),
-            own_pane: own_pane.map(|p| p.as_str().to_owned()),
+            own_pane: own_pane.map(|p| p.pane.as_str().to_owned()),
             complete: self.model.complete,
             repos,
             work,
@@ -807,7 +976,6 @@ fn anchor_error(repo_id: &str, e: git::Error) -> SourceError /* // coverage: off
     let detail = format!("{repo_id}: {e}"); // coverage: off - same
     SourceError { source, detail } // coverage: off - same
 } // coverage: off - same
-
 /// The repo row's name and path: the main checkout's, or - when no anchor
 /// is a main checkout, a bare repo for instance - the common dir itself.
 fn repo_display<'a>(
@@ -964,7 +1132,77 @@ fn work_row(repo_id: &str, repo_name: &str, state: &vector::WorkState) -> WorkRo
         live_sessions: v.live_agent_sessions,
         past_sessions: v.past_agent_sessions,
         last_activity: v.last_git_activity.map(epoch),
+        attention: Attention::None,
+        section: None,
         summary: work_summary(v),
+    }
+}
+
+/// Whether the conversation is bound to the work row: its checkout path for
+/// a row with one, its branch for a branch-only row, its repo identity for
+/// a project space. A detached row binds only by path.
+pub fn binds(row: &WorkRow, c: &ConversationRow) -> bool {
+    match (row.kind, row.worktree.as_deref(), row.branch.as_deref()) {
+        (WorkKind::ProjectSpace, _, _) => c.repo.as_deref() == Some(row.repo.as_str()),
+        (_, Some(root), _) => {
+            c.repo.as_deref() == Some(row.repo.as_str()) && c.worktree.as_deref() == Some(root)
+        }
+        (_, None, Some(branch)) => {
+            c.repo.as_deref() == Some(row.repo.as_str()) && c.branch.as_deref() == Some(branch)
+        }
+        // A row with neither worktree nor branch binds nothing; anchors
+        // always carry one.
+        _ => false, // coverage: off - a fabricated row shape: anchors always carry a worktree or a branch
+    }
+}
+
+/// Fold the bound conversations' attention into the row's rollup, section
+/// and summary. First match wins: `Needs you` for waiting/failed-unseen/
+/// completed-unseen, `Active` for a live busy process with nothing higher.
+fn classify_work(row: &mut WorkRow, conversations: &[ConversationRow]) {
+    let bound: Vec<&ConversationRow> = conversations.iter().filter(|c| binds(row, c)).collect();
+    row.attention = attention::rollup(bound.iter().map(|c| &c.attention));
+    row.section = match row.attention {
+        Attention::Waiting | Attention::Error | Attention::CompletedUnseen => {
+            Some(WorkSection::NeedsYou)
+        }
+        Attention::Working => Some(WorkSection::Active),
+        _ => None,
+    };
+    if row.section.is_none() {
+        return;
+    }
+    // The summary states why the row sits in its section: the attention
+    // and its reason first (`waiting: permission prompt`, `error:
+    // StopFailure`, `done`), `working` beside a retained latch while the
+    // agent grinds on, then the Git shape when it has something to say.
+    let mut parts = Vec::new();
+    let detail = bound
+        .iter()
+        .find(|c| c.attention == row.attention)
+        .and_then(|c| c.attention_detail.as_deref());
+    parts.push(match detail {
+        Some(d) => format!("{}: {d}", row.attention.label()),
+        None => row.attention.label().to_owned(),
+    });
+    if row.section == Some(WorkSection::NeedsYou)
+        && bound.iter().any(|c| c.state == ConversationState::Busy)
+    {
+        parts.push("working".to_owned());
+    }
+    if row.summary != "clean" {
+        parts.push(row.summary.clone());
+    }
+    row.summary = parts.join(" · ");
+}
+
+/// The section's sort slot: `Needs you`, then `Active`, then the flat
+/// remainder.
+fn section_order(row: &WorkRow) -> u8 {
+    match row.section {
+        Some(WorkSection::NeedsYou) => 0,
+        Some(WorkSection::Active) => 1,
+        None => 2,
     }
 }
 
@@ -1019,6 +1257,8 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         live_sessions: 0,
         past_sessions: 0,
         last_activity: None,
+        attention: Attention::None,
+        section: None,
         summary: "no git".to_owned(),
     }
 }
@@ -1067,6 +1307,14 @@ fn pending<T>(evidence: &Evidence<T>) -> bool {
 #[rustfmt::skip]
 fn unprobed_listing(remote: &str) -> RemoteListing { RemoteListing { head: RemoteHead::Unreachable(format!("remote {remote} was not probed")), refs: Evidence::Unknown(format!("remote {remote} was not probed")) } } // coverage: off - apply only consults remotes the asks enumeration seeded
 
+/// A process start as its known epoch seconds; `None` when undated.
+fn process_start(start: ProcessStart) -> Option<u64> {
+    match start {
+        ProcessStart::At(at) => Some(at),
+        ProcessStart::Unavailable => None,
+    }
+}
+
 /// `resolved` -> the row's attachment view.
 fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
     let (liveness, liveness_detail) = match &r.liveness {
@@ -1082,10 +1330,7 @@ fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
     };
     AttachmentRow {
         pid: r.attachment.process.pid,
-        pid_start: match r.attachment.process.pid_start {
-            ProcessStart::At(at) => Some(at),
-            ProcessStart::Unavailable => None,
-        },
+        pid_start: process_start(r.attachment.process.pid_start),
         liveness,
         liveness_detail,
         pane: r.attachment.pane.as_ref().map(display_pane),
@@ -1100,25 +1345,121 @@ fn display_pane(pane: &PaneRef) -> String {
     pane.to_string()
 }
 
+/// A focus acknowledgement the store refused, reported for the evidence
+/// view. Its own function, like `anchor_error`, so each line carries one
+/// fault path rustfmt cannot reflow away from its marker.
+fn seen_state_error(key: &str, e: std::io::Error) -> SourceError /* // coverage: off - a seen-state write failure needs a store fault mid-pass */
+{
+    let source = "store".to_owned(); // coverage: off - a seen-state write failure needs a store fault mid-pass
+    let detail = format!("seen-state for {key:?}: {e}"); // coverage: off - same
+    SourceError { source, detail } // coverage: off - same
+} // coverage: off - same
+
+/// A live record's process instance and content as far as its stand-in date
+/// goes: a change to any of it is a new reading, dated afresh.
+#[derive(Debug, PartialEq)]
+struct Undated {
+    pid: u32,
+    pid_start: ProcessStart,
+    status: Option<String>,
+    waiting_for: Option<String>,
+    first_ms: u64,
+}
+
+/// The attachment's process instance, dated. The provider's own `pid_start`
+/// wins when it carries one; otherwise the already-collected OS process row
+/// dates the same pid without another system call. When neither can date
+/// it, the pid-only limitation stands.
+fn observed_instance(
+    resolved: &crate::runtime::ResolvedAttachment,
+    processes: Option<&crate::process::ProcessTable>,
+) -> ProcessInstance {
+    let mut instance = resolved.attachment.process;
+    if instance.pid_start == ProcessStart::Unavailable
+        && let Some(row) = processes.and_then(|table| table.get(instance.pid))
+    {
+        instance.pid_start = row.start;
+    }
+    instance
+}
+
+/// Forget timestamp-less dates whose conversation is not live this pass: a
+/// dead interval observed between polls cannot carry the episode into a
+/// resume.
+fn retain_live_undated(undated: &mut HashMap<String, Undated>, live_keys: &HashSet<String>) {
+    undated.retain(|key, _| live_keys.contains(key));
+}
+
+/// Whether two readings of one pid's start are the same instance. An
+/// OS-derived start is recomputed from `etime` each poll and can move by a
+/// second across a boundary, so it compares with `ProcessStart`'s tolerance
+/// rather than exactly; two undated readings stay pid-only and equal.
+fn same_start(a: ProcessStart, b: ProcessStart) -> bool {
+    a.matches(&b).unwrap_or(a == b)
+}
+
+/// When `live` was first read under `instance` with its current content,
+/// epoch ms: `now_ms` for a new or changed record, the remembered time for
+/// the same one.
+fn first_read(
+    seen: &mut HashMap<String, Undated>,
+    key: &str,
+    live: &crate::claude::Live,
+    instance: ProcessInstance,
+    now_ms: u64,
+) -> u64 {
+    let same = seen.get(key).is_some_and(|u| {
+        u.pid == instance.pid
+            && same_start(u.pid_start, instance.pid_start)
+            && u.status == live.status_raw
+            && u.waiting_for == live.waiting_for
+    });
+    if !same {
+        seen.insert(
+            key.to_owned(),
+            Undated {
+                pid: instance.pid,
+                pid_start: instance.pid_start,
+                status: live.status_raw.clone(),
+                waiting_for: live.waiting_for.clone(),
+                first_ms: now_ms,
+            },
+        );
+    }
+    seen[key].first_ms
+}
+
+/// Whether `pane` is the dashboard's own: the socket qualifies the id, so
+/// the same `%N` on another server is a watched pane, not the dashboard -
+/// and still acknowledges. Sockets compare as files: `$TMUX` carries
+/// tmux's resolved path, discovery the spelling it listed, and the two
+/// differ under a symlinked socket directory.
+fn is_own_pane(own_pane: Option<&PaneRef>, pane: &PaneRef) -> bool {
+    let Some(own) = own_pane else {
+        return false;
+    };
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_owned());
+    own.pane == pane.pane
+        && (own.socket == pane.socket || canonical(&own.socket) == canonical(&pane.socket))
+}
+
 fn conversation_row(
     conv: &Conversation,
     attachment: Option<AttachmentRow>,
+    derived: attention::Derived,
     repo: Option<String>,
     worktree: Option<PathBuf>,
     branch: Option<String>,
 ) -> ConversationRow {
-    let (state, state_raw, waiting_for) = match conv.state() {
-        StateEvidence::Published(p) => (
-            match p.status {
-                Some(PublishedStatus::Busy) => ConversationState::Busy,
-                Some(PublishedStatus::Idle) => ConversationState::Idle,
-                Some(PublishedStatus::Waiting) => ConversationState::Waiting,
-                None => ConversationState::Unknown,
-            },
-            p.raw,
-            p.waiting_for,
-        ),
-        StateEvidence::Absent => (ConversationState::Unknown, None, None),
+    let state = match derived.exec {
+        Exec::Busy => ConversationState::Busy,
+        Exec::Idle => ConversationState::Idle,
+        Exec::Waiting => ConversationState::Waiting,
+        Exec::Unknown => ConversationState::Unknown,
+    };
+    let state_raw = match conv.state() {
+        StateEvidence::Published(p) => p.raw,
+        StateEvidence::Absent => None,
     };
     ConversationRow {
         provider: Provider::Claude,
@@ -1127,8 +1468,19 @@ fn conversation_row(
         title: conv.title(),
         state,
         state_raw,
-        waiting_for,
-        state_since: conv.state_since().map(epoch),
+        waiting_for: derived.waiting_for,
+        // Without a live claim arbitration proves no `since`; the row keeps
+        // the provider's own time so history still has an age.
+        state_since: derived
+            .since_ms
+            .map(|ms| ms / 1000)
+            .or_else(|| conv.state_since().map(epoch)),
+        state_since_ms: derived.since_ms,
+        attention: derived.attention,
+        attention_detail: derived.attention_detail,
+        attention_seq: (derived.ack_through > 0).then_some(derived.ack_through),
+        attention_wait_ms: derived.wait_ms,
+        journal_seq: (derived.journal_seq > 0).then_some(derived.journal_seq),
         last_activity: conv.last_activity().map(epoch),
         live: conv.live.is_some(),
         attachment,
@@ -1154,13 +1506,16 @@ fn conversation_row(
     }
 }
 
-/// Ordering for the sorted conversation list: attention rank then
-/// time-in-state, so a waiting row outranks everything older. Work rows
-/// sort per publish, by meaningful activity, most recent first.
+/// Ordering for the sorted conversation list: the cross-row attention
+/// rank then time-in-state, so a waiting row outranks everything older.
+/// Retained attention on a dead conversation keeps its rank - an
+/// unacknowledged `end` or `error` is durable. Work rows sort per publish,
+/// by section then meaningful activity.
 fn sort_conversations(conversations: &mut [ConversationRow], at: SystemTime) {
     conversations.sort_by(|a, b| {
-        attention_rank(a)
-            .cmp(&attention_rank(b))
+        a.attention
+            .rank()
+            .cmp(&b.attention.rank())
             .then_with(|| age_of(a, at).cmp(&age_of(b, at)))
             .then_with(|| a.session_id.cmp(&b.session_id))
     });
@@ -1183,21 +1538,6 @@ fn repo_order(conversations: &[Conversation], placements: &[Option<CwdPlacement>
     let mut ids: Vec<String> = activity.keys().cloned().collect();
     ids.sort_by_key(|id| std::cmp::Reverse(activity[id]));
     ids
-}
-
-/// Lower sorts first: the attention glyph's inbox order. A claim the
-/// runtime proved dead ranks below everything - the published state its
-/// stale file still reports is not a live signal.
-fn attention_rank(c: &ConversationRow) -> u8 {
-    if c.live && !c.running() {
-        return 4;
-    }
-    match c.state {
-        ConversationState::Waiting => 0,
-        ConversationState::Busy => 1,
-        ConversationState::Idle => 2,
-        ConversationState::Unknown => 3,
-    }
 }
 
 /// How long the row has carried its effective state; unknown sorts last.
@@ -1234,8 +1574,10 @@ pub fn to_json(snapshot: &Snapshot) -> serde_json::Result<String> {
 mod tests {
     use super::*;
     use crate::claude::{Live, Transcript}; // coverage: off - the unexecuted instantiation's region edge
-    use crate::process::ProcessInstance;
+    use crate::process::{ProcessInstance, ProcessRow, ProcessTable};
+    use crate::provider::PublishedStatus;
     use crate::runtime::{EvidenceSource, LiveAttachment, ResolvedAttachment}; // coverage: off - the unexecuted instantiation's region edge
+    use crate::tmux::PaneId;
     use std::fs;
 
     /// One conversation fabricated to order: `live` and `transcript` each
@@ -1248,24 +1590,36 @@ mod tests {
         }
     }
 
-    fn live_with(status: Option<&str>) -> Live {
+    /// A live record publishing `busy`; tests override what they need.
+    fn live() -> Live {
         Live {
             file: PathBuf::from("/root/sessions/1.json"),
             pid: 1,
             pid_start: ProcessStart::Unavailable,
             cwd: None,
             tmux: None,
-            status_raw: status.map(str::to_owned),
-            status: status.and_then(|s| match s {
-                "busy" => Some(PublishedStatus::Busy),
-                "idle" => Some(PublishedStatus::Idle),
-                "waiting" => Some(PublishedStatus::Waiting),
-                _ => None,
-            }),
+            status_raw: Some("busy".to_owned()),
+            status: Some(PublishedStatus::Busy),
             waiting_for: None,
             updated_at: None,
             status_updated_at: None,
             name: None,
+        }
+    }
+
+    /// A transcript whose newest record is at `last_at`.
+    fn transcript_at(last_at: SystemTime) -> Transcript {
+        Transcript {
+            file: PathBuf::from("/root/projects/-r/1.jsonl"),
+            slug: "-r".to_owned(),
+            session_id: "11111111-2222-3333-4444-555555555555".to_owned(),
+            project_cwd: None,
+            summary: None,
+            latest_prompt: None,
+            latest_reply: None,
+            first_at: None,
+            last_at: Some(last_at),
+            malformed_lines: 0,
         }
     }
 
@@ -1290,25 +1644,97 @@ mod tests {
         }
     }
 
+    /// A derived verdict fabricated to order.
+    fn derived(exec: Exec, attention: Attention) -> attention::Derived {
+        attention::Derived {
+            exec,
+            since_ms: None,
+            waiting_for: None,
+            attention,
+            attention_detail: None,
+            ack_through: 0,
+            wait_ms: None,
+            journal_seq: 0,
+            marked: false,
+        }
+    }
+
     #[test]
     fn a_row_exists_for_every_conversation_shape() {
         // Live-only, transcript-only and merged each produce one row; the
-        // state column is the published status, `unknown` otherwise.
-        for (live, want) in [
-            (live_with(Some("busy")), ConversationState::Busy),
-            (live_with(Some("idle")), ConversationState::Idle),
-            (live_with(Some("waiting")), ConversationState::Waiting),
-            (live_with(Some("strange")), ConversationState::Unknown),
-            (live_with(None), ConversationState::Unknown),
+        // state column is the arbitrated verdict, not the published claim.
+        for (exec, want) in [
+            (Exec::Busy, ConversationState::Busy),
+            (Exec::Idle, ConversationState::Idle),
+            (Exec::Waiting, ConversationState::Waiting),
+            (Exec::Unknown, ConversationState::Unknown),
         ] {
-            let row = conversation_row(&conversation(Some(live), None), None, None, None, None);
+            let row = conversation_row(
+                &conversation(Some(live()), None),
+                None,
+                derived(exec, Attention::None),
+                None,
+                None,
+                None,
+            );
             assert_eq!(row.state, want, "{want:?}");
             assert!(row.live);
         }
-        let row = conversation_row(&conversation(None, None), None, None, None, None);
+        let row = conversation_row(
+            &conversation(None, None),
+            None,
+            derived(Exec::Unknown, Attention::None),
+            None,
+            None,
+            None,
+        );
         assert_eq!(row.state, ConversationState::Unknown);
         assert!(!row.live);
         assert_eq!(row.short_id, "11111111");
+        assert_eq!(row.attention, Attention::None);
+    }
+
+    #[test]
+    fn a_row_without_a_live_claim_keeps_the_provider_time() {
+        // Arbitration proves no `since` without a live process, but the
+        // row still has an age: the published status time, else the
+        // transcript's newest record - so history keeps its age column and
+        // survives an `age:` filter.
+        let at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let row = conversation_row(
+            &conversation(None, Some(transcript_at(at))),
+            None,
+            derived(Exec::Unknown, Attention::None),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(row.state_since, Some(1_800_000_000));
+        // A not-busy mark names only an arbitrated `since`.
+        assert_eq!(row.state_since_ms, None);
+        let mut live = live();
+        live.status_updated_at = Some(at + Duration::from_secs(60));
+        let row = conversation_row(
+            &conversation(Some(live), Some(transcript_at(at))),
+            None,
+            derived(Exec::Unknown, Attention::None),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(row.state_since, Some(1_800_000_060));
+        // An arbitrated `since` wins over the provider's.
+        let mut d = derived(Exec::Busy, Attention::Working);
+        d.since_ms = Some(1_700_000_000_000);
+        let row = conversation_row(
+            &conversation(None, Some(transcript_at(at))),
+            None,
+            d,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(row.state_since, Some(1_700_000_000));
     }
 
     #[test]
@@ -1394,6 +1820,93 @@ mod tests {
             landed: Evidence::Unknown("no base".to_owned()),
             last_git_activity: None,
         }
+    }
+
+    #[test]
+    fn classification_rolls_attention_up_to_first_match_sections() {
+        // A work row's section is the bound conversations' best rank:
+        // waiting/error/done -> `Needs you`, working -> `Active`, anything
+        // else stays flat.
+        // A branch-only row, fabricated: no checkout, a Git summary to its
+        // name.
+        let mut row = WorkRow {
+            kind: WorkKind::Branch,
+            worktree: None,
+            branch: Some("feat".to_owned()),
+            summary: "no wt ↑?".to_owned(),
+            ..space_row("r", Path::new("/r"))
+        };
+        row.repo = "/r/.git".to_owned();
+        let conv = |attention, state| {
+            let mut c = conversation_row(
+                &conversation(None, None),
+                None,
+                derived(Exec::Unknown, attention),
+                Some("/r/.git".to_owned()),
+                None,
+                Some("feat".to_owned()),
+            );
+            c.state = state;
+            c
+        };
+        // `classify_work` composes the summary once per publish; the test
+        // rebuilds the row between classifications to keep it honest.
+        let fresh = || WorkRow {
+            kind: WorkKind::Branch,
+            worktree: None,
+            branch: Some("feat".to_owned()),
+            summary: "no wt ↑?".to_owned(),
+            ..space_row("r", Path::new("/r"))
+        };
+        let mut row = fresh();
+        row.repo = "/r/.git".to_owned();
+        classify_work(
+            &mut row,
+            &[conv(Attention::Working, ConversationState::Busy)],
+        );
+        assert_eq!(row.section, Some(WorkSection::Active));
+        assert_eq!(row.attention, Attention::Working);
+        assert_eq!(row.summary, "working · no wt ↑?");
+
+        // A retained error with the agent back at work: `error · working`.
+        let mut row = fresh();
+        row.repo = "/r/.git".to_owned();
+        let mut err = conv(Attention::Error, ConversationState::Busy);
+        err.attention_detail = Some("StopFailure".to_owned());
+        classify_work(&mut row, &[err]);
+        assert_eq!(row.section, Some(WorkSection::NeedsYou));
+        assert_eq!(row.summary, "error: StopFailure · working · no wt ↑?");
+
+        // A clean Git shape adds nothing beside the attention.
+        let mut row = fresh();
+        row.repo = "/r/.git".to_owned();
+        row.summary = "clean".to_owned();
+        classify_work(
+            &mut row,
+            &[conv(Attention::CompletedUnseen, ConversationState::Idle)],
+        );
+        assert_eq!(row.summary, "done");
+
+        let mut row = fresh();
+        row.repo = "/r/.git".to_owned();
+        classify_work(&mut row, &[conv(Attention::None, ConversationState::Idle)]);
+        assert_eq!(row.section, None);
+        // A conversation on another branch does not bind.
+        let mut other = conv(Attention::Waiting, ConversationState::Waiting);
+        other.branch = Some("elsewhere".to_owned());
+        classify_work(&mut row, &[other]);
+        assert_eq!(row.section, None);
+        assert_eq!(row.attention, Attention::None);
+        // And the ordering puts Needs you first.
+        assert!(
+            section_order(&WorkRow {
+                section: Some(WorkSection::NeedsYou),
+                ..space_row("s", Path::new("/s"))
+            }) < section_order(&WorkRow {
+                section: Some(WorkSection::Active),
+                ..space_row("s", Path::new("/s"))
+            })
+        );
     }
 
     #[test]
@@ -1486,15 +1999,21 @@ mod tests {
 
     #[test]
     fn attention_orders_waiting_then_busy_then_idle_then_unknown() {
-        let row = |state: ConversationState, since: Option<u64>| ConversationRow {
+        let row = |attention: Attention, since: Option<u64>| ConversationRow {
             provider: Provider::Claude,
             session_id: String::new(),
             short_id: String::new(),
             title: None,
-            state,
+            state: ConversationState::Unknown,
             state_raw: None,
             waiting_for: None,
             state_since: since,
+            state_since_ms: since.map(|s| s * 1000),
+            attention,
+            attention_detail: None,
+            attention_seq: None,
+            attention_wait_ms: None,
+            journal_seq: None,
             last_activity: None,
             live: false,
             attachment: None,
@@ -1509,17 +2028,23 @@ mod tests {
             branch: None,
         };
         let now = SystemTime::now();
-        assert_eq!(attention_rank(&row(ConversationState::Waiting, None)), 0);
-        assert_eq!(attention_rank(&row(ConversationState::Busy, None)), 1);
-        assert_eq!(attention_rank(&row(ConversationState::Idle, None)), 2);
-        assert_eq!(attention_rank(&row(ConversationState::Unknown, None)), 3);
-        // No state timestamp means infinite age: sorted last of its rank.
-        assert_eq!(
-            age_of(&row(ConversationState::Waiting, None), now),
-            Duration::MAX
+        // The inbox order is the attention rank, not the state.
+        assert!(
+            row(Attention::Waiting, None).attention.rank()
+                < row(Attention::Working, None).attention.rank()
         );
+        assert!(
+            row(Attention::Error, None).attention.rank()
+                < row(Attention::CompletedUnseen, None).attention.rank()
+        );
+        assert!(
+            row(Attention::None, None).attention.rank()
+                > row(Attention::Unknown, None).attention.rank()
+        );
+        // No state timestamp means infinite age: sorted last of its rank.
+        assert_eq!(age_of(&row(Attention::Waiting, None), now), Duration::MAX);
         assert_eq!(
-            age_of(&row(ConversationState::Waiting, Some(1)), now),
+            age_of(&row(Attention::Waiting, Some(1)), now),
             now.duration_since(UNIX_EPOCH + Duration::from_secs(1))
                 .unwrap()
         );
@@ -1584,7 +2109,6 @@ mod tests {
         let mut errors = Vec::new();
         assert!(resolve_cwd(Path::new("/definitely/gone"), &mut errors).is_none());
         assert!(errors.is_empty());
-
         // A plain directory is a project space.
         let dir = std::env::temp_dir().join(format!("asd-space-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -1616,7 +2140,7 @@ mod tests {
 
     /// A conversation whose live record sits at `cwd`.
     fn live_at(cwd: &Path) -> Live {
-        let mut live = live_with(None);
+        let mut live = live();
         live.cwd = Some(cwd.to_owned());
         live
     }
@@ -1643,5 +2167,242 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         let _ = fs::set_permissions(&gitfile, fs::Permissions::from_mode(0o644));
         let _ = fs::remove_dir_all(&dead_dir);
+    }
+
+    #[test]
+    fn an_undated_record_keeps_its_first_read_time_until_content_or_process_changes() {
+        let mut seen = HashMap::new();
+        let mut live = live();
+        let mut instance = ProcessInstance {
+            pid: live.pid,
+            pid_start: live.pid_start,
+        };
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 1_000), 1_000);
+        // The same content read again keeps its date.
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 2_000), 1_000);
+        // A new reading - another status or wait reason - is dated afresh.
+        live.status_raw = Some("waiting".to_owned());
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 3_000), 3_000);
+        live.waiting_for = Some("permission prompt".to_owned());
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 4_000), 4_000);
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 5_000), 4_000);
+        // A resumed conversation under another process is a new reading even
+        // when its timestamp-less state has identical content. Otherwise an old
+        // wait acknowledgement or not-busy mark could apply to the new process.
+        instance.pid += 1;
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 6_000), 6_000);
+        instance.pid_start = ProcessStart::At(7_000);
+        assert_eq!(first_read(&mut seen, "k", &live, instance, 7_000), 7_000);
+        // Conversations are dated independently.
+        assert_eq!(
+            first_read(&mut seen, "other", &live, instance, 8_000),
+            8_000
+        );
+    }
+
+    #[test]
+    fn observed_process_identity_uses_the_provider_then_the_os_fallback() {
+        let row = |start| ProcessRow {
+            pid: 42,
+            ppid: 1,
+            start,
+            exe: Some("claude".to_owned()),
+            tty: None,
+            state: 'S',
+        };
+        // The provider's own start date wins over the OS snapshot's row.
+        let resolved = attachment(Liveness::Instance, Placement::Superseded, false);
+        let table = ProcessTable::from_rows(vec![row(ProcessStart::At(999))]);
+        assert_eq!(
+            observed_instance(&resolved, Some(&table)),
+            ProcessInstance {
+                pid: 42,
+                pid_start: ProcessStart::At(1_800_000_000),
+            }
+        );
+        // Provider silent: the already-collected process row dates the
+        // instance without another system call.
+        let mut resolved = attachment(
+            Liveness::PidOnly("no start".to_owned()),
+            Placement::Superseded,
+            false,
+        );
+        resolved.attachment.process.pid_start = ProcessStart::Unavailable;
+        assert_eq!(
+            observed_instance(&resolved, Some(&table)).pid_start,
+            ProcessStart::At(999)
+        );
+        // Both silent - no row, or a row without a date - and the pid-only
+        // limitation stands.
+        let undated = ProcessTable::from_rows(vec![row(ProcessStart::Unavailable)]);
+        assert_eq!(
+            observed_instance(&resolved, Some(&undated)).pid_start,
+            ProcessStart::Unavailable
+        );
+        assert_eq!(
+            observed_instance(&resolved, None).pid_start,
+            ProcessStart::Unavailable
+        );
+    }
+
+    #[test]
+    fn undated_state_is_retained_only_for_live_conversations() {
+        let undated = |first_ms| Undated {
+            pid: 1,
+            pid_start: ProcessStart::Unavailable,
+            status: Some("busy".to_owned()),
+            waiting_for: None,
+            first_ms,
+        };
+        let mut seen = HashMap::new();
+        seen.insert("claude\0live".to_owned(), undated(5_000));
+        seen.insert("claude\0dead".to_owned(), undated(6_000));
+        // A conversation whose process was observed dead loses its
+        // timestamp-less date; a live one keeps it.
+        let live_keys: HashSet<String> = ["claude\0live".to_owned()].into_iter().collect();
+        retain_live_undated(&mut seen, &live_keys);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen["claude\0live"].first_ms, 5_000);
+    }
+
+    #[test]
+    fn a_start_that_moves_a_second_between_polls_is_the_same_instance() {
+        // `etime` quantizes, so the OS-derived start of one process can read
+        // a second apart on consecutive polls without being a replacement.
+        let mut undated = HashMap::new();
+        let mut live = live();
+        live.status_raw = Some("waiting".to_owned());
+        let at = |start| ProcessInstance {
+            pid: 7,
+            pid_start: ProcessStart::At(start),
+        };
+        let first = first_read(&mut undated, "k", &live, at(1_000), 10_000);
+        assert_eq!(
+            first_read(&mut undated, "k", &live, at(1_001), 20_000),
+            first
+        );
+        assert_eq!(first_read(&mut undated, "k", &live, at(999), 30_000), first);
+        assert_eq!(
+            first_read(&mut undated, "k", &live, at(1_003), 40_000),
+            40_000
+        );
+    }
+
+    #[test]
+    fn a_replacement_process_reopens_an_undated_wait_and_busy_mark() {
+        // A resumed process publishing the same timestamp-less record must
+        // not inherit the previous process's first-read date: that date is
+        // what authored seen-state and marks are judged against.
+        let mut undated = HashMap::new();
+        let mut live = live();
+        live.status = Some(PublishedStatus::Waiting);
+        live.status_raw = Some("waiting".to_owned());
+        live.waiting_for = Some("permission prompt".to_owned());
+        let old_instance = ProcessInstance {
+            pid: 7,
+            pid_start: ProcessStart::At(1_000),
+        };
+        let new_instance = ProcessInstance {
+            pid: 9,
+            pid_start: ProcessStart::At(2_000),
+        };
+        // The old process's wait was read and acknowledged; the same
+        // record reopens under the replacement.
+        let old_first = first_read(&mut undated, "k", &live, old_instance, 10_000);
+        let new_first = first_read(&mut undated, "k", &live, new_instance, 20_000);
+        let mut idle = attention::WeakIdle::default();
+        let derived = attention::derive(attention::Inputs {
+            fold: None,
+            seen: store::Seen {
+                seq: 0,
+                wait_ms: Some(old_first),
+            },
+            mark: None,
+            published: Some(attention::Published {
+                status: live.status,
+                waiting_for: live.waiting_for.clone(),
+                observed_ms: new_first,
+                since_ms: Some(new_first),
+            }),
+            live: Some((new_instance.pid, Some(2_000))),
+            now_ms: 20_000,
+            ack_ok: true,
+            idle: &mut idle,
+        });
+        assert_eq!(derived.attention, Attention::Waiting);
+        assert_eq!(derived.wait_ms, Some(new_first));
+        // The same resume under a `busy` record: the mark written against
+        // the old process's date cannot suppress the replacement's Busy.
+        live.status = Some(PublishedStatus::Busy);
+        live.status_raw = Some("busy".to_owned());
+        live.waiting_for = None;
+        let old_first = first_read(&mut undated, "b", &live, old_instance, 10_000);
+        let mark = store::Mark {
+            since_ms: old_first,
+            seq: 0,
+            at_ms: old_first + 1,
+        };
+        let new_first = first_read(&mut undated, "b", &live, new_instance, 30_000);
+        let mut idle = attention::WeakIdle::default();
+        let derived = attention::derive(attention::Inputs {
+            fold: None,
+            seen: store::Seen::default(),
+            mark: Some(&mark),
+            published: Some(attention::Published {
+                status: live.status,
+                waiting_for: live.waiting_for.clone(),
+                observed_ms: new_first,
+                since_ms: Some(new_first),
+            }),
+            live: Some((new_instance.pid, Some(2_000))),
+            now_ms: 30_000,
+            ack_ok: true,
+            idle: &mut idle,
+        });
+        assert_eq!(derived.exec, Exec::Busy);
+        assert_eq!(derived.attention, Attention::Working);
+        assert!(!derived.marked);
+    }
+
+    #[test]
+    fn own_pane_matches_socket_and_id_together() {
+        let pref = |socket: &str| PaneRef {
+            socket: PathBuf::from(socket),
+            pane: PaneId::parse("%1").unwrap(),
+        };
+        // Two servers can each carry a `%1`: only the matching socket's is
+        // the dashboard's own - a watched `%1` elsewhere acknowledges.
+        assert!(is_own_pane(Some(&pref("/sock/a")), &pref("/sock/a")));
+        assert!(!is_own_pane(Some(&pref("/sock/a")), &pref("/sock/b")));
+        assert!(!is_own_pane(None, &pref("/sock/a")));
+        assert!(!is_own_pane(
+            Some(&pref("/sock/a")),
+            &PaneRef {
+                socket: PathBuf::from("/sock/a"),
+                pane: PaneId::parse("%2").unwrap(),
+            }
+        ));
+    }
+
+    #[test]
+    fn own_pane_matches_one_server_under_two_spellings() {
+        // `$TMUX` carries tmux's resolved socket path while discovery may
+        // keep a symlinked spelling of the same server: still the
+        // dashboard's own pane.
+        let root = std::env::temp_dir().join(format!("agent-sessions-own-{}", std::process::id()));
+        let real = root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("default"), "").unwrap();
+        let link = root.join("link");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let pref = |socket: PathBuf| PaneRef {
+            socket,
+            pane: PaneId::parse("%1").unwrap(),
+        };
+        let own = pref(real.join("default"));
+        assert!(is_own_pane(Some(&own), &pref(link.join("default"))));
+        assert!(!is_own_pane(Some(&own), &pref(link.join("other"))));
+        fs::remove_dir_all(&root).unwrap();
     }
 }

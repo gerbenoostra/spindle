@@ -51,8 +51,9 @@ fn help_lists_only_what_is_shipped() {
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("--version"), "{stdout}");
+        assert!(stdout.contains("agent-sessions hook"), "{stdout}");
         // No stubbed subcommands: help names nothing the binary cannot do.
-        for future in ["hook", "register", "doctor"] {
+        for future in ["register", "doctor"] {
             assert!(
                 !stdout.contains(&format!("agent-sessions {future}")),
                 "help promises `{future}`, which has not shipped: {stdout}"
@@ -222,7 +223,8 @@ fn json_without_list_is_a_usage_error() {
 #[test]
 fn unshipped_subcommands_are_usage_errors() {
     for args in [
-        vec!["hook", "claude", "stop"],
+        vec!["hook"],
+        vec!["hook", "claude"],
         vec!["register"],
         vec!["doctor"],
         vec!["frobnicate"],

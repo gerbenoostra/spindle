@@ -35,6 +35,17 @@ impl Provider {
             Provider::Devin => "devin", // coverage: off - Devin ships with its provider task
         }
     }
+
+    /// The wire name back to a provider, for `hook <provider>`. `None` for
+    /// anything else: provider names are a closed set, not free text.
+    pub fn parse(name: &str) -> Option<Provider> {
+        match name {
+            "claude" => Some(Provider::Claude),
+            "vibe" => Some(Provider::Vibe),
+            "devin" => Some(Provider::Devin),
+            _ => None,
+        }
+    }
 }
 
 /// A conversation's durable identity: provider plus the provider's own
@@ -201,7 +212,7 @@ impl Runtime {
         }
     }
 
-    /// L3 pane resolution for one pid: published handle, parent ancestry
+    /// Pane resolution for one pid, in order: published handle, parent ancestry
     /// to a `pane_pid`, controlling tty, then `Unknown`. A published handle
     /// that names one live pane binds - unless derived evidence names a
     /// different one, which is a contradiction and fails closed.

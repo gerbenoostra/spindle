@@ -976,8 +976,14 @@ mod tests {
     /// the only shape collect() cannot derive a fact from - it must collect
     /// `Unknown`s, not crash.
     fn broken_repo() -> Repo {
-        let dir =
-            std::env::temp_dir().join(format!("agent-sessions-broken-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        // A unique dir per call: two broken-repo tests share a process, and
+        // a shared path turns fixture writes into a race.
+        let dir = std::env::temp_dir().join(format!(
+            "agent-sessions-broken-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("not-a-repo");
         std::fs::write(&file, "x").unwrap();

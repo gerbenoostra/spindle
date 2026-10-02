@@ -22,11 +22,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
+use crate::attention::Attention;
 use crate::config;
 use crate::snapshot::{
     ConversationRow, ConversationState, RepoRow, Snapshot, WorkKind, WorkRow, to_json,
 };
-use crate::tmux::PaneId;
+use crate::store::{self, Store};
+use crate::tmux::{self, PaneRef};
 
 /// The four panes, in `Tab` order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +48,7 @@ impl Pane {
             Pane::Detail => Pane::Repos,
         }
     }
+
     /// The list this pane drives, if it is one.
     fn list(self) -> Option<List> {
         match self {
@@ -146,6 +149,13 @@ pub struct App {
     /// The collector thread died: the last snapshot stays on screen and the
     /// footer says so instead of letting the dashboard look live.
     collector_dead: bool,
+    /// The store `space` writes acknowledgements and not-busy marks into;
+    /// `None` where no state dir could be placed, making `space` inert.
+    store: Option<Store>,
+    /// A failed action's message, shown in the footer in place of the hints
+    /// until the next key - a keypress that wrote nothing must not look
+    /// like it worked.
+    notice: Option<String>,
     /// The spinner's frame index while a snapshot is still incomplete.
     /// `Cell` because a draw is `&self`: the animation ticks by rendering.
     spin: std::cell::Cell<u64>,
@@ -184,8 +194,17 @@ impl App {
             help: false,
             quit: false,
             collector_dead: false,
+            store: None,
+            notice: None,
             spin: std::cell::Cell::new(0),
         }
+    }
+
+    /// The store `space` writes to: `acknowledge` and the not-busy mark
+    /// land here.
+    pub fn with_store(mut self, store: Store) -> App {
+        self.store = Some(store);
+        self
     }
 
     /// Swap in a fresh snapshot. Rows are re-sorted on every collect, so a
@@ -293,7 +312,7 @@ impl App {
                 )
             })
             .map(Row::Work)
-            .collect::<Vec<_>>(); // coverage: off - the unexecuted instantiation's region edge
+            .collect::<Vec<_>>();
         let work_scope = match self.cursor[list_index(List::Work)] /* // coverage: off - the get-miss arm is unreachable: cursors clamp before a view */ {
             0 => None, // coverage: off - the unreachable arm's match edge lands here
             cursor => work // coverage: off - same
@@ -358,11 +377,13 @@ impl App {
     /// One key press.
     ///
     /// The handled set is exactly the shipped one: `1`-`4` focus, `Tab`
-    /// cycles, `j`/`k` move the cursor, `/` filters the focused list, `?`
+    /// cycles, `j`/`k` move the cursor, `/` filters the focused list,
+    /// `space` acknowledges attention or marks a Busy row not-busy, `?`
     /// toggles help, `q` quits, `Esc` closes help or a filter. Everything
     /// else is inert: an unbound key does nothing, and nothing here pretends
     /// to a behaviour a later task owns.
     pub fn key(&mut self, key: Key) {
+        self.notice = None;
         if let Some((list, buffer)) = &mut self.editing {
             match key {
                 Key::Char(c) => buffer.push(c),
@@ -401,8 +422,91 @@ impl App {
                     self.editing = Some((list, self.filter_raw[list_index(list)].clone()));
                 }
             }
+            Key::Char(' ') => self.space(),
             _ => {}
         }
+    }
+
+    /// `space` on the focused row - the write goes to the journal's
+    /// authored files, then the next collect reflects it.
+    ///
+    /// On a row carrying unacknowledged attention, `space` writes
+    /// seen-state through the newest unacknowledged event and the live
+    /// wait it shows: a deliberate acknowledgement, the same one a focus
+    /// observation writes. On a row that is `Busy` with none of that, `space` is the
+    /// authored not-busy mark instead - it names the dismissed `Busy`'s
+    /// `effective_since` and is superseded by any newer event or
+    /// observation. A `repos` row does neither. A work row decides once
+    /// for every bound conversation: one pending latch makes the keypress
+    /// acknowledgements only. A write the store refuses is reported in the
+    /// footer.
+    fn space(&mut self) {
+        self.notice = self
+            .space_writes()
+            .map(|e| format!("space: not saved - {e}"));
+    }
+
+    /// The writes `space` performs; the first refusal, when there is one.
+    fn space_writes(&self) -> Option<std::io::Error> {
+        let store = self.store.as_ref()?;
+        let list = self.focused_list()?;
+        let view = self.view();
+        let cursor = self.cursor[list_index(list)];
+        if cursor == 0 {
+            return None;
+        };
+        let Some(row) = view.rows(list).get(cursor - 1) else {
+            return None; // coverage: off - the get-miss arm is unreachable: cursors clamp before a view
+        };
+        let convs: Vec<&ConversationRow> = match row {
+            Row::Conversation(c) => vec![*c],
+            Row::Work(w) => self
+                .snapshot
+                .conversations
+                .iter()
+                .filter(|c| crate::snapshot::binds(w, c))
+                .collect::<Vec<_>>(),
+            Row::Repo(_) => Vec::new(),
+        };
+        // A work row decides once for all its bound conversations: a single
+        // pending latch turns the whole keypress into acknowledgements -
+        // a not-busy mark written beside unacknowledged attention would
+        // contradict it. The two authored kinds are exclusive - a work row
+        // by that rule, a conversation row by producing one action - so
+        // the keypress runs at most one acknowledgement batch and at most
+        // one mark batch, each a single store transaction.
+        let pending =
+            |c: &ConversationRow| c.attention_seq.is_some() || c.attention_wait_ms.is_some();
+        let ack_only = matches!(row, Row::Work(_)) && convs.iter().any(|c| pending(c));
+        let mut acks: Vec<(String, u64, Option<u64>)> = Vec::new();
+        let mut marks: Vec<(String, u64, u64)> = Vec::new();
+        for c in convs {
+            let key = store::conversation_key(c.provider.as_str(), &c.session_id);
+            if pending(c) {
+                acks.push((key, c.attention_seq.unwrap_or(0), c.attention_wait_ms));
+            } else if !ack_only
+                && c.attention == Attention::Working
+                && let Some(since_ms) = c.state_since_ms
+            {
+                // Only a Busy row earns the mark: a busy conversation with
+                // no higher attention has nothing to acknowledge. A Busy
+                // only the provider published has no journal sequence yet;
+                // the mark sits at zero and any first event supersedes it.
+                marks.push((key, since_ms, c.journal_seq.unwrap_or(0)));
+            }
+        }
+        let acks: Vec<(&str, u64, Option<u64>)> = acks
+            .iter()
+            .map(|(key, seq, wait)| (key.as_str(), *seq, *wait))
+            .collect();
+        let marks: Vec<(&str, u64, u64)> = marks
+            .iter()
+            .map(|(key, since, seq)| (key.as_str(), *since, *seq))
+            .collect();
+        if let Err(e) = store.acknowledge_many(&acks) {
+            return Some(e);
+        }
+        store.mark_not_busy_many(&marks).err()
     }
 
     /// `j`/`k` on the focused list: move, clamp, and reset the cursors below
@@ -481,21 +585,31 @@ impl App {
         f.render_widget(block, area);
 
         // Follow the cursor: when the list is taller than its pane, scroll so
-        // the selected line stays visible - and build only the lines that
-        // can render. No horizontal scroll anywhere.
+        // the selected line stays visible. Section headers are part of the
+        // line stream - they scroll with the rows they head (the [2] Work
+        // list is the only one with sections yet).
         let cursor = self.cursor[list_index(list)];
         let visible = inner.height as usize;
-        let scroll = cursor.saturating_sub(visible.saturating_sub(1));
-        let mut lines = Vec::with_capacity(visible.saturating_add(1));
-        if scroll == 0 {
-            lines.push(self.all_row(list, rows, inner.width, cursor == 0));
-        }
-        for (i, row) in rows.iter().enumerate().skip(scroll.saturating_sub(1)) {
-            if lines.len() >= visible {
-                break;
+        let mut display: Vec<Line<'_>> = Vec::new();
+        display.push(self.all_row(list, rows, inner.width, cursor == 0));
+        let mut cursor_line = 0usize;
+        let mut last_section = None;
+        for (i, row) in rows.iter().enumerate() {
+            if let Row::Work(w) = row
+                && w.section != last_section
+            {
+                if let Some(section) = w.section {
+                    display.push(section_header(section));
+                }
+                last_section = w.section;
             }
-            lines.push(self.row(list, row, inner.width, cursor == i + 1));
+            if cursor == i + 1 {
+                cursor_line = display.len();
+            }
+            display.push(self.row(list, row, inner.width, cursor == i + 1));
         }
+        let scroll = cursor_line.saturating_sub(visible.saturating_sub(1));
+        let lines: Vec<Line<'_>> = display.into_iter().skip(scroll).take(visible).collect();
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -547,7 +661,7 @@ impl App {
             Row::Conversation(c) => RowCells {
                 glyph: conversation_glyph(c),
                 label: &format!("{} {}", c.short_id, c.title.as_deref().unwrap_or("?")),
-                middle: c.provider.as_str(),
+                middle: &conversation_middle(c),
                 age: &age(self.now(), c.state_since),
                 selected,
                 dim_label: c.title.is_none(),
@@ -695,6 +809,8 @@ impl App {
     fn footer(&self, f: &mut Frame<'_>, area: Rect) {
         let text = if self.collector_dead {
             "collector stopped - last snapshot | q quit".to_owned()
+        } else if let Some(notice) = &self.notice {
+            notice.clone()
         } else {
             let spinner = self.spinner(area.width);
             let hints = if self.editing.is_some() {
@@ -706,7 +822,8 @@ impl App {
                 }
             } else {
                 let hints = match self.focused_list() {
-                    Some(_) => "1-4 focus | tab next | j/k move | / filter",
+                    Some(List::Repos) => "1-4 focus | tab next | j/k move | / filter",
+                    Some(_) => "1-4 focus | tab next | j/k move | / filter | space ack",
                     None => "1-4 focus | tab next | j/k move",
                 };
                 format!("{hints} | ? keys | q quit")
@@ -726,7 +843,7 @@ impl App {
     fn spinner(&self, width: u16) -> String {
         if self.snapshot.complete {
             return String::new();
-        }
+        };
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame = FRAMES[(self.spin.get() as usize) % FRAMES.len()];
         self.spin.set(self.spin.get() + 1);
@@ -747,7 +864,7 @@ impl App {
                     List::Conversations => "[3] Conversations - what needs me right now",
                 }),
                 Line::from(""),
-                Line::from("j/k move   / filter   enter/jump (later)"),
+                Line::from("j/k move   / filter   space ack/mark   enter/jump (later)"),
             ],
             None => vec![Line::from("[4] Detail - follows the focused list")],
         };
@@ -956,14 +1073,11 @@ fn repo_counts(repo: &RepoRow) -> String {
     }
 }
 
-/// A work row's glyph from its live evidence: `●` while a live agent or
-/// process is bound to it, blank otherwise.
+/// A work row's glyph: the rolled-up attention of its bound
+/// conversations. A non-agent process (`live_pids` with no session) is
+/// not attention - it counts in the row's fields, not its glyph.
 fn work_glyph(w: &WorkRow) -> &'static str {
-    if w.live_sessions > 0 || w.live_pids > 0 {
-        "●"
-    } else {
-        ""
-    }
+    w.attention.glyph()
 }
 
 /// The work row's label: `name ⌂worktree`; a project space's workspace is
@@ -981,35 +1095,75 @@ fn work_name(w: &WorkRow) -> String {
     format!("{}{}", w.name, wt)
 }
 
-/// A conversation row's glyph from its published state. A claim the runtime
-/// proved dead carries no attention glyph: the published state the stale
-/// file still reports is history, not a live signal.
-fn conversation_glyph(c: &ConversationRow) -> &'static str {
-    if c.live && !c.running() {
-        return "";
-    }
-    match c.state {
-        ConversationState::Waiting => "!",
-        ConversationState::Busy => "●",
-        ConversationState::Unknown => "?",
-        ConversationState::Idle => "",
+/// The conversation row's middle field: the provider, plus `working`
+/// beside a retained latch when the agent has gone back to grinding -
+/// the retained `error`/`done` asks for you while the state field says
+/// the turn runs.
+fn conversation_middle(c: &ConversationRow) -> String {
+    match c.attention {
+        Attention::Error | Attention::CompletedUnseen if c.state == ConversationState::Busy => {
+            format!("{} · working", c.provider.as_str())
+        }
+        _ => c.provider.as_str().to_owned(),
     }
 }
 
-/// The detail header's state text: `waiting on you`, `busy`, `idle`,
-/// `unknown` - whatever the evidence says, with its reason. A claim the
-/// runtime proved dead reads `dead`: the stale file's published state is
-/// history, not a live signal.
+/// A `[2]` section header line: the section's name, dimmed, unselectable
+/// in spirit - the cursor counts rows, not headers.
+fn section_header(section: crate::snapshot::WorkSection) -> Line<'static> {
+    Line::from(Span::styled(
+        section.title().to_owned(),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// A conversation row's glyph is its attention: `!`/`✗`/`✓`/`●`/`?`/blank.
+/// A retained `end` or `error` survives the process's death - the latch is
+/// what the row owes you, not what the process is doing.
+fn conversation_glyph(c: &ConversationRow) -> &'static str {
+    c.attention.glyph()
+}
+
+/// The detail header's state text: the attention's word when the row
+/// carries one (`waiting: permission prompt`, `error`, `done`), then the
+/// effective state. A claim the runtime proved dead reads `dead` beside
+/// whatever latch survives it.
 fn detail_state(c: &ConversationRow) -> String {
-    if c.live && !c.running() {
-        return "dead".to_owned();
-    }
-    match c.state {
-        ConversationState::Waiting => match &c.waiting_for {
+    let attention = match c.attention {
+        Attention::Waiting => match c.attention_detail.as_deref().or(c.waiting_for.as_deref()) {
             Some(reason) => format!("waiting: {reason}"),
             None => "waiting".to_owned(),
         },
-        state => state.as_str().to_owned(),
+        Attention::Error => match &c.attention_detail {
+            Some(detail) => format!("error: {detail}"),
+            None => "error".to_owned(),
+        },
+        Attention::CompletedUnseen => "done".to_owned(),
+        Attention::Working => "working".to_owned(),
+        Attention::Unknown | Attention::None => String::new(),
+    };
+    // The effective state's own word, when it adds something the attention
+    // label does not already say: `error · working`, not `waiting ·
+    // waiting`.
+    let state = if c.live && !c.running() {
+        Some("dead")
+    } else {
+        match c.state {
+            ConversationState::Waiting if c.attention != Attention::Waiting => {
+                Some(c.state.as_str())
+            }
+            ConversationState::Busy if c.attention != Attention::Working => Some("working"),
+            ConversationState::Idle if c.attention == Attention::None => Some("idle"),
+            _ => None,
+        }
+    };
+    match (attention.is_empty(), state) {
+        (true, Some(s)) => s.to_owned(),
+        (true, None) => c.state.as_str().to_owned(),
+        (false, Some(s)) => format!("{attention} · {s}"),
+        (false, None) => attention,
     }
 }
 
@@ -1027,7 +1181,6 @@ pub enum Key {
     Down,
 } // coverage: off - the unexecuted instantiation's exit edge
 // coverage: off - the instantiation edge lands on this line
-
 /// `code` -> a `Key`, or `None` for input the shell does not bind. Terminal // coverage: off - the zero regions on this doc and `map_key`'s edges are unexecuted-instantiation copies
 /// events and key releases are dropped here, before they can alias a byte // coverage: off - same
 /// the app layer would act on. // coverage: off - same
@@ -1071,7 +1224,6 @@ pub fn run(
     crossterm::execute!(stdout, EnterAlternateScreen)?; // coverage: off - `?` needs a broken terminal
     let backend = ratatui::backend::CrosstermBackend::new(stdout); // coverage: off - same
     let mut terminal = Terminal::new(backend)?; // coverage: off - `?` needs a broken terminal
-
     // One pending snapshot at most: the worker computes the next pass only
     // once the loop has taken the previous one, so a slow collect can delay
     // the next swap but never a redraw or a key press.
@@ -1089,7 +1241,6 @@ pub fn run(
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?; // coverage: off - same
     result // coverage: off - same
 } // coverage: off - the unexecuted instantiation's exit edge
-
 /// The collector's own loop, on its own thread: one staged pass streams
 /// its snapshots through `publish`, each handed over once the previous one
 /// was taken (the bounded channel paces the worker), then `interval` of
@@ -1109,9 +1260,8 @@ fn collect_worker(
             return;
         }
         std::thread::sleep(interval);
-    } // coverage: off - the re-loop edge of the instantiation that never spawned a worker
+    }
 } // coverage: off - same
-
 /// What the collector channel produced since the last draw.
 #[rustfmt::skip] // coverage: off - the unexecuted instantiation's region edge
 enum Feed { // coverage: off - the unexecuted instantiation's region edge
@@ -1192,26 +1342,34 @@ pub fn terminal_present() -> bool {
     io::stdout().is_terminal()
 }
 
-/// The dashboard's own pane when it runs inside tmux, so focus observation
-/// does not mistake the dashboard for work needing attention.
-pub fn own_pane() -> Option<PaneId> {
-    parse_own_pane(std::env::var("TMUX_PANE").ok()) // coverage: off - the Ok arm needs TMUX_PANE set: only inside tmux
+/// The dashboard's own pane - socket and id - when it runs inside tmux, so
+/// focus observation does not mistake the dashboard for work needing
+/// attention.
+pub fn own_pane() -> Option<PaneRef> {
+    tmux::pane_ref_from_env(
+        std::env::var_os("TMUX").as_deref(),
+        std::env::var("TMUX_PANE").ok().as_deref(),
+    )
 }
 
-/// `$TMUX_PANE` parses to a pane id; anything else is no pane, not a guess.
-fn parse_own_pane(value: Option<String>) -> Option<PaneId> {
-    value.and_then(|v| PaneId::parse(&v))
+/// The collector for the configured root and store: `~/.claude` (or
+/// `$CLAUDE_CONFIG_DIR`) plus `$XDG_STATE_HOME/agent-sessions` when the
+/// environment places one.
+fn collector() -> Result<crate::snapshot::Collector, String> {
+    let claude = crate::claude::default_root()?;
+    let collector = crate::snapshot::Collector::new(claude);
+    Ok(
+        match config::Config::state_dir(&|name| std::env::var(name).ok()) {
+            Some(dir) => collector.with_store(dir),
+            None => collector, // coverage: off - needs neither XDG_STATE_HOME nor HOME, which the passing path keeps
+        },
+    )
 }
 
-/// `~/.claude`, or `$CLAUDE_CONFIG_DIR` when set.
-fn claude_root() -> Result<std::path::PathBuf, String> {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return Ok(dir.into());
-    }
-    Ok(std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .ok_or("HOME is not set")?
-        .join(".claude"))
+/// The store `space` on an app writes to: `None` where no state dir could
+/// be placed, which is also what makes `space` inert.
+fn app_store() -> Option<Store> {
+    config::Config::state_dir(&|name| std::env::var(name).ok()).map(Store::open)
 }
 
 /// `agent-sessions` with no arguments: the dashboard itself.
@@ -1219,19 +1377,23 @@ pub fn tui() -> Result<(), String> {
     if !terminal_present() {
         return Err("the dashboard needs a terminal (piped stdout? try `list --json`)".to_owned());
     }
-    let mut collector = crate::snapshot::Collector::new(claude_root()?); // coverage: off - `?` needs HOME unset, which the passing path keeps
+    let mut collector = collector()?; // coverage: off - `?` needs neither CLAUDE_CONFIG_DIR nor HOME, which the passing path keeps
     let collect = move |publish: &mut dyn FnMut(Snapshot) -> bool| {
         let runtime = crate::runtime::Runtime::observe(); // coverage: off - the closure only runs inside `run`, which needs a real terminal
         collector.collect_staged(&runtime, own_pane().as_ref(), publish) // coverage: off - same
     };
     // The event loop starts before stage 1 lands: an empty, incomplete
     // snapshot paints the frame while collection fills it in.
-    run(App::new(Snapshot::empty()), collect).map_err(|e| e.to_string()) // coverage: off - `map_err` needs a failing terminal
+    let app = match app_store() {
+        Some(store) => App::new(Snapshot::empty()).with_store(store),
+        None => App::new(Snapshot::empty()), // coverage: off - needs neither XDG_STATE_HOME nor HOME, which the passing path keeps
+    };
+    run(app, collect).map_err(|e| e.to_string()) // coverage: off - `map_err` needs a failing terminal
 }
 
 /// `agent-sessions list --json`: the complete unfiltered snapshot.
 pub fn list_json() -> Result<String, String> {
-    let mut collector = crate::snapshot::Collector::new(claude_root()?);
+    let mut collector = collector()?;
     let runtime = crate::runtime::Runtime::observe();
     let snapshot = collector.collect(&runtime, own_pane().as_ref());
     to_json(&snapshot) // coverage: off - `list_json` runs only inside the binary
@@ -1296,7 +1458,9 @@ mod tests {
                     live_sessions: 1,
                     past_sessions: 2,
                     last_activity: Some(1_800_000_000 - 120),
-                    summary: "↑3 ~dirty".to_owned(),
+                    attention: Attention::Waiting,
+                    section: Some(crate::snapshot::WorkSection::NeedsYou),
+                    summary: "waiting: permission prompt · ↑3 ~dirty".to_owned(),
                 },
                 WorkRow {
                     repo: "/repos/a/.git".to_owned(),
@@ -1317,6 +1481,8 @@ mod tests {
                     live_sessions: 0,
                     past_sessions: 0,
                     last_activity: Some(1_800_000_000 - 9 * 86400),
+                    attention: Attention::None,
+                    section: None,
                     summary: "no wt · no remote".to_owned(),
                 },
                 WorkRow {
@@ -1338,6 +1504,8 @@ mod tests {
                     live_sessions: 0,
                     past_sessions: 0,
                     last_activity: None,
+                    attention: Attention::None,
+                    section: None,
                     summary: "no git".to_owned(),
                 },
             ],
@@ -1351,6 +1519,12 @@ mod tests {
                     state_raw: Some("waiting".to_owned()),
                     waiting_for: Some("permission prompt".to_owned()),
                     state_since: Some(1_800_000_000 - 120),
+                    state_since_ms: Some((1_800_000_000 - 120) * 1000),
+                    attention: Attention::Waiting,
+                    attention_detail: Some("permission prompt".to_owned()),
+                    attention_seq: Some(4),
+                    attention_wait_ms: Some((1_800_000_000 - 120) * 1000),
+                    journal_seq: Some(7),
                     last_activity: Some(1_800_000_000 - 120),
                     live: true,
                     attachment: Some(AttachmentRow {
@@ -1387,6 +1561,12 @@ mod tests {
                     state_raw: Some("idle".to_owned()),
                     waiting_for: None,
                     state_since: Some(1_800_000_000 - 3600),
+                    state_since_ms: Some((1_800_000_000 - 3600) * 1000),
+                    attention: Attention::None,
+                    attention_detail: None,
+                    attention_seq: None,
+                    attention_wait_ms: None,
+                    journal_seq: None,
                     last_activity: Some(1_800_000_000 - 3600),
                     live: false,
                     attachment: None,
@@ -1413,6 +1593,12 @@ mod tests {
                     state_raw: None,
                     waiting_for: None,
                     state_since: None,
+                    state_since_ms: None,
+                    attention: Attention::None,
+                    attention_detail: None,
+                    attention_seq: None,
+                    attention_wait_ms: None,
+                    journal_seq: None,
                     last_activity: None,
                     live: false,
                     attachment: None,
@@ -1535,8 +1721,286 @@ mod tests {
         // The medium tier carries the compact summary and the age too, not
         // just the label: at 90 columns the left lists are ~34 cells wide.
         let text = render_to(&app, 90, 24);
-        assert!(text.contains("↑3 ~dirty"), "{text}");
+        assert!(text.contains("no wt · no remote"), "{text}");
         assert!(text.contains("2m"), "{text}");
+    }
+
+    #[test]
+    fn attention_sections_and_glyphs_render_at_55_and_200_columns() {
+        // The fixture's waiting conversation makes `feat/login` a `Needs
+        // you` row: `!` on the work row and the conversation, the section
+        // header leading the list, the reason in the summary.
+        for width in [55u16, 200] {
+            let app = App::new(fixture());
+            let text = render_to(&app, width, 24);
+            assert!(text.contains("Needs you"), "{text}");
+            assert!(text.contains("! feat/lo"), "{text}");
+            assert!(text.contains("! 8f423bbb"), "{text}");
+            let waiting = text
+                .lines()
+                .position(|l| l.contains("Needs you"))
+                .expect("the section");
+            let old = text
+                .lines()
+                .position(|l| l.contains("feat/old"))
+                .expect("the flat row");
+            assert!(waiting < old, "{text}");
+        }
+        // The reason text fits only where the pane can afford it: 200
+        // columns show it whole, 55 clips it inside the narrow list.
+        let text = render_to(&App::new(fixture()), 200, 24);
+        assert!(text.contains("waiting: permission prompt"), "{text}");
+        let text = render_to(&App::new(fixture()), 55, 24);
+        assert!(!text.contains("permission prompt"), "{text}");
+        // A retained error beside a live `busy`: ✗, `error · working`, and
+        // the row still under `Needs you`.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::Error;
+        snapshot.conversations[0].attention_detail = Some("StopFailure".to_owned());
+        snapshot.conversations[0].state = ConversationState::Busy;
+        snapshot.work[0].attention = Attention::Error;
+        snapshot.work[0].summary = "error: StopFailure · working · ↑3 ~dirty".to_owned();
+        let app = App::new(snapshot);
+        for width in [55u16, 200] {
+            let text = render_to(&app, width, 24);
+            assert!(text.contains("✗ feat/lo"), "{text}");
+            assert!(text.contains("✗ 8f423bbb"), "{text}");
+        }
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("error: StopFailure · working"), "{text}");
+        assert!(text.contains("claude · working"), "{text}");
+        // A completed-unseen latch: ✓ under `Needs you`.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::CompletedUnseen;
+        snapshot.conversations[0].attention_detail = None;
+        snapshot.conversations[0].state = ConversationState::Idle;
+        snapshot.work[0].attention = Attention::CompletedUnseen;
+        snapshot.work[0].summary = "done · ↑3 ~dirty".to_owned();
+        let app = App::new(snapshot);
+        let text = render_to(&app, 55, 24);
+        assert!(text.contains("✓ feat/lo"), "{text}");
+        assert!(text.contains("✓ 8f423bbb"), "{text}");
+        // An `Active` row: ● under its own header.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::Working;
+        snapshot.conversations[0].attention_detail = None;
+        snapshot.conversations[0].state = ConversationState::Busy;
+        snapshot.work[0].attention = Attention::Working;
+        snapshot.work[0].section = Some(crate::snapshot::WorkSection::Active);
+        snapshot.work[0].summary = "working · ↑3 ~dirty".to_owned();
+        let mut app = App::new(snapshot);
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("Active"), "{text}");
+        assert!(text.contains("● feat/login"), "{text}");
+        assert!(text.contains("working · ↑3 ~dirty"), "{text}");
+        assert!(text.contains("● 8f423bbb"), "{text}");
+        // The detail header reads `working` for a Working latch, and the
+        // retained-error-over-waiting shape keeps both words.
+        app.key(Key::Char('j'));
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("working"), "{text}");
+        let mut snapshot = fixture();
+        snapshot.conversations[0].state = ConversationState::Waiting;
+        snapshot.conversations[0].attention = Attention::Error;
+        snapshot.conversations[0].attention_detail = Some("StopFailure".to_owned());
+        let mut app = App::new(snapshot);
+        app.key(Key::Char('j'));
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("error: StopFailure · waiting"), "{text}");
+    }
+
+    #[test]
+    fn space_writes_seen_state_and_not_busy_marks() {
+        let dir = std::env::temp_dir().join(format!("as-space-{}", std::process::id()));
+        let store = crate::store::Store::open(dir.clone());
+        let mut app = App::new(fixture()).with_store(store);
+        // Cursor on the waiting conversation: `space` writes seen-state
+        // through its `attention_seq` and the live wait it shows.
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let seen = crate::store::Store::open(dir.clone()).load().seen;
+        let key = store::conversation_key("claude", "8f423bbb-1111-2222-3333-444444444444");
+        let wait = Some((1_800_000_000 - 120) * 1000);
+        assert_eq!(
+            seen.get(&key).copied(),
+            Some(store::Seen {
+                seq: 4,
+                wait_ms: wait
+            }),
+            "{seen:?}"
+        );
+        // A wait only the provider published has no sequence: `space`
+        // acknowledges its episode alone.
+        let other = store::conversation_key("claude", "published-wait");
+        let mut snapshot = fixture();
+        snapshot.conversations[0].session_id = "published-wait".to_owned();
+        snapshot.conversations[0].attention_seq = None;
+        app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let seen = crate::store::Store::open(dir.clone()).load().seen;
+        assert_eq!(
+            seen.get(&other).copied(),
+            Some(store::Seen {
+                seq: 0,
+                wait_ms: wait
+            }),
+            "{seen:?}"
+        );
+        // Cursor on a plain `Busy` conversation with nothing to ack: `space`
+        // writes the not-busy mark naming the `Busy`'s `effective_since`.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::Working;
+        snapshot.conversations[0].attention_detail = None;
+        snapshot.conversations[0].attention_seq = None;
+        snapshot.conversations[0].attention_wait_ms = None;
+        snapshot.conversations[0].state = ConversationState::Busy;
+        app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let marks = crate::store::Store::open(dir.clone()).load().marks;
+        let mark = marks.get(&key).expect("a mark landed");
+        assert_eq!(mark.since_ms, (1_800_000_000 - 120) * 1000);
+        assert_eq!(mark.seq, 7);
+        // A `Busy` only the provider published - no hook event yet - is
+        // marked too, at sequence zero: any first event supersedes it.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::Working;
+        snapshot.conversations[0].attention_detail = None;
+        snapshot.conversations[0].attention_seq = None;
+        snapshot.conversations[0].attention_wait_ms = None;
+        snapshot.conversations[0].journal_seq = None;
+        snapshot.conversations[0].state = ConversationState::Busy;
+        app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let marks = crate::store::Store::open(dir.clone()).load().marks;
+        assert_eq!(marks.get(&key).map(|m| m.seq), Some(0), "{marks:?}");
+
+        // Every inert arm of `space`: no store, a non-list focus, the `all`
+        // row, a `repos` row, and a conversation that is neither latched nor
+        // Busy.
+        let mut bare = App::new(fixture());
+        bare.key(Key::Char(' ')); // no store: writes nothing
+        let mut app = App::new(fixture()).with_store(crate::store::Store::open(dir.clone()));
+        for keys in [
+            vec![Key::Char('4'), Key::Char(' ')], // Detail focus: no list
+            vec![
+                Key::Char('1'),
+                Key::Char('j'),
+                Key::Char('j'),
+                Key::Char(' '),
+            ], // a repo row
+            vec![Key::Char('2'), Key::Char(' ')], // Work's `all` row
+        ] {
+            press(&mut app, &keys);
+        }
+        // A work row's `space` acknowledges every bound conversation.
+        press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char(' ')]);
+        // And a conversation that is neither latched nor Busy is skipped,
+        // not miswritten.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::None;
+        snapshot.conversations[0].attention_seq = None;
+        snapshot.conversations[0].attention_wait_ms = None;
+        snapshot.conversations[0].journal_seq = None;
+        app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let loaded = crate::store::Store::open(dir.clone()).load();
+        assert_eq!(loaded.marks.len(), 1, "no extra mark: {:?}", loaded.marks);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_space_write_says_so_until_the_next_key() {
+        // A seen-state file the store cannot carry refuses the rewrite;
+        // the keypress must not look like it worked.
+        let dir = std::env::temp_dir().join(format!("as-space-err-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("seen.json"), "{oops").unwrap();
+        let mut app = App::new(fixture()).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("space: not saved"), "{text}");
+        // So does a refused not-busy mark.
+        std::fs::write(dir.join("marks.json"), "{oops").unwrap();
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::Working;
+        snapshot.conversations[0].attention_seq = None;
+        snapshot.conversations[0].attention_wait_ms = None;
+        snapshot.conversations[0].state = ConversationState::Busy;
+        let mut app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char(' ')]);
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("space: not saved"), "{text}");
+        // The next key clears it: the footer is hints again.
+        press(&mut app, &[Key::Char('k')]);
+        let text = render_to(&app, 200, 24);
+        assert!(!text.contains("space: not saved"), "{text}");
+        assert!(text.contains("q quit"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_work_row_space_batches_one_kind_of_authored_action() {
+        // Both conversations bound to the work row carry pending
+        // attention: one `space` acknowledges every bound key, and the
+        // pending latch keeps the keypress acknowledgements only.
+        let dir = std::env::temp_dir().join(format!("as-space-wa-{}", std::process::id()));
+        let mut snapshot = fixture();
+        snapshot.conversations[1].attention = Attention::Waiting;
+        snapshot.conversations[1].attention_detail = Some("permission prompt".to_owned());
+        snapshot.conversations[1].attention_seq = Some(6);
+        snapshot.conversations[1].attention_wait_ms = Some((1_800_000_000 - 3600) * 1000);
+        let mut app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char(' ')]);
+        let loaded = crate::store::Store::open(dir.clone()).load();
+        let first = store::conversation_key("claude", "8f423bbb-1111-2222-3333-444444444444");
+        let second = store::conversation_key("claude", "02aa0bbb-1111-2222-3333-444444444444");
+        assert_eq!(
+            loaded.seen.get(&first).copied(),
+            Some(store::Seen {
+                seq: 4,
+                wait_ms: Some((1_800_000_000 - 120) * 1000)
+            }),
+            "{:?}",
+            loaded.seen
+        );
+        assert_eq!(
+            loaded.seen.get(&second).copied(),
+            Some(store::Seen {
+                seq: 6,
+                wait_ms: Some((1_800_000_000 - 3600) * 1000)
+            }),
+            "{:?}",
+            loaded.seen
+        );
+        assert!(loaded.marks.is_empty(), "{:?}", loaded.marks);
+        let _ = std::fs::remove_dir_all(&dir);
+        // A fresh store and snapshot: both bound conversations Working
+        // with nothing to acknowledge - the same keypress marks both.
+        let dir = std::env::temp_dir().join(format!("as-space-wm-{}", std::process::id()));
+        let mut snapshot = fixture();
+        for c in &mut snapshot.conversations[..2] {
+            c.attention = Attention::Working;
+            c.attention_detail = None;
+            c.attention_seq = None;
+            c.attention_wait_ms = None;
+            c.state = ConversationState::Busy;
+        }
+        let mut app = App::new(snapshot).with_store(crate::store::Store::open(dir.clone()));
+        press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char(' ')]);
+        let loaded = crate::store::Store::open(dir.clone()).load();
+        assert!(loaded.seen.is_empty(), "{:?}", loaded.seen);
+        assert_eq!(
+            loaded.marks.get(&first).map(|m| (m.since_ms, m.seq)),
+            Some(((1_800_000_000 - 120) * 1000, 7)),
+            "{:?}",
+            loaded.marks
+        );
+        assert_eq!(
+            loaded.marks.get(&second).map(|m| (m.since_ms, m.seq)),
+            Some(((1_800_000_000 - 3600) * 1000, 0)),
+            "{:?}",
+            loaded.marks
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2052,19 +2516,42 @@ mod tests {
         let mut conv = ConversationRow {
             ..fixture().conversations[0].clone()
         };
-        conv.state = ConversationState::Busy;
-        assert_eq!(conversation_glyph(&conv), "●");
-        conv.state = ConversationState::Idle;
-        assert_eq!(conversation_glyph(&conv), "");
-        // waiting without a reason still says waiting.
-        conv.state = ConversationState::Waiting;
+        // The glyph is the attention, whatever the execution state is.
+        for (attention, glyph) in [
+            (Attention::Waiting, "!"),
+            (Attention::Error, "✗"),
+            (Attention::CompletedUnseen, "✓"),
+            (Attention::Working, "●"),
+            (Attention::Unknown, "?"),
+            (Attention::None, ""),
+        ] {
+            conv.attention = attention;
+            assert_eq!(conversation_glyph(&conv), glyph, "{attention:?}");
+        }
+        // Detail text: the attention's word beside the effective state's,
+        // when the two differ.
+        conv.attention = Attention::Waiting;
+        conv.attention_detail = None;
         conv.waiting_for = None;
+        conv.state = ConversationState::Waiting;
         assert_eq!(detail_state(&conv), "waiting");
+        conv.attention = Attention::Error;
+        conv.attention_detail = Some("StopFailure".to_owned());
         conv.state = ConversationState::Busy;
-        assert_eq!(detail_state(&conv), "busy");
+        assert_eq!(detail_state(&conv), "error: StopFailure · working");
+        conv.attention = Attention::CompletedUnseen;
+        conv.attention_detail = None;
+        conv.state = ConversationState::Idle;
+        assert_eq!(detail_state(&conv), "done");
+        conv.attention = Attention::None;
+        assert_eq!(detail_state(&conv), "idle");
+        conv.attention = Attention::None;
+        conv.state = ConversationState::Busy;
+        assert_eq!(detail_state(&conv), "working");
         // A live file whose claimed pid is dead is a record, not a process:
-        // it is not `running`, and its published `busy` earns no glyph.
+        // it is not `running`; a retained latch still shows its glyph.
         let mut dead = fixture().conversations[0].clone();
+        dead.attention = Attention::None;
         dead.attachment = dead.attachment.map(|a| AttachmentRow {
             liveness: AttachmentLiveness::Dead,
             ..a
@@ -2072,6 +2559,17 @@ mod tests {
         assert!(!dead.running());
         assert_eq!(conversation_glyph(&dead), "");
         assert_eq!(detail_state(&dead), "dead");
+        // ... while a dead conversation with an unseen error keeps the ✗.
+        dead.attention = Attention::Error;
+        dead.attention_detail = None;
+        assert_eq!(conversation_glyph(&dead), "✗");
+        assert_eq!(detail_state(&dead), "error · dead");
+        // The middle field says `working` beside a retained latch.
+        dead.state = ConversationState::Busy;
+        assert_eq!(conversation_middle(&dead), "claude · working");
+        dead.attention = Attention::Waiting;
+        dead.state = ConversationState::Waiting;
+        assert_eq!(conversation_middle(&dead), "claude");
         // Glyph colours by meaning; the empty glyph colours nothing.
         assert_eq!(glyph_style("✗").fg, Some(Color::LightRed));
         assert_eq!(glyph_style("✓").fg, Some(Color::LightGreen));
@@ -2105,11 +2603,19 @@ mod tests {
 
     #[test]
     fn own_pane_detection_is_honest() {
-        // $TMUX_PANE parses or yields nothing; the dashboard never invents a pane.
-        // Terminal detection is covered by `tests/cli.rs`, which pipes stdout
-        // deterministically; a test binary inherits whatever stdout it is given.
-        assert_eq!(parse_own_pane(Some("%12".to_owned())), PaneId::parse("%12"));
-        assert_eq!(parse_own_pane(Some("nonsense".to_owned())), None);
-        assert_eq!(parse_own_pane(None), None);
+        // $TMUX + $TMUX_PANE must both name real values - socket and id -
+        // or there is no own pane; the dashboard never invents one. The
+        // ambient reads themselves stay untested: a test binary inherits
+        // whatever environment it is given.
+        fn tmux(s: &str) -> Option<&std::ffi::OsStr> {
+            Some(std::ffi::OsStr::new(s))
+        }
+        let pref = tmux::pane_ref_from_env(tmux("/tmp/sock,1,0"), Some("%12")).unwrap();
+        assert_eq!(pref.pane.as_str(), "%12");
+        assert_eq!(pref.socket, PathBuf::from("/tmp/sock"));
+        assert!(tmux::pane_ref_from_env(None, Some("%12")).is_none());
+        assert!(tmux::pane_ref_from_env(tmux("/tmp/sock,1,0"), None).is_none());
+        assert!(tmux::pane_ref_from_env(tmux(",1,0"), Some("%12")).is_none());
+        assert!(tmux::pane_ref_from_env(tmux("/tmp/sock,1,0"), Some("junk")).is_none());
     }
 }

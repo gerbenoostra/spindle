@@ -2,7 +2,7 @@
 name = "agent-sessions"
 version = "0.0.2"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "One dashboard for every agentic session and worktree"
 repository = "https://github.com/gerbenoostra/spindle"
 license = "MIT"

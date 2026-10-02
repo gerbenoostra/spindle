@@ -44,6 +44,10 @@ coverage:
     #!/usr/bin/env bash
     set -euo pipefail
     command -v jq >/dev/null || { echo "the coverage gate needs jq." >&2; exit 1; }
+    # Earlier runs leave profiles and test binaries behind, and the report
+    # reads them too: stale mappings then surface as phantom uncovered
+    # regions on lines the current tests reach. Measure from a clean slate.
+    cargo llvm-cov clean --workspace
     cargo llvm-cov --no-report
     cargo llvm-cov report --summary-only
     echo

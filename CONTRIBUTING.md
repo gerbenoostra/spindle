@@ -205,6 +205,27 @@ just unlink               # back to the installed binary
 for another destination. `agent-sessions --version` prints the executable that
 actually ran, so a shadow is never invisible.
 
+## Checking attention by hand
+
+The tests drive attention through the journal, the reducer and the renderer.
+Focus acknowledgement also needs a real attached tmux client, so a change to
+it deserves a manual pass, kept as disposable as the tests:
+
+- Use a temporary `XDG_STATE_HOME`, a `TMUX_TMPDIR` in a `mktemp -d`
+  directory, a dedicated `tmux -L <socket>` server with a client attached,
+  and a scratch checkout. Run the built TUI in one window and the agent in
+  another.
+- A stand-in agent is enough for most checks: a symlinked system binary in
+  the agent window, plus real `agent-sessions hook claude <event>` calls
+  carrying its session id.
+- A real `claude` cannot run disposably: under a temporary `HOME` it reports
+  "Not logged in", and logging in writes a keychain credential. A real-agent
+  pass therefore uses your own Claude login, with hooks wired in the scratch
+  checkout's `.claude/settings.json` and your global settings untouched.
+- Check that `!`, `✓` and `✗` survive cursor movement and the detail pane,
+  that focusing the agent window clears them within a refresh, and that
+  `seen.json` in the temporary state directory advances.
+
 ## Packaging
 
 To verify packaging works, build the local flake; it installs nothing.

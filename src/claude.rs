@@ -36,7 +36,7 @@ use crate::runtime::{AgentSessionKey, EvidenceSource, ProcessClaim, Provider};
 
 /// The basename Claude's own executable runs under; also the liveness check's
 /// guard against pid reuse.
-const EXE: &str = "claude";
+pub const EXE: &str = "claude";
 
 /// A Claude plugin rooted at its config directory (`~/.claude`), holding the
 /// transcript index across scans so only changed files are reparsed.
@@ -772,10 +772,21 @@ fn message_text(record: &serde_json::Value, role: &str) -> Option<String> {
     }
 }
 
+/// `~/.claude`, or `$CLAUDE_CONFIG_DIR` when set.
+pub fn default_root() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Ok(dir.into());
+    }
+    Ok(std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("HOME is not set")?
+        .join(".claude"))
+}
+
 /// `2026-09-22T16:18:53.123Z` (or a `+02:00` offset) as a `SystemTime`.
 /// Provider timestamps are ISO-8601; anything else is no timestamp, not a
 /// guessed one.
-fn parse_iso8601(text: &str) -> Option<SystemTime> {
+pub fn parse_iso8601(text: &str) -> Option<SystemTime> {
     let (date, time) = text.split_once('T').or_else(|| text.split_once(' '))?;
     let mut d = date.split('-');
     let (year, month, day) = (
@@ -926,7 +937,8 @@ mod tests {
                 "\"status\":\"waiting\",\"waitingFor\":\"permission prompt\"",
             ),
         );
-        // Unknown keys drift in without breaking anything (F1 shape).
+        // Unknown keys drift in without breaking anything: Claude adds
+        // session-file keys between releases.
         root.write("sessions/4300.json", &live_json(4300, ID_B, "busy"));
         // Malformed JSON and a missing sessionId are each one excluded record.
         root.write("sessions/4400.json", "{not json");
