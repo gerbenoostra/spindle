@@ -1045,3 +1045,38 @@ fn an_unreachable_remote_is_not_activity() {
         .git(&world.a.main, &["remote", "set-url", "origin", url.trim()]);
     quiet(&collect(&world));
 }
+
+#[test]
+fn a_park_during_a_pass_holds_in_every_later_stage() {
+    let world = world();
+    let runtime = Runtime::observe_over(&[]);
+    let mut collector = Collector::new(claude(&world.home))
+        .with_store(state(&world.home))
+        .with_workers(1);
+    // The first pass writes the incarnation records `p` names.
+    let first = collector.collect(&runtime, None);
+    let identity = work(&first, "feat-old")
+        .identity
+        .clone()
+        .expect("an authored identity");
+    // `p` lands while the next pass is mid-flight, right after its first
+    // stage published: every later stage must already read it parked.
+    let store = store(&world.home);
+    let mut published = 0usize;
+    let mut stale = Vec::new();
+    collector.collect_staged(&runtime, None, &mut |snapshot| {
+        published += 1;
+        if published == 1 {
+            store
+                .toggle_parked(&WorkIdentity::Branch(identity.clone()))
+                .expect("parks");
+        } else if let Some(row) = snapshot.work.iter().find(|w| w.name == "feat-old")
+            && !row.parked
+        {
+            stale.push((published, row.section));
+        }
+        true
+    });
+    assert!(published > 2, "{published}");
+    assert!(stale.is_empty(), "stages that dropped the park: {stale:?}");
+}

@@ -1046,17 +1046,28 @@ impl Collector {
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) -> bool {
         let now = epoch(runtime.observed_at);
+        // Authored state as the store reads now, not as stage 1 loaded it:
+        // a `p` that lands mid-pass must hold in every later stage. A read
+        // that fails keeps the model's copy; stage 1 and the sync already
+        // report the file's errors.
+        let fresh = self
+            .store
+            .as_ref()
+            .map(Store::work)
+            .filter(|(_, errors)| errors.is_empty())
+            .map(|(work, _)| work);
+        let authored = fresh.as_ref().unwrap_or(&self.model.work);
         let mut work = Vec::new();
         for (id, model) in &self.model.repos {
             match &model.data {
                 RepoData::Git(local) => {
                     for anchor in &local.anchors {
-                        work.push(work_row(id, &model.name, &anchor.state, &self.model.work));
+                        work.push(work_row(id, &model.name, &anchor.state, authored));
                     }
                 }
                 RepoData::Space(row) => {
                     let mut row = (**row).clone();
-                    apply_path_record(&mut row, &self.model.work);
+                    apply_path_record(&mut row, authored);
                     work.push(row);
                 }
             }
