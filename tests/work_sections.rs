@@ -955,3 +955,53 @@ fn forge_state_drives_checks_reasons_and_stays_informational() {
     let green = work(&snapshot, "feat-green");
     assert_eq!(green.pipeline, Pipeline::Succeeded);
 }
+
+/// Backdate a transcript file: its conversation's last turn reads `days`
+/// old.
+fn age_transcript(home: &TempDir, id: &str, days: u64) {
+    fs::File::options()
+        .write(true)
+        .open(home.join(format!(".claude/projects/t/{id}.jsonl")))
+        .expect("the transcript")
+        .set_modified(UNIX_EPOCH + Duration::from_secs(now() - days * 86400))
+        .expect("mtime sets");
+}
+
+#[test]
+fn a_resumable_conversation_does_not_hold_finished_or_quiet_work() {
+    let home = TempDir::new("work-resumable");
+    let a = FixtureRepo::new("origin");
+    // Landed and clean, with a dead conversation in its worktree: the
+    // work is finished, so cleanup claims it, not `resumable idle`.
+    a.branch_with_commits("feat-merged", 1, true);
+    a.land("feat-merged", Landing::Merge);
+    let merged = a.add_worktree("merged", Some("feat-merged"));
+    transcript(&home, NEEDS_ID, &merged);
+    age_transcript(&home, NEEDS_ID, 40);
+    // Unlanded, a month quiet, its worktree added today over the old
+    // commits and holding a month-old dead conversation: `Forgotten`.
+    // The add itself is no activity.
+    old_pushed_branch(&a, "feat-old", Duration::from_secs(30 * 86400));
+    let old = a.add_worktree("old", Some("feat-old"));
+    transcript(&home, RESUME_ID, &old);
+    age_transcript(&home, RESUME_ID, 30);
+    let world = World {
+        home,
+        a,
+        b: FixtureRepo::new("origin"),
+        agent: None,
+    };
+    let snapshot = collect(&world);
+    let merged = work(&snapshot, "feat-merged");
+    assert_eq!(merged.section, WorkSection::ReadyToClean, "{merged:?}");
+    let old = work(&snapshot, "feat-old");
+    assert_eq!(old.section, WorkSection::Forgotten, "{old:?}");
+    assert!(old.summary.starts_with("idle 30d"), "{}", old.summary);
+    // The conversations stay listed: only the row's section moved.
+    assert!(
+        snapshot
+            .conversations
+            .iter()
+            .any(|c| c.session_id == RESUME_ID)
+    );
+}

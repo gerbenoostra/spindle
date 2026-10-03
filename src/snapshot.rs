@@ -1578,15 +1578,18 @@ fn section_reason(
         Attention::Working => return (WorkSection::Active, attention_reason(row, bound)),
         Attention::Unknown | Attention::None => {}
     }
-    if let Some(reason) = follow_up(row, bound) {
-        return (WorkSection::FollowUp, reason);
-    }
-    // Forgotten: unfinished, nothing running, quiet strictly beyond the
-    // configured threshold - and parked suppresses only this.
     let finished = matches!(row.landed, Some(Landed::Ancestor | Landed::Content));
     let quiet_beyond = row
         .last_activity
         .is_some_and(|a| now.saturating_sub(a) > forgotten_after.as_secs());
+    // A resumable conversation asks for a pick-up only while its work is
+    // unfinished and recent: landed work goes on to cleanup and quiet work
+    // to `Forgotten`, with the conversation still listed in [3].
+    if let Some(reason) = follow_up(row, bound, !finished && !quiet_beyond) {
+        return (WorkSection::FollowUp, reason);
+    }
+    // Forgotten: unfinished, nothing running, quiet strictly beyond the
+    // configured threshold - and parked suppresses only this.
     if row.kind != WorkKind::ProjectSpace
         && !row.parked
         && !finished
@@ -1608,9 +1611,10 @@ fn section_reason(
 }
 
 /// The FollowUp triggers in order: known failed or pending checks, a dirty
-/// tree, unpushed commits, a resumable idle conversation, or a blocked
-/// cleanup verdict. Unknown forge state triggers nothing by itself.
-fn follow_up(row: &WorkRow, bound: &[&ConversationRow]) -> Option<String> {
+/// tree, unpushed commits, a resumable idle conversation when `pick_up`
+/// says the work is still unfinished and recent, or a blocked cleanup
+/// verdict. Unknown forge state triggers nothing by itself.
+fn follow_up(row: &WorkRow, bound: &[&ConversationRow], pick_up: bool) -> Option<String> {
     if row.forge == WorkItem::Open {
         match row.pipeline {
             Pipeline::Failed => return Some("checks failed".to_owned()),
@@ -1633,9 +1637,10 @@ fn follow_up(row: &WorkRow, bound: &[&ConversationRow]) -> Option<String> {
     if let Some(n) = row.unpushed.filter(|n| *n > 0) {
         return Some(format!("unpushed {n}"));
     }
-    if bound
-        .iter()
-        .any(|c| !c.running() && !c.resume_argv.is_empty())
+    if pick_up
+        && bound
+            .iter()
+            .any(|c| !c.running() && !c.resume_argv.is_empty())
     {
         return Some("resumable idle".to_owned());
     }
