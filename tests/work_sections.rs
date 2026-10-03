@@ -584,15 +584,18 @@ fn parked_suppresses_forgotten_and_nothing_else() {
     assert!(!old.summary.contains("parked"), "{}", old.summary);
 
     // A path record transitions the same way: reseed `notes` with a
-    // different fingerprint and the store dates the change at the sync.
+    // proven fingerprint, then a different one, and the store dates the
+    // change at the sync.
     let notes_path = world.home.join("notes").canonicalize().unwrap();
-    let inputs = LifecycleInputs {
-        dirty: Some(true),
-        ..LifecycleInputs::default()
-    };
-    store(&world.home)
-        .sync_path(&notes_path.display().to_string(), &inputs, now() * 1000)
-        .expect("seeds");
+    for dirty in [false, true] {
+        let inputs = LifecycleInputs {
+            dirty: Some(dirty),
+            ..LifecycleInputs::default()
+        };
+        store(&world.home)
+            .sync_path(&notes_path.display().to_string(), &inputs, now() * 1000)
+            .expect("seeds");
+    }
     let snapshot = collect(&world);
     let notes = work(&snapshot, "notes");
     assert!(notes.last_activity.is_some(), "{}", notes.summary);

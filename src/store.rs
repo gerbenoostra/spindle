@@ -421,6 +421,25 @@ impl LifecycleInputs {
             pipeline: self.pipeline.clone().or_else(|| prior.pipeline.clone()),
         }
     }
+
+    /// Whether this reading is a lifecycle transition from `prior`: the
+    /// checkout appeared, vanished or moved, or a field proven on both
+    /// sides changed. A field's first proven value - unproven when the
+    /// record was made - is adopted without dating anything.
+    fn transitions_from(&self, prior: &LifecycleInputs) -> bool {
+        fn changed<T: PartialEq>(new: &Option<T>, old: &Option<T>) -> bool {
+            matches!((new, old), (Some(n), Some(o)) if n != o)
+        }
+        self.worktree != prior.worktree
+            || self.worktree_path != prior.worktree_path
+            || changed(&self.dirty, &prior.dirty)
+            || changed(&self.ahead, &prior.ahead)
+            || changed(&self.unpushed, &prior.unpushed)
+            || changed(&self.upstream, &prior.upstream)
+            || changed(&self.landed, &prior.landed)
+            || changed(&self.forge, &prior.forge)
+            || changed(&self.pipeline, &prior.pipeline)
+    }
 }
 
 /// One local ref a pass observed in a repository, with the facts the
@@ -889,11 +908,15 @@ impl Store {
                     let Some(record) = work.branches.get_mut(&id) else {
                         continue; // coverage: off - the lookup only ever names a stored id
                     };
+                    // A changed proven fingerprint is a transition; first
+                    // observation never lands here. A newly proven field
+                    // is stored without dating anything.
+                    if obs.inputs.transitions_from(&record.inputs) {
+                        record.activity_at = Some(observed_ms);
+                        changed = true;
+                    }
                     let inputs = obs.inputs.over(&record.inputs);
                     if record.inputs != inputs {
-                        // A changed proven fingerprint is a transition;
-                        // first observation never lands here.
-                        record.activity_at = Some(observed_ms);
                         record.inputs = inputs;
                         changed = true;
                     }
@@ -943,9 +966,12 @@ impl Store {
         let mut changed = false;
         match work.paths.get_mut(path) {
             Some(record) => {
+                if inputs.transitions_from(&record.inputs) {
+                    record.activity_at = Some(observed_ms);
+                    changed = true;
+                }
                 let inputs = inputs.over(&record.inputs);
                 if record.inputs != inputs {
-                    record.activity_at = Some(observed_ms);
                     record.inputs = inputs;
                     changed = true;
                 }
@@ -2497,6 +2523,35 @@ mod tests {
         store.sync_path("/space", &offline, 2_000).unwrap();
         let work = store.load().work;
         assert_eq!(work.path("/space").unwrap().activity_at, None);
+
+        // A record made while a field was unproven - a first run offline -
+        // adopts the field's first proven value without dating it, then
+        // dates a later proven change.
+        let repo = "/fresh/.git";
+        let first = |inputs: &LifecycleInputs, at| {
+            store
+                .sync_repo(
+                    repo,
+                    &[ObservedRef {
+                        name: "feat".to_owned(),
+                        inputs: inputs.clone(),
+                    }],
+                    at,
+                )
+                .unwrap();
+            store.load().work.branch(repo, "feat").unwrap().clone()
+        };
+        first(&offline, 1_000);
+        let record = first(&proven, 2_000);
+        assert_eq!(record.activity_at, None);
+        assert_eq!(record.inputs, proven);
+        assert_eq!(first(&merged, 3_000).activity_at, Some(3_000));
+        store.sync_path("/fresh-space", &offline, 1_000).unwrap();
+        store.sync_path("/fresh-space", &proven, 2_000).unwrap();
+        let work = store.load().work;
+        let space = work.path("/fresh-space").unwrap();
+        assert_eq!(space.activity_at, None);
+        assert_eq!(space.inputs, proven);
     }
 
     #[test]
@@ -2516,8 +2571,13 @@ mod tests {
             .sync_path("/space", &LifecycleInputs::default(), 2_000)
             .unwrap();
         assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes);
-        // A changed fingerprint is a transition: it lands `activity_at`
-        // and rewrites once.
+        // A changed proven fingerprint is a transition: it lands
+        // `activity_at` and rewrites once.
+        let clean = LifecycleInputs {
+            dirty: Some(false),
+            ..LifecycleInputs::default()
+        };
+        store.sync_path("/space", &clean, 2_500).unwrap();
         let inputs = LifecycleInputs {
             dirty: Some(true),
             ..LifecycleInputs::default()
