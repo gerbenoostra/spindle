@@ -735,22 +735,21 @@ impl App {
         width: u16,
         selected: bool,
     ) -> Line<'static> {
+        // Only [1]'s `all` row carries a glyph: the attention rolled up
+        // over every repo in view.
+        let mut glyph = "";
         let counts = match list {
             List::Repos => {
-                let open: usize = rows
+                let repos: Vec<&RepoRow> = rows
                     .iter()
                     .filter_map(|r| match r {
-                        Row::Repo(r) => Some(r.open),
+                        Row::Repo(r) => Some(*r),
                         _ => None, // coverage: off - repos holds Repo rows only
                     })
-                    .sum();
-                let clean: usize = rows
-                    .iter()
-                    .filter_map(|r| match r {
-                        Row::Repo(r) => Some(r.clean),
-                        _ => None, // coverage: off - repos holds Repo rows only
-                    })
-                    .sum();
+                    .collect();
+                glyph = crate::attention::rollup(repos.iter().map(|r| &r.attention)).glyph();
+                let open: usize = repos.iter().map(|r| r.open).sum();
+                let clean: usize = repos.iter().map(|r| r.clean).sum();
                 format!("{open} open · {clean} clean")
             }
             List::Work => format!("{} open · {} clean", view.work_open, view.work_clean),
@@ -765,7 +764,7 @@ impl App {
         self.render_row(
             width,
             &RowCells {
-                glyph: "",
+                glyph,
                 label: "all",
                 middle: &counts,
                 age: "",
@@ -1951,6 +1950,9 @@ mod tests {
             let text = render_to(&app, width, 24);
             assert!(text.contains("Needs you"), "{text}");
             assert!(text.contains("! a/feat/lo"), "{text}");
+            // [1]'s `all` row rolls the repos' attention up; the other
+            // lists' `all` rows carry no glyph.
+            assert_eq!(text.matches("! all").count(), 1, "{text}");
             assert!(text.contains("! 8f423bbb"), "{text}");
             let waiting = text
                 .lines()
