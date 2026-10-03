@@ -444,9 +444,8 @@ pub struct BranchRecord {
     pub repo: String,
     /// The short ref name.
     pub ref_name: String,
-    /// First and latest pass that observed the ref, epoch milliseconds.
+    /// The first pass that observed the ref, epoch milliseconds.
     pub first_observed_at: u64,
-    pub last_observed_at: u64,
     /// When the ref was observed gone, epoch ms; `None` while active.
     #[serde(default)]
     pub ended_at: Option<u64>,
@@ -898,10 +897,6 @@ impl Store {
                         record.inputs = inputs;
                         changed = true;
                     }
-                    if record.last_observed_at != observed_ms {
-                        record.last_observed_at = observed_ms;
-                        changed = true;
-                    }
                 }
                 None => {
                     // No active record for this ref - first observation,
@@ -915,7 +910,6 @@ impl Store {
                             repo: repo.to_owned(),
                             ref_name: obs.name.clone(),
                             first_observed_at: observed_ms,
-                            last_observed_at: observed_ms,
                             ended_at: None,
                             parked: false,
                             activity_at: None,
@@ -2400,13 +2394,13 @@ mod tests {
         let feat = work.branch(repo, "feat").expect("feat is active");
         assert_ne!(main.id, feat.id);
         assert_eq!(main.first_observed_at, 1_000);
-        assert_eq!(main.last_observed_at, 1_000);
         assert_eq!(main.activity_at, None, "first observation dates nothing");
         assert!(!main.parked);
-        // The same observation again is a no-op: the file does not move.
+        // The same observation on a later pass is a no-op: the file does
+        // not move, so a dashboard left open rewrites nothing per refresh.
         let bytes = fs::read(temp.path(WORK)).unwrap();
         store
-            .sync_repo(repo, &[obs("main", false), obs("feat", false)], 1_000)
+            .sync_repo(repo, &[obs("main", false), obs("feat", false)], 1_500)
             .unwrap();
         assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes);
         // A fingerprint change dates the transition at its observation.
@@ -2417,7 +2411,6 @@ mod tests {
         let feat = work.branch(repo, "feat").unwrap();
         assert_eq!(feat.activity_at, Some(2_000));
         assert_eq!(feat.inputs.dirty, Some(true));
-        assert_eq!(feat.last_observed_at, 2_000);
         // `feat` gone from the observation: the record closes and stays -
         // it leaves the active lookup but remains in the history.
         let old_id = feat.id.clone();
