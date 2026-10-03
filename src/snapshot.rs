@@ -317,9 +317,10 @@ pub struct WorkRow {
     pub live_sessions: usize,
     /// Conversations ever recorded against the row's path.
     pub past_sessions: usize,
-    /// Newest of the HEAD reflog's last entry and its mtime, folded with
-    /// the authored record's transition time and bound conversations'
-    /// activity; `None` is `?`.
+    /// Latest meaningful activity: the newest real work in the row's
+    /// reflogs (never creation or checkout bookkeeping), the authored
+    /// record's last proven transition and bound conversations' turns;
+    /// `None` is `?`.
     pub last_activity: Option<u64>,
     /// The rolled-up attention of the conversations bound to the row.
     pub attention: Attention,
@@ -1392,13 +1393,9 @@ fn work_row(
         },
         None => {
             let path = v.worktree.as_ref().map(|p| p.display().to_string());
-            match path.and_then(|p| authored.path(&p).map(|r| (p, r))) {
-                Some((p, r)) => (Some(p), r.parked, r.activity_at),
-                None => (
-                    v.worktree.as_ref().map(|p| p.display().to_string()),
-                    false,
-                    None,
-                ),
+            match path.as_deref().and_then(|p| authored.path(p)) {
+                Some(r) => (path, r.parked, r.activity_at),
+                None => (path, false, None),
             }
         }
     };

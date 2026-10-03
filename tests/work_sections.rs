@@ -156,8 +156,8 @@ fn proc_start(pid: u32) -> String {
 
 /// A branch that reads `age` old: every commit carries the backdated
 /// committer clock (reflog entries take it too), and the branch reflog's
-/// mtime is set to match - `reflog_activity` is the newest of the last
-/// entry and the mtime.
+/// mtime is set to match - `reflog_times` folds the mtime into the newest
+/// work entry when the last write was work.
 fn old_pushed_branch(repo: &FixtureRepo, branch: &str, age: Duration) {
     let epoch = now() - age.as_secs();
     let date = format!("@{epoch} +0000");
