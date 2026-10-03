@@ -269,6 +269,31 @@ fn world() -> World {
     // every live session in its repository.
     transcript(&home, OTHER_ID, &b.main);
     old_pushed_branch(&b, "feat-old", Duration::from_secs(30 * 86400));
+    // `feat-stale` was created now over an old commit: the creation line
+    // is bookkeeping and the tip's committerdate predates it, so the ref
+    // proves no work at all - unknown activity, `?`. `feat-mystery` has
+    // no reflog left: the committerdate fallback still dates it.
+    let tree = b.git(&b.main, &["rev-parse", "HEAD^{tree}"]);
+    let epoch = now() - 20 * 86400;
+    let stale = fixture::command(
+        Some(&b.main),
+        &["commit-tree", tree.trim(), "-p", "main", "-m", "stale"],
+    )
+    .env("GIT_COMMITTER_DATE", format!("@{epoch} +0000"))
+    .env("GIT_AUTHOR_DATE", format!("@{epoch} +0000"))
+    .output()
+    .expect("commit-tree runs");
+    assert!(
+        stale.status.success(),
+        "commit-tree failed: {}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    let stale = String::from_utf8_lossy(&stale.stdout).trim().to_owned();
+    b.git(&b.main, &["branch", "feat-stale", &stale]);
+    b.git(&b.main, &["push", "-u", "origin", "feat-stale"]);
+    b.git(&b.main, &["branch", "feat-mystery", "main"]);
+    fs::remove_file(b.main.join(".git/logs/refs/heads/feat-mystery"))
+        .expect("the fabricated reflog deletes");
     let t = home.join(format!(".claude/projects/t/{OTHER_ID}.jsonl"));
     fs::File::options()
         .write(true)
@@ -367,6 +392,16 @@ fn every_section_classifies_and_survives_serialization() {
         squashed.summary,
         "review: requires `git branch -D` · no wt ↑1 merged"
     );
+    // `feat-stale` was created now over an old commit: creation and a
+    // borrowed old committerdate are not work, so the row keeps `?` for
+    // activity and `Forgotten` cannot claim it.
+    let stale = work(&snapshot, "feat-stale");
+    assert_eq!(stale.section, WorkSection::CleanupReview, "{stale:?}");
+    assert_eq!(stale.last_activity, None, "{stale:?}");
+    // No reflog at all: the tip's committerdate stays the fallback date.
+    let mystery = work(&snapshot, "feat-mystery");
+    assert_eq!(mystery.section, WorkSection::ReadyToClean, "{mystery:?}");
+    assert!(mystery.last_activity.is_some(), "{mystery:?}");
 
     // Blocked rows name their blocker and are never cleanup candidates;
     // unknown forge state stays informational.
@@ -450,7 +485,7 @@ fn the_lists_render_at_55_and_200_columns() {
         assert!(text.contains("Follow up"), "{text}");
         assert!(text.contains("Forgotten"), "{text}");
         // Under `all`, cleanup collapses into exactly one line.
-        assert!(text.contains("Cleanup 2 safe"), "{text}");
+        assert!(text.contains("Cleanup 3 safe"), "{text}");
         assert!(!text.contains("Ready to clean"), "{text}");
         assert!(!text.contains("Cleanup review"), "{text}");
         assert!(!text.contains("main/feat-merged"), "{text}");
@@ -461,25 +496,44 @@ fn the_lists_render_at_55_and_200_columns() {
     // cleanup line and the full repo-prefixed label.
     let text = render(&app, 200, 44);
     assert!(text.contains("main/feat-needs"), "{text}");
-    assert!(text.contains("Cleanup 2 safe · 1 review"), "{text}");
+    assert!(text.contains("Cleanup 3 safe · 2 review"), "{text}");
     assert!(text.contains("resumable idle · no git"), "{text}");
     // Repo rows carry the rolled-up counts and the attention glyph.
     assert!(text.contains("open · 3 clean"), "{text}");
+    // A row with no proven work renders `?` for its age - the notes
+    // space's transcript carries no timestamp.
+    let notes = text
+        .lines()
+        .find(|l| l.contains("notes") && l.contains("resumable idle"))
+        .expect("the notes row renders");
+    assert!(notes.contains("no git ?│"), "{notes}");
     // The Work list's footer advertises `p`.
     app.key(Key::Char('2'));
     let text = render(&app, 200, 44);
     assert!(text.contains("p park"), "{text}");
 
     // Under repo scope the cleanup rows expand under their own headers
-    // and labels lose the repo prefix.
+    // and labels lose the repo prefix - and `feat-stale`, created over an
+    // old commit with no work since, renders its unknown age as `?`.
     app.key(Key::Char('1'));
+    app.key(Key::Char('j'));
     app.key(Key::Char('j'));
     app.key(Key::Char('2'));
     let text = render(&app, 200, 44);
     assert!(text.contains("Ready to clean"), "{text}");
     assert!(text.contains("Cleanup review"), "{text}");
+    assert!(!text.contains("Cleanup 3 safe"), "{text}");
+    let stale = text
+        .lines()
+        .find(|l| l.contains("feat-stale"))
+        .expect("feat-stale renders");
+    assert!(stale.contains("?│"), "{stale}");
+    // Repo `a` still expands its own cleanup rows unprefixed.
+    app.key(Key::Char('1'));
+    app.key(Key::Char('k'));
+    app.key(Key::Char('2'));
+    let text = render(&app, 200, 44);
     assert!(text.contains("● feat-active"), "{text}");
-    assert!(!text.contains("Cleanup 2 safe"), "{text}");
 }
 
 #[test]
@@ -766,6 +820,12 @@ fn forge_state_drives_checks_reasons_and_stays_informational() {
     a.land("feat-shipped", Landing::Merge);
     a.branch_with_commits("feat-green", 1, true);
     a.branch_with_commits("feat-clear", 1, true);
+    // Landed on main, but its worktree carries uncommitted changes:
+    // landed plus blocked.
+    a.branch_with_commits("feat-blocked", 1, true);
+    a.land("feat-blocked", Landing::Merge);
+    let blocked = a.add_worktree("blocked", Some("feat-blocked"));
+    fs::write(blocked.join("dirty.txt"), "x").expect("dirty writes");
     transcript(&home, OTHER_ID, &a.main);
     // Only now point `origin` at a forge URL: every earlier push ran
     // against the real (local) remote, and `ls-remote` fails cleanly on
@@ -796,11 +856,12 @@ fn forge_state_drives_checks_reasons_and_stays_informational() {
     let stubs = TempDir::new("forge-stubs");
     let body = format!(
         "#!/bin/sh\ncase \"$*\" in\n  *feat-fail*) printf '%s' '{}' ;;\n  *feat-pend*) printf '%s' '{}' ;;\n  *feat-green*) printf '%s' '{}' ;;
-  *feat-clear*) printf '%s' '{}' ;;\n  *feat-shipped*--state\\ open*|*feat-shipped*open*) printf '[]' ;;\n  *feat-shipped*) printf '%s' '{}' ;;\n  *) printf '[]' ;;\nesac\nexit 0\n",
+  *feat-clear*) printf '%s' '{}' ;;\n  *feat-blocked*) printf '%s' '{}' ;;\n  *feat-shipped*--state\\ open*|*feat-shipped*open*) printf '[]' ;;\n  *feat-shipped*) printf '%s' '{}' ;;\n  *) printf '[]' ;;\nesac\nexit 0\n",
         r#"[{"number":41,"state":"OPEN","url":"https://github.invalid/o/r/pull/41","statusCheckRollup":[{"status":"COMPLETED","conclusion":"FAILURE"}]}]"#,
         r#"[{"number":42,"state":"OPEN","url":"https://github.invalid/o/r/pull/42","statusCheckRollup":[{"status":"IN_PROGRESS"}]}]"#,
         r#"[{"number":45,"state":"OPEN","url":"https://github.invalid/o/r/pull/45","statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}]}]"#,
         r#"[{"number":46,"state":"OPEN","url":"https://github.invalid/o/r/pull/46","statusCheckRollup":[]}]"#,
+        r#"[{"number":47,"state":"OPEN","url":"https://github.invalid/o/r/pull/47","statusCheckRollup":[]}]"#,
         r#"[{"number":43,"state":"MERGED","url":"https://github.invalid/o/r/pull/43","statusCheckRollup":[]}]"#,
     );
     let gh = stubs.join("gh");
@@ -856,6 +917,23 @@ fn forge_state_drives_checks_reasons_and_stays_informational() {
     let shipped = work(&snapshot, "feat-shipped");
     assert_eq!(shipped.forge, WorkItem::Closed);
     assert!(shipped.forge_label.is_some());
+    // Landed with a live PR open and uncommitted work in its worktree:
+    // blocked, follow-up, `merged · blocked` - never a cleanup candidate.
+    let blocked = work(&snapshot, "feat-blocked");
+    assert_eq!(blocked.section, WorkSection::FollowUp, "{blocked:?}");
+    assert_eq!(blocked.forge, WorkItem::Open);
+    assert_eq!(blocked.pipeline, Pipeline::Unknown);
+    assert!(
+        blocked.summary.starts_with("merged · blocked"),
+        "{}",
+        blocked.summary
+    );
+    let removal = blocked.worktree_removal.as_ref().expect("a removal");
+    assert_eq!(
+        removal.verdict,
+        agent_sessions::verdict::Verdict::Blocked,
+        "{removal:?}"
+    );
     // `main`'s transcript row is the space row for the repo; pushed rows
     // whose PR queries answered nothing get NotExisting, others Unknown.
     let main = work(&snapshot, "main");

@@ -730,22 +730,86 @@ impl Repo {
         }
     }
 
-    /// Last entry time of a worktree's HEAD reflog, or of a branch reflog,
-    /// taken with the log file's mtime: the newest of the two is the activity
-    /// signal. // coverage: off - the unexecuted instantiation's region edge
-    pub fn reflog_activity(&self, log: &Path) -> Option<SystemTime> {
-        // coverage: off - same
+    /// How a reflog reads for activity: `created_at` is the moment the ref
+    /// or checkout came to be - the null-old entry every reflog starts
+    /// with; `worked_at` is the newest entry that moved the ref for real -
+    /// a commit, merge, reset or rebase. Bookkeeping lines (`checkout:`,
+    /// `clone:`, `branch:`/`Branch:` creation and renames, and any entry
+    /// whose old and new tips agree) are not work, and when such a line
+    /// was the last write even the file's mtime does not count.
+    pub fn reflog_times(&self, log: &Path) -> ReflogTimes {
         let path = self.common_dir.join(log); // coverage: off - `join`'s empty-path arm is the missed region; a reflog name is never empty
-        let text = fs::read_to_string(&path).ok()?;
-        let last = text.lines().rev().find(|l| !l.trim().is_empty())?;
-        // `<old> <new> <ident> <epoch> <tz>\t<msg>`: the epoch is the second
-        // token before the tab when read from the right, which is robust
-        // against spaces inside the identity.
-        let fields = last.split('\t').next().unwrap_or(last);
-        let epoch: u64 = fields.split_whitespace().nth_back(1)?.parse().ok()?;
-        let entry = UNIX_EPOCH + Duration::from_secs(epoch);
-        let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
-        Some(mtime.map_or(entry, |m| m.max(entry)))
+        let mut times = ReflogTimes::default();
+        let Ok(text) = fs::read_to_string(&path) else {
+            return times;
+        };
+        let mut last_is_work = false;
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let Some(entry) = ReflogEntry::parse(line) else {
+                last_is_work = false;
+                continue;
+            };
+            last_is_work = entry.work;
+            if entry.creation && times.created_at.is_none() {
+                times.created_at = Some(entry.at);
+            }
+            if entry.work {
+                times.worked_at = Some(times.worked_at.map_or(entry.at, |w| w.max(entry.at)));
+            }
+        }
+        // The file's mtime only timestamps its last write: it counts when
+        // that write was work.
+        if last_is_work && let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) {
+            times.worked_at = Some(times.worked_at.map_or(mtime, |w| w.max(mtime)));
+        }
+        times
+    }
+}
+
+/// What one reflog proves about its ref's lifecycle.
+#[derive(Debug, Default)]
+pub struct ReflogTimes {
+    /// The ref's creation/checkout epoch - the null-old entry's time.
+    pub created_at: Option<SystemTime>,
+    /// The newest real work entry's time, folded with the file's mtime
+    /// when the last write was work.
+    pub worked_at: Option<SystemTime>,
+}
+
+/// One reflog line: `<old> <new> <ident> <epoch> <tz>\t<msg>`.
+struct ReflogEntry {
+    /// The line's `old` was the null sha: the entry created the ref.
+    creation: bool,
+    /// The entry moved the tip or tree - its message is not bookkeeping
+    /// and old and new differ.
+    work: bool,
+    /// The committer-clock epoch stamped on the line.
+    at: SystemTime,
+}
+
+impl ReflogEntry {
+    /// Messages Git writes for lifecycle bookkeeping rather than work:
+    /// `checkout: moving from X to Y`, `clone: from Z`, `branch: Created
+    /// from`/`branch: Reset to`, `Branch: renamed`.
+    const BOOKKEEPING: &'static [&'static str] = &["checkout:", "clone:", "branch:", "Branch:"];
+
+    fn parse(line: &str) -> Option<ReflogEntry> {
+        let fields = line.split('\t').next().unwrap_or(line);
+        let mut fields = fields.split_whitespace();
+        let old = fields.next()?; // coverage: off - the caller only parses non-empty lines, which always have a first token
+        let new = fields.next()?;
+        // The epoch is the second token before the tab when read from the
+        // right - robust against spaces inside the identity.
+        let epoch: u64 = fields.nth_back(1)?.parse().ok()?;
+        let message = line.split('\t').nth(1).unwrap_or("");
+        Some(ReflogEntry {
+            creation: !old.is_empty() && old.bytes().all(|b| b == b'0'),
+            work: old != new
+                && !Self::BOOKKEEPING
+                    .iter()
+                    .any(|prefix| message.starts_with(prefix)),
+            at: UNIX_EPOCH + Duration::from_secs(epoch),
+        })
     }
 }
 
@@ -1128,7 +1192,11 @@ mod tests {
         assert!(!repo.paths_match("a", "b", &["x".to_owned()]).is_known());
         assert!(repo.ref_facts().is_err());
         assert!(repo.ahead_behind("refs/heads/main").is_err());
-        assert!(repo.reflog_activity(Path::new("logs/HEAD")).is_none());
+        assert!(
+            repo.reflog_times(Path::new("logs/HEAD"))
+                .worked_at
+                .is_none()
+        );
         assert!(!repo.dirty(Path::new("/also/not/here")).is_known());
     }
 
@@ -1317,35 +1385,82 @@ mod tests {
     }
 
     #[test]
-    fn reflog_activity_reads_the_last_entry_and_mtime() {
+    fn reflog_times_reads_work_entries_not_bookkeeping() {
         let temp = Temp::new();
         let repo = Repo {
             common_dir: temp.0.clone(),
         };
+        let log = Path::new("logs/HEAD");
         // No log at all is no evidence.
-        assert_eq!(repo.reflog_activity(Path::new("logs/HEAD")), None);
+        let times = repo.reflog_times(log);
+        assert_eq!(times.created_at, None);
+        assert_eq!(times.worked_at, None);
 
         let log_dir = temp.0.join("logs");
         fs::create_dir_all(&log_dir).unwrap();
         // A log of only blank lines has no entry to read.
         fs::write(log_dir.join("HEAD"), "  \n\n").unwrap();
-        assert_eq!(repo.reflog_activity(Path::new("logs/HEAD")), None);
+        assert_eq!(repo.reflog_times(log).worked_at, None);
         // Garbage parses to nothing rather than to a guessed time: a line
         // without an epoch field, and a line whose epoch is not a number.
         fs::write(log_dir.join("HEAD"), "onefield\n").unwrap();
-        assert_eq!(repo.reflog_activity(Path::new("logs/HEAD")), None);
+        assert_eq!(repo.reflog_times(log).worked_at, None);
         fs::write(log_dir.join("HEAD"), "not a reflog line\n").unwrap();
-        assert_eq!(repo.reflog_activity(Path::new("logs/HEAD")), None);
+        assert_eq!(repo.reflog_times(log).worked_at, None);
+        fs::write(log_dir.join("HEAD"), "old new\n").unwrap();
+        assert_eq!(repo.reflog_times(log).worked_at, None);
 
+        // A creation-only log records the moment but proves no work - not
+        // even the file's own mtime counts against a bookkeeping line.
         fs::write(
             log_dir.join("HEAD"),
-            "0000 1111 A Name <a@b> 1700000000 +0200\tcommit: x\n",
+            "0000 1111 A Name <a@b> 1700000000 +0200\tbranch: Created from main\n",
         )
         .unwrap();
-        let at = repo
-            .reflog_activity(Path::new("logs/HEAD"))
-            .expect("a parseable log has a time");
-        assert!(at >= UNIX_EPOCH + Duration::from_secs(1700000000));
+        let times = repo.reflog_times(log);
+        assert_eq!(
+            times.created_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000000))
+        );
+        assert_eq!(times.worked_at, None, "{times:?}");
+
+        // A checkout-only log - a worktree just added - is the same.
+        fs::write(
+            log_dir.join("HEAD"),
+            "0000 1111 A Name <a@b> 1700000001 +0200\tcheckout: moving from main to feat\n",
+        )
+        .unwrap();
+        let times = repo.reflog_times(log);
+        assert_eq!(
+            times.created_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000001))
+        );
+        assert_eq!(times.worked_at, None, "{times:?}");
+
+        // A later commit is work.
+        fs::write(
+            log_dir.join("HEAD"),
+            "0000 1111 A Name <a@b> 1700000000 +0200\tbranch: Created from main\n\
+             1111 2222 A Name <a@b> 1700000500 +0200\tcommit: real work\n",
+        )
+        .unwrap();
+        let times = repo.reflog_times(log);
+        let worked = times.worked_at.expect("the commit is work");
+        assert!(worked >= UNIX_EPOCH + Duration::from_secs(1700000500));
+        // And a checkout written after that commit is still not work -
+        // the mtime it moved does not refresh `worked_at`.
+        fs::write(
+            log_dir.join("HEAD"),
+            "1111 2222 A Name <a@b> 1700000500 +0200\tcommit: real work\n\
+             2222 3333 A Name <a@b> 1700000999 +0200\tcheckout: moving to other\n",
+        )
+        .unwrap();
+        let times = repo.reflog_times(log);
+        assert_eq!(
+            times.worked_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000500)),
+            "{times:?}"
+        );
     }
 
     #[test]

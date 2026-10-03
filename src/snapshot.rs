@@ -1618,6 +1618,15 @@ fn follow_up(row: &WorkRow, bound: &[&ConversationRow]) -> Option<String> {
             Pipeline::Succeeded | Pipeline::Unknown => {}
         }
     }
+    let blocked = [row.worktree_removal.as_ref(), row.branch_deletion.as_ref()]
+        .into_iter()
+        .flatten()
+        .find(|a| a.verdict == Verdict::Blocked);
+    // Landed work whose cleanup is blocked names both facts - its
+    // remaining dirt is part of why it is blocked, not a separate ask.
+    if blocked.is_some() && matches!(row.landed, Some(Landed::Ancestor | Landed::Content)) {
+        return Some("merged · blocked".to_owned());
+    }
     if row.dirty == Some(true) {
         return Some("dirty".to_owned());
     }
@@ -1630,16 +1639,9 @@ fn follow_up(row: &WorkRow, bound: &[&ConversationRow]) -> Option<String> {
     {
         return Some("resumable idle".to_owned());
     }
-    let blocked = [row.worktree_removal.as_ref(), row.branch_deletion.as_ref()]
-        .into_iter()
-        .flatten()
-        .find(|a| a.verdict == Verdict::Blocked);
     if let Some(blocked) = blocked {
-        // Landed work whose cleanup is blocked names both facts; anything
-        // else names its first concrete blocker.
-        if matches!(row.landed, Some(Landed::Ancestor | Landed::Content)) {
-            return Some("merged · blocked".to_owned());
-        }
+        // A blocked row that is not landed names its first concrete
+        // blocker and is never a cleanup candidate.
         let first = blocked.reasons.first().map(String::as_str).unwrap_or("?");
         return Some(format!("blocked: {first}"));
     }

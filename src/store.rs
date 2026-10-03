@@ -458,10 +458,14 @@ pub struct PathRecord {
 /// The `work.json` payload: the authored Work state.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Work {
-    /// `(repo, ref_name)` -> the incarnation record - active, or the most
-    /// recent closed one until a reappearance replaces it.
+    /// Incarnation id -> the record, active or closed. Closed records are
+    /// retained: they are the incarnation history a later pass numbers
+    /// and reconciles against.
     #[serde(default)]
     pub branches: std::collections::BTreeMap<String, BranchRecord>,
+    /// `branch_key(repo, ref_name)` -> the active incarnation's id.
+    #[serde(default)]
+    pub active_branches: std::collections::BTreeMap<String, String>,
     /// Canonical path -> the detached worktree or project space record.
     #[serde(default)]
     pub paths: std::collections::BTreeMap<String, PathRecord>,
@@ -472,9 +476,8 @@ impl Work {
     /// A closed record answers `None`: a reappeared ref gets its identity
     /// from the record a sync creates, never from the closed past.
     pub fn branch(&self, repo: &str, ref_name: &str) -> Option<&BranchRecord> {
-        self.branches
-            .get(&branch_key(repo, ref_name))
-            .filter(|r| r.ended_at.is_none())
+        let id = self.active_branches.get(&branch_key(repo, ref_name))?;
+        self.branches.get(id).filter(|r| r.ended_at.is_none())
     }
 
     /// The path record for `path`, if one exists.
@@ -830,23 +833,43 @@ impl Store {
         let _lock = Lock::acquire(&self.dir.join(LOCK))?;
         let mut work = self.read_work_for_update()?;
         let mut changed = false;
-        // Refs the pass did not observe close their active record.
+        // Refs the pass did not observe close their active record and
+        // leave the active lookup - the closed record itself is kept.
         let observed: std::collections::HashSet<&str> =
             refs.iter().map(|r| r.name.as_str()).collect();
-        for record in work
-            .branches
-            .values_mut()
-            .filter(|r| r.repo == repo && r.ended_at.is_none())
-        {
+        let prefix = format!("{repo}\u{0}");
+        let active: Vec<String> = work
+            .active_branches
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in active {
+            let Some(id) = work.active_branches.get(&key).cloned() else {
+                continue; // coverage: off - `key` came from this map
+            };
+            let Some(record) = work.branches.get_mut(&id) else {
+                continue; // coverage: off - the lookup only ever names a stored id
+            };
             if !observed.contains(record.ref_name.as_str()) {
                 record.ended_at = Some(observed_ms);
+                work.active_branches.remove(&key);
                 changed = true;
             }
         }
         for obs in refs {
             let key = branch_key(repo, &obs.name);
-            match work.branches.get_mut(&key) {
-                Some(record) if record.ended_at.is_none() => {
+            let active = work
+                .active_branches
+                .get(&key)
+                .and_then(|id| work.branches.get(id))
+                .filter(|r| r.ended_at.is_none())
+                .map(|r| r.id.clone());
+            match active {
+                Some(id) => {
+                    let Some(record) = work.branches.get_mut(&id) else {
+                        continue; // coverage: off - the lookup only ever names a stored id
+                    };
                     if record.inputs != obs.inputs {
                         // A changed fingerprint is a transition; first
                         // observation never lands here.
@@ -859,11 +882,15 @@ impl Store {
                         changed = true;
                     }
                 }
-                _ => {
+                None => {
+                    // No active record for this ref - first observation,
+                    // or a reappearance: a new incarnation with its own
+                    // id, leaving every closed record in place.
+                    let id = incarnation_id(repo, &obs.name, observed_ms);
                     work.branches.insert(
-                        key,
+                        id.clone(),
                         BranchRecord {
-                            id: incarnation_id(repo, &obs.name, observed_ms),
+                            id: id.clone(),
                             repo: repo.to_owned(),
                             ref_name: obs.name.clone(),
                             first_observed_at: observed_ms,
@@ -874,6 +901,7 @@ impl Store {
                             inputs: obs.inputs.clone(),
                         },
                     );
+                    work.active_branches.insert(key, id);
                     changed = true;
                 }
             }
@@ -943,8 +971,8 @@ impl Store {
             WorkIdentity::Branch(id) => {
                 let record = work
                     .branches
-                    .values_mut()
-                    .find(|r| r.id == *id && r.ended_at.is_none())
+                    .get_mut(id)
+                    .filter(|r| r.ended_at.is_none())
                     .ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::NotFound,
@@ -2368,15 +2396,18 @@ mod tests {
         assert_eq!(feat.activity_at, Some(2_000));
         assert_eq!(feat.inputs.dirty, Some(true));
         assert_eq!(feat.last_observed_at, 2_000);
-        // `feat` gone from the observation: the record closes.
+        // `feat` gone from the observation: the record closes and stays -
+        // it leaves the active lookup but remains in the history.
+        let old_id = feat.id.clone();
         store.sync_repo(repo, &[obs("main", false)], 3_000).unwrap();
         let work = store.load().work;
         assert!(work.branch(repo, "feat").is_none());
-        let closed = &work.branches[&branch_key(repo, "feat")];
+        assert!(!work.active_branches.contains_key(&branch_key(repo, "feat")));
+        let closed = &work.branches[&old_id];
         assert_eq!(closed.ended_at, Some(3_000));
-        // Reappearance opens a new incarnation: new id, unparked, the
-        // closed record replaced.
-        let old_id = closed.id.clone();
+        assert_eq!(closed.first_observed_at, 1_000);
+        // Reappearance opens a new incarnation: new id, unparked, and the
+        // closed record survives beside it.
         store
             .sync_repo(repo, &[obs("main", false), obs("feat", false)], 4_000)
             .unwrap();
@@ -2385,12 +2416,14 @@ mod tests {
         assert_ne!(feat.id, old_id);
         assert_eq!(feat.first_observed_at, 4_000);
         assert_eq!(feat.ended_at, None);
+        assert_eq!(work.branches.len(), 3, "{:?}", work.branches);
+        assert_eq!(work.branches[&old_id].ended_at, Some(3_000));
         // Another repo's records are not touched by this repo's sync.
         assert_eq!(work.branch(repo, "main").unwrap().id, main.id);
         let other = store.load().work;
         store.sync_repo("/other/.git", &[], 5_000).unwrap();
         let work = store.load().work;
-        assert_eq!(work.branches.len(), 2, "{:?}", work.branches);
+        assert_eq!(work.branches.len(), 3, "{:?}", work.branches);
         assert!(other.branch(repo, "main").is_some());
     }
 
@@ -2473,10 +2506,30 @@ mod tests {
             .toggle_parked(&WorkIdentity::Path("/nowhere".to_owned()))
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
-        // And a closed incarnation cannot be parked by its old id.
+        // Park the incarnation, then close it: the closed record keeps
+        // its parked flag, the old id refuses the toggle, and the
+        // reappeared ref comes back as a new unparked incarnation.
+        assert!(
+            store
+                .toggle_parked(&WorkIdentity::Branch(id.clone()))
+                .unwrap()
+        );
         store.sync_repo(repo, &[obs("main", false)], 2_000).unwrap();
-        let err = store.toggle_parked(&WorkIdentity::Branch(id)).unwrap_err();
+        let err = store
+            .toggle_parked(&WorkIdentity::Branch(id.clone()))
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let work = store.load().work;
+        assert!(work.branches[&id].parked, "the closed record keeps it");
+        assert_eq!(work.branches[&id].ended_at, Some(2_000));
+        store
+            .sync_repo(repo, &[obs("main", false), obs("feat", true)], 3_000)
+            .unwrap();
+        let work = store.load().work;
+        let feat = work.branch(repo, "feat").expect("feat reincarnated");
+        assert_ne!(feat.id, id);
+        assert!(!feat.parked, "the new incarnation starts unparked");
+        assert!(work.branches.contains_key(&id));
     }
 
     #[test]
