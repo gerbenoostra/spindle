@@ -166,6 +166,19 @@ pub enum Upstream {
     Unknown,
 }
 
+impl Upstream {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Upstream::Tracked => "tracked",
+            Upstream::NeverPushed => "never_pushed",
+            Upstream::RemoteGone => "remote_gone",
+            Upstream::NotApplicable => "not_applicable",
+            Upstream::Unknown => "unknown",
+        }
+    }
+}
+
 /// `WorkRow.landed`: whether HEAD's content already lives on the base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -177,6 +190,17 @@ pub enum Landed {
     Content,
     /// Proven not landed (including the no-delta case).
     No,
+}
+
+impl Landed {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Landed::Ancestor => "ancestor",
+            Landed::Content => "content",
+            Landed::No => "no",
+        }
+    }
 }
 
 /// `AttachmentRow.liveness`: the claim's proven process state.
@@ -1346,19 +1370,7 @@ fn work_row(
         }
         Anchor::Branch { name } => (WorkKind::Branch, name.clone(), Some(name.clone())),
     };
-    let upstream = match &v.upstream_state {
-        UpstreamState::NeverPushed => Upstream::NeverPushed,
-        UpstreamState::Tracked { .. } => Upstream::Tracked,
-        UpstreamState::RemoteGone { .. } => Upstream::RemoteGone,
-        UpstreamState::Unknown(_) => Upstream::Unknown,
-        UpstreamState::NotApplicable => Upstream::NotApplicable,
-    };
-    let upstream_detail = match &v.upstream_state {
-        UpstreamState::Tracked { remote, merge_ref }
-        | UpstreamState::RemoteGone { remote, merge_ref } => Some(format!("{remote}/{merge_ref}")),
-        UpstreamState::Unknown(reason) => Some(reason.clone()),
-        _ => None,
-    };
+    let (upstream, upstream_detail) = upstream_of(&v.upstream_state);
     // Work identity: an active incarnation's id for a branch row, the
     // canonical path for a detached one. A branch whose record the sync
     // has not written yet carries no identity rather than a guess.
@@ -1392,11 +1404,7 @@ fn work_row(
         unpushed: v.unpushed_commits.known().copied(),
         upstream,
         upstream_detail,
-        landed: v.landed.known().map(|l| match l {
-            LandedVerdict::AncestorMerged => Landed::Ancestor,
-            LandedVerdict::ContentMerged => Landed::Content,
-            LandedVerdict::No => Landed::No,
-        }),
+        landed: landed_of(v),
         base: state.base.known().map(|b| b.label()),
         windows: v.windows.total,
         live_pids: v.live_pids,
@@ -1425,54 +1433,53 @@ fn work_row(
     }
 }
 
+/// The row's upstream reading and its detail: `remote/merge_ref` for a
+/// configured upstream, the reason for an unknown one.
+fn upstream_of(state: &UpstreamState) -> (Upstream, Option<String>) {
+    match state {
+        UpstreamState::NeverPushed => (Upstream::NeverPushed, None),
+        UpstreamState::Tracked { remote, merge_ref } => {
+            (Upstream::Tracked, Some(format!("{remote}/{merge_ref}")))
+        }
+        UpstreamState::RemoteGone { remote, merge_ref } => {
+            (Upstream::RemoteGone, Some(format!("{remote}/{merge_ref}")))
+        }
+        UpstreamState::Unknown(reason) => (Upstream::Unknown, Some(reason.clone())),
+        UpstreamState::NotApplicable => (Upstream::NotApplicable, None),
+    }
+}
+
+/// The row's proven landed verdict, `None` while unproven.
+fn landed_of(v: &vector::StateVector) -> Option<Landed> {
+    v.landed.known().map(|l| match l {
+        LandedVerdict::AncestorMerged => Landed::Ancestor,
+        LandedVerdict::ContentMerged => Landed::Content,
+        LandedVerdict::No => Landed::No,
+    })
+}
+
 /// The lifecycle fingerprint one anchor's state produces for the authored
 /// record: every field a `work.json` record compares next pass to date a
-/// transition at its observation.
+/// transition at its observation. Unproven readings are `None`, so they
+/// keep the record's last proven value instead of dating a transition.
 fn lifecycle_inputs(state: &vector::WorkState) -> store::LifecycleInputs {
     let v = &state.vector;
+    let (upstream, detail) = upstream_of(&v.upstream_state);
     store::LifecycleInputs {
         dirty: v.dirty.known().copied(),
         worktree: v.worktree.is_some(),
         worktree_path: v.worktree.as_ref().map(|p| p.display().to_string()),
         ahead: v.commits_ahead_of_base.known().copied(),
         unpushed: v.unpushed_commits.known().copied(),
-        upstream: Some(match &v.upstream_state {
-            UpstreamState::NeverPushed => "never_pushed".to_owned(),
-            UpstreamState::Tracked { remote, merge_ref } => {
-                format!("tracked {remote}/{merge_ref}")
-            }
-            UpstreamState::RemoteGone { remote, merge_ref } => {
-                format!("remote_gone {remote}/{merge_ref}")
-            }
-            UpstreamState::Unknown(reason) => format!("unknown {reason}"),
-            UpstreamState::NotApplicable => "not_applicable".to_owned(),
+        upstream: (upstream != Upstream::Unknown).then(|| match detail {
+            Some(detail) => format!("{} {detail}", upstream.as_str()),
+            None => upstream.as_str().to_owned(),
         }),
-        landed: v.landed.known().map(|l| {
-            match l {
-                LandedVerdict::AncestorMerged => "ancestor",
-                LandedVerdict::ContentMerged => "content",
-                LandedVerdict::No => "no",
-            }
-            .to_owned()
-        }),
-        forge: Some(
-            match state.forge.item {
-                WorkItem::Unknown => "unknown",
-                WorkItem::NotExisting => "not_existing",
-                WorkItem::Open => "open",
-                WorkItem::Closed => "closed",
-            }
-            .to_owned(),
-        ),
-        pipeline: Some(
-            match state.forge.pipeline {
-                Pipeline::Busy => "busy",
-                Pipeline::Succeeded => "succeeded",
-                Pipeline::Failed => "failed",
-                Pipeline::Unknown => "unknown",
-            }
-            .to_owned(),
-        ),
+        landed: landed_of(v).map(|l| l.as_str().to_owned()),
+        forge: (state.forge.item != WorkItem::Unknown)
+            .then(|| state.forge.item.as_str().to_owned()),
+        pipeline: (state.forge.pipeline != Pipeline::Unknown)
+            .then(|| state.forge.pipeline.as_str().to_owned()),
     }
 }
 
@@ -2845,6 +2852,34 @@ mod tests {
             assert_eq!(wire(&state), serde_json::json!(want));
         }
         assert_eq!(Provider::Claude.as_str(), "claude");
+        for upstream in [
+            Upstream::Tracked,
+            Upstream::NeverPushed,
+            Upstream::RemoteGone,
+            Upstream::NotApplicable,
+            Upstream::Unknown,
+        ] {
+            assert_eq!(wire(&upstream), serde_json::json!(upstream.as_str()));
+        }
+        for landed in [Landed::Ancestor, Landed::Content, Landed::No] {
+            assert_eq!(wire(&landed), serde_json::json!(landed.as_str()));
+        }
+        for item in [
+            WorkItem::Unknown,
+            WorkItem::NotExisting,
+            WorkItem::Open,
+            WorkItem::Closed,
+        ] {
+            assert_eq!(wire(&item), serde_json::json!(item.as_str()));
+        }
+        for pipeline in [
+            Pipeline::Busy,
+            Pipeline::Succeeded,
+            Pipeline::Failed,
+            Pipeline::Unknown,
+        ] {
+            assert_eq!(wire(&pipeline), serde_json::json!(pipeline.as_str()));
+        }
         for (value, want) in [
             (wire(&Upstream::Tracked), "tracked"),
             (wire(&Upstream::NeverPushed), "never_pushed"),

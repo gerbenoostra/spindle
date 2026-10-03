@@ -370,8 +370,9 @@ pub struct Mark {
 /// activity: dirty flag and tree shape, delivery evidence, forge state.
 /// Persisted as the record's last reading so a restart does not redate an
 /// unchanged state, and a changed input dates at its observation time.
-/// Every field is optional so unproven evidence stays distinct from a
-/// proven value.
+/// An optional field is `None` when unproven: it keeps the last proven
+/// value and dates nothing, so an offline pass, a forge outage or a timed
+/// out probe is never mistaken for work.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleInputs {
     /// The worktree's dirty flag; `None` when unproven or not applicable.
@@ -389,18 +390,37 @@ pub struct LifecycleInputs {
     /// Commits the configured upstream does not have.
     #[serde(default)]
     pub unpushed: Option<u64>,
-    /// The upstream state's wire spelling plus its detail.
+    /// The proven upstream state's wire spelling plus its detail.
     #[serde(default)]
     pub upstream: Option<String>,
     /// The landed verdict's wire spelling.
     #[serde(default)]
     pub landed: Option<String>,
-    /// The forge work-item state's wire spelling.
+    /// The known forge work-item state's wire spelling.
     #[serde(default)]
     pub forge: Option<String>,
     /// The open item's pipeline state.
     #[serde(default)]
     pub pipeline: Option<String>,
+}
+
+impl LifecycleInputs {
+    /// This reading laid over `prior`: every unproven field keeps the
+    /// prior proven value. The checkout's presence and path are always
+    /// observed, never unproven.
+    fn over(&self, prior: &LifecycleInputs) -> LifecycleInputs {
+        LifecycleInputs {
+            dirty: self.dirty.or(prior.dirty),
+            worktree: self.worktree,
+            worktree_path: self.worktree_path.clone(),
+            ahead: self.ahead.or(prior.ahead),
+            unpushed: self.unpushed.or(prior.unpushed),
+            upstream: self.upstream.clone().or_else(|| prior.upstream.clone()),
+            landed: self.landed.clone().or_else(|| prior.landed.clone()),
+            forge: self.forge.clone().or_else(|| prior.forge.clone()),
+            pipeline: self.pipeline.clone().or_else(|| prior.pipeline.clone()),
+        }
+    }
 }
 
 /// One local ref a pass observed in a repository, with the facts the
@@ -870,11 +890,12 @@ impl Store {
                     let Some(record) = work.branches.get_mut(&id) else {
                         continue; // coverage: off - the lookup only ever names a stored id
                     };
-                    if record.inputs != obs.inputs {
-                        // A changed fingerprint is a transition; first
-                        // observation never lands here.
+                    let inputs = obs.inputs.over(&record.inputs);
+                    if record.inputs != inputs {
+                        // A changed proven fingerprint is a transition;
+                        // first observation never lands here.
                         record.activity_at = Some(observed_ms);
-                        record.inputs = obs.inputs.clone();
+                        record.inputs = inputs;
                         changed = true;
                     }
                     if record.last_observed_at != observed_ms {
@@ -928,9 +949,10 @@ impl Store {
         let mut changed = false;
         match work.paths.get_mut(path) {
             Some(record) => {
-                if record.inputs != *inputs {
+                let inputs = inputs.over(&record.inputs);
+                if record.inputs != inputs {
                     record.activity_at = Some(observed_ms);
-                    record.inputs = inputs.clone();
+                    record.inputs = inputs;
                     changed = true;
                 }
             }
@@ -2425,6 +2447,63 @@ mod tests {
         let work = store.load().work;
         assert_eq!(work.branches.len(), 3, "{:?}", work.branches);
         assert!(other.branch(repo, "main").is_some());
+    }
+
+    #[test]
+    fn an_unproven_reading_keeps_the_last_proven_value_and_dates_nothing() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        let proven = LifecycleInputs {
+            dirty: Some(false),
+            upstream: Some("tracked origin/feat".to_owned()),
+            forge: Some("open".to_owned()),
+            ..LifecycleInputs::default()
+        };
+        let observe = |inputs: &LifecycleInputs, at| {
+            store
+                .sync_repo(
+                    repo,
+                    &[ObservedRef {
+                        name: "feat".to_owned(),
+                        inputs: inputs.clone(),
+                    }],
+                    at,
+                )
+                .unwrap();
+            store.load().work.branch(repo, "feat").unwrap().clone()
+        };
+        observe(&proven, 1_000);
+        // Offline: upstream and forge go unproven. Nothing dates, and the
+        // record keeps the proven readings.
+        let offline = LifecycleInputs {
+            upstream: None,
+            forge: None,
+            ..proven.clone()
+        };
+        let record = observe(&offline, 2_000);
+        assert_eq!(record.activity_at, None);
+        assert_eq!(record.inputs, proven);
+        // Back online with the same answers: still nothing to date.
+        assert_eq!(observe(&proven, 3_000).activity_at, None);
+        // A proven change dates, even when other fields are unproven.
+        let merged = LifecycleInputs {
+            forge: Some("closed".to_owned()),
+            upstream: None,
+            ..proven.clone()
+        };
+        let record = observe(&merged, 4_000);
+        assert_eq!(record.activity_at, Some(4_000));
+        assert_eq!(record.inputs.forge.as_deref(), Some("closed"));
+        assert_eq!(
+            record.inputs.upstream.as_deref(),
+            Some("tracked origin/feat")
+        );
+        // The same holds for a path record.
+        store.sync_path("/space", &proven, 1_000).unwrap();
+        store.sync_path("/space", &offline, 2_000).unwrap();
+        let work = store.load().work;
+        assert_eq!(work.path("/space").unwrap().activity_at, None);
     }
 
     #[test]

@@ -1005,3 +1005,43 @@ fn a_resumable_conversation_does_not_hold_finished_or_quiet_work() {
             .any(|c| c.session_id == RESUME_ID)
     );
 }
+
+#[test]
+fn an_unreachable_remote_is_not_activity() {
+    let home = TempDir::new("work-offline");
+    let a = FixtureRepo::new("origin");
+    old_pushed_branch(&a, "feat-quiet", Duration::from_secs(30 * 86400));
+    // A conversation on the main checkout brings the repo into scope.
+    transcript(&home, OTHER_ID, &a.main);
+    age_transcript(&home, OTHER_ID, 30);
+    let world = World {
+        home,
+        a,
+        b: FixtureRepo::new("origin"),
+        agent: None,
+    };
+    let quiet = |snapshot: &Snapshot| {
+        let row = work(snapshot, "feat-quiet");
+        assert_eq!(row.section, WorkSection::Forgotten, "{row:?}");
+        assert!(row.summary.starts_with("idle 30d"), "{}", row.summary);
+    };
+    quiet(&collect(&world));
+    // Offline: the remote cannot be asked, so upstream and delivery read
+    // unknown. An unproven reading is no transition - the row stays
+    // `Forgotten` at its old age - and neither is coming back online.
+    let url = world.a.git(&world.a.main, &["remote", "get-url", "origin"]);
+    world.a.git(
+        &world.a.main,
+        &["remote", "set-url", "origin", "/nonexistent/remote.git"],
+    );
+    let offline = collect(&world);
+    assert_eq!(
+        work(&offline, "feat-quiet").upstream,
+        agent_sessions::snapshot::Upstream::Unknown
+    );
+    quiet(&offline);
+    world
+        .a
+        .git(&world.a.main, &["remote", "set-url", "origin", url.trim()]);
+    quiet(&collect(&world));
+}

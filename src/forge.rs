@@ -29,6 +29,18 @@ pub enum WorkItem {
     Closed,
 }
 
+impl WorkItem {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkItem::Unknown => "unknown",
+            WorkItem::NotExisting => "not_existing",
+            WorkItem::Open => "open",
+            WorkItem::Closed => "closed",
+        }
+    }
+}
+
 /// Pipeline state of an open work item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +49,18 @@ pub enum Pipeline {
     Succeeded,
     Failed,
     Unknown,
+}
+
+impl Pipeline {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Pipeline::Busy => "busy",
+            Pipeline::Succeeded => "succeeded",
+            Pipeline::Failed => "failed",
+            Pipeline::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
