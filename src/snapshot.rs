@@ -487,8 +487,11 @@ struct Model {
     conversations: Vec<ConversationRow>,
     repos: BTreeMap<String, RepoModel>,
     /// The authored Work state - incarnation ids, parked flags, lifecycle
-    /// fingerprints - loaded at stage 1 and refreshed by the pass's sync.
+    /// fingerprints - loaded at stage 1 and re-read whenever `work.json`
+    /// changed: by the pass's own sync, or by a `p` landing mid-pass.
     work: store::Work,
+    /// The `work.json` stamp `work` was read at.
+    work_stamp: Option<store::WorkStamp>,
     errors: Vec<SourceError>,
     skipped: Vec<String>,
     stale_sockets: usize,
@@ -584,10 +587,14 @@ impl Collector {
         let observed_at = runtime.observed_at;
         let inventory = self.claude.scan();
         self.model.errors = inventory.errors;
+        // Stamp before loading: a write racing the load then shows as a
+        // changed stamp at the next publish, never as a missed one.
+        let work_stamp = self.store.as_ref().and_then(Store::work_stamp);
         let mut loaded = self.store.as_ref().map(Store::load).unwrap_or_default();
         self.model.errors.append(&mut loaded.errors);
         self.model.errors.extend(self.warnings.iter().cloned());
         self.model.work = std::mem::take(&mut loaded.work);
+        self.model.work_stamp = work_stamp;
         self.model.skipped = inventory
             .skipped
             .iter()
@@ -1020,9 +1027,25 @@ impl Collector {
                 }
             }
         }
-        let (work, mut errors) = store.work();
-        self.model.work = work;
+        let mut errors = self.refresh_work();
         self.model.errors.append(&mut errors);
+    }
+
+    /// Re-read `work.json` into the model when its stamp moved since the
+    /// last read - the pass's own sync or a `p` from the TUI - and return
+    /// that read's errors. An unchanged file is not parsed again.
+    fn refresh_work(&mut self) -> Vec<SourceError> {
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        let stamp = store.work_stamp();
+        if stamp == self.model.work_stamp {
+            return Vec::new();
+        }
+        let (work, errors) = store.work();
+        self.model.work = work;
+        self.model.work_stamp = stamp;
+        errors
     }
 
     /// One pass run to completion: the staged collect's final snapshot,
@@ -1041,23 +1064,17 @@ impl Collector {
     /// projected from every anchor's state, repo rollups recomputed, and
     /// the completeness flag as it currently stands.
     fn emit(
-        &self,
+        &mut self,
         runtime: &Runtime,
         own_pane: Option<&PaneRef>,
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) -> bool {
         let now = epoch(runtime.observed_at);
-        // Authored state as the store reads now, not as stage 1 loaded it:
-        // a `p` that lands mid-pass must hold in every later stage. A read
-        // that fails keeps the model's copy; stage 1 and the sync already
-        // report the file's errors.
-        let fresh = self
-            .store
-            .as_ref()
-            .map(Store::work)
-            .filter(|(_, errors)| errors.is_empty())
-            .map(|(work, _)| work);
-        let authored = fresh.as_ref().unwrap_or(&self.model.work);
+        // Authored state as the store holds it now, not as stage 1 loaded
+        // it: a `p` that lands mid-pass must hold in every later stage.
+        // Stage 1 and the sync already report the file's read errors.
+        let _ = self.refresh_work();
+        let authored = &self.model.work;
         let mut work = Vec::new();
         for (id, model) in &self.model.repos {
             match &model.data {

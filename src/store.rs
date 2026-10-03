@@ -524,6 +524,15 @@ impl Work {
     }
 }
 
+/// What [`Store::work_stamp`] compares: a `work.json` read is current
+/// while its stamp is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkStamp {
+    ino: u64,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
 /// The exact identity `p` toggles `parked` on: a branch incarnation's id,
 /// or a canonical path for rows with no ref.
 #[derive(Debug)]
@@ -1037,6 +1046,20 @@ impl Store {
         };
         self.write_work(&work)?; // coverage: off - the error edge needs the atomic write to fail
         Ok(parked)
+    }
+
+    /// The identity of `work.json` as it stands - inode, length and mtime -
+    /// or `None` when absent. Every write is an atomic rename onto a new
+    /// inode, so an unchanged stamp means an unchanged file and a reader
+    /// can skip re-parsing it.
+    pub fn work_stamp(&self) -> Option<WorkStamp> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(self.dir.join(WORK)).ok()?;
+        Some(WorkStamp {
+            ino: meta.ino(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
     }
 
     /// The authored work state as the file reads today, plus any read
@@ -2552,6 +2575,32 @@ mod tests {
         let space = work.path("/fresh-space").unwrap();
         assert_eq!(space.activity_at, None);
         assert_eq!(space.inputs, proven);
+    }
+
+    #[test]
+    fn the_work_stamp_moves_with_every_write_and_only_then() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        assert_eq!(store.work_stamp(), None, "no file, no stamp");
+        store
+            .sync_path("/p", &LifecycleInputs::default(), 1_000)
+            .unwrap();
+        let first = store.work_stamp().expect("the file exists");
+        // A no-op sync leaves the file, and so the stamp, alone.
+        store
+            .sync_path("/p", &LifecycleInputs::default(), 2_000)
+            .unwrap();
+        assert_eq!(store.work_stamp(), Some(first));
+        // A same-length rewrite still moves it: the rename is a new inode.
+        store
+            .toggle_parked(&WorkIdentity::Path("/p".to_owned()))
+            .unwrap();
+        let parked = store.work_stamp().expect("the file exists");
+        assert_ne!(parked, first);
+        store
+            .toggle_parked(&WorkIdentity::Path("/p".to_owned()))
+            .unwrap();
+        assert_ne!(store.work_stamp(), Some(parked));
     }
 
     #[test]
