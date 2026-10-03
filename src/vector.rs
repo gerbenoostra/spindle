@@ -522,35 +522,38 @@ fn anchor_work(
     AnchorWork { state, local } // coverage: off - the unexecuted instantiation's region edge
 }
 
-/// Newest real work the reflog records, and - when the batch supplied it
-/// and the commit strictly postdates the ref's creation - the tip's
-/// committerdate. The committerdate matters when a branch moved without a
-/// reflog write; a probe path keeps reflog only.
+/// Newest real work the anchor's reflogs record: a checkout's HEAD log,
+/// plus - for anything on a branch - the branch's own log and, when the
+/// batch supplied it and the commit strictly postdates the ref's creation,
+/// the tip's committerdate. The branch log matters for a worktree added
+/// over commits made elsewhere, whose HEAD log holds only the add; the
+/// committerdate matters when a branch moved without a reflog write; a
+/// probe path keeps reflog only.
 fn last_git_activity(
     repo: &Repo,
     anchor: &Anchor,
     fact: Option<&git::BranchFact>,
 ) -> Option<SystemTime> {
-    let committed = fact
-        .and_then(|f| f.committer_date)
-        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
-    match anchor {
-        Anchor::Worktree { admin_id, main, .. } => {
-            // The HEAD reflog's real work only: a `checkout:` line is a
-            // lifecycle event, not activity.
-            worktree_head_log(*main, admin_id.as_deref())
-                .and_then(|log| repo.reflog_times(&log).worked_at)
-        }
-        Anchor::Branch { name } => {
-            let times = repo.reflog_times(&PathBuf::from(format!("logs/refs/heads/{name}")));
-            // A tip commit counts only when it strictly postdates the
-            // ref's creation: `git branch feat old-sha` borrows an old
-            // commit's date without doing work. When the log proves no
-            // creation, the committer date is the fallback it always was.
-            let committed = committed.filter(|t| times.created_at.is_none_or(|c| *t > c));
-            [times.worked_at, committed].into_iter().flatten().max()
-        }
-    }
+    // The HEAD reflog's real work only: the add's creation line and a
+    // `checkout:` line are lifecycle events, not activity.
+    let head = match anchor {
+        Anchor::Worktree { admin_id, main, .. } => worktree_head_log(*main, admin_id.as_deref())
+            .and_then(|log| repo.reflog_times(&log).worked_at),
+        Anchor::Branch { .. } => None,
+    };
+    let branch = anchor.branch().and_then(|name| {
+        let times = repo.reflog_times(&PathBuf::from(format!("logs/refs/heads/{name}")));
+        let committed = fact
+            .and_then(|f| f.committer_date)
+            .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
+        // A tip commit counts only when it strictly postdates the ref's
+        // creation: `git branch feat old-sha` borrows an old commit's
+        // date without doing work. When the log proves no creation, the
+        // committer date is the fallback it always was.
+        let committed = committed.filter(|t| times.created_at.is_none_or(|c| *t > c));
+        [times.worked_at, committed].into_iter().flatten().max()
+    });
+    [head, branch].into_iter().flatten().max()
 } // coverage: off - the unexecuted instantiation's exit edge
 
 /// `branch.<name>.remote`/`.merge`: the batch's `upstream:remotename` and

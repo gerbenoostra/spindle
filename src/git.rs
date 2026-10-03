@@ -733,10 +733,10 @@ impl Repo {
     /// How a reflog reads for activity: `created_at` is the moment the ref
     /// or checkout came to be - the null-old entry every reflog starts
     /// with; `worked_at` is the newest entry that moved the ref for real -
-    /// a commit, merge, reset or rebase. Bookkeeping lines (`checkout:`,
-    /// `clone:`, `branch: Created from`, `Branch: renamed`, and any entry
-    /// whose old and new tips agree) are not work, and when such a line
-    /// was the last write even the file's mtime does not count.
+    /// a commit, merge, reset or rebase. Creation entries other than an
+    /// initial commit, bookkeeping lines (`checkout:`, `Branch: renamed`)
+    /// and entries whose old and new tips agree are not work, and when
+    /// such a line was the last write even the file's mtime does not count.
     pub fn reflog_times(&self, log: &Path) -> ReflogTimes {
         let path = self.common_dir.join(log); // coverage: off - `join`'s empty-path arm is the missed region; a reflog name is never empty
         let mut times = ReflogTimes::default();
@@ -780,24 +780,20 @@ pub struct ReflogTimes {
 struct ReflogEntry {
     /// The line's `old` was the null sha: the entry created the ref.
     creation: bool,
-    /// The entry moved the tip or tree - its message is not bookkeeping
-    /// and old and new differ.
+    /// The entry moved the tip or tree: an initial commit, or a
+    /// non-creation entry whose message is not bookkeeping and whose old
+    /// and new differ.
     work: bool,
     /// The committer-clock epoch stamped on the line.
     at: SystemTime,
 }
 
 impl ReflogEntry {
-    /// Messages Git writes for lifecycle bookkeeping rather than work:
-    /// `checkout: moving from X to Y`, `clone: from Z`, `branch: Created
-    /// from`, `Branch: renamed`. A `branch: Reset to` entry is not here -
-    /// when it moves the tip it is real work like any reset.
-    const BOOKKEEPING: &'static [&'static str] = &[
-        "checkout:",
-        "clone:",
-        "branch: Created from",
-        "Branch: renamed",
-    ];
+    /// Messages Git writes on an existing ref for lifecycle bookkeeping
+    /// rather than work: `checkout: moving from X to Y` and `Branch:
+    /// renamed`. A `branch: Reset to` entry is not here - when it moves the
+    /// tip it is real work like any reset.
+    const BOOKKEEPING: &'static [&'static str] = &["checkout:", "Branch: renamed"];
 
     fn parse(line: &str) -> Option<ReflogEntry> {
         let fields = line.split('\t').next().unwrap_or(line);
@@ -808,12 +804,22 @@ impl ReflogEntry {
         // right - robust against spaces inside the identity.
         let epoch: u64 = fields.nth_back(1)?.parse().ok()?;
         let message = line.split('\t').nth(1).unwrap_or("");
-        Some(ReflogEntry {
-            creation: !old.is_empty() && old.bytes().all(|b| b == b'0'),
-            work: old != new
+        let creation = !old.is_empty() && old.bytes().all(|b| b == b'0');
+        // A creation entry records the ref coming to be - `branch: Created
+        // from`, `clone: from`, or the message-less line `git worktree add`
+        // writes - and is work only when it is the repository's first
+        // commit (`commit (initial): ...`).
+        let work = if creation {
+            message.starts_with("commit (initial)")
+        } else {
+            old != new
                 && !Self::BOOKKEEPING
                     .iter()
-                    .any(|prefix| message.starts_with(prefix)),
+                    .any(|prefix| message.starts_with(prefix))
+        };
+        Some(ReflogEntry {
+            creation,
+            work,
             at: UNIX_EPOCH + Duration::from_secs(epoch),
         })
     }
@@ -1430,10 +1436,13 @@ mod tests {
         );
         assert_eq!(times.worked_at, None, "{times:?}");
 
-        // A checkout-only log - a worktree just added - is the same.
+        // A worktree just added is the same. `git worktree add` writes a
+        // message-less creation line (no tab at all) and then a same-tip
+        // `reset: moving to HEAD` - the shape git 2.54 writes verbatim.
         fs::write(
             log_dir.join("HEAD"),
-            "0000 1111 A Name <a@b> 1700000001 +0200\tcheckout: moving from main to feat\n",
+            "0000 1111 A Name <a@b> 1700000001 +0200\n\
+             1111 1111 A Name <a@b> 1700000001 +0200\treset: moving to HEAD\n",
         )
         .unwrap();
         let times = repo.reflog_times(log);
@@ -1442,6 +1451,18 @@ mod tests {
             Some(UNIX_EPOCH + Duration::from_secs(1700000001))
         );
         assert_eq!(times.worked_at, None, "{times:?}");
+
+        // A repository's first commit creates its branch and is work.
+        fs::write(
+            log_dir.join("HEAD"),
+            "0000 1111 A Name <a@b> 1700000002 +0200\tcommit (initial): one\n",
+        )
+        .unwrap();
+        let worked = repo
+            .reflog_times(log)
+            .worked_at
+            .expect("the initial commit is work");
+        assert!(worked >= UNIX_EPOCH + Duration::from_secs(1700000002));
 
         // A later commit is work.
         fs::write(
