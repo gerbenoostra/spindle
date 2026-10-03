@@ -734,7 +734,7 @@ impl Repo {
     /// or checkout came to be - the null-old entry every reflog starts
     /// with; `worked_at` is the newest entry that moved the ref for real -
     /// a commit, merge, reset or rebase. Bookkeeping lines (`checkout:`,
-    /// `clone:`, `branch:`/`Branch:` creation and renames, and any entry
+    /// `clone:`, `branch: Created from`, `Branch: renamed`, and any entry
     /// whose old and new tips agree) are not work, and when such a line
     /// was the last write even the file's mtime does not count.
     pub fn reflog_times(&self, log: &Path) -> ReflogTimes {
@@ -790,8 +790,14 @@ struct ReflogEntry {
 impl ReflogEntry {
     /// Messages Git writes for lifecycle bookkeeping rather than work:
     /// `checkout: moving from X to Y`, `clone: from Z`, `branch: Created
-    /// from`/`branch: Reset to`, `Branch: renamed`.
-    const BOOKKEEPING: &'static [&'static str] = &["checkout:", "clone:", "branch:", "Branch:"];
+    /// from`, `Branch: renamed`. A `branch: Reset to` entry is not here -
+    /// when it moves the tip it is real work like any reset.
+    const BOOKKEEPING: &'static [&'static str] = &[
+        "checkout:",
+        "clone:",
+        "branch: Created from",
+        "Branch: renamed",
+    ];
 
     fn parse(line: &str) -> Option<ReflogEntry> {
         let fields = line.split('\t').next().unwrap_or(line);
@@ -1459,6 +1465,31 @@ mod tests {
         assert_eq!(
             times.worked_at,
             Some(UNIX_EPOCH + Duration::from_secs(1700000500)),
+            "{times:?}"
+        );
+        // A `branch: Reset to` entry is not creation bookkeeping: it moved
+        // the tip, so it is work like any other reset. The file's mtime is
+        // pinned older than the entry so `worked_at` proves the epoch.
+        fs::write(
+            log_dir.join("HEAD"),
+            "0000 1111 A Name <a@b> 1700000000 +0200\tbranch: Created from main\n\
+             1111 2222 A Name <a@b> 1700000900 +0200\tbranch: Reset to target\n",
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(log_dir.join("HEAD"))
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1700000800))
+            .unwrap();
+        let times = repo.reflog_times(log);
+        assert_eq!(
+            times.created_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000000))
+        );
+        assert_eq!(
+            times.worked_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000900)),
             "{times:?}"
         );
     }
