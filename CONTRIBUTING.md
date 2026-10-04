@@ -136,16 +136,17 @@ readers:
   socket must not return every pane twice. `tmux-agent-status`'s
   `@agent_status`/`@agent_pane_status` options are never read: they are a
   lossy projection of the primary evidence collected here.
-- `ps`: one `ps -A -o pid,ppid,etime,stat,tty,comm` snapshot per refresh.
-  `etime` is elapsed time, so a start is `snapshot - elapsed`, compared
-  within one second. macOS `ps` has no `etimes`, and `lstart` needs a
-  timezone database - which is why provider start times are normalized to
-  UTC epochs rather than the other way round. `comm` is not a
-  full-fidelity basename: Linux caps it at 15 bytes and macOS can emit a
-  16-byte argv0 prefix, so a cap-length prefix mismatch is unproven, not
-  dead. A row whose `etime` cannot be parsed is kept with an unavailable
-  start (pid-only evidence); a zombie is dead. Controlling ttys are
-  normalized to `/dev/...` on both platforms.
+- `ps`: one `ps -A -o pid,ppid,lstart,stat,tty,comm` snapshot per refresh,
+  run under `LC_ALL=C` and the POSIX `TZ=UTC0`, so `lstart` is the
+  kernel's start time as a UTC ctime - the form provider records use -
+  read without a timezone database and compared within one second.
+  `etime` is not used: a start derived from elapsed time depends on when
+  `ps` sampled, and a loaded machine's `ps -A` can take over a second.
+  `comm` is not a full-fidelity basename: Linux caps it at 15 bytes and
+  macOS can emit a 16-byte argv0 prefix, so a cap-length prefix mismatch
+  is unproven, not dead. A row whose `lstart` cannot be parsed is kept
+  with an unavailable start (pid-only evidence); a zombie is dead.
+  Controlling ttys are normalized to `/dev/...` on both platforms.
 - git: the optional `wt.*` worktree metadata is read via
   `git config --worktree --get`; absence covers both an unset key and the
   `extensions.worktreeConfig`-disabled refusal, and it is never written.

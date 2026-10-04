@@ -115,35 +115,16 @@ fn transcript(home: &TempDir, slug: &str, id: &str, cwd: &Path) {
     .expect("transcript writes");
 }
 
-/// The live process's start as Claude's `procStart` ctime (UTC).
+/// The live process's start as Claude's `procStart` ctime (UTC), read from
+/// the kernel through `ps -o lstart` so the `(pid, pid_start)` pair
+/// validates as that instance.
 fn proc_start(pid: u32) -> String {
-    let out = Command::new("ps")
-        .args(["-o", "etime=", "-p", &pid.to_string()])
+    let out = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC0")
         .output()
         .expect("ps runs");
-    let text = String::from_utf8_lossy(&out.stdout);
-    let secs: u64 = {
-        let t = text.trim();
-        let (days, rest) = match t.split_once('-') {
-            Some((d, r)) => (d.parse::<u64>().unwrap(), r),
-            None => (0, t),
-        };
-        let mut parts = rest.rsplitn(3, ':');
-        let s = parts.next().unwrap().parse::<u64>().unwrap();
-        let m = parts.next().map_or(0, |p| p.parse().unwrap());
-        let h = parts.next().map_or(0, |p| p.parse().unwrap());
-        days * 86400 + h * 3600 + m * 60 + s
-    };
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        - secs;
-    // UTC ctime via `date -u -r`: the platforms both know it.
-    let out = Command::new("date")
-        .args(["-u", "-r", &epoch.to_string(), "+%a %b %e %H:%M:%S %Y"])
-        .output()
-        .expect("date runs");
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 

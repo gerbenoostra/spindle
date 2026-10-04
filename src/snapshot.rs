@@ -2319,10 +2319,10 @@ fn retain_live_undated(undated: &mut HashMap<String, Undated>, live_keys: &HashS
     undated.retain(|key, _| live_keys.contains(key));
 }
 
-/// Whether two readings of one pid's start are the same instance. An
-/// OS-derived start is recomputed from `etime` each poll and can move by a
-/// second across a boundary, so it compares with `ProcessStart`'s tolerance
-/// rather than exactly; two undated readings stay pid-only and equal.
+/// Whether two readings of one pid's start are the same instance. A start
+/// may come from the OS or from a provider's quantized record, so it
+/// compares with `ProcessStart`'s tolerance rather than exactly; two
+/// undated readings stay pid-only and equal.
 fn same_start(a: ProcessStart, b: ProcessStart) -> bool {
     a.matches(&b).unwrap_or(a == b)
 }
@@ -3543,8 +3543,8 @@ mod tests {
 
     #[test]
     fn a_start_that_moves_a_second_between_polls_is_the_same_instance() {
-        // `etime` quantizes, so the OS-derived start of one process can read
-        // a second apart on consecutive polls without being a replacement.
+        // Start readings quantize to the second from different sources, so
+        // one process can read a second apart without being a replacement.
         let mut undated = HashMap::new();
         let mut live = live();
         live.status_raw = Some("waiting".to_owned());
