@@ -71,11 +71,23 @@ pub fn tmux_or_skip() -> bool {
 /// One Claude transcript user record for `id` at `cwd`, newline-terminated,
 /// shaped like the records Claude writes: `timestamp` is now, and
 /// `gitBranch` is the branch checked out in `cwd` right now (`HEAD` when
-/// detached), omitted outside a Git checkout.
+/// detached), omitted outside a Git checkout - `cwd` is the project.
 pub fn claude_turn(id: &str, cwd: &std::path::Path, text: &str) -> String {
+    claude_record(id, cwd, cwd, text)
+}
+
+/// The same record run from `cwd` inside a session whose project is
+/// `project`: Claude's `gitBranch` names the project directory's branch,
+/// wherever the record itself ran.
+pub fn claude_record(
+    id: &str,
+    cwd: &std::path::Path,
+    project: &std::path::Path,
+    text: &str,
+) -> String {
     let branch = std::process::Command::new("git")
         .arg("-C")
-        .arg(cwd)
+        .arg(project)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .ok()

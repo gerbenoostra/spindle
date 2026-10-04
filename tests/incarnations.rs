@@ -108,15 +108,20 @@ fn transcript(home: &TempDir, id: &str, cwd: &Path) {
 }
 
 /// Append one more record to `id`'s transcript: the conversation kept
-/// working, at `cwd` on whatever branch is checked out there now.
+/// working, from `cwd` in a session whose project is `cwd` too.
 fn turn(home: &TempDir, id: &str, cwd: &Path) {
+    turn_from(home, id, cwd, cwd);
+}
+
+/// The same, run from `cwd` while the session's project is `project`.
+fn turn_from(home: &TempDir, id: &str, cwd: &Path, project: &Path) {
     use std::io::Write;
     let path = home.join(format!(".claude/projects/t/{id}.jsonl"));
     let mut f = fs::OpenOptions::new()
         .append(true)
         .open(path)
         .expect("the transcript");
-    f.write_all(support::claude_turn(id, cwd, "more").as_bytes())
+    f.write_all(support::claude_record(id, cwd, project, "more").as_bytes())
         .expect("the turn appends");
 }
 
@@ -1134,32 +1139,27 @@ fn a_conversation_that_followed_a_switch_records_both_from_its_own_records() {
 }
 
 #[test]
-fn a_repo_switch_closes_the_interval_too() {
+fn a_record_from_another_repository_stays_on_the_projects_branch() {
     let world = world();
     let other_repo = FixtureRepo::new("origin");
-    // A conversation of its own brings the other repository into scope:
-    // collection follows where conversations sit, not where they went.
+    // A conversation of its own brings the other repository into scope.
     transcript(&world.home, OTHER, &other_repo.main);
     world.repo.branch_with_commits("feat", 1, true);
     let wt = world.repo.add_worktree("feat", Some("feat"));
     transcript(&world.home, CONV, &wt);
     collect(&world);
     let feat_id = record(&world, "feat").unwrap().id;
-    // The conversation moves into another repository's checkout and
-    // works there: same rule - the first interval ends where the next
-    // record begins.
-    turn(&world.home, CONV, &other_repo.main);
-    let second = collect(&world);
-    let conv = conversation(&second, CONV);
-    assert_eq!(conv.touches.len(), 2, "{:?}", conv.touches);
+    // The conversation runs a command inside the other repository: its
+    // record still names the project's branch, so the evidence says
+    // nothing about the other repository - no touch lands there and the
+    // feat interval holds.
+    turn_from(&world.home, CONV, &other_repo.main, &wt);
+    let snapshot = collect(&world);
+    let conv = conversation(&snapshot, CONV);
+    assert_eq!(conv.touches.len(), 1, "{:?}", conv.touches);
     assert_eq!(conv.touches[0].incarnation_id, feat_id);
-    assert_eq!(
-        conv.touches[0].valid_until,
-        Some(conv.touches[1].valid_from)
-    );
-    assert_eq!(conv.touches[1].repo, repo_id(&other_repo));
-    assert_eq!(conv.touches[1].ref_name, "main");
-    assert_eq!(conv.touches[1].valid_until, None);
+    assert_eq!(conv.touches[0].valid_until, None);
+    assert!(conv.touches.iter().all(|t| t.repo == repo_id(&world.repo)));
 }
 
 #[test]
@@ -1199,23 +1199,19 @@ fn the_global_scope_lists_each_conversation_once_with_its_touch_path() {
 }
 
 #[test]
-fn a_trail_through_subdirectories_and_vanished_paths_places_exactly() {
+fn a_trail_through_subdirectories_and_detached_heads_places_exactly() {
     let world = world();
     world.repo.branch_with_commits("feat", 1, true);
     let wt = world.repo.add_worktree("feat", Some("feat"));
     transcript(&world.home, CONV, &wt);
-    // Work continues from a subdirectory: the same repo and branch, one
-    // interval, not two.
+    // Work continues from a subdirectory: the same branch, one interval.
     let sub = wt.join("sub");
     fs::create_dir_all(&sub).expect("mkdir");
-    turn(&world.home, CONV, &sub);
-    // Then from a checkout that is gone by the time anyone looks: the
-    // mark ends the feat interval and places nothing itself.
-    let gone = FixtureRepo::new("origin");
-    turn(&world.home, CONV, &gone.main);
-    let gone_path = gone.main.clone();
-    drop(gone);
-    assert!(!gone_path.exists());
+    turn_from(&world.home, CONV, &sub, &wt);
+    // Then the project detaches: `HEAD` names no branch, so the feat
+    // interval ends at that record and nothing new is placed.
+    world.repo.git(&wt, &["checkout", "--detach"]);
+    turn(&world.home, CONV, &wt);
     let snapshot = collect(&world);
     let conv = conversation(&snapshot, CONV);
     assert_eq!(conv.touches.len(), 1, "{:?}", conv.touches);

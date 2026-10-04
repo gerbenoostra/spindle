@@ -496,14 +496,13 @@ pub struct ConversationRow {
     pub trail: Vec<TrailMark>,
 }
 
-/// One provider branch mark, its cwd resolved: from `at_ms` (epoch ms)
-/// on, the conversation worked on `branch` in `repo`. `None` in either is
-/// a stretch with no placeable branch - detached, or a cwd that no longer
-/// resolves.
+/// One provider branch mark, placed: from `at_ms` (epoch ms) on, the
+/// conversation's project in `repo` was on `branch`; `None` is a detached
+/// stretch with no placeable branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrailMark {
     pub at_ms: u64,
-    pub repo: Option<String>,
+    pub repo: String,
     pub branch: Option<String>,
 }
 
@@ -818,9 +817,8 @@ impl Collector {
         // nothing still on disk. Distinct cwds are few while conversations
         // are many, so each resolves once per pass - a failure is one
         // error, not one per conversation.
-        let mut memo = HashMap::new();
-        let placements = resolve_cwds(&inventory.conversations, &mut memo, &mut self.model.errors);
-        let trails = resolve_trails(&inventory.conversations, &mut memo, &mut self.model.errors);
+        let placements = resolve_cwds(&inventory.conversations, &mut self.model.errors);
+        let trails = resolve_trails(&inventory.conversations, &placements);
         for ((conv, place), trail) in self
             .model
             .conversations
@@ -1428,9 +1426,9 @@ enum CwdPlacement {
 /// identical error per conversation sharing it.
 fn resolve_cwds(
     conversations: &[Conversation],
-    memo: &mut HashMap<PathBuf, Option<CwdPlacement>>,
     errors: &mut Vec<SourceError>,
 ) -> Vec<Option<CwdPlacement>> {
+    let mut memo: HashMap<PathBuf, Option<CwdPlacement>> = HashMap::new();
     conversations
         .iter()
         .map(|conv| match conv.cwd() {
@@ -1443,41 +1441,29 @@ fn resolve_cwds(
         .collect()
 }
 
-/// Every conversation's provider branch trail with each mark's cwd
-/// resolved to its repository through the same memo, consecutive marks
-/// naming the same `(repo, branch)` merged. A mark whose cwd no longer
-/// resolves to a checkout keeps no repo: it ends the mark before it and
-/// places nothing itself.
+/// Every conversation's provider branch trail, placed in the repository
+/// its own cwd resolved to: the branch names the provider records are the
+/// project directory's, so they belong to that repository and no other.
+/// A conversation whose cwd is no checkout has no placeable trail.
 fn resolve_trails(
     conversations: &[Conversation],
-    memo: &mut HashMap<PathBuf, Option<CwdPlacement>>,
-    errors: &mut Vec<SourceError>,
+    placements: &[Option<CwdPlacement>],
 ) -> Vec<Vec<TrailMark>> {
     conversations
         .iter()
-        .map(|conv| {
-            let mut trail: Vec<TrailMark> = Vec::new();
-            for mark in conv.branch_trail() {
-                let repo = match memo
-                    .entry(mark.cwd.clone())
-                    .or_insert_with(|| resolve_cwd(&mark.cwd, errors))
-                {
-                    Some(CwdPlacement::Checkout { repo_id, .. }) => Some(repo_id.clone()),
-                    _ => None,
-                };
-                if trail
-                    .last()
-                    .is_some_and(|m| m.repo == repo && m.branch == mark.branch)
-                {
-                    continue;
-                }
-                trail.push(TrailMark {
+        .zip(placements)
+        .map(|(conv, place)| {
+            let Some(CwdPlacement::Checkout { repo_id, .. }) = place else {
+                return Vec::new();
+            };
+            conv.branch_trail()
+                .iter()
+                .map(|mark| TrailMark {
                     at_ms: store::epoch_ms(mark.at),
-                    repo,
+                    repo: repo_id.clone(),
                     branch: mark.branch.clone(),
-                });
-            }
-            trail
+                })
+                .collect()
         })
         .collect()
 }
@@ -1810,9 +1796,10 @@ fn dated_touches(
 ) -> Vec<store::DatedTouch> {
     let mut touches = Vec::new();
     for (i, mark) in trail.iter().enumerate() {
-        let (Some(repo), Some(branch)) = (&mark.repo, &mark.branch) else {
+        let Some(branch) = &mark.branch else {
             continue;
         };
+        let repo = &mark.repo;
         let Some(id) = incarnation_at(authored, repo, branch, mark.at_ms) else {
             continue;
         };
@@ -3571,7 +3558,7 @@ mod tests {
             conversation(None, None),
         ];
         let mut errors = Vec::new();
-        let placements = resolve_cwds(&conversations, &mut HashMap::new(), &mut errors);
+        let placements = resolve_cwds(&conversations, &mut errors);
         assert_eq!(placements.len(), 3);
         assert!(placements.iter().all(Option::is_none));
         assert_eq!(errors.len(), 1, "{errors:?}");
