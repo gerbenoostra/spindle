@@ -67,3 +67,109 @@ pub fn tmux_or_skip() -> bool {
     }
     found
 }
+
+/// One Claude transcript user record for `id` at `cwd`, newline-terminated,
+/// shaped like the records Claude writes: `timestamp` is now, and
+/// `gitBranch` is the branch checked out in `cwd` right now (`HEAD` when
+/// detached), omitted outside a Git checkout.
+pub fn claude_turn(id: &str, cwd: &std::path::Path, text: &str) -> String {
+    let branch = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+    let git_branch = branch
+        .map(|b| format!(",\"gitBranch\":\"{b}\""))
+        .unwrap_or_default();
+    format!(
+        "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"{}\"{git_branch},\"timestamp\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}}}}\n",
+        cwd.display(),
+        iso_now()
+    )
+}
+
+/// Now as `YYYY-MM-DDTHH:MM:SS.mmmZ`, the form Claude stamps records with.
+pub fn iso_now() -> String {
+    iso(std::time::SystemTime::now())
+}
+
+/// `at` as `YYYY-MM-DDTHH:MM:SS.mmmZ`, the form Claude stamps records with.
+pub fn iso(at: std::time::SystemTime) -> String {
+    let since = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch");
+    let secs = since.as_secs();
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60,
+        since.subsec_millis()
+    )
+}
+
+/// A `claude` process that is really `bash`: a symlink, not a copy - macOS
+/// kills a relocated copy of a signed system binary, while `comm` still
+/// reports the invoked name. Spawns `sleep` under the `claude` name.
+pub fn live_claude(
+    home: &tempdir::TempDir,
+    id: &str,
+    status: &str,
+    worktree: &std::path::Path,
+) -> std::process::Child {
+    let exe = home.join("claude");
+    // One link serves every agent the home runs.
+    if !exe.exists() {
+        std::os::unix::fs::symlink(on_path("bash"), &exe).expect("bash links");
+    }
+    let child = std::process::Command::new(&exe)
+        .arg("-c")
+        .arg("sleep 300; exit")
+        // Killing the guard leaves `sleep` orphaned: it must not hold the
+        // test harness's output pipes open for its remaining lifetime.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the agent spawns");
+    let sessions = home.join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    std::fs::write(
+        sessions.join(format!("{}.json", child.id())),
+        format!(
+            "{{\"pid\":{},\"sessionId\":\"{id}\",\"status\":\"{status}\",\"updatedAt\":1788621019906,\"statusUpdatedAt\":1788621019906,\"cwd\":\"{}\",\"procStart\":\"{}\"}}",
+            child.id(),
+            worktree.display(),
+            proc_start(child.id()),
+        ),
+    )
+    .expect("session file writes");
+    child
+}
+
+/// The live process's start as Claude's `procStart` ctime (UTC), read from
+/// the kernel through `ps -o lstart` so the `(pid, pid_start)` pair
+/// validates as that instance.
+pub fn proc_start(pid: u32) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC0")
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}

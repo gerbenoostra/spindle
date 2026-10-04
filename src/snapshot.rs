@@ -320,8 +320,9 @@ pub struct TouchRow {
     pub ref_name: String,
     /// The incarnation's 1-based number within `(repo, ref_name)`.
     pub incarnation: usize,
-    /// The ref's tip the placement observed.
-    pub head: String,
+    /// The ref's tip the placement observed; `None` when the evidence
+    /// named the branch only.
+    pub head: Option<String>,
     pub valid_from: u64,
     /// `None` while the placement is current.
     pub valid_until: Option<u64>,
@@ -482,11 +483,28 @@ pub struct ConversationRow {
     pub repo: Option<String>,
     pub worktree: Option<PathBuf>,
     pub branch: Option<String>,
-    /// The conversation's persisted touch intervals, in the order they
-    /// landed - the exact placements each pass proved.
+    /// The conversation's persisted touch intervals, oldest first - the
+    /// exact placements live observation and the provider's records
+    /// proved.
     pub touches: Vec<TouchRow>,
-    /// The incarnation the open interval names, if one is current.
+    /// The incarnation the newest open interval names, if one is current.
     pub current_incarnation: Option<String>,
+    /// The provider's branch trail with each mark's repo resolved: the
+    /// evidence dated touches derive from. Not part of the snapshot
+    /// contract - the touches are.
+    #[serde(skip)]
+    pub trail: Vec<TrailMark>,
+}
+
+/// One provider branch mark, its cwd resolved: from `at_ms` (epoch ms)
+/// on, the conversation worked on `branch` in `repo`. `None` in either is
+/// a stretch with no placeable branch - detached, or a cwd that no longer
+/// resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrailMark {
+    pub at_ms: u64,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
 }
 
 impl ConversationRow {
@@ -800,8 +818,17 @@ impl Collector {
         // nothing still on disk. Distinct cwds are few while conversations
         // are many, so each resolves once per pass - a failure is one
         // error, not one per conversation.
-        let placements = resolve_cwds(&inventory.conversations, &mut self.model.errors);
-        for (conv, place) in self.model.conversations.iter_mut().zip(placements.iter()) {
+        let mut memo = HashMap::new();
+        let placements = resolve_cwds(&inventory.conversations, &mut memo, &mut self.model.errors);
+        let trails = resolve_trails(&inventory.conversations, &mut memo, &mut self.model.errors);
+        for ((conv, place), trail) in self
+            .model
+            .conversations
+            .iter_mut()
+            .zip(placements.iter())
+            .zip(trails)
+        {
+            conv.trail = trail;
             let (repo, worktree, branch) = match place {
                 Some(CwdPlacement::Checkout {
                     repo_id,
@@ -1113,27 +1140,36 @@ impl Collector {
         let mut errors = self.refresh_work();
         self.model.errors.append(&mut errors);
         let mut placements = Vec::new();
+        let mut dated = Vec::new();
         for c in &self.model.conversations {
+            let key = store::conversation_key(c.provider.as_str(), &c.session_id);
+            dated.extend(dated_touches(&key, &c.trail, &self.model.work));
+            // A cwd places only a live conversation: where a dead one's
+            // directory points now says nothing about where it worked.
+            if !c.running() {
+                continue;
+            }
+            // No checkout on a branch, no record of it, or an unproven tip
+            // (a touch would name a head it cannot swear to): no exact
+            // placement.
             let (Some(repo), Some(branch)) = (&c.repo, &c.branch) else {
                 continue;
             };
-            let Some(record) = self.model.work.branch(repo, branch) else {
-                continue;
-            };
-            // An unproven tip is no exact placement: the touch would name
-            // a head it cannot swear to.
-            let Some(head) = heads.get(&(repo.clone(), branch.clone())) else {
+            let (Some(record), Some(head)) = (
+                self.model.work.branch(repo, branch),
+                heads.get(&(repo.clone(), branch.clone())),
+            ) else {
                 continue;
             };
             placements.push(store::TouchPlacement {
-                conversation: store::conversation_key(c.provider.as_str(), &c.session_id),
+                conversation: key,
                 branch: record.id.clone(),
                 head: head.clone(),
                 provenance: store::TouchProvenance::Cwd,
                 confidence: store::Confidence::Exact,
             });
         }
-        if let Err(e) = store.sync_touches(&placements, observed_ms) {
+        if let Err(e) = store.sync_touches(&placements, &dated, observed_ms) {
             self.model.errors.push(SourceError {
                 source: "work.json".to_owned(),
                 detail: format!("touches: {e}"),
@@ -1200,11 +1236,15 @@ impl Collector {
                 .filter(|t| t.conversation == key)
                 .filter_map(|t| touch_row(t, authored, &numbers))
                 .collect();
-            c.current_incarnation = authored
+            // Provider intervals can land after the observed ones they
+            // predate: the row reads in time order, landing order within.
+            c.touches.sort_by_key(|t| t.valid_from);
+            c.current_incarnation = c
                 .touches
                 .iter()
-                .rfind(|t| t.conversation == key && t.valid_until.is_none())
-                .map(|t| t.branch.clone());
+                .filter(|t| t.valid_until.is_none())
+                .max_by_key(|t| t.valid_from)
+                .map(|t| t.incarnation_id.clone());
         }
         let mut work = Vec::new();
         for (id, model) in &self.model.repos {
@@ -1388,9 +1428,9 @@ enum CwdPlacement {
 /// identical error per conversation sharing it.
 fn resolve_cwds(
     conversations: &[Conversation],
+    memo: &mut HashMap<PathBuf, Option<CwdPlacement>>,
     errors: &mut Vec<SourceError>,
 ) -> Vec<Option<CwdPlacement>> {
-    let mut memo: HashMap<PathBuf, Option<CwdPlacement>> = HashMap::new();
     conversations
         .iter()
         .map(|conv| match conv.cwd() {
@@ -1399,6 +1439,45 @@ fn resolve_cwds(
                 .or_insert_with(|| resolve_cwd(cwd, errors))
                 .clone(),
             None => None,
+        })
+        .collect()
+}
+
+/// Every conversation's provider branch trail with each mark's cwd
+/// resolved to its repository through the same memo, consecutive marks
+/// naming the same `(repo, branch)` merged. A mark whose cwd no longer
+/// resolves to a checkout keeps no repo: it ends the mark before it and
+/// places nothing itself.
+fn resolve_trails(
+    conversations: &[Conversation],
+    memo: &mut HashMap<PathBuf, Option<CwdPlacement>>,
+    errors: &mut Vec<SourceError>,
+) -> Vec<Vec<TrailMark>> {
+    conversations
+        .iter()
+        .map(|conv| {
+            let mut trail: Vec<TrailMark> = Vec::new();
+            for mark in conv.branch_trail() {
+                let repo = match memo
+                    .entry(mark.cwd.clone())
+                    .or_insert_with(|| resolve_cwd(&mark.cwd, errors))
+                {
+                    Some(CwdPlacement::Checkout { repo_id, .. }) => Some(repo_id.clone()),
+                    _ => None,
+                };
+                if trail
+                    .last()
+                    .is_some_and(|m| m.repo == repo && m.branch == mark.branch)
+                {
+                    continue;
+                }
+                trail.push(TrailMark {
+                    at_ms: store::epoch_ms(mark.at),
+                    repo,
+                    branch: mark.branch.clone(),
+                });
+            }
+            trail
         })
         .collect()
 }
@@ -1718,6 +1797,58 @@ fn work_state_error(repo_id: &str, e: std::io::Error) -> SourceError {
         source: "work.json".to_owned(),
         detail: format!("{repo_id}: {e}"),
     }
+}
+
+/// The dated touches a provider's branch trail proves: each mark that
+/// names a branch in a resolved repo becomes an interval until the next
+/// mark, on the one incarnation of that name that provably existed at the
+/// mark. A mark no single incarnation covers places nothing.
+fn dated_touches(
+    conversation: &str,
+    trail: &[TrailMark],
+    authored: &store::Work,
+) -> Vec<store::DatedTouch> {
+    let mut touches = Vec::new();
+    for (i, mark) in trail.iter().enumerate() {
+        let (Some(repo), Some(branch)) = (&mark.repo, &mark.branch) else {
+            continue;
+        };
+        let Some(id) = incarnation_at(authored, repo, branch, mark.at_ms) else {
+            continue;
+        };
+        touches.push(store::DatedTouch {
+            conversation: conversation.to_owned(),
+            branch: id,
+            valid_from: mark.at_ms,
+            valid_until: trail.get(i + 1).map(|next| next.at_ms),
+        });
+    }
+    touches
+}
+
+/// The incarnation of `(repo, ref_name)` that provably existed at `at_ms`:
+/// from its reflog creation (or, without one, its first observation)
+/// through its end. Zero or several candidates is no answer - a time
+/// before any proven start, or inside a boundary the records cannot
+/// order, fails closed.
+fn incarnation_at(
+    authored: &store::Work,
+    repo: &str,
+    ref_name: &str,
+    at_ms: u64,
+) -> Option<String> {
+    let mut covering = authored.branches.values().filter(|r| {
+        let start = r
+            .creation_evidence
+            .as_ref()
+            .map_or(r.first_observed_at, |c| c.at_ms.min(r.first_observed_at));
+        r.repo == repo
+            && r.ref_name == ref_name
+            && start <= at_ms
+            && r.ended_at.is_none_or(|e| at_ms <= e)
+    });
+    let found = covering.next()?;
+    covering.next().is_none().then(|| found.id.clone())
 }
 
 /// Whether the anchor's branch tip moved off the active record's last
@@ -2434,6 +2565,7 @@ fn conversation_row(
         branch,
         touches: Vec::new(),
         current_incarnation: None,
+        trail: Vec::new(),
     }
 }
 
@@ -2551,6 +2683,7 @@ mod tests {
             first_at: None,
             last_at: Some(last_at),
             malformed_lines: 0,
+            branch_trail: Vec::new(),
         }
     }
 
@@ -2601,7 +2734,7 @@ mod tests {
             repo: "/r/.git".to_owned(),
             ref_name: "feat".to_owned(),
             incarnation: 1,
-            head: "aaaaaa".to_owned(),
+            head: Some("aaaaaa".to_owned()),
             valid_from: 1_000,
             valid_until: None,
             provenance: store::TouchProvenance::Cwd,
@@ -2650,7 +2783,7 @@ mod tests {
         let touch = store::BranchTouch {
             conversation: "claude:s1".to_owned(),
             branch: "i-gone".to_owned(),
-            head: "a".to_owned(),
+            head: Some("a".to_owned()),
             valid_from: 1_000,
             valid_until: None,
             provenance: store::TouchProvenance::Cwd,
@@ -2665,7 +2798,7 @@ mod tests {
         let touch = store::BranchTouch {
             conversation: "claude:s1".to_owned(),
             branch: "i-1".to_owned(),
-            head: "a".to_owned(),
+            head: Some("a".to_owned()),
             valid_from: 1_500,
             valid_until: Some(2_000),
             provenance: store::TouchProvenance::Cwd,
@@ -3274,6 +3407,7 @@ mod tests {
             branch: None,
             touches: Vec::new(),
             current_incarnation: None,
+            trail: Vec::new(),
         };
         let now = SystemTime::now();
         // The inbox order is the attention rank, not the state.
@@ -3437,7 +3571,7 @@ mod tests {
             conversation(None, None),
         ];
         let mut errors = Vec::new();
-        let placements = resolve_cwds(&conversations, &mut errors);
+        let placements = resolve_cwds(&conversations, &mut HashMap::new(), &mut errors);
         assert_eq!(placements.len(), 3);
         assert!(placements.iter().all(Option::is_none));
         assert_eq!(errors.len(), 1, "{errors:?}");

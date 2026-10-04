@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use agent_sessions::runtime::Runtime;
 use agent_sessions::snapshot::{Collector, Snapshot, WorkRow, to_json};
 use agent_sessions::store::{
-    BranchRecord, Confidence, ContinuityEvidence, LifecycleInputs, ObservedRef,
+    BranchRecord, Confidence, ContinuityEvidence, DatedTouch, LifecycleInputs, ObservedRef,
     RefCreationEvidence, Store, TouchPlacement, TouchProvenance,
 };
 use agent_sessions::tui::{App, Key};
@@ -102,12 +102,49 @@ fn transcript(home: &TempDir, id: &str, cwd: &Path) {
     fs::create_dir_all(&projects).expect("mkdir");
     fs::write(
         projects.join(format!("{id}.jsonl")),
-        format!(
-            "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"the task\"}}}}\n",
-            cwd.display()
-        ),
+        support::claude_turn(id, cwd, "the task"),
     )
     .expect("transcript writes");
+}
+
+/// Append one more record to `id`'s transcript: the conversation kept
+/// working, at `cwd` on whatever branch is checked out there now.
+fn turn(home: &TempDir, id: &str, cwd: &Path) {
+    use std::io::Write;
+    let path = home.join(format!(".claude/projects/t/{id}.jsonl"));
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("the transcript");
+    f.write_all(support::claude_turn(id, cwd, "more").as_bytes())
+        .expect("the turn appends");
+}
+
+/// A live Claude conversation at `cwd`: a running process, its session
+/// file and its transcript. The process dies with the guard.
+struct Live(std::process::Child);
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn live(home: &TempDir, id: &str, cwd: &Path) -> Live {
+    transcript(home, id, cwd);
+    Live(support::live_claude(home, id, "idle", cwd))
+}
+
+/// The conversation's touches of one provenance, in row order.
+fn touches_by(
+    c: &agent_sessions::snapshot::ConversationRow,
+    provenance: TouchProvenance,
+) -> Vec<&agent_sessions::snapshot::TouchRow> {
+    c.touches
+        .iter()
+        .filter(|t| t.provenance == provenance)
+        .collect()
 }
 
 /// The work row named `name`.
@@ -481,71 +518,6 @@ fn a_stale_rename_line_never_steals_a_recreated_name() {
 }
 
 #[test]
-fn a_branch_switch_closes_one_touch_interval_and_opens_the_next() {
-    let world = world();
-    world.repo.branch_with_commits("feat", 1, true);
-    let wt = world.repo.add_worktree("feat", Some("feat"));
-    transcript(&world.home, CONV, &wt);
-    let first = collect(&world);
-    let conv = conversation(&first, CONV);
-    let feat_id = work(&first, "feat").identity.clone().unwrap();
-    assert_eq!(conv.touches.len(), 1);
-    assert_eq!(conv.touches[0].incarnation_id, feat_id);
-    assert_eq!(conv.touches[0].valid_until, None);
-    assert_eq!(conv.touches[0].provenance, TouchProvenance::Cwd);
-    assert_eq!(conv.touches[0].confidence, Confidence::Exact);
-    assert_eq!(
-        conv.touches[0].head,
-        world.repo.git(&wt, &["rev-parse", "feat"]).trim()
-    );
-    assert_eq!(conv.current_incarnation.as_deref(), Some(feat_id.as_str()));
-
-    // The worktree switches branch: the interval closes at exactly the
-    // pass that opened the next one - append-only history.
-    world.repo.git(&wt, &["checkout", "-b", "other"]);
-    let second = collect(&world);
-    let conv = conversation(&second, CONV);
-    let other_id = work(&second, "other").identity.clone().unwrap();
-    assert_eq!(conv.touches.len(), 2, "{:?}", conv.touches);
-    let (old, new) = (&conv.touches[0], &conv.touches[1]);
-    assert_eq!(old.incarnation_id, feat_id);
-    assert_eq!(new.incarnation_id, other_id);
-    assert_eq!(old.valid_until, Some(new.valid_from));
-    assert_eq!(new.valid_until, None);
-    assert_eq!(conv.current_incarnation.as_deref(), Some(other_id.as_str()));
-    // A restart reproduces the same intervals - nothing rewrote history.
-    let third = collect(&world);
-    assert_eq!(conversation(&third, CONV).touches, conv.touches);
-}
-
-#[test]
-fn a_repo_switch_closes_the_interval_too() {
-    let world = world();
-    let other_repo = FixtureRepo::new("origin");
-    world.repo.branch_with_commits("feat", 1, true);
-    let wt = world.repo.add_worktree("feat", Some("feat"));
-    transcript(&world.home, CONV, &wt);
-    collect(&world);
-    let feat_id = record(&world, "feat").unwrap().id;
-    // The conversation's cwd moves into another repository's checkout:
-    // same rule - close the open interval, open the new placement.
-    transcript(&world.home, CONV, &other_repo.main);
-    let second = collect(&world);
-    let conv = conversation(&second, CONV);
-    assert_eq!(conv.touches.len(), 2, "{:?}", conv.touches);
-    assert_eq!(conv.touches[0].incarnation_id, feat_id);
-    assert!(conv.touches[0].valid_until.is_some());
-    assert_eq!(
-        conv.touches[0].valid_until,
-        Some(conv.touches[1].valid_from)
-    );
-    let other_id = repo_id(&other_repo);
-    assert_eq!(conv.touches[1].repo, other_id);
-    assert_eq!(conv.touches[1].ref_name, "main");
-    assert_eq!(conv.touches[1].valid_until, None);
-}
-
-#[test]
 fn a_symlinked_checkout_lands_on_the_same_repo_and_incarnation() {
     let world = world();
     world.repo.branch_with_commits("feat", 1, true);
@@ -629,7 +601,7 @@ fn the_store_keeps_ninety_days_or_touched_history_whichever_is_longer() {
     let dropped = work.branch(repo, "dropped").unwrap().id.clone();
     // `kept` holds a conversation's placement; `dropped` has none.
     store
-        .sync_touches(&[placement("claude:s1", &kept, "aaa")], 1_500)
+        .sync_touches(&[placement("claude:s1", &kept, "aaa")], &[], 1_500)
         .unwrap();
     // Both close together at 2_000 - the touch interval closes with its
     // incarnation, not at some later absence.
@@ -762,9 +734,24 @@ fn sync_repo_separates_what_it_cannot_prove_and_keeps_what_it_can() {
     let work = store.load().work;
     let moved = work.branch(repo, "new-name").unwrap();
     assert_eq!(moved.id, old);
+    assert_eq!(moved.head.as_deref(), Some("n"));
     assert_eq!(moved.continuity_evidence, ContinuityEvidence::ProvenRename);
     assert_eq!(moved.creation_evidence.as_ref().map(|c| c.at_ms), Some(900));
     assert!(work.branch(repo, "old-name").is_none());
+
+    // A rename whose tip this pass did not prove keeps the last proven
+    // head: missing evidence erases nothing.
+    store
+        .sync_repo(
+            repo,
+            &[obs_renamed("third-name", None, None, "new-name")],
+            33_000,
+        )
+        .unwrap();
+    let work = store.load().work;
+    let moved = work.branch(repo, "third-name").unwrap();
+    assert_eq!(moved.id, old);
+    assert_eq!(moved.head.as_deref(), Some("n"));
 
     // A stale rename claiming a taken destination moves nothing either:
     // `dest` keeps its own record, `gone-src` simply closes.
@@ -815,38 +802,70 @@ fn sync_touches_is_append_only_and_idempotent() {
 
     // First placement opens; the identical repeat writes nothing.
     store
-        .sync_touches(&[placement("claude:s1", &id, "a")], 1_500)
+        .sync_touches(&[placement("claude:s1", &id, "a")], &[], 1_500)
         .unwrap();
     let bytes = fs::read(dir.join("store/work.json")).unwrap();
     store
-        .sync_touches(&[placement("claude:s1", &id, "a")], 1_600)
+        .sync_touches(&[placement("claude:s1", &id, "a")], &[], 1_600)
         .unwrap();
     assert_eq!(fs::read(dir.join("store/work.json")).unwrap(), bytes);
 
     // A moved head on the same incarnation corrects: close, append -
     // never rewrite the earlier interval.
     store
-        .sync_touches(&[placement("claude:s1", &id, "b")], 2_000)
+        .sync_touches(&[placement("claude:s1", &id, "b")], &[], 2_000)
         .unwrap();
     let work = store.load().work;
     assert_eq!(work.touches.len(), 2);
     assert_eq!(work.touches[0].valid_until, Some(2_000));
-    assert_eq!(work.touches[1].head, "b");
+    assert_eq!(work.touches[1].head.as_deref(), Some("b"));
     assert_eq!(work.touches[1].valid_from, 2_000);
 
     // Absence closes nothing: a pass without the conversation's
     // placement leaves the interval open.
-    store.sync_touches(&[], 3_000).unwrap();
+    store.sync_touches(&[], &[], 3_000).unwrap();
     assert_eq!(store.load().work.touches[1].valid_until, None);
 
     // A placement on a closed incarnation lands nowhere.
     store.sync_repo(repo, &[], 4_000).unwrap();
     store
-        .sync_touches(&[placement("claude:s1", &id, "b")], 5_000)
+        .sync_touches(&[placement("claude:s1", &id, "b")], &[], 5_000)
         .unwrap();
     let work = store.load().work;
     assert_eq!(work.touches.len(), 2);
     assert_eq!(work.touches[1].valid_until, Some(4_000));
+
+    // Dated provider intervals: one naming no stored record lands
+    // nowhere; one on the closed incarnation is history, its end bounded
+    // by the incarnation's; replaying it changes nothing.
+    let dated = |branch: &str, from: u64, until: Option<u64>| DatedTouch {
+        conversation: "claude:s2".to_owned(),
+        branch: branch.to_owned(),
+        valid_from: from,
+        valid_until: until,
+    };
+    store
+        .sync_touches(
+            &[],
+            &[
+                dated("i-missing", 1_000, None),
+                dated(&id, 1_200, Some(9_000)),
+            ],
+            6_000,
+        )
+        .unwrap();
+    let work = store.load().work;
+    assert_eq!(work.touches.len(), 3);
+    let history = &work.touches[2];
+    assert_eq!(history.branch, id);
+    assert_eq!(history.provenance, TouchProvenance::ProviderBranch);
+    assert_eq!(history.head, None);
+    assert_eq!(history.valid_until, Some(4_000));
+    let bytes = fs::read(dir.join("store/work.json")).unwrap();
+    store
+        .sync_touches(&[], &[dated(&id, 1_200, Some(9_000))], 7_000)
+        .unwrap();
+    assert!(fs::read(dir.join("store/work.json")).unwrap() == bytes);
 }
 
 #[test]
@@ -964,15 +983,196 @@ fn the_history_rows_render_excluded_and_scope_their_own_conversations() {
 }
 
 #[test]
+fn a_live_worktree_switch_closes_one_cwd_interval_and_opens_the_next() {
+    let world = world();
+    world.repo.branch_with_commits("feat", 1, true);
+    let wt = world.repo.add_worktree("feat", Some("feat"));
+    let _agent = live(&world.home, CONV, &wt);
+    let first = collect(&world);
+    let conv = conversation(&first, CONV);
+    assert!(conv.running());
+    let feat_id = work(&first, "feat").identity.clone().unwrap();
+    let cwd = touches_by(conv, TouchProvenance::Cwd);
+    assert_eq!(cwd.len(), 1, "{:?}", conv.touches);
+    assert_eq!(cwd[0].incarnation_id, feat_id);
+    assert_eq!(cwd[0].valid_until, None);
+    assert_eq!(cwd[0].confidence, Confidence::Exact);
+    assert_eq!(
+        cwd[0].head.as_deref(),
+        Some(world.repo.git(&wt, &["rev-parse", "feat"]).trim())
+    );
+    assert_eq!(conv.current_incarnation.as_deref(), Some(feat_id.as_str()));
+
+    // The live conversation's worktree switches branch: the observed
+    // interval closes at exactly the pass that opens the next one.
+    world.repo.git(&wt, &["checkout", "-b", "other"]);
+    let second = collect(&world);
+    let conv = conversation(&second, CONV);
+    let other_id = work(&second, "other").identity.clone().unwrap();
+    let cwd = touches_by(conv, TouchProvenance::Cwd);
+    assert_eq!(cwd.len(), 2, "{:?}", conv.touches);
+    assert_eq!(cwd[0].incarnation_id, feat_id);
+    assert_eq!(cwd[1].incarnation_id, other_id);
+    assert_eq!(cwd[0].valid_until, Some(cwd[1].valid_from));
+    assert_eq!(cwd[1].valid_until, None);
+    assert_eq!(conv.current_incarnation.as_deref(), Some(other_id.as_str()));
+    // A restart reproduces the same intervals - nothing rewrote history.
+    let third = collect(&world);
+    assert_eq!(conversation(&third, CONV).touches, conv.touches);
+}
+
+#[test]
+fn a_dead_conversation_stays_on_the_branch_it_worked_on() {
+    let world = world();
+    world.repo.branch_with_commits("feat", 1, true);
+    let wt = world.repo.add_worktree("feat", Some("feat"));
+    transcript(&world.home, CONV, &wt);
+    let first = collect(&world);
+    let feat_id = work(&first, "feat").identity.clone().unwrap();
+    let conv = conversation(&first, CONV);
+    assert!(!conv.running());
+    // Its own records place it: provider evidence, no tip.
+    assert_eq!(conv.touches.len(), 1, "{:?}", conv.touches);
+    assert_eq!(conv.touches[0].provenance, TouchProvenance::ProviderBranch);
+    assert_eq!(conv.touches[0].incarnation_id, feat_id);
+    assert_eq!(conv.touches[0].head, None);
+    assert!(agent_sessions::snapshot::binds(work(&first, "feat"), conv));
+
+    // The worktree moves on without it: where the directory points now
+    // says nothing about where the finished conversation worked.
+    world.repo.git(&wt, &["checkout", "-b", "other"]);
+    let second = collect(&world);
+    let conv = conversation(&second, CONV);
+    assert_eq!(conv.touches.len(), 1, "{:?}", conv.touches);
+    assert_eq!(conv.touches[0].incarnation_id, feat_id);
+    assert!(agent_sessions::snapshot::binds(work(&second, "feat"), conv));
+    let other = work(&second, "other");
+    assert!(!agent_sessions::snapshot::binds(other, conv));
+    assert_eq!(other.past_sessions, 0, "{other:?}");
+}
+
+#[test]
+fn a_recreated_name_never_inherits_the_old_incarnations_conversations() {
+    let world = world();
+    world.repo.branch_with_commits("feat", 1, true);
+    let wt = world.repo.add_worktree("feat", Some("feat"));
+    transcript(&world.home, CONV, &wt);
+    let first = collect(&world);
+    let old = work(&first, "feat").identity.clone().unwrap();
+    // Delete the branch out from under the worktree, then recreate it
+    // there: the same path, the same name, a new incarnation.
+    world.repo.git(&wt, &["checkout", "--detach"]);
+    git(&world.repo, &["branch", "-D", "feat"]);
+    collect(&world);
+    world.repo.git(&wt, &["checkout", "-b", "feat"]);
+    let snapshot = collect(&world);
+    let feat = work(&snapshot, "feat");
+    assert_eq!(feat.incarnation.as_ref().unwrap().number, 2);
+    let conv = conversation(&snapshot, CONV);
+    // The conversation keeps exactly its closed feat#1 interval: no
+    // attention, session count or binding reaches feat#2.
+    assert_eq!(conv.touches.len(), 1, "{:?}", conv.touches);
+    assert_eq!(conv.touches[0].incarnation_id, old);
+    assert!(conv.touches[0].valid_until.is_some());
+    assert!(!agent_sessions::snapshot::binds(feat, conv));
+    assert_eq!(feat.past_sessions, 0, "{feat:?}");
+    assert_eq!(feat.live_sessions, 0, "{feat:?}");
+}
+
+#[test]
+fn a_record_older_than_every_incarnation_places_nothing() {
+    let world = world();
+    world.repo.branch_with_commits("feat", 1, true);
+    let wt = world.repo.add_worktree("feat", Some("feat"));
+    // A record dated before the ref provably existed names some earlier
+    // `feat` nobody recorded: it fails closed instead of guessing.
+    let projects = world.home.join(".claude/projects/t");
+    fs::create_dir_all(&projects).expect("mkdir");
+    fs::write(
+        projects.join(format!("{CONV}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{CONV}\",\"cwd\":\"{}\",\"gitBranch\":\"feat\",\"timestamp\":\"2020-01-01T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"old\"}}}}\n",
+            wt.display()
+        ),
+    )
+    .expect("transcript writes");
+    let snapshot = collect(&world);
+    assert!(conversation(&snapshot, CONV).touches.is_empty());
+    assert_eq!(work(&snapshot, "feat").past_sessions, 0);
+}
+
+#[test]
+fn a_conversation_that_followed_a_switch_records_both_from_its_own_records() {
+    let world = world();
+    world.repo.branch_with_commits("feat", 1, true);
+    let wt = world.repo.add_worktree("feat", Some("feat"));
+    transcript(&world.home, CONV, &wt);
+    collect(&world);
+    // The conversation switched the branch and kept working: its next
+    // record names the new branch, and its trail closes the first
+    // interval at exactly that record.
+    world.repo.git(&wt, &["checkout", "-b", "other"]);
+    turn(&world.home, CONV, &wt);
+    let snapshot = collect(&world);
+    let conv = conversation(&snapshot, CONV);
+    let names: Vec<&str> = conv.touches.iter().map(|t| t.ref_name.as_str()).collect();
+    assert_eq!(names, ["feat", "other"], "{:?}", conv.touches);
+    assert_eq!(
+        conv.touches[0].valid_until,
+        Some(conv.touches[1].valid_from)
+    );
+    assert_eq!(conv.touches[1].valid_until, None);
+    assert!(
+        conv.touches
+            .iter()
+            .all(|t| t.provenance == TouchProvenance::ProviderBranch)
+    );
+    assert_eq!(conv.current_incarnation, work(&snapshot, "other").identity);
+    // A restart reproduces the same intervals.
+    let again = collect(&world);
+    assert_eq!(conversation(&again, CONV).touches, conv.touches);
+}
+
+#[test]
+fn a_repo_switch_closes_the_interval_too() {
+    let world = world();
+    let other_repo = FixtureRepo::new("origin");
+    // A conversation of its own brings the other repository into scope:
+    // collection follows where conversations sit, not where they went.
+    transcript(&world.home, OTHER, &other_repo.main);
+    world.repo.branch_with_commits("feat", 1, true);
+    let wt = world.repo.add_worktree("feat", Some("feat"));
+    transcript(&world.home, CONV, &wt);
+    collect(&world);
+    let feat_id = record(&world, "feat").unwrap().id;
+    // The conversation moves into another repository's checkout and
+    // works there: same rule - the first interval ends where the next
+    // record begins.
+    turn(&world.home, CONV, &other_repo.main);
+    let second = collect(&world);
+    let conv = conversation(&second, CONV);
+    assert_eq!(conv.touches.len(), 2, "{:?}", conv.touches);
+    assert_eq!(conv.touches[0].incarnation_id, feat_id);
+    assert_eq!(
+        conv.touches[0].valid_until,
+        Some(conv.touches[1].valid_from)
+    );
+    assert_eq!(conv.touches[1].repo, repo_id(&other_repo));
+    assert_eq!(conv.touches[1].ref_name, "main");
+    assert_eq!(conv.touches[1].valid_until, None);
+}
+
+#[test]
 fn the_global_scope_lists_each_conversation_once_with_its_touch_path() {
     let world = world();
     world.repo.branch_with_commits("feat", 1, true);
     let wt = world.repo.add_worktree("feat", Some("feat"));
     transcript(&world.home, CONV, &wt);
     collect(&world);
-    // A branch switch gives the conversation a two-incarnation path:
-    // feat#1 -> other#1.
+    // A switch the conversation worked through gives it a
+    // two-incarnation path: feat#1 -> other#1.
     world.repo.git(&wt, &["checkout", "-b", "other"]);
+    turn(&world.home, CONV, &wt);
     // A second conversation sits in the main checkout - one touch.
     transcript(&world.home, OTHER, &world.repo.main);
     // A third has no resolved placement at all.
@@ -999,21 +1199,52 @@ fn the_global_scope_lists_each_conversation_once_with_its_touch_path() {
 }
 
 #[test]
-fn a_conversation_row_carries_every_touch_interval_in_order() {
+fn a_trail_through_subdirectories_and_vanished_paths_places_exactly() {
     let world = world();
     world.repo.branch_with_commits("feat", 1, true);
     let wt = world.repo.add_worktree("feat", Some("feat"));
     transcript(&world.home, CONV, &wt);
-    collect(&world);
-    world.repo.git(&wt, &["checkout", "-b", "other"]);
+    // Work continues from a subdirectory: the same repo and branch, one
+    // interval, not two.
+    let sub = wt.join("sub");
+    fs::create_dir_all(&sub).expect("mkdir");
+    turn(&world.home, CONV, &sub);
+    // Then from a checkout that is gone by the time anyone looks: the
+    // mark ends the feat interval and places nothing itself.
+    let gone = FixtureRepo::new("origin");
+    turn(&world.home, CONV, &gone.main);
+    let gone_path = gone.main.clone();
+    drop(gone);
+    assert!(!gone_path.exists());
     let snapshot = collect(&world);
     let conv = conversation(&snapshot, CONV);
-    // Append order is the timeline: feat first, then other.
-    let names: Vec<&str> = conv.touches.iter().map(|t| t.ref_name.as_str()).collect();
-    assert_eq!(names, ["feat", "other"]);
-    assert!(conv.touches.iter().all(|t| t.incarnation > 0));
-    assert!(conv.touches.iter().all(|t| t.repo == repo_id(&world.repo)));
-    // The work row's identity is the open interval's incarnation.
-    let other = work(&snapshot, "other");
-    assert_eq!(conv.current_incarnation, other.identity);
+    assert_eq!(conv.touches.len(), 1, "{:?}", conv.touches);
+    assert_eq!(conv.touches[0].ref_name, "feat");
+    assert!(conv.touches[0].valid_until.is_some());
+    assert!(!agent_sessions::snapshot::binds(
+        work(&snapshot, "feat"),
+        conv
+    ));
+}
+
+#[test]
+fn a_live_conversation_off_any_recorded_branch_opens_no_cwd_interval() {
+    let world = world();
+    // Live in a project space (no branch at all) and on an unborn branch
+    // (a name with no ref behind it): neither has an incarnation to touch.
+    let space = world.home.join("space");
+    fs::create_dir_all(&space).expect("mkdir");
+    let unborn = world.home.join("unborn");
+    fs::create_dir_all(&unborn).expect("mkdir");
+    fixture::command(Some(&unborn), &["init", "-q", "-b", "fresh"])
+        .output()
+        .expect("git init");
+    let _a = live(&world.home, CONV, &space);
+    let _b = live(&world.home, OTHER, &unborn);
+    let snapshot = collect(&world);
+    for id in [CONV, OTHER] {
+        let conv = conversation(&snapshot, id);
+        assert!(conv.running(), "{id}");
+        assert!(conv.touches.is_empty(), "{id}: {:?}", conv.touches);
+    }
 }

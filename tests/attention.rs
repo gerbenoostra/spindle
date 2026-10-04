@@ -115,9 +115,7 @@ fn transcript(home: &TempDir, slug: &str, id: &str, cwd: &Path) {
     .expect("transcript writes");
 }
 
-/// The live process's start as Claude's `procStart` ctime (UTC), read from
-/// the kernel through `ps -o lstart` so the `(pid, pid_start)` pair
-/// validates as that instance.
+/// The live process's start as Claude's `procStart` ctime (UTC).
 fn proc_start(pid: u32) -> String {
     let out = std::process::Command::new("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
@@ -643,6 +641,7 @@ fn cursor_movement_writes_no_seen_state() {
             branch: None,
             touches: Vec::new(),
             current_incarnation: None,
+            trail: Vec::new(),
         });
     let mut app = agent_sessions::tui::App::new(snapshot).with_store(store);
     for key in [

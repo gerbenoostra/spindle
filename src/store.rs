@@ -504,8 +504,10 @@ pub struct BranchTouch {
     pub conversation: String,
     /// The incarnation's `BranchRecord.id`.
     pub branch: String,
-    /// The ref's tip the placement observed.
-    pub head: String,
+    /// The ref's tip the placement observed; `None` where the evidence
+    /// names a branch but not its tip (a provider's dated record).
+    #[serde(default)]
+    pub head: Option<String>,
     /// Interval start, epoch milliseconds.
     pub valid_from: u64,
     /// Interval end, epoch ms; `None` while current.
@@ -530,6 +532,23 @@ pub struct TouchPlacement {
     pub provenance: TouchProvenance,
     /// How exact the placement is; only `Exact` exists today.
     pub confidence: Confidence,
+}
+
+/// One interval a provider's own dated records place a conversation on
+/// an incarnation: `ProviderBranch` provenance, exact, with no tip - the
+/// records name the branch, not its head. Re-derived from the same
+/// append-only records every pass, so it is keyed by `(conversation,
+/// branch, valid_from)`.
+#[derive(Debug, Clone)]
+pub struct DatedTouch {
+    /// `conversation_key(provider, session)`.
+    pub conversation: String,
+    /// The incarnation's `BranchRecord.id`.
+    pub branch: String,
+    /// Interval start, epoch milliseconds.
+    pub valid_from: u64,
+    /// Interval end, epoch ms; `None` while the records' last mark holds.
+    pub valid_until: Option<u64>,
 }
 
 /// One local ref a pass observed in a repository, with the facts the
@@ -786,7 +805,7 @@ fn touch_of(placement: &TouchPlacement, at_ms: u64) -> BranchTouch {
     BranchTouch {
         conversation: placement.conversation.clone(),
         branch: placement.branch.clone(),
-        head: placement.head.clone(),
+        head: Some(placement.head.clone()),
         valid_from: at_ms,
         valid_until: None,
         provenance: placement.provenance,
@@ -1292,18 +1311,29 @@ impl Store {
         Ok(())
     }
 
-    /// Reconcile the persisted touch intervals with the current exact
-    /// placements one pass proved, at `observed_ms` (epoch milliseconds):
-    /// a first placement opens an interval, an unchanged one is a no-op,
-    /// a moved head or a moved incarnation closes the open interval and
-    /// appends the next at the same observation time - history stays
-    /// append-only. A conversation absent from `placements` keeps its
-    /// open interval: missing evidence closes nothing.
+    /// Reconcile the persisted touch intervals with what one pass proved,
+    /// at `observed_ms` (epoch milliseconds), under one lock and at most
+    /// one rewrite.
     ///
-    /// One lock and at most one rewrite; an empty call with no file to
-    /// reconcile touches nothing.
-    pub fn sync_touches(&self, placements: &[TouchPlacement], observed_ms: u64) -> io::Result<()> {
-        if placements.is_empty() && !self.dir.join(WORK).exists() {
+    /// `placements` are live observations: a first placement opens an
+    /// interval, an unchanged one is a no-op, a moved head or incarnation
+    /// closes the conversation's open observed interval and appends the
+    /// next at the same time. They land only on live incarnations.
+    ///
+    /// `dated` intervals come from a provider's own records: an unknown
+    /// one appends as given, a known open one may close, nothing else
+    /// moves. They may land on closed incarnations - that is history.
+    ///
+    /// History stays append-only, and a conversation absent from both
+    /// keeps its open intervals: missing evidence closes nothing. An empty
+    /// call with no file to reconcile touches nothing.
+    pub fn sync_touches(
+        &self,
+        placements: &[TouchPlacement],
+        dated: &[DatedTouch],
+        observed_ms: u64,
+    ) -> io::Result<()> {
+        if placements.is_empty() && dated.is_empty() && !self.dir.join(WORK).exists() {
             return Ok(());
         }
         fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
@@ -1320,14 +1350,15 @@ impl Store {
             {
                 continue;
             }
-            let open = work
-                .touches
-                .iter()
-                .rposition(|t| t.conversation == placement.conversation && t.valid_until.is_none());
+            let open = work.touches.iter().rposition(|t| {
+                t.conversation == placement.conversation
+                    && t.provenance == placement.provenance
+                    && t.valid_until.is_none()
+            });
             match open {
                 Some(i)
                     if work.touches[i].branch == placement.branch
-                        && work.touches[i].head == placement.head => {}
+                        && work.touches[i].head.as_deref() == Some(placement.head.as_str()) => {}
                 Some(i) => {
                     work.touches[i].valid_until = Some(observed_ms);
                     work.touches.push(touch_of(placement, observed_ms));
@@ -1335,6 +1366,45 @@ impl Store {
                 }
                 None => {
                     work.touches.push(touch_of(placement, observed_ms));
+                    changed = true;
+                }
+            }
+        }
+        let mut known: HashMap<(String, String, u64), usize> = work
+            .touches
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.provenance == TouchProvenance::ProviderBranch)
+            .map(|(i, t)| ((t.conversation.clone(), t.branch.clone(), t.valid_from), i))
+            .collect();
+        for d in dated {
+            let Some(record) = work.branches.get(&d.branch) else {
+                continue;
+            };
+            // A closed incarnation bounds every interval on it.
+            let until = match (d.valid_until, record.ended_at) {
+                (Some(u), Some(e)) => Some(u.min(e)),
+                (u, e) => u.or(e),
+            };
+            let key = (d.conversation.clone(), d.branch.clone(), d.valid_from);
+            match known.get(&key) {
+                Some(&i) => {
+                    if work.touches[i].valid_until.is_none() && until.is_some() {
+                        work.touches[i].valid_until = until;
+                        changed = true;
+                    }
+                }
+                None => {
+                    known.insert(key, work.touches.len());
+                    work.touches.push(BranchTouch {
+                        conversation: d.conversation.clone(),
+                        branch: d.branch.clone(),
+                        head: None,
+                        valid_from: d.valid_from,
+                        valid_until: until,
+                        provenance: TouchProvenance::ProviderBranch,
+                        confidence: Confidence::Exact,
+                    });
                     changed = true;
                 }
             }
@@ -3154,6 +3224,7 @@ mod tests {
                         provenance: TouchProvenance::Cwd,
                         confidence: Confidence::Exact,
                     }],
+                    &[],
                     1
                 )
                 .unwrap_err()
@@ -3189,6 +3260,7 @@ mod tests {
                         provenance: TouchProvenance::Cwd,
                         confidence: Confidence::Exact,
                     }],
+                    &[],
                     1_000,
                 )
                 .unwrap_err();

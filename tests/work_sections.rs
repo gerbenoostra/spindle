@@ -12,7 +12,7 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Child;
 use std::time::{Duration, UNIX_EPOCH};
 
 use agent_sessions::attention::Attention;
@@ -84,6 +84,18 @@ fn transcript(home: &TempDir, id: &str, cwd: &Path) {
     fs::create_dir_all(&projects).expect("mkdir");
     fs::write(
         projects.join(format!("{id}.jsonl")),
+        support::claude_turn(id, cwd, "the task"),
+    )
+    .expect("transcript writes");
+}
+
+/// A transcript whose one record carries no timestamp: a conversation
+/// that proves no time of activity at all.
+fn undated_transcript(home: &TempDir, id: &str, cwd: &Path) {
+    let projects = home.join(".claude/projects/t");
+    fs::create_dir_all(&projects).expect("mkdir");
+    fs::write(
+        projects.join(format!("{id}.jsonl")),
         format!(
             "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"the task\"}}}}\n",
             cwd.display()
@@ -98,45 +110,6 @@ fn event(home: &TempDir, session: &str, native: &str, event: NormEvent, reason: 
     r.event = Some(event);
     r.reason = Some(reason.to_owned());
     store(home).append(r).expect("append");
-}
-
-/// A `claude` process that is really `bash`: a symlink, not a copy - macOS
-/// kills a relocated copy of a signed system binary, while `comm` still
-/// reports the invoked name. Spawns `sleep` under the `claude` name.
-fn live_agent(home: &TempDir, id: &str, status: &str, worktree: &Path) -> Child {
-    let exe = home.join("claude");
-    std::os::unix::fs::symlink(support::on_path("bash"), &exe).expect("bash links");
-    let child = Command::new(&exe)
-        .arg("-c")
-        .arg("sleep 300; exit")
-        .spawn()
-        .expect("the agent spawns");
-    let sessions = home.join(".claude/sessions");
-    fs::create_dir_all(&sessions).expect("mkdir");
-    fs::write(
-        sessions.join(format!("{}.json", child.id())),
-        format!(
-            "{{\"pid\":{},\"sessionId\":\"{id}\",\"status\":\"{status}\",\"updatedAt\":1788621019906,\"statusUpdatedAt\":1788621019906,\"cwd\":\"{}\",\"procStart\":\"{}\"}}",
-            child.id(),
-            worktree.display(),
-            proc_start(child.id()),
-        ),
-    )
-    .expect("session file writes");
-    child
-}
-
-/// The live process's start as Claude's `procStart` ctime (UTC), read from
-/// the kernel through `ps -o lstart` so the `(pid, pid_start)` pair
-/// validates as that instance.
-fn proc_start(pid: u32) -> String {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC0")
-        .output()
-        .expect("ps runs");
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
 /// A branch that reads `age` old: every commit carries the backdated
@@ -222,7 +195,7 @@ fn world() -> World {
     // `Active`: a live `busy` agent bound to the worktree.
     a.branch_with_commits("feat-active", 1, true);
     let active_wt = a.add_worktree("active", Some("feat-active"));
-    let agent = live_agent(&home, ACTIVE_ID, "busy", &active_wt);
+    let agent = support::live_claude(&home, ACTIVE_ID, "busy", &active_wt);
     transcript(&home, ACTIVE_ID, &active_wt);
 
     // `Follow up`, four ways: dirty, unpushed, resumable idle, and - the
@@ -236,7 +209,7 @@ fn world() -> World {
     transcript(&home, RESUME_ID, &resume);
     let notes = home.join("notes");
     fs::create_dir_all(&notes).expect("mkdir");
-    transcript(&home, SPACE_ID, &notes);
+    undated_transcript(&home, SPACE_ID, &notes);
 
     // `Ready to clean`: merged, clean, nothing live. `Cleanup review`:
     // squash-landed, so only `-D` could delete it. And a detached
@@ -947,11 +920,28 @@ fn forge_state_drives_checks_reasons_and_stays_informational() {
 /// Backdate a transcript file: its conversation's last turn reads `days`
 /// old.
 fn age_transcript(home: &TempDir, id: &str, days: u64) {
+    // The records' own stamps age with the file: a month-old conversation
+    // wrote month-old records.
+    let at = UNIX_EPOCH + Duration::from_secs(now() - days * 86400);
+    let path = home.join(format!(".claude/projects/t/{id}.jsonl"));
+    let text = fs::read_to_string(&path).expect("the transcript");
+    let aged: String = text
+        .lines()
+        .map(|line| {
+            let Some(start) = line.find("\"timestamp\":\"") else {
+                return format!("{line}\n");
+            };
+            let value = start + "\"timestamp\":\"".len();
+            let end = value + line[value..].find('"').expect("a closed stamp");
+            format!("{}{}{}\n", &line[..value], support::iso(at), &line[end..])
+        })
+        .collect();
+    fs::write(&path, aged).expect("the transcript rewrites");
     fs::File::options()
         .write(true)
-        .open(home.join(format!(".claude/projects/t/{id}.jsonl")))
+        .open(&path)
         .expect("the transcript")
-        .set_modified(UNIX_EPOCH + Duration::from_secs(now() - days * 86400))
+        .set_modified(at)
         .expect("mtime sets");
 }
 
