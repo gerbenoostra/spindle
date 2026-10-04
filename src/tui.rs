@@ -25,7 +25,8 @@ use ratatui::{Frame, Terminal};
 use crate::attention::Attention;
 use crate::config;
 use crate::snapshot::{
-    ConversationRow, ConversationState, RepoRow, Snapshot, WorkKind, WorkRow, WorkSection, to_json,
+    ConversationRow, ConversationState, IncarnationRow, RepoRow, Snapshot, WorkKind, WorkRow,
+    WorkSection, to_json,
 };
 use crate::store::{self, Store};
 use crate::tmux::{self, PaneRef};
@@ -145,6 +146,9 @@ pub struct App {
     /// `/` editing session: which list, and the in-progress buffer.
     editing: Option<(List, String)>,
     help: bool,
+    /// `h`: whether [2] also lists the retained earlier same-name
+    /// incarnations below their active rows, marked excluded.
+    history: bool,
     quit: bool,
     /// The collector thread died: the last snapshot stays on screen and the
     /// footer says so instead of letting the dashboard look live.
@@ -170,6 +174,10 @@ pub struct App {
 enum Row<'a> {
     Repo(&'a RepoRow),
     Work(&'a WorkRow),
+    /// An excluded earlier same-name incarnation, injected by `h` after
+    /// its active row: selectable so [3] scopes to exactly it, inert for
+    /// `space` and `p`.
+    History(&'a WorkRow, &'a IncarnationRow),
     Conversation(&'a ConversationRow),
 }
 
@@ -196,6 +204,7 @@ impl App {
             filter_raw: [String::new(), String::new(), String::new()],
             editing: None,
             help: false,
+            history: false,
             quit: false,
             collector_dead: false,
             store: None,
@@ -333,32 +342,51 @@ impl App {
                 )
             })
             .collect::<Vec<_>>();
-        // The `all` row's counts cover the whole scope, collapsed or not.
+        // The `all` row's counts cover the whole scope, collapsed or not -
+        // over the active rows only: `h`'s injected history never changes
+        // the lifecycle counts.
         let work_open = work_rows.iter().filter(|w| w.section.open()).count();
         let work_clean = work_rows.len() - work_open;
         // Under `all`, the cleanup sections collapse into one summary line;
-        // under a repo they list their rows like any section.
-        let (work, cleanup) = if repo_scope.is_some() {
-            (work_rows.into_iter().map(Row::Work).collect(), None)
-        } else {
-            let mut work = Vec::new();
-            let mut safe = 0usize;
-            let mut review = 0usize;
-            for w in work_rows {
+        // under a repo they list their rows like any section. History rows
+        // inject directly after their active row when `h` is on.
+        let mut work = Vec::new();
+        let mut safe = 0usize;
+        let mut review = 0usize;
+        let collapse_cleanup = repo_scope.is_none();
+        for w in work_rows {
+            if collapse_cleanup {
                 match w.section {
-                    WorkSection::ReadyToClean => safe += 1,
-                    WorkSection::CleanupReview => review += 1,
-                    _ => work.push(Row::Work(w)),
+                    WorkSection::ReadyToClean => {
+                        safe += 1;
+                        continue;
+                    }
+                    WorkSection::CleanupReview => {
+                        review += 1;
+                        continue;
+                    }
+                    _ => {}
                 }
             }
-            (work, (safe + review > 0).then_some((safe, review)))
-        };
+            work.push(Row::Work(w));
+            if self.history {
+                for h in &w.same_name_history {
+                    work.push(Row::History(w, h));
+                }
+            }
+        }
+        let cleanup = (collapse_cleanup && safe + review > 0).then_some((safe, review));
         let work_scope = match self.cursor[list_index(List::Work)] /* // coverage: off - the get-miss arm is unreachable: cursors clamp before a view */ {
             0 => None, // coverage: off - the unreachable arm's match edge lands here
             cursor => work // coverage: off - same
                 .get(cursor - 1)
                 .map(|row| match row { // coverage: off - same
                 Row::Work(w) => scope_of(w),
+                Row::History(_, h) => WorkScope::Incarnation {
+                    id: h.id.clone(),
+                    label: format!("{}#{}", h.ref_name, h.number),
+                    excluded: true,
+                },
                 _ /* // coverage: off - work holds Work rows only */ => WorkScope::Space {
                     id: String::new(),                    // coverage: off - same
                     path: Path::new("").to_path_buf(),    // coverage: off - same
@@ -372,16 +400,16 @@ impl App {
             .filter(|c| {
                 if let Some(work) = &work_scope {
                     // A conversation under one work row matches on worktree
-                    // path, or on branch for branch-only rows; under `all`
-                    // work, on the repo alone.
+                    // path for a detached row, on touches to exactly that
+                    // incarnation for a branch-bearing one - active or
+                    // excluded history - or on the space's canonical id.
                     match work {
                         WorkScope::Worktree { repo, root } => {
                             c.repo.as_deref() == Some(repo.as_str())
                                 && c.worktree.as_deref() == Some(root.as_path())
                         }
-                        WorkScope::Branch { repo, branch } => {
-                            c.repo.as_deref() == Some(repo.as_str())
-                                && c.branch.as_deref() == Some(branch.as_str())
+                        WorkScope::Incarnation { id, .. } => {
+                            c.touches.iter().any(|t| t.incarnation_id == *id)
                         }
                         WorkScope::Space { id, .. } => c.repo.as_deref() == Some(id.as_str()),
                     }
@@ -468,6 +496,7 @@ impl App {
             }
             Key::Char(' ') => self.space(),
             Key::Char('p') => self.park(),
+            Key::Char('h') => self.history = !self.history,
             _ => {}
         }
     }
@@ -511,7 +540,9 @@ impl App {
                 .iter()
                 .filter(|c| crate::snapshot::binds(w, c))
                 .collect::<Vec<_>>(),
-            Row::Repo(_) => Vec::new(),
+            // Excluded history is read-only: `space` acknowledges and
+            // marks nothing on it.
+            Row::Repo(_) | Row::History(..) => Vec::new(),
         };
         // A work row decides once for all its bound conversations: a single
         // pending latch turns the whole keypress into acknowledgements -
@@ -707,6 +738,19 @@ impl App {
                 cursor_line = display.len();
             }
             display.push(self.row(list, row, view, inner.width, cursor == i + 1));
+            // The global work scope gives each conversation a dim context
+            // line - part of the same cursor item, never a row of its
+            // own; it disappears once a scope is selected.
+            if let Row::Conversation(c) = row
+                && list == List::Conversations
+                && view.work_scope.is_none()
+                && let Some(context) = conversation_context(c, view.repo_scope.as_deref())
+            {
+                display.push(Line::from(Span::styled(
+                    fit(&format!("    {context}"), inner.width as usize),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
         }
         // The `all`-scoped Work list ends on one collapsed cleanup line
         // instead of listing the Ready to clean / Cleanup review rows.
@@ -801,6 +845,20 @@ impl App {
                 age: &age(self.now(), w.last_activity),
                 selected,
                 dim_label: false,
+            },
+            Row::History(w, h) => RowCells {
+                // Excluded history: dim, no attention glyph, marked
+                // `excluded`, aged by when the incarnation ended.
+                glyph: "",
+                label: &work_label(
+                    w,
+                    list == List::Work && view.repo_scope.is_none(),
+                    Some(h.number),
+                ),
+                middle: "excluded",
+                age: &age(self.now(), h.ended_at),
+                selected,
+                dim_label: true,
             },
             Row::Conversation(c) => RowCells {
                 glyph: conversation_glyph(c),
@@ -906,13 +964,23 @@ impl App {
                 )),
             ),
             (Some(List::Work), Some(Row::Work(w))) => (
-                format!("[4] Work - {}", w.name),
+                format!("[4] Work - {}", numbered_name(w)),
                 Line::from(format!(
                     "{} {} - {} · {}",
                     work_glyph(w),
-                    w.name,
+                    numbered_name(w),
                     w.kind.as_str().replace('_', " "),
                     age(self.now(), w.last_activity)
+                )),
+            ),
+            (Some(List::Work), Some(Row::History(_, h))) => (
+                format!("[4] Work - {}#{}", h.ref_name, h.number),
+                Line::from(format!(
+                    "  {}#{} - incarnation · excluded · observed {} · ended {}",
+                    h.ref_name,
+                    h.number,
+                    age(self.now(), Some(h.first_observed_at)),
+                    age(self.now(), h.ended_at)
                 )),
             ),
             (Some(List::Conversations), Some(Row::Conversation(c))) => (
@@ -962,7 +1030,7 @@ impl App {
             } else if area.width < 60 {
                 match self.focused_list() {
                     Some(List::Work) => {
-                        "1-4 | tab | j/k | p park | / filter | ? | q quit".to_owned()
+                        "1-4 | tab | j/k | p park | h | / filter | ? | q quit".to_owned()
                     }
                     Some(_) => "1-4 | tab | j/k | / filter | ? | q quit".to_owned(),
                     None => "1-4 | tab | j/k | ? | q quit".to_owned(),
@@ -971,7 +1039,7 @@ impl App {
                 let hints = match self.focused_list() {
                     Some(List::Repos) => "1-4 focus | tab next | j/k move | / filter",
                     Some(List::Work) => {
-                        "1-4 focus | tab next | j/k move | / filter | space ack | p park"
+                        "1-4 focus | tab next | j/k move | / filter | space ack | p park | h history"
                     }
                     Some(_) => "1-4 focus | tab next | j/k move | / filter | space ack",
                     None => "1-4 focus | tab next | j/k move",
@@ -1016,7 +1084,7 @@ impl App {
                 Line::from(""),
                 Line::from(match list {
                     List::Work => {
-                        "j/k move   / filter   space ack/mark   p park   enter/jump (later)"
+                        "j/k move   / filter   space ack/mark   p park   h history   enter/jump (later)"
                     }
                     _ => "j/k move   / filter   space ack/mark   enter/jump (later)",
                 }),
@@ -1066,8 +1134,15 @@ impl App {
                 Some(WorkScope::Worktree { root, .. }) => {
                     format!("[3] Conversations  {}", root.display())
                 }
-                Some(WorkScope::Branch { branch, .. }) => {
-                    format!("[3] Conversations  {branch}")
+                Some(WorkScope::Incarnation {
+                    label, excluded, ..
+                }) => {
+                    let state = if *excluded {
+                        "excluded history"
+                    } else {
+                        "current incarnation"
+                    };
+                    format!("[3] Conversations  {label} · {state}")
                 }
                 Some(WorkScope::Space { path, .. }) => {
                     format!("[3] Conversations  {}", path.display())
@@ -1114,6 +1189,9 @@ fn selection_key(row: &Row<'_>) -> String {
     match row {
         Row::Repo(r) => r.id.clone(),
         Row::Work(w) => work_key(w),
+        // The incarnation id itself: the selection follows the exact
+        // history row, not the name it shares with the active one.
+        Row::History(_, h) => h.id.clone(),
         Row::Conversation(c) => format!("{}\u{0}{}", c.provider.as_str(), c.session_id),
     }
 }
@@ -1130,13 +1208,17 @@ fn scope_of(w: &WorkRow) -> WorkScope {
             id: w.repo.clone(),
             path: root.clone(),
         },
-        (_, Some(root), _) => WorkScope::Worktree {
+        (WorkKind::Detached, Some(root), _) => WorkScope::Worktree {
             repo: w.repo.clone(),
             root: root.clone(),
         },
-        (_, None, Some(branch)) => WorkScope::Branch {
-            repo: w.repo.clone(),
-            branch: branch.clone(),
+        (_, _, Some(branch)) => WorkScope::Incarnation {
+            id: w.identity.clone().unwrap_or_default(),
+            label: match w.incarnation.as_ref() {
+                Some(i) => format!("{}#{}", branch, i.number),
+                None => branch.clone(),
+            },
+            excluded: false,
         },
         _ /* // coverage: off - an anchor always names one of these */ => WorkScope::Space {
             id: String::new(),               // coverage: off - same
@@ -1152,8 +1234,15 @@ enum WorkScope {
         repo: String,
         root: std::path::PathBuf,
     },
-    /// A branch with no checkout of its own; conversations on that branch.
-    Branch { repo: String, branch: String },
+    /// One branch incarnation, active or excluded history; conversations
+    /// with a touch to exactly this id.
+    Incarnation {
+        id: String,
+        /// `<branch>#N` for the [3] title.
+        label: String,
+        /// Whether the row scopes to a retained earlier incarnation.
+        excluded: bool,
+    },
     /// A non-git project space; conversations anchored on its canonical id
     /// (`repo`), whatever spelling their recorded cwd carries.
     Space {
@@ -1246,13 +1335,32 @@ fn work_glyph(w: &WorkRow) -> &'static str {
     w.attention.glyph()
 }
 
-/// The work row's label: `name ⌂worktree`, prefixed with the repo's name
-/// under the global `all` scope; a project space's workspace is its name
-/// already, so it carries no suffix.
+/// The work row's label: `name#N ⌂worktree`, prefixed with the repo's
+/// name under the global `all` scope; a project space's workspace is its
+/// name already, so it carries no suffix.
 fn work_name(w: &WorkRow, global: bool) -> String {
+    work_label(w, global, w.incarnation.as_ref().map(|i| i.number))
+}
+
+/// The row's name with its `#N`: `feat#2`, or the bare name where no
+/// incarnation numbers it.
+fn numbered_name(w: &WorkRow) -> String {
+    match &w.incarnation {
+        Some(i) => format!("{}#{}", w.name, i.number),
+        None => w.name.clone(),
+    }
+}
+
+/// `work_name` with the incarnation number spelled out: `name` is the
+/// branch name plus its `#N` when a number is known.
+fn work_label(w: &WorkRow, global: bool, number: Option<usize>) -> String {
     if w.kind == WorkKind::ProjectSpace {
         return w.name.clone();
     }
+    let name = match number {
+        Some(n) => format!("{}#{}", w.name, n),
+        None => w.name.clone(),
+    };
     let wt = w
         .worktree
         .as_ref()
@@ -1260,10 +1368,96 @@ fn work_name(w: &WorkRow, global: bool) -> String {
         .map(|n| format!(" ⌂{}", n.to_string_lossy()))
         .unwrap_or_default();
     if global {
-        format!("{}/{}{}", w.repo_name, w.name, wt)
+        format!("{}/{}{}", w.repo_name, name, wt)
     } else {
-        format!("{}{}", w.name, wt)
+        format!("{}{}", name, wt)
     }
+}
+
+/// The conversation's dim second line under the global work scope:
+/// `a#N → b#M` when its ordered distinct touches name several in-scope
+/// incarnations, else the `repo · branch#N · worktree` context of the one
+/// it carries - or its bare repo/worktree context when it touched none.
+/// `repo_scope` narrows "in scope" to touches in the selected repo.
+fn conversation_context(c: &ConversationRow, repo_scope: Option<&str>) -> Option<String> {
+    let mut distinct: Vec<&crate::snapshot::TouchRow> = Vec::new();
+    for t in &c.touches {
+        if !repo_scope.is_none_or(|s| t.repo == s) {
+            continue;
+        }
+        if !distinct
+            .iter()
+            .any(|d| d.incarnation_id == t.incarnation_id)
+        {
+            distinct.push(t);
+        }
+    }
+    let multi_repo = distinct
+        .iter()
+        .map(|t| t.repo.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1;
+    let label = |t: &crate::snapshot::TouchRow| {
+        if multi_repo {
+            format!("{}/{}#{}", repo_label(&t.repo), t.ref_name, t.incarnation)
+        } else {
+            format!("{}#{}", t.ref_name, t.incarnation)
+        }
+    };
+    if distinct.len() > 1 {
+        Some(
+            distinct
+                .iter()
+                .map(|t| label(t))
+                .collect::<Vec<_>>()
+                .join(" → "),
+        )
+    } else if let Some(t) = distinct.first() {
+        let mut parts = vec![
+            repo_label(&t.repo),
+            format!("{}#{}", t.ref_name, t.incarnation),
+        ];
+        if let Some(wt) = &c.worktree {
+            parts.push(path_label(wt));
+        }
+        Some(parts.join(" · "))
+    } else {
+        // No touch yet: the resolved identity is all the context there is.
+        let mut parts = Vec::new();
+        if let Some(repo) = &c.repo {
+            parts.push(repo_label(repo));
+        }
+        if let Some(branch) = &c.branch {
+            parts.push(branch.clone());
+        }
+        if let Some(wt) = &c.worktree {
+            parts.push(path_label(wt));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
+/// The repo's display name from its id: the basename, or the `.git`
+/// directory's parent's.
+fn repo_label(repo: &str) -> String {
+    let p = Path::new(repo);
+    let target = if p.file_name().is_some_and(|n| n == ".git") {
+        p.parent().unwrap_or(p)
+    } else {
+        p
+    };
+    target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo.to_owned())
+}
+
+/// A worktree's display name: its basename.
+fn path_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// The conversation row's middle field: the provider, plus `working`
@@ -1583,6 +1777,39 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
 
+    /// The incarnation row a fixture work row carries, `number` within
+    /// its `(repo, ref_name)`.
+    fn incarnation(id: &str, repo: &str, ref_name: &str, number: usize) -> IncarnationRow {
+        IncarnationRow {
+            id: id.to_owned(),
+            number,
+            repo: repo.to_owned(),
+            ref_name: ref_name.to_owned(),
+            first_observed_at: 1_800_000_000 - 7200,
+            last_observed_at: 1_800_000_000 - 120,
+            creation_head: None,
+            creation_at: None,
+            ended_at: None,
+            continuity: crate::store::ContinuityEvidence::FirstObservation,
+            excluded: false,
+        }
+    }
+
+    /// The open touch binding a fixture conversation to `id`.
+    fn touch(id: &str, repo: &str, ref_name: &str) -> crate::snapshot::TouchRow {
+        crate::snapshot::TouchRow {
+            incarnation_id: id.to_owned(),
+            repo: repo.to_owned(),
+            ref_name: ref_name.to_owned(),
+            incarnation: 1,
+            head: "aaaaaa".to_owned(),
+            valid_from: 1_800_000_000 - 3600,
+            valid_until: None,
+            provenance: crate::store::TouchProvenance::Cwd,
+            confidence: crate::store::Confidence::Exact,
+        }
+    }
+
     /// A snapshot the render path can be exercised against - known and
     /// unknown fields, all providers' row shapes, at a fixed instant.
     fn fixture() -> Snapshot {
@@ -1639,6 +1866,8 @@ mod tests {
                     last_activity: Some(1_800_000_000 - 120),
                     attention: Attention::Waiting,
                     identity: Some("i111".to_owned()),
+                    incarnation: Some(incarnation("i111", "/repos/a/.git", "feat/login", 1)),
+                    same_name_history: Vec::new(),
                     parked: false,
                     forge: crate::forge::WorkItem::Open,
                     pipeline: crate::forge::Pipeline::Unknown,
@@ -1676,6 +1905,8 @@ mod tests {
                     last_activity: Some(1_800_000_000 - 9 * 86400),
                     attention: Attention::None,
                     identity: Some("i222".to_owned()),
+                    incarnation: Some(incarnation("i222", "/repos/a/.git", "feat/old", 1)),
+                    same_name_history: Vec::new(),
                     parked: false,
                     forge: crate::forge::WorkItem::Unknown,
                     pipeline: crate::forge::Pipeline::Unknown,
@@ -1713,6 +1944,8 @@ mod tests {
                     last_activity: None,
                     attention: Attention::None,
                     identity: Some("/spaces/notes".to_owned()),
+                    incarnation: None,
+                    same_name_history: Vec::new(),
                     parked: false,
                     forge: crate::forge::WorkItem::Unknown,
                     pipeline: crate::forge::Pipeline::Unknown,
@@ -1766,6 +1999,8 @@ mod tests {
                     repo: Some("/repos/a/.git".to_owned()),
                     worktree: Some(PathBuf::from("/repos/a-login")),
                     branch: Some("feat/login".to_owned()),
+                    touches: vec![touch("i111", "/repos/a/.git", "feat/login")],
+                    current_incarnation: Some("i111".to_owned()),
                 },
                 ConversationRow {
                     provider: Provider::Claude,
@@ -1798,6 +2033,8 @@ mod tests {
                     repo: Some("/repos/a/.git".to_owned()),
                     worktree: Some(PathBuf::from("/repos/a-login")),
                     branch: Some("feat/login".to_owned()),
+                    touches: vec![touch("i111", "/repos/a/.git", "feat/login")],
+                    current_incarnation: Some("i111".to_owned()),
                 },
                 ConversationRow {
                     provider: Provider::Claude,
@@ -1826,6 +2063,8 @@ mod tests {
                     repo: None,
                     worktree: None,
                     branch: None,
+                    touches: Vec::new(),
+                    current_incarnation: None,
                 },
             ],
             errors: vec![],
@@ -2370,7 +2609,6 @@ mod tests {
                 Key::Char('d'),
                 Key::Char('D'),
                 Key::Char('c'),
-                Key::Char('h'),
                 Key::Char('i'),
                 Key::Char(' '),
                 Key::Enter,
@@ -2378,6 +2616,106 @@ mod tests {
         );
         assert_eq!(render_to(&app, 55, 24), before);
         assert!(!app.quit());
+    }
+
+    #[test]
+    fn the_context_line_spells_one_touch_many_touches_and_none() {
+        let touch = |id: &str, repo: &str, name: &str, n: usize| crate::snapshot::TouchRow {
+            incarnation_id: id.to_owned(),
+            repo: repo.to_owned(),
+            ref_name: name.to_owned(),
+            incarnation: n,
+            head: "aaaaaa".to_owned(),
+            valid_from: 1_000,
+            valid_until: None,
+            provenance: crate::store::TouchProvenance::Cwd,
+            confidence: crate::store::Confidence::Exact,
+        };
+        // One touch: `repo · branch#N · worktree`.
+        let mut c = fixture().conversations[0].clone();
+        assert_eq!(
+            conversation_context(&c, None).as_deref(),
+            Some("a · feat/login#1 · a-login")
+        );
+        // A same-incarnation repeat - a head correction - collapses into
+        // the one it corrects, never a second leg of the path.
+        c.touches
+            .push(touch("i111", "/repos/a/.git", "feat/login", 1));
+        assert_eq!(
+            conversation_context(&c, None).as_deref(),
+            Some("a · feat/login#1 · a-login")
+        );
+        // Two incarnations one repo: the ordered path `a#N → b#M`.
+        c.touches
+            .push(touch("i222", "/repos/a/.git", "feat/old", 2));
+        assert_eq!(
+            conversation_context(&c, None).as_deref(),
+            Some("feat/login#1 → feat/old#2")
+        );
+        // A path crossing repos qualifies each leg with its repo.
+        c.touches.push(touch("i9", "/repos/b/.git", "b", 1));
+        assert_eq!(
+            conversation_context(&c, None).as_deref(),
+            Some("a/feat/login#1 → a/feat/old#2 → b/b#1")
+        );
+        // A repo scope keeps only that repo's legs.
+        assert_eq!(
+            conversation_context(&c, Some("/repos/a/.git")).as_deref(),
+            Some("feat/login#1 → feat/old#2")
+        );
+        assert_eq!(
+            conversation_context(&c, Some("/repos/b/.git")).as_deref(),
+            Some("b · b#1 · a-login")
+        );
+        // A touch without a worktree resolves the same, shorter.
+        let mut c = fixture().conversations[0].clone();
+        c.worktree = None;
+        assert_eq!(
+            conversation_context(&c, None).as_deref(),
+            Some("a · feat/login#1")
+        );
+        // No touch at all: the resolved identity is the context, with or
+        // without a worktree.
+        let mut bare = fixture().conversations[2].clone();
+        bare.repo = Some("/repos/a/.git".to_owned());
+        bare.branch = Some("feat".to_owned());
+        bare.worktree = None;
+        assert_eq!(
+            conversation_context(&bare, None).as_deref(),
+            Some("a · feat")
+        );
+        bare.worktree = Some(PathBuf::from("/repos/a-feat"));
+        assert_eq!(
+            conversation_context(&bare, None).as_deref(),
+            Some("a · feat · a-feat")
+        );
+        // And with nothing resolved, no line at all.
+        let bare = fixture().conversations[2].clone();
+        assert_eq!(conversation_context(&bare, None), None);
+        // The label helpers refuse guesses: a nameless path renders its
+        // whole spelling rather than a fabricated basename.
+        assert_eq!(repo_label("/"), "/");
+        assert_eq!(path_label(Path::new("/")), "/");
+    }
+
+    #[test]
+    fn a_detached_row_scopes_by_its_worktree() {
+        let mut snap = fixture();
+        let detached = &mut snap.work[1];
+        detached.kind = WorkKind::Detached;
+        detached.branch = None;
+        detached.incarnation = None;
+        detached.worktree = Some(PathBuf::from("/repos/a-det"));
+        // A conversation inside the detached checkout binds by path even
+        // without a touch; the worktree one does not belong to it.
+        snap.conversations[1].worktree = Some(PathBuf::from("/repos/a-det"));
+        snap.conversations[1].touches = Vec::new();
+        let mut app = App::new(snap);
+        press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char('j')]);
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("[3] Conversations  /repos/a-det"), "{text}");
+        assert!(text.contains("02aa0bbb"), "{text}");
+        assert!(!text.contains("8f423bbb"), "{text}");
     }
 
     #[test]
@@ -2806,8 +3144,8 @@ mod tests {
             worktree: None,
             ..fixture().work[1].clone()
         };
-        assert_eq!(work_name(&bare, false), "feat/old");
-        assert_eq!(work_name(&bare, true), "a/feat/old");
+        assert_eq!(work_name(&bare, false), "feat/old#1");
+        assert_eq!(work_name(&bare, true), "a/feat/old#1");
         // Key events map; unbound codes are None.
         use crossterm::event::KeyCode;
         assert_eq!(map_key(KeyCode::Tab), Some(Key::Tab));

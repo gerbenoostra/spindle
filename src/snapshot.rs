@@ -284,6 +284,51 @@ impl ConversationState {
     }
 }
 
+/// One branch incarnation as the snapshot serializes it: a row of the
+/// persisted record, numbered oldest-first within its `(repo, ref_name)`.
+/// Times are epoch seconds - the store's milliseconds converted.
+#[derive(Debug, Clone, Serialize)]
+pub struct IncarnationRow {
+    /// The persisted `BranchRecord.id`.
+    pub id: String,
+    /// 1-based within `(repo, ref_name)`, oldest first.
+    pub number: usize,
+    pub repo: String,
+    pub ref_name: String,
+    pub first_observed_at: u64,
+    pub last_observed_at: u64,
+    /// The head the ref was created at, when the reflog proved it.
+    pub creation_head: Option<String>,
+    /// When the ref was created, when the reflog proved it.
+    pub creation_at: Option<u64>,
+    pub ended_at: Option<u64>,
+    /// The evidence that last established or separated this identity.
+    pub continuity: store::ContinuityEvidence,
+    /// `true` on retained earlier same-name history: it scopes and lists
+    /// but never contributes to the current row.
+    pub excluded: bool,
+}
+
+/// One persisted touch interval as the snapshot serializes it: the
+/// conversation's placement on an incarnation with HEAD, provenance and
+/// confidence. Times are epoch seconds.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TouchRow {
+    /// The touched `BranchRecord.id`.
+    pub incarnation_id: String,
+    pub repo: String,
+    pub ref_name: String,
+    /// The incarnation's 1-based number within `(repo, ref_name)`.
+    pub incarnation: usize,
+    /// The ref's tip the placement observed.
+    pub head: String,
+    pub valid_from: u64,
+    /// `None` while the placement is current.
+    pub valid_until: Option<u64>,
+    pub provenance: store::TouchProvenance,
+    pub confidence: store::Confidence,
+}
+
 /// One Work row: a checkout on a branch, a detached checkout, a local branch
 /// without one, or a non-git project space.
 #[derive(Debug, Clone, Serialize)]
@@ -328,6 +373,13 @@ pub struct WorkRow {
     /// branch rows, the canonical path for a detached worktree or a
     /// project space. `None` for a branch that has no record yet.
     pub identity: Option<String>,
+    /// The active incarnation the identity names - its `#N` number and
+    /// continuity evidence. `None` where `identity` is not an incarnation.
+    pub incarnation: Option<IncarnationRow>,
+    /// Retained earlier incarnations of the same `(repo, ref_name)`,
+    /// numbered oldest first and excluded from everything this row
+    /// derives - `h` lists them below the row.
+    pub same_name_history: Vec<IncarnationRow>,
     /// The authored parked flag from `work.json`; suppresses only the
     /// `Forgotten` placement and reads back in the summary as `· parked`.
     pub parked: bool,
@@ -430,6 +482,11 @@ pub struct ConversationRow {
     pub repo: Option<String>,
     pub worktree: Option<PathBuf>,
     pub branch: Option<String>,
+    /// The conversation's persisted touch intervals, in the order they
+    /// landed - the exact placements each pass proved.
+    pub touches: Vec<TouchRow>,
+    /// The incarnation the open interval names, if one is current.
+    pub current_incarnation: Option<String>,
 }
 
 impl ConversationRow {
@@ -980,10 +1037,15 @@ impl Collector {
 
     /// Sync `work.json` with what the pass observed: one ref sync per Git
     /// repo (which closes records for vanished refs and opens new
-    /// incarnations), one path sync per detached anchor and project space.
-    /// Then `model.work` re-reads so the published snapshot's identities
-    /// and parked flags are this pass's, not the stage-1 load's.
+    /// incarnations), one path sync per detached anchor and project
+    /// space, then one touch sync over every conversation's exact
+    /// placement. `model.work` re-reads after each write so the published
+    /// snapshot's identities, intervals and parked flags are this
+    /// pass's, not the stage-1 load's.
     fn sync_work(&mut self, store: &Store, observed_ms: u64) {
+        // `(repo, branch)` -> the tip the pass proved: what a touch's
+        // `head` carries.
+        let mut heads: HashMap<(String, String), String> = HashMap::new();
         for (repo_id, model) in &self.model.repos {
             match &model.data {
                 RepoData::Git(local) => {
@@ -993,8 +1055,17 @@ impl Collector {
                         .iter()
                         .filter_map(|w| {
                             let name = w.state.anchor.branch()?;
+                            if let Some(head) = w.ref_head() {
+                                heads.insert((repo_id.clone(), name.to_owned()), head.to_owned());
+                            }
                             seen.insert(name.to_owned()).then(|| store::ObservedRef {
                                 name: name.to_owned(),
+                                head: w.ref_head().map(str::to_owned),
+                                creation: w.ref_creation().map(|c| store::RefCreationEvidence {
+                                    head: c.head.clone(),
+                                    at_ms: store::epoch_ms(c.at),
+                                }),
+                                renamed_from: w.renamed_from().map(str::to_owned),
                                 inputs: lifecycle_inputs(&w.state),
                             })
                         })
@@ -1026,6 +1097,37 @@ impl Collector {
                     }
                 }
             }
+        }
+        // Repo reconciliation first: placements name the active
+        // incarnation ids the sync just settled.
+        let mut errors = self.refresh_work();
+        self.model.errors.append(&mut errors);
+        let mut placements = Vec::new();
+        for c in &self.model.conversations {
+            let (Some(repo), Some(branch)) = (&c.repo, &c.branch) else {
+                continue;
+            };
+            let Some(record) = self.model.work.branch(repo, branch) else {
+                continue;
+            };
+            // An unproven tip is no exact placement: the touch would name
+            // a head it cannot swear to.
+            let Some(head) = heads.get(&(repo.clone(), branch.clone())) else {
+                continue;
+            };
+            placements.push(store::TouchPlacement {
+                conversation: store::conversation_key(c.provider.as_str(), &c.session_id),
+                branch: record.id.clone(),
+                head: head.clone(),
+                provenance: store::TouchProvenance::Cwd,
+                confidence: store::Confidence::Exact,
+            });
+        }
+        if let Err(e) = store.sync_touches(&placements, observed_ms) {
+            self.model.errors.push(SourceError {
+                source: "work.json".to_owned(),
+                detail: format!("touches: {e}"),
+            });
         }
         let mut errors = self.refresh_work();
         self.model.errors.append(&mut errors);
@@ -1075,6 +1177,25 @@ impl Collector {
         // Stage 1 and the sync already report the file's read errors.
         let _ = self.refresh_work();
         let authored = &self.model.work;
+        // Touches re-derive per publish like the Work identities: stage 1
+        // may show last pass's persisted intervals, the publish after the
+        // sync shows the reconciled ones. The model carries them so
+        // `binds` sees the same rows classification does.
+        let numbers = incarnation_numbers(authored);
+        for c in &mut self.model.conversations {
+            let key = store::conversation_key(c.provider.as_str(), &c.session_id);
+            c.touches = authored
+                .touches
+                .iter()
+                .filter(|t| t.conversation == key)
+                .filter_map(|t| touch_row(t, authored, &numbers))
+                .collect();
+            c.current_incarnation = authored
+                .touches
+                .iter()
+                .rfind(|t| t.conversation == key && t.valid_until.is_none())
+                .map(|t| t.branch.clone());
+        }
         let mut work = Vec::new();
         for (id, model) in &self.model.repos {
             match &model.data {
@@ -1416,6 +1537,27 @@ fn work_row(
             }
         }
     };
+    // The incarnation rows: every retained record of this `(repo,
+    // ref_name)`, numbered oldest first - the active one on the row, the
+    // closed ones as excluded same-name history.
+    let mut incarnation = None;
+    let mut same_name_history = Vec::new();
+    if let Some(name) = &branch {
+        let mut records: Vec<&store::BranchRecord> = authored
+            .branches
+            .values()
+            .filter(|r| r.repo == repo_id && &r.ref_name == name)
+            .collect();
+        sort_incarnations(&mut records);
+        for (number, record) in records.into_iter().enumerate() {
+            let row = incarnation_row(record, number + 1);
+            if record.ended_at.is_some() {
+                same_name_history.push(row);
+            } else {
+                incarnation = Some(row);
+            }
+        }
+    }
     let (removal, deletion) = verdict::cleanup(state, &state.forge);
     WorkRow {
         repo: repo_id.to_owned(),
@@ -1446,6 +1588,8 @@ fn work_row(
             .max(),
         attention: Attention::None,
         identity,
+        incarnation,
+        same_name_history,
         parked,
         forge: state.forge.item,
         pipeline: state.forge.pipeline,
@@ -1528,6 +1672,78 @@ fn work_state_error(repo_id: &str, e: std::io::Error) -> SourceError {
     }
 }
 
+/// Incarnation order within a `(repo, ref_name)`: oldest first,
+/// `(first_observed_at, id)` - the id is a stable tiebreak for two
+/// records a single pass both dated.
+fn sort_incarnations(records: &mut [&store::BranchRecord]) {
+    records.sort_by(|a, b| {
+        a.first_observed_at
+            .cmp(&b.first_observed_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+/// The `#N` numbers: every retained incarnation's 1-based rank within its
+/// `(repo, ref_name)`, ordered `(first_observed_at, id)` - the numbering a
+/// `#1`/`#2` label and a touch path share.
+fn incarnation_numbers(authored: &store::Work) -> HashMap<String, usize> {
+    let mut by_name: HashMap<(&str, &str), Vec<&store::BranchRecord>> = HashMap::new();
+    for record in authored.branches.values() {
+        by_name
+            .entry((record.repo.as_str(), record.ref_name.as_str()))
+            .or_default()
+            .push(record);
+    }
+    let mut numbers = HashMap::new();
+    for records in by_name.values_mut() {
+        sort_incarnations(records);
+        for (i, record) in records.iter().enumerate() {
+            numbers.insert(record.id.clone(), i + 1);
+        }
+    }
+    numbers
+}
+
+/// One persisted record as its serialized row, numbered within its
+/// `(repo, ref_name)` and marked excluded when closed.
+fn incarnation_row(record: &store::BranchRecord, number: usize) -> IncarnationRow {
+    IncarnationRow {
+        id: record.id.clone(),
+        number,
+        repo: record.repo.clone(),
+        ref_name: record.ref_name.clone(),
+        first_observed_at: record.first_observed_at / 1000,
+        last_observed_at: record.last_observed_at / 1000,
+        creation_head: record.creation_evidence.as_ref().map(|c| c.head.clone()),
+        creation_at: record.creation_evidence.as_ref().map(|c| c.at_ms / 1000),
+        ended_at: record.ended_at.map(|ms| ms / 1000),
+        continuity: record.continuity_evidence,
+        excluded: record.ended_at.is_some(),
+    }
+}
+
+/// One persisted touch interval as its serialized row: the incarnation's
+/// repo, name and number resolved from the authored records. `None` when
+/// the record itself is gone.
+fn touch_row(
+    touch: &store::BranchTouch,
+    authored: &store::Work,
+    numbers: &HashMap<String, usize>,
+) -> Option<TouchRow> {
+    let record = authored.branches.get(&touch.branch)?;
+    Some(TouchRow {
+        incarnation_id: touch.branch.clone(),
+        repo: record.repo.clone(),
+        ref_name: record.ref_name.clone(),
+        incarnation: numbers.get(&touch.branch).copied().unwrap_or(0), // coverage: off - numbering covers every stored record
+        head: touch.head.clone(),
+        valid_from: touch.valid_from / 1000,
+        valid_until: touch.valid_until.map(|ms| ms / 1000),
+        provenance: touch.provenance,
+        confidence: touch.confidence,
+    })
+}
+
 /// Refresh a path-keyed row's authored fields - a project space's row is
 /// stored in the model, so parked and transition dates apply per publish.
 fn apply_path_record(row: &mut WorkRow, authored: &store::Work) {
@@ -1544,18 +1760,26 @@ fn apply_path_record(row: &mut WorkRow, authored: &store::Work) {
     }
 }
 
-/// Whether the conversation is bound to the work row: its checkout path for
-/// a row with one, its branch for a branch-only row, its repo identity for
-/// a project space. A detached row binds only by path.
+/// Whether the conversation is bound to the work row: an open exact
+/// touch to the row's incarnation for a branch-bearing row - the name
+/// and the worktree path are only labels, the touch is the binding - a
+/// checkout path for a detached row, or its repo identity for a project
+/// space. A branch row with no recorded incarnation binds nothing
+/// rather than guessing.
 pub fn binds(row: &WorkRow, c: &ConversationRow) -> bool {
     match (row.kind, row.worktree.as_deref(), row.branch.as_deref()) {
         (WorkKind::ProjectSpace, _, _) => c.repo.as_deref() == Some(row.repo.as_str()),
-        (_, Some(root), _) => {
+        (WorkKind::Detached, Some(root), _) => {
             c.repo.as_deref() == Some(row.repo.as_str()) && c.worktree.as_deref() == Some(root)
         }
-        (_, None, Some(branch)) => {
-            c.repo.as_deref() == Some(row.repo.as_str()) && c.branch.as_deref() == Some(branch)
-        }
+        (_, _, Some(_)) => match &row.identity {
+            Some(id) => c.touches.iter().any(|t| {
+                t.incarnation_id == *id
+                    && t.valid_until.is_none()
+                    && t.confidence == store::Confidence::Exact
+            }),
+            None => false,
+        },
         // A row with neither worktree nor branch binds nothing; anchors
         // always carry one.
         _ => false, // coverage: off - a fabricated row shape: anchors always carry a worktree or a branch
@@ -1884,6 +2108,8 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         last_activity: None,
         attention: Attention::None,
         identity: Some(path.display().to_string()),
+        incarnation: None,
+        same_name_history: Vec::new(),
         parked: false,
         forge: WorkItem::Unknown,
         pipeline: Pipeline::Unknown,
@@ -2141,6 +2367,8 @@ fn conversation_row(
         repo,
         worktree,
         branch,
+        touches: Vec::new(),
+        current_incarnation: None,
     }
 }
 
@@ -2282,6 +2510,39 @@ mod tests {
         }
     }
 
+    /// A branch record fabricated to order.
+    fn branch_record(id: &str, first_ms: u64, ended_ms: Option<u64>) -> store::BranchRecord {
+        store::BranchRecord {
+            id: id.to_owned(),
+            repo: "/r/.git".to_owned(),
+            ref_name: "feat".to_owned(),
+            first_observed_at: first_ms,
+            last_observed_at: first_ms,
+            creation_evidence: None,
+            continuity_evidence: store::ContinuityEvidence::FirstObservation,
+            ended_at: ended_ms,
+            parked: false,
+            activity_at: None,
+            inputs: store::LifecycleInputs::default(),
+        }
+    }
+
+    /// An open exact touch to `id`, as a fabricated conversation carries
+    /// it.
+    fn open_touch(id: &str) -> TouchRow {
+        TouchRow {
+            incarnation_id: id.to_owned(),
+            repo: "/r/.git".to_owned(),
+            ref_name: "feat".to_owned(),
+            incarnation: 1,
+            head: "aaaaaa".to_owned(),
+            valid_from: 1_000,
+            valid_until: None,
+            provenance: store::TouchProvenance::Cwd,
+            confidence: store::Confidence::Exact,
+        }
+    }
+
     /// A derived verdict fabricated to order.
     fn derived(exec: Exec, attention: Attention) -> attention::Derived {
         attention::Derived {
@@ -2295,6 +2556,118 @@ mod tests {
             journal_seq: 0,
             marked: false,
         }
+    }
+
+    #[test]
+    fn incarnation_numbering_is_oldest_first_with_a_stable_tiebreak() {
+        // Two records one pass both dated order by id - deterministic,
+        // never insertion order.
+        let mut work = store::Work::default();
+        work.branches
+            .insert("i-zz".to_owned(), branch_record("i-zz", 1_000, Some(2_000)));
+        work.branches
+            .insert("i-aa".to_owned(), branch_record("i-aa", 1_000, None));
+        work.branches
+            .insert("i-old".to_owned(), branch_record("i-old", 500, None));
+        let numbers = incarnation_numbers(&work);
+        assert_eq!(numbers["i-old"], 1);
+        assert_eq!(numbers["i-aa"], 2);
+        assert_eq!(numbers["i-zz"], 3);
+    }
+
+    #[test]
+    fn a_touch_whose_record_is_gone_serializes_to_nothing() {
+        // A dangling interval - a record pruned while the touch that
+        // referenced it was lost - is dropped from the view, not guessed.
+        let work = store::Work::default();
+        let numbers = incarnation_numbers(&work);
+        let touch = store::BranchTouch {
+            conversation: "claude:s1".to_owned(),
+            branch: "i-gone".to_owned(),
+            head: "a".to_owned(),
+            valid_from: 1_000,
+            valid_until: None,
+            provenance: store::TouchProvenance::Cwd,
+            confidence: store::Confidence::Exact,
+        };
+        assert!(touch_row(&touch, &work, &numbers).is_none());
+        // With the record present, the interval resolves its context.
+        let mut work = store::Work::default();
+        work.branches
+            .insert("i-1".to_owned(), branch_record("i-1", 1_000, Some(2_000)));
+        let numbers = incarnation_numbers(&work);
+        let touch = store::BranchTouch {
+            conversation: "claude:s1".to_owned(),
+            branch: "i-1".to_owned(),
+            head: "a".to_owned(),
+            valid_from: 1_500,
+            valid_until: Some(2_000),
+            provenance: store::TouchProvenance::Cwd,
+            confidence: store::Confidence::Exact,
+        };
+        let row = touch_row(&touch, &work, &numbers).expect("the row resolves");
+        assert_eq!(row.incarnation, 1);
+        assert_eq!(row.ref_name, "feat");
+        assert_eq!(row.valid_from, 1);
+        assert_eq!(row.valid_until, Some(2));
+    }
+
+    #[test]
+    fn work_row_splits_active_incarnation_from_excluded_history() {
+        // The same-name records split across the row: the active one is
+        // the numbered incarnation, the closed ones are excluded history.
+        let mut work = store::Work::default();
+        work.branches
+            .insert("i-1".to_owned(), branch_record("i-1", 1_000, Some(2_000)));
+        work.branches
+            .insert("i-2".to_owned(), branch_record("i-2", 3_000, Some(4_000)));
+        work.branches
+            .insert("i-3".to_owned(), branch_record("i-3", 5_000, None));
+        work.active_branches
+            .insert("/r/.git\0feat".to_owned(), "i-3".to_owned());
+        let state = vector::WorkState {
+            repo: git::Repo {
+                common_dir: PathBuf::from("/r/.git"),
+            },
+            anchor: Anchor::Branch {
+                name: "feat".to_owned(),
+            },
+            remote_url: None,
+            base: Evidence::Unknown("no base asked".to_owned()),
+            forge: ForgeStatus {
+                item: WorkItem::Unknown,
+                pipeline: Pipeline::Unknown,
+                label: None,
+                url: None,
+                reason: None,
+            },
+            vector: vector::StateVector {
+                worktree: None,
+                windows: WindowCount::default(),
+                live_pids: 0,
+                live_agent_sessions: 0,
+                past_agent_sessions: 0,
+                dirty: Evidence::Known(false),
+                commits_ahead_of_base: Evidence::Unknown("none asked".to_owned()),
+                upstream_state: UpstreamState::NotApplicable,
+                unpushed_commits: Evidence::Unknown("none asked".to_owned()),
+                landed: Evidence::Unknown("none asked".to_owned()),
+                last_git_activity: None,
+            },
+        };
+        let row = work_row("/r/.git", "r", &state, &work);
+        let inc = row.incarnation.expect("the active incarnation");
+        assert_eq!(inc.id, "i-3");
+        assert_eq!(inc.number, 3);
+        assert!(!inc.excluded);
+        let ids: Vec<&str> = row
+            .same_name_history
+            .iter()
+            .map(|h| h.id.as_str())
+            .collect();
+        assert_eq!(ids, ["i-1", "i-2"]);
+        assert!(row.same_name_history.iter().all(|h| h.excluded));
+        assert_eq!(row.identity.as_deref(), Some("i-3"));
     }
 
     #[test]
@@ -2461,6 +2834,9 @@ mod tests {
                 Some("feat".to_owned()),
             );
             c.state = state;
+            // The fabricated row's identity is its path; the touch to it
+            // is what binds the conversation to the row.
+            c.touches = vec![open_touch("/r")];
             c
         };
         // `classify_work` composes the summary once per publish; the test
@@ -2516,9 +2892,11 @@ mod tests {
         let mut row = fresh();
         classify_work(&mut row, &[], threshold, now);
         assert_eq!(row.summary, "open · no wt ↑?");
-        // A conversation on another branch does not bind.
+        // A conversation on another branch does not bind: its touch
+        // names a different incarnation.
         let mut other = conv(Attention::Waiting, ConversationState::Waiting);
         other.branch = Some("elsewhere".to_owned());
+        other.touches = vec![open_touch("i-elsewhere")];
         classify_work(&mut row, &[other], threshold, now);
         assert_eq!(row.section, WorkSection::FollowUp);
         assert_eq!(row.attention, Attention::None);
@@ -2828,6 +3206,8 @@ mod tests {
             repo: None,
             worktree: None,
             branch: None,
+            touches: Vec::new(),
+            current_incarnation: None,
         };
         let now = SystemTime::now();
         // The inbox order is the attention rank, not the state.

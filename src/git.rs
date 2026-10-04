@@ -384,6 +384,9 @@ pub struct BranchFact {
     /// reported for a worktree whose directory was deleted, which matches
     /// `worktree list`'s prunable records.
     pub worktree: Option<PathBuf>,
+    /// `%(objectname)`: the branch tip's OID - what a continuity check
+    /// compares the persisted creation evidence's head against.
+    pub head: Option<String>,
 }
 
 /// The batched ref read: every local branch's [`BranchFact`] plus every
@@ -557,7 +560,7 @@ impl Repo {
             self,
             &[
                 "for-each-ref",
-                "--format=%(refname)%00%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream:track)%00%(committerdate:unix)%00%(worktreepath)%00%(symref)",
+                "--format=%(refname)%00%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream:track)%00%(committerdate:unix)%00%(worktreepath)%00%(symref)%00%(objectname)",
                 "refs/heads",
                 "refs/remotes",
             ],
@@ -632,6 +635,53 @@ impl Repo {
                 }
             }
         }
+    }
+
+    /// Every local branch's tip OID from one `for-each-ref`: the fallback
+    /// the `ref_facts` error arm keeps for tip evidence on a git too old
+    /// for the upstream atoms - `refname` and `objectname` are the oldest
+    /// atoms the command knows.
+    pub fn branch_tips(&self) -> Result<HashMap<String, String>, Error> {
+        let text = in_repo(
+            self,
+            &[
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)",
+                "refs/heads/",
+            ],
+        )?; // coverage: off - needs a git too old for the ref_facts atoms
+        Ok(parse_branch_tips(&text)) // coverage: off - same
+    }
+
+    /// The incarnation evidence one branch's own reflog proves: the newest
+    /// null-old entry names the head and moment this incarnation came to
+    /// be, and the latest `Branch: renamed` line names the ref the log
+    /// moved from. A deleted ref's log is gone with it; a recreated ref's
+    /// log starts on a fresh null-old line, and a rename carries the whole
+    /// log - original creation line included - to the new name.
+    pub fn ref_lifecycle(&self, branch: &str) -> RefLifecycle {
+        let path = self.common_dir.join(format!("logs/refs/heads/{branch}"));
+        let mut lifecycle = RefLifecycle::default();
+        let Ok(text) = fs::read_to_string(&path) else {
+            return lifecycle;
+        };
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let Some(entry) = ReflogEntry::parse(line) else {
+                continue;
+            };
+            if entry.creation {
+                lifecycle.creation = Some(RefCreation {
+                    head: entry.head.clone(),
+                    at: entry.at,
+                });
+            }
+            if let Some((old, new)) = &entry.renamed
+                && new == branch
+            {
+                lifecycle.renamed_from = Some(old.clone());
+            }
+        }
+        lifecycle
     }
 
     /// Whether `refname` resolves locally (`rev-parse --verify -q`).
@@ -766,6 +816,25 @@ impl Repo {
     }
 }
 
+/// What a branch's own reflog proves about this incarnation of the ref.
+#[derive(Debug, Clone, Default)]
+pub struct RefLifecycle {
+    /// The newest null-old entry: the head and moment this incarnation
+    /// came to be.
+    pub creation: Option<RefCreation>,
+    /// The short name a `Branch: renamed` entry moved this log from.
+    pub renamed_from: Option<String>,
+}
+
+/// A ref's creation as its reflog's newest null-old entry proves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefCreation {
+    /// The tip the ref was created at - `new` on the null-old line.
+    pub head: String,
+    /// The committer-clock time stamped on the creation entry.
+    pub at: SystemTime,
+}
+
 /// What one reflog proves about its ref's lifecycle.
 #[derive(Debug, Default)]
 pub struct ReflogTimes {
@@ -786,6 +855,11 @@ struct ReflogEntry {
     work: bool,
     /// The committer-clock epoch stamped on the line.
     at: SystemTime,
+    /// The line's `new` sha: the tip after this entry.
+    head: String,
+    /// `(old, new)` short names when the message is exactly
+    /// `Branch: renamed refs/heads/<old> to refs/heads/<new>`.
+    renamed: Option<(String, String)>,
 }
 
 impl ReflogEntry {
@@ -821,8 +895,32 @@ impl ReflogEntry {
             creation,
             work,
             at: UNIX_EPOCH + Duration::from_secs(epoch),
+            head: new.to_owned(),
+            renamed: parse_rename(message),
         })
     }
+}
+
+/// `Branch: renamed refs/heads/<old> to refs/heads/<new>` -> `(<old>,
+/// <new>)` as short names, exact. Anything else is not rename evidence.
+fn parse_rename(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("Branch: renamed refs/heads/")?;
+    let (old, new) = rest.split_once(" to refs/heads/")?;
+    Some((old.to_owned(), new.to_owned()))
+}
+
+/// The `branch_tips` output: `refs/heads/<name>\0<oid>` per line; a
+/// malformed line is dropped rather than guessed at.
+fn parse_branch_tips(text: &str) -> HashMap<String, String> {
+    let mut tips = HashMap::new();
+    for line in text.lines() {
+        if let Some((refname, oid)) = line.split_once('\0')
+            && let Some(name) = refname.strip_prefix("refs/heads/")
+        {
+            tips.insert(name.to_owned(), oid.to_owned());
+        }
+    }
+    tips
 }
 
 /// The `ref_facts` output: one line per ref - refnames can never contain a
@@ -846,6 +944,9 @@ fn parse_ref_facts(text: &str) -> RefFacts {
             let track = fields.next().and_then(parse_track);
             let committer_date = fields.next().and_then(|d| d.parse::<u64>().ok());
             let worktree = fields.next().filter(|w| !w.is_empty()).map(PathBuf::from);
+            // `%(symref)` sits between worktreepath and objectname; a local
+            // branch is never a symref, so the field is skipped unread.
+            let head = fields.nth(1).filter(|h| !h.is_empty()).map(str::to_owned);
             facts.branches.insert(
                 branch.to_owned(),
                 BranchFact {
@@ -853,11 +954,13 @@ fn parse_ref_facts(text: &str) -> RefFacts {
                     track,
                     committer_date,
                     worktree,
+                    head,
                 },
             );
         } else if let Some(rest) = refname.strip_prefix("refs/remotes/") {
-            // `%(symref)` is the last field: non-empty only for the
-            // `<remote>/HEAD` symbolic refs.
+            // `%(symref)` is field six: non-empty only for the
+            // `<remote>/HEAD` symbolic refs. `%(objectname)` after it is
+            // branch-tip evidence the remotes arm does not read.
             let symref = fields.nth(5).unwrap_or("");
             if let Some(remote) = rest.strip_suffix("/HEAD")
                 && let Some(target) = symref
@@ -1516,17 +1619,80 @@ mod tests {
     }
 
     #[test]
+    fn ref_lifecycle_reads_creation_head_and_rename() {
+        let temp = Temp::new();
+        let repo = Repo {
+            common_dir: temp.0.clone(),
+        };
+        // No log at all is no evidence.
+        let lifecycle = repo.ref_lifecycle("feat");
+        assert!(lifecycle.creation.is_none());
+        assert!(lifecycle.renamed_from.is_none());
+
+        fs::create_dir_all(temp.0.join("logs/refs/heads")).unwrap();
+        // The newest null-old line is the incarnation's creation; the
+        // latest rename INTO this name is its source. Unparseable lines
+        // and renames that moved the log AWAY do not count.
+        fs::write(
+            temp.0.join("logs/refs/heads/feat"),
+            "0000 aaaa A Name <a@b> 1700000000 +0200\tbranch: Created from main\n\
+             aaaa bbbb A Name <a@b> 1700000100 +0200\tcommit: work\n\
+             a line that is not a reflog entry\n\
+             bbbb bbbb A Name <a@b> 1700000200 +0200\tBranch: renamed refs/heads/old to refs/heads/feat\n\
+             bbbb bbbb A Name <a@b> 1700000300 +0200\tBranch: renamed refs/heads/feat to refs/heads/elsewhere\n",
+        )
+        .unwrap();
+        let lifecycle = repo.ref_lifecycle("feat");
+        let creation = lifecycle.creation.expect("the creation line");
+        assert_eq!(creation.head, "aaaa");
+        assert_eq!(creation.at, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        assert_eq!(lifecycle.renamed_from.as_deref(), Some("old"));
+
+        // A second null-old line - the shape a recreated ref's fresh log
+        // shows - is the newest creation, not the first.
+        fs::write(
+            temp.0.join("logs/refs/heads/feat"),
+            "0000 cccc A Name <a@b> 1700001000 +0200\tbranch: Created from main\n",
+        )
+        .unwrap();
+        let lifecycle = repo.ref_lifecycle("feat");
+        assert_eq!(lifecycle.creation.unwrap().head, "cccc");
+        assert!(lifecycle.renamed_from.is_none());
+    }
+
+    #[test]
+    fn rename_and_tip_lines_parse_only_their_real_shapes() {
+        // The rename evidence is exact: the fixed prefix, then ` to
+        // refs/heads/`; anything looser is not a rename.
+        assert_eq!(
+            parse_rename("Branch: renamed refs/heads/a to refs/heads/b"),
+            Some(("a".to_owned(), "b".to_owned()))
+        );
+        assert_eq!(parse_rename("commit: work"), None);
+        assert_eq!(parse_rename("Branch: renamed a to b"), None);
+        assert_eq!(
+            parse_rename("Branch: renamed refs/heads/a to something-else"),
+            None
+        );
+        // The tips output keeps heads lines only; a malformed line drops.
+        let tips = parse_branch_tips("refs/heads/a\0aaaa\nrefs/remotes/r/a\0bbbb\nno-separator\n");
+        assert_eq!(tips["a"], "aaaa");
+        assert_eq!(tips.len(), 1);
+    }
+
+    #[test]
     fn ref_facts_parses_every_atom_shape() {
-        // refname, upstream pair, track, committerdate, worktreepath, symref.
+        // refname, upstream pair, track, committerdate, worktreepath,
+        // symref, objectname.
         let text = concat!(
-            "refs/heads/main\0origin\0refs/heads/main\0\01700000000\0/wt/main\0\n",
-            "refs/heads/feat\0origin\0refs/heads/feat\0[ahead 2, behind 1]\01700000001\0\0\n",
-            "refs/heads/gone\0origin\0refs/heads/gone\0[gone]\01700000002\0/wt/gone\0\n",
-            "refs/heads/lone\0\0\0\01700000003\0\0\n",
-            "refs/remotes/origin/main\0\0\0[behind 4]\01700000000\0\0\n",
-            "refs/remotes/origin/HEAD\0\0\0\0\0\0refs/remotes/origin/main\n",
+            "refs/heads/main\0origin\0refs/heads/main\0\01700000000\0/wt/main\0\0aaaa\n",
+            "refs/heads/feat\0origin\0refs/heads/feat\0[ahead 2, behind 1]\01700000001\0\0\0bbbb\n",
+            "refs/heads/gone\0origin\0refs/heads/gone\0[gone]\01700000002\0/wt/gone\0\0cccc\n",
+            "refs/heads/lone\0\0\0\01700000003\0\0\0dddd\n",
+            "refs/remotes/origin/main\0\0\0[behind 4]\01700000000\0\0\0eeee\n",
+            "refs/remotes/origin/HEAD\0\0\0\0\0\0refs/remotes/origin/main\0ffff\n",
             "garbage-without-fields\n",
-            "refs/tags/v1\0\0\0\0\0\0\0\n",
+            "refs/tags/v1\0\0\0\0\0\0\0\0gggg\n",
         );
         let facts = parse_ref_facts(text);
 
@@ -1540,6 +1706,7 @@ mod tests {
         );
         assert_eq!(main.worktree.as_deref(), Some(Path::new("/wt/main")));
         assert_eq!(main.committer_date, Some(1700000000));
+        assert_eq!(main.head.as_deref(), Some("aaaa"));
         // An empty track field is "in sync", not "no data".
         assert_eq!(main.track, None);
 

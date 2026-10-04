@@ -287,6 +287,12 @@ struct AnchorLocal {
     unreachable: Option<Evidence<u64>>,
     dirty: Evidence<bool>,
     last_git_activity: Option<SystemTime>,
+    /// The branch tip's OID, from the batch or the old-git fallback.
+    head_oid: Option<String>,
+    /// The newest null-old creation the branch's own reflog proves.
+    creation: Option<git::RefCreation>,
+    /// The short name a `Branch: renamed` reflog line moved this ref from.
+    renamed_from: Option<String>,
 }
 
 /// One anchor with its local facts and current vector state.
@@ -309,6 +315,22 @@ impl AnchorWork {
                 _ => None,
             },
         }
+    }
+
+    /// The tip OID the pass proved for the anchor's branch, if any.
+    pub fn ref_head(&self) -> Option<&str> {
+        self.local.head_oid.as_deref()
+    }
+
+    /// The newest null-old creation the branch's reflog proves.
+    pub fn ref_creation(&self) -> Option<&git::RefCreation> {
+        self.local.creation.as_ref()
+    }
+
+    /// The short name a `Branch: renamed` reflog line moved this ref
+    /// from - the exact evidence that preserves identity across names.
+    pub fn renamed_from(&self) -> Option<&str> {
+        self.local.renamed_from.as_deref()
     }
 
     /// Patch the remote-owned fields from a finished [`apply_remote`].
@@ -356,8 +378,12 @@ pub fn collect_local_repo(
     runtime_of: impl Fn(&Anchor) -> RuntimeFacts,
 ) -> Result<RepoLocal, git::Error> {
     // The batch is best-effort: an older git rejects the atom format and
-    // every batched fact falls back to its per-branch probe.
+    // every batched fact falls back to its per-branch probe - except the
+    // tip OIDs, which the fallback reads in one `for-each-ref`.
     let facts = repo.ref_facts().ok();
+    let tips = facts
+        .is_none()
+        .then(|| repo.branch_tips().unwrap_or_default()); // coverage: off - needs a git too old for the atoms
     let mut anchors = Vec::new();
     let mut checked_out = std::collections::HashSet::new();
     for wt in repo.worktrees()? {
@@ -398,7 +424,7 @@ pub fn collect_local_repo(
         .into_iter()
         .map(|anchor| {
             let runtime = runtime_of(&anchor);
-            anchor_work(repo, anchor, facts.as_ref(), runtime)
+            anchor_work(repo, anchor, facts.as_ref(), tips.as_ref(), runtime)
         })
         .collect();
     let remotes = repo.remotes();
@@ -459,11 +485,20 @@ fn anchor_work(
     repo: &Repo,
     anchor: Anchor,
     facts: Option<&git::RefFacts>,
+    tips: Option<&HashMap<String, String>>,
     runtime: RuntimeFacts,
 ) -> AnchorWork {
     let branch = anchor.branch();
     let fact = branch.and_then(|b| facts.and_then(|f| f.branches.get(b)));
     let config = branch.map(|b| upstream_config(repo, b, fact));
+    // The branch's own reflog is the incarnation evidence: the newest
+    // null-old entry proves this incarnation's creation, and a
+    // `Branch: renamed` line proves continuity through a rename.
+    let lifecycle = branch.map(|name| repo.ref_lifecycle(name));
+    let head_oid = branch.and_then(|name| {
+        fact.and_then(|f| f.head.clone())
+            .or_else(|| tips.and_then(|m| m.get(name).cloned()))
+    });
     let local = AnchorLocal {
         remote_url: remote_url(repo, &config),
         config,
@@ -486,6 +521,9 @@ fn anchor_work(
             Anchor::Branch { .. } => Evidence::Known(false),
         },
         last_git_activity: last_git_activity(repo, &anchor, fact),
+        head_oid,
+        creation: lifecycle.as_ref().and_then(|l| l.creation.clone()),
+        renamed_from: lifecycle.and_then(|l| l.renamed_from),
     };
     let state = WorkState {
         repo: repo.clone(),
@@ -960,7 +998,8 @@ fn probe_repo_local(
     runtime: RuntimeFacts,
     remotes: Result<Vec<String>, git::Error>,
 ) -> RepoLocal {
-    let work = anchor_work(repo, anchor, None, runtime);
+    let tips = repo.branch_tips().unwrap_or_default();
+    let work = anchor_work(repo, anchor, None, Some(&tips), runtime);
     let asks = remote_asks(std::slice::from_ref(&work), &remotes);
     let local_heads = local_heads(repo, &asks, None);
     RepoLocal {

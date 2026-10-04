@@ -442,12 +442,109 @@ impl LifecycleInputs {
     }
 }
 
+/// A ref's creation as its reflog's newest null-old entry proves it: the
+/// head the ref came to be at, and when, in epoch milliseconds. Two
+/// incarnations sharing the name never share this evidence - a deleted
+/// ref's log dies with it and a recreated ref starts a fresh null-old
+/// line, so unequal creations are a proven boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefCreationEvidence {
+    /// The tip the ref was created at.
+    pub head: String,
+    /// When the ref was created, epoch milliseconds.
+    pub at_ms: u64,
+}
+
+/// Which evidence last established - or separated - an incarnation's
+/// identity. `ProvenRename` and `Ambiguous` are terminal for the record:
+/// they say how it began under this name, and later confirmations do not
+/// rewrite that. The rest track the latest continuity decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuityEvidence {
+    /// First sighting: nothing prior had to be reconciled.
+    #[default]
+    FirstObservation,
+    /// The persisted creation evidence matched the ref's reflog.
+    SameReflogCreation,
+    /// A `Branch: renamed` reflog line moved the record to this name.
+    ProvenRename,
+    /// The tip moved while the creation evidence held.
+    ForcePush,
+    /// A boundary was detected but no evidence could prove which side of
+    /// it the history belongs to: the record was separated rather than
+    /// merged.
+    Ambiguous,
+}
+
+/// What a touch placement was derived from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TouchProvenance {
+    /// The conversation's cwd resolved inside a checkout of the branch.
+    Cwd,
+    /// The provider declared the branch itself.
+    ProviderBranch,
+}
+
+/// How exact a touch's placement claim is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    /// Proven: the placement carries no inference.
+    Exact,
+}
+
+/// One interval of a conversation's placement on a branch incarnation:
+/// append-only history - a correction never rewrites an interval, it
+/// closes it and opens the next.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchTouch {
+    /// `conversation_key(provider, session)`.
+    pub conversation: String,
+    /// The incarnation's `BranchRecord.id`.
+    pub branch: String,
+    /// The ref's tip the placement observed.
+    pub head: String,
+    /// Interval start, epoch milliseconds.
+    pub valid_from: u64,
+    /// Interval end, epoch ms; `None` while current.
+    #[serde(default)]
+    pub valid_until: Option<u64>,
+    pub provenance: TouchProvenance,
+    pub confidence: Confidence,
+}
+
+/// One conversation's exact placement on an incarnation, as a pass
+/// observed it: the open interval [`Store::sync_touches`] reconciles
+/// against.
+#[derive(Debug, Clone)]
+pub struct TouchPlacement {
+    /// `conversation_key(provider, session)`.
+    pub conversation: String,
+    /// The active incarnation's `BranchRecord.id`.
+    pub branch: String,
+    /// The ref's tip at the observation.
+    pub head: String,
+    /// What the placement was derived from.
+    pub provenance: TouchProvenance,
+    /// How exact the placement is; only `Exact` exists today.
+    pub confidence: Confidence,
+}
+
 /// One local ref a pass observed in a repository, with the facts the
-/// record fingerprints.
+/// record fingerprints and the lifecycle evidence continuity judges by.
 #[derive(Debug, Clone)]
 pub struct ObservedRef {
     /// The short branch name (`refs/heads/<name>`).
     pub name: String,
+    /// The ref's tip OID this pass, when the collector proved it.
+    pub head: Option<String>,
+    /// The newest null-old reflog entry's creation evidence.
+    pub creation: Option<RefCreationEvidence>,
+    /// The short name a `Branch: renamed` reflog line moved this ref
+    /// from - the exact evidence that preserves identity across names.
+    pub renamed_from: Option<String>,
     pub inputs: LifecycleInputs,
 }
 
@@ -465,6 +562,20 @@ pub struct BranchRecord {
     pub ref_name: String,
     /// The first pass that observed the ref, epoch milliseconds.
     pub first_observed_at: u64,
+    /// The newest observation the record absorbed, epoch milliseconds:
+    /// it moves when the record is opened, renamed or changed - an
+    /// unchanged record is not re-dated, so an unchanged pass rewrites
+    /// no file. Records written before this field existed carry `0`
+    /// until their next absorbed observation.
+    #[serde(default)]
+    pub last_observed_at: u64,
+    /// The ref's creation evidence as last proven - what continuity is
+    /// judged against.
+    #[serde(default)]
+    pub creation_evidence: Option<RefCreationEvidence>,
+    /// The evidence that last established or separated this identity.
+    #[serde(default)]
+    pub continuity_evidence: ContinuityEvidence,
     /// When the ref was observed gone, epoch ms; `None` while active.
     #[serde(default)]
     pub ended_at: Option<u64>,
@@ -507,6 +618,10 @@ pub struct Work {
     /// Canonical path -> the detached worktree or project space record.
     #[serde(default)]
     pub paths: std::collections::BTreeMap<String, PathRecord>,
+    /// Every touch interval ever recorded, append-only: the conversation
+    /// placements each pass proved, in the order they landed.
+    #[serde(default)]
+    pub touches: Vec<BranchTouch>,
 }
 
 impl Work {
@@ -564,6 +679,105 @@ fn incarnation_id(repo: &str, ref_name: &str, at_ms: u64) -> String {
     )
         .hash(&mut h);
     format!("i{:016x}", h.finish())
+}
+
+/// How long a closed incarnation record is kept: ninety days, or as long
+/// as a touch references it - whichever outlives the other.
+const RETAIN_CLOSED_MS: u64 = 90 * 24 * 3600 * 1000;
+
+/// Whether the observation proves the still-present ref is not the
+/// recorded incarnation, and how the new record labels the split: a
+/// creation strictly newer than the stored one is a proven recreate
+/// (`FirstObservation`), anything else detectable - an equal-time or
+/// older creation the record cannot explain, or a creation dated after
+/// the record's first observation while the record carried no evidence
+/// at all - is a boundary without a proven side, `Ambiguous`. `None`
+/// means no boundary is detectable: the observation continues the record.
+fn creation_boundary(record: &BranchRecord, obs: &ObservedRef) -> Option<ContinuityEvidence> {
+    match (&record.creation_evidence, &obs.creation) {
+        (Some(have), Some(seen)) if have != seen => Some(if seen.at_ms > have.at_ms {
+            ContinuityEvidence::FirstObservation
+        } else {
+            ContinuityEvidence::Ambiguous
+        }),
+        // The record was made before creation evidence existed, and the
+        // observed creation postdates it: the ref it recorded is gone.
+        (None, Some(seen)) if seen.at_ms > record.first_observed_at => {
+            Some(ContinuityEvidence::FirstObservation)
+        }
+        _ => None,
+    }
+}
+
+/// The continuity a confirmed-same record carries: the tip at the
+/// creation head is `same_reflog_creation`, a moved tip under unchanged
+/// creation evidence is `force_push`. `None` when the tip was not proven
+/// this pass - the record keeps its last proven reading.
+fn continuity_of(
+    creation: Option<&RefCreationEvidence>,
+    head: Option<&str>,
+) -> Option<ContinuityEvidence> {
+    let creation = creation?;
+    Some(match head {
+        Some(head) if head == creation.head => ContinuityEvidence::SameReflogCreation,
+        Some(_) => ContinuityEvidence::ForcePush,
+        None => return None,
+    })
+}
+
+/// Open a new incarnation for `obs` at `observed_ms`: new id, `parked:
+/// false`, the observation's evidence and fingerprint stored.
+fn open_incarnation(
+    work: &mut Work,
+    repo: &str,
+    obs: &ObservedRef,
+    observed_ms: u64,
+    continuity: ContinuityEvidence,
+) {
+    let id = incarnation_id(repo, &obs.name, observed_ms);
+    work.branches.insert(
+        id.clone(),
+        BranchRecord {
+            id: id.clone(),
+            repo: repo.to_owned(),
+            ref_name: obs.name.clone(),
+            first_observed_at: observed_ms,
+            last_observed_at: observed_ms,
+            creation_evidence: obs.creation.clone(),
+            continuity_evidence: continuity,
+            ended_at: None,
+            parked: false,
+            activity_at: None,
+            inputs: obs.inputs.clone(),
+        },
+    );
+    work.active_branches.insert(branch_key(repo, &obs.name), id);
+}
+
+/// Close every open touch interval naming `branch` at `at_ms`: an
+/// incarnation that ended cannot keep current placements.
+fn close_touches(work: &mut Work, branch: &str, at_ms: u64) -> bool {
+    let mut closed = false;
+    for touch in &mut work.touches {
+        if touch.branch == branch && touch.valid_until.is_none() {
+            touch.valid_until = Some(at_ms);
+            closed = true;
+        }
+    }
+    closed
+}
+
+/// The touch interval a placement opens.
+fn touch_of(placement: &TouchPlacement, at_ms: u64) -> BranchTouch {
+    BranchTouch {
+        conversation: placement.conversation.clone(),
+        branch: placement.branch.clone(),
+        head: placement.head.clone(),
+        valid_from: at_ms,
+        valid_until: None,
+        provenance: placement.provenance,
+        confidence: placement.confidence,
+    }
 }
 
 /// The checkpoint file: the reduction at `through` commit sequence.
@@ -868,6 +1082,16 @@ impl Store {
     /// fingerprinted without dating activity. A changed fingerprint on a
     /// live record is a lifecycle transition dated `observed_ms`.
     ///
+    /// Continuity: a proven `Branch: renamed` line moves the record with
+    /// its id; reflog creation evidence that no longer matches proves a
+    /// boundary the ref's continued presence hid (a missed
+    /// delete/recreate); a tip move under unchanged creation evidence is
+    /// continuous (`force_push`), never a boundary; and evidence that
+    /// detects a boundary it cannot explain separates rather than merges
+    /// (`ambiguous`). Closing a record closes its open touch intervals at
+    /// the same time, and closed records are pruned only past
+    /// [`RETAIN_CLOSED_MS`] and only while no touch references them.
+    ///
     /// One lock and at most one rewrite; a sync that changes nothing -
     /// no refs to record and none to close - touches no file.
     pub fn sync_repo(&self, repo: &str, refs: &[ObservedRef], observed_ms: u64) -> io::Result<()> {
@@ -880,10 +1104,37 @@ impl Store {
         let _lock = Lock::acquire(&self.dir.join(LOCK))?;
         let mut work = self.read_work_for_update()?;
         let mut changed = false;
-        // Refs the pass did not observe close their active record and
-        // leave the active lookup - the closed record itself is kept.
         let observed: std::collections::HashSet<&str> =
             refs.iter().map(|r| r.name.as_str()).collect();
+
+        // A proven rename moves the record under the new name before
+        // disappearance is judged: the ref's reflog - creation line,
+        // history and all - moved with it, so id and `first_observed_at`
+        // hold and only the label changes.
+        for obs in refs {
+            let Some(old) = obs.renamed_from.as_deref().filter(|o| *o != obs.name) else {
+                continue;
+            };
+            let old_key = branch_key(repo, old);
+            let Some(id) = work.active_branches.get(&old_key).cloned() else {
+                continue;
+            };
+            let Some(record) = work.branches.get_mut(&id) else {
+                continue; // coverage: off - the lookup only ever names a stored id
+            };
+            work.active_branches.remove(&old_key);
+            record.ref_name = obs.name.clone();
+            record.last_observed_at = observed_ms;
+            record.continuity_evidence = ContinuityEvidence::ProvenRename;
+            if record.creation_evidence.is_none() {
+                record.creation_evidence = obs.creation.clone();
+            }
+            work.active_branches.insert(branch_key(repo, &obs.name), id);
+            changed = true;
+        }
+
+        // Refs the pass did not observe close their active record and
+        // leave the active lookup - the closed record itself is kept.
         let prefix = format!("{repo}\u{0}");
         let active: Vec<String> = work
             .active_branches
@@ -895,14 +1146,19 @@ impl Store {
             let Some(id) = work.active_branches.get(&key).cloned() else {
                 continue; // coverage: off - `key` came from this map
             };
-            let Some(record) = work.branches.get_mut(&id) else {
+            let Some(record) = work.branches.get(&id) else {
                 continue; // coverage: off - the lookup only ever names a stored id
             };
-            if !observed.contains(record.ref_name.as_str()) {
-                record.ended_at = Some(observed_ms);
-                work.active_branches.remove(&key);
-                changed = true;
+            if observed.contains(record.ref_name.as_str()) {
+                continue;
             }
+            let Some(record) = work.branches.get_mut(&id) else {
+                continue; // coverage: off - the same lookup just answered it
+            };
+            record.ended_at = Some(observed_ms);
+            work.active_branches.remove(&key);
+            close_touches(&mut work, &id, observed_ms);
+            changed = true;
         }
         for obs in refs {
             let key = branch_key(repo, &obs.name);
@@ -914,41 +1170,148 @@ impl Store {
                 .map(|r| r.id.clone());
             match active {
                 Some(id) => {
+                    let boundary = {
+                        let Some(record) = work.branches.get(&id) else {
+                            continue; // coverage: off - the lookup only ever names a stored id
+                        };
+                        creation_boundary(record, obs)
+                    };
+                    if let Some(continuity) = boundary {
+                        // The evidence proves - or fails to rule out - a
+                        // delete/recreate between polls: the observed ref
+                        // is not the recorded incarnation. Close at the
+                        // observation and open the next record; an
+                        // unprovable boundary serializes `ambiguous`.
+                        let Some(record) = work.branches.get_mut(&id) else {
+                            continue; // coverage: off - the same lookup just answered it
+                        };
+                        record.ended_at = Some(observed_ms);
+                        work.active_branches.remove(&key);
+                        close_touches(&mut work, &id, observed_ms);
+                        open_incarnation(&mut work, repo, obs, observed_ms, continuity);
+                        changed = true;
+                        continue;
+                    }
                     let Some(record) = work.branches.get_mut(&id) else {
                         continue; // coverage: off - the lookup only ever names a stored id
                     };
+                    // The record absorbs the observation only where it
+                    // changes: `last_observed_at` moves with the absorbed
+                    // change, never with a pass that proved nothing new.
+                    let mut absorbed = false;
+                    // Creation evidence adopts its first proven value
+                    // without dating anything, like every other field.
+                    if record.creation_evidence.is_none() && obs.creation.is_some() {
+                        record.creation_evidence = obs.creation.clone();
+                        absorbed = true;
+                    }
+                    let continuity =
+                        continuity_of(record.creation_evidence.as_ref(), obs.head.as_deref());
+                    // How the record began (`proven_rename`, `ambiguous`)
+                    // is not rewritten by later confirmations.
+                    if let Some(continuity) = continuity
+                        && !matches!(
+                            record.continuity_evidence,
+                            ContinuityEvidence::ProvenRename | ContinuityEvidence::Ambiguous
+                        )
+                        && record.continuity_evidence != continuity
+                    {
+                        record.continuity_evidence = continuity;
+                        absorbed = true;
+                    }
                     // A changed proven fingerprint is a transition; first
                     // observation never lands here. A newly proven field
                     // is stored without dating anything.
                     if obs.inputs.transitions_from(&record.inputs) {
                         record.activity_at = Some(observed_ms);
-                        changed = true;
+                        absorbed = true;
                     }
                     let inputs = obs.inputs.over(&record.inputs);
                     if record.inputs != inputs {
                         record.inputs = inputs;
+                        absorbed = true;
+                    }
+                    if absorbed {
+                        record.last_observed_at = observed_ms;
                         changed = true;
                     }
                 }
                 None => {
-                    // No active record for this ref - first observation,
-                    // or a reappearance: a new incarnation with its own
-                    // id, leaving every closed record in place.
-                    let id = incarnation_id(repo, &obs.name, observed_ms);
-                    work.branches.insert(
-                        id.clone(),
-                        BranchRecord {
-                            id: id.clone(),
-                            repo: repo.to_owned(),
-                            ref_name: obs.name.clone(),
-                            first_observed_at: observed_ms,
-                            ended_at: None,
-                            parked: false,
-                            activity_at: None,
-                            inputs: obs.inputs.clone(),
-                        },
+                    open_incarnation(
+                        &mut work,
+                        repo,
+                        obs,
+                        observed_ms,
+                        ContinuityEvidence::FirstObservation,
                     );
-                    work.active_branches.insert(key, id);
+                    changed = true;
+                }
+            }
+        }
+        // Closed records keep 90 days, or as long as a touch references
+        // them - the history an `h` view would name. Stale active lookups
+        // never survive the record they named.
+        let cutoff = observed_ms.saturating_sub(RETAIN_CLOSED_MS);
+        let touched: std::collections::HashSet<&str> =
+            work.touches.iter().map(|t| t.branch.as_str()).collect();
+        let before = work.branches.len();
+        work.branches.retain(|id, r| {
+            r.ended_at.is_none_or(|e| e >= cutoff) || touched.contains(id.as_str())
+        });
+        changed |= work.branches.len() != before;
+        let before = work.active_branches.len();
+        work.active_branches
+            .retain(|_, id| work.branches.contains_key(id));
+        changed |= work.active_branches.len() != before;
+        if changed {
+            self.write_work(&work)?; // coverage: off - the error edge needs the atomic write to fail
+        }
+        Ok(())
+    }
+
+    /// Reconcile the persisted touch intervals with the current exact
+    /// placements one pass proved, at `observed_ms` (epoch milliseconds):
+    /// a first placement opens an interval, an unchanged one is a no-op,
+    /// a moved head or a moved incarnation closes the open interval and
+    /// appends the next at the same observation time - history stays
+    /// append-only. A conversation absent from `placements` keeps its
+    /// open interval: missing evidence closes nothing.
+    ///
+    /// One lock and at most one rewrite; an empty call with no file to
+    /// reconcile touches nothing.
+    pub fn sync_touches(&self, placements: &[TouchPlacement], observed_ms: u64) -> io::Result<()> {
+        if placements.is_empty() && !self.dir.join(WORK).exists() {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
+        let _lock = Lock::acquire(&self.dir.join(LOCK))?;
+        let mut work = self.read_work_for_update()?;
+        let mut changed = false;
+        for placement in placements {
+            // A placement lands only on a live incarnation; a closed one
+            // has its intervals closed at the boundary, never reopened.
+            if !work
+                .branches
+                .get(&placement.branch)
+                .is_some_and(|r| r.ended_at.is_none())
+            {
+                continue;
+            }
+            let open = work
+                .touches
+                .iter()
+                .rposition(|t| t.conversation == placement.conversation && t.valid_until.is_none());
+            match open {
+                Some(i)
+                    if work.touches[i].branch == placement.branch
+                        && work.touches[i].head == placement.head => {}
+                Some(i) => {
+                    work.touches[i].valid_until = Some(observed_ms);
+                    work.touches.push(touch_of(placement, observed_ms));
+                    changed = true;
+                }
+                None => {
+                    work.touches.push(touch_of(placement, observed_ms));
                     changed = true;
                 }
             }
@@ -2422,6 +2785,9 @@ mod tests {
     fn obs(name: &str, dirty: bool) -> ObservedRef {
         ObservedRef {
             name: name.to_owned(),
+            head: None,
+            creation: None,
+            renamed_from: None,
             inputs: LifecycleInputs {
                 dirty: Some(dirty),
                 ..LifecycleInputs::default()
@@ -2508,6 +2874,9 @@ mod tests {
                     repo,
                     &[ObservedRef {
                         name: "feat".to_owned(),
+                        head: None,
+                        creation: None,
+                        renamed_from: None,
                         inputs: inputs.clone(),
                     }],
                     at,
@@ -2557,6 +2926,9 @@ mod tests {
                     repo,
                     &[ObservedRef {
                         name: "feat".to_owned(),
+                        head: None,
+                        creation: None,
+                        renamed_from: None,
                         inputs: inputs.clone(),
                     }],
                     at,
@@ -2746,6 +3118,22 @@ mod tests {
                 .kind(),
             io::ErrorKind::WouldBlock
         );
+        assert_eq!(
+            store
+                .sync_touches(
+                    &[TouchPlacement {
+                        conversation: "claude:s1".to_owned(),
+                        branch: "i-x".to_owned(),
+                        head: "a".to_owned(),
+                        provenance: TouchProvenance::Cwd,
+                        confidence: Confidence::Exact,
+                    }],
+                    1
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
         drop(held);
         // Malformed and future-schema files refuse the read-modify-write
         // and keep their bytes.
@@ -2764,6 +3152,19 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             let err = store
                 .toggle_parked(&WorkIdentity::Path("/p".to_owned()))
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            let err = store
+                .sync_touches(
+                    &[TouchPlacement {
+                        conversation: "claude:s1".to_owned(),
+                        branch: "i-x".to_owned(),
+                        head: "a".to_owned(),
+                        provenance: TouchProvenance::Cwd,
+                        confidence: Confidence::Exact,
+                    }],
+                    1_000,
+                )
                 .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes.as_bytes());
