@@ -572,8 +572,16 @@ fn the_json_carries_ids_numbers_intervals_and_evidence() {
     let world = world();
     git(&world.repo, &["branch", "feat"]);
     collect(&world);
+    // Recreated between passes at the same tip: only the reflog creation
+    // stamp tells the two apart, so it must fall in a later second than
+    // the first creation - left to the clock, both often share one.
     git(&world.repo, &["branch", "-D", "feat"]);
-    git(&world.repo, &["branch", "feat"]);
+    let later = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 5;
+    git_dated(&world.repo, &format!("@{later} +0000"), &["branch", "feat"]);
     let snapshot = collect(&world);
     let json: serde_json::Value = serde_json::from_str(&to_json(&snapshot).unwrap()).unwrap();
     let feat = json["work"]
