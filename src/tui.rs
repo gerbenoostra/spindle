@@ -496,7 +496,7 @@ impl App {
             }
             Key::Char(' ') => self.space(),
             Key::Char('p') => self.park(),
-            Key::Char('h') => self.history = !self.history,
+            Key::Char('h') => self.toggle_history(),
             _ => {}
         }
     }
@@ -583,6 +583,15 @@ impl App {
             return Some(e);
         }
         store.mark_not_busy_many(&marks).err()
+    }
+
+    /// `h`: toggle the excluded-history rows. The row vector changes, so
+    /// the cursors reseat by identity like a refresh: a selection on a
+    /// hidden history row falls back to `all`, an active one stays put.
+    fn toggle_history(&mut self) {
+        let keys = self.selection_keys();
+        self.history = !self.history;
+        self.reseat(keys);
     }
 
     /// `p` on a concrete Work row: flip the authored `parked` on its exact
@@ -734,9 +743,6 @@ impl App {
                 display.push(section_header(w.section));
                 last_section = Some(w.section);
             }
-            if cursor == i + 1 {
-                cursor_line = display.len();
-            }
             display.push(self.row(list, row, view, inner.width, cursor == i + 1));
             // The global work scope gives each conversation a dim context
             // line - part of the same cursor item, never a row of its
@@ -750,6 +756,12 @@ impl App {
                     fit(&format!("    {context}"), inner.width as usize),
                     Style::default().fg(Color::DarkGray),
                 )));
+            }
+            // Scroll is computed against the selected item's FINAL
+            // display line - its optional context line included - so a
+            // two-line item at the list's foot never clips.
+            if cursor == i + 1 {
+                cursor_line = display.len() - 1;
             }
         }
         // The `all`-scoped Work list ends on one collapsed cleanup line
@@ -2696,6 +2708,39 @@ mod tests {
         // whole spelling rather than a fabricated basename.
         assert_eq!(repo_label("/"), "/");
         assert_eq!(path_label(Path::new("/")), "/");
+    }
+
+    #[test]
+    fn a_selected_conversation_keeps_its_context_line_in_view() {
+        // The last row carries a two-line item: scrolling to it must
+        // keep its context line, not just its primary, inside the pane.
+        let mut snap = fixture();
+        let last = &mut snap.conversations[2];
+        last.touches = vec![crate::snapshot::TouchRow {
+            incarnation_id: "i9".to_owned(),
+            repo: "/repos/a/.git".to_owned(),
+            ref_name: "feat".to_owned(),
+            incarnation: 1,
+            head: "aaaaaa".to_owned(),
+            valid_from: 1_000,
+            valid_until: None,
+            provenance: crate::store::TouchProvenance::Cwd,
+            confidence: crate::store::Confidence::Exact,
+        }];
+        last.worktree = Some(PathBuf::from("/repos/a-wt"));
+        let mut app = App::new(snap);
+        press(
+            &mut app,
+            &[
+                Key::Char('3'),
+                Key::Char('j'),
+                Key::Char('j'),
+                Key::Char('j'),
+            ],
+        );
+        let text = render_to(&app, 55, 22);
+        assert!(text.contains("33cc0bbb"), "{text}");
+        assert!(text.contains("a · feat#1"), "{text}");
     }
 
     #[test]

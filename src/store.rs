@@ -562,11 +562,11 @@ pub struct BranchRecord {
     pub ref_name: String,
     /// The first pass that observed the ref, epoch milliseconds.
     pub first_observed_at: u64,
-    /// The newest observation the record absorbed, epoch milliseconds:
-    /// it moves when the record is opened, renamed or changed - an
-    /// unchanged record is not re-dated, so an unchanged pass rewrites
-    /// no file. Records written before this field existed carry `0`
-    /// until their next absorbed observation.
+    /// The last pass that observed the ref at all, epoch milliseconds:
+    /// it moves with every successful observation, changed or not, so a
+    /// retained record rewrites the file each reconciliation. Records
+    /// written before this field existed carry `0` until their next
+    /// observation.
     #[serde(default)]
     pub last_observed_at: u64,
     /// The ref's creation evidence as last proven - what continuity is
@@ -1119,6 +1119,19 @@ impl Store {
             let Some(id) = work.active_branches.get(&old_key).cloned() else {
                 continue;
             };
+            // The rename line persists in the moved reflog forever: it
+            // applies only while the old ref went unobserved this pass
+            // and the destination is not already a different active
+            // incarnation. A recreated old name opens its own record; a
+            // taken destination never loses its lookup.
+            if observed.contains(old)
+                || work
+                    .active_branches
+                    .get(&branch_key(repo, &obs.name))
+                    .is_some_and(|d| *d != id)
+            {
+                continue;
+            }
             let Some(record) = work.branches.get_mut(&id) else {
                 continue; // coverage: off - the lookup only ever names a stored id
             };
@@ -1195,15 +1208,17 @@ impl Store {
                     let Some(record) = work.branches.get_mut(&id) else {
                         continue; // coverage: off - the lookup only ever names a stored id
                     };
-                    // The record absorbs the observation only where it
-                    // changes: `last_observed_at` moves with the absorbed
-                    // change, never with a pass that proved nothing new.
-                    let mut absorbed = false;
+                    // `last_observed_at` is the last successful
+                    // observation itself: it moves with every pass that
+                    // proves the ref alive, evidence changed or not - so
+                    // a successful reconciliation rewrites the file.
+                    // `activity_at` remains the transition date.
+                    record.last_observed_at = observed_ms;
+                    changed = true;
                     // Creation evidence adopts its first proven value
                     // without dating anything, like every other field.
                     if record.creation_evidence.is_none() && obs.creation.is_some() {
                         record.creation_evidence = obs.creation.clone();
-                        absorbed = true;
                     }
                     let continuity =
                         continuity_of(record.creation_evidence.as_ref(), obs.head.as_deref());
@@ -1217,23 +1232,16 @@ impl Store {
                         && record.continuity_evidence != continuity
                     {
                         record.continuity_evidence = continuity;
-                        absorbed = true;
                     }
                     // A changed proven fingerprint is a transition; first
                     // observation never lands here. A newly proven field
                     // is stored without dating anything.
                     if obs.inputs.transitions_from(&record.inputs) {
                         record.activity_at = Some(observed_ms);
-                        absorbed = true;
                     }
                     let inputs = obs.inputs.over(&record.inputs);
                     if record.inputs != inputs {
                         record.inputs = inputs;
-                        absorbed = true;
-                    }
-                    if absorbed {
-                        record.last_observed_at = observed_ms;
-                        changed = true;
                     }
                 }
                 None => {
@@ -2811,13 +2819,17 @@ mod tests {
         assert_eq!(main.first_observed_at, 1_000);
         assert_eq!(main.activity_at, None, "first observation dates nothing");
         assert!(!main.parked);
-        // The same observation on a later pass is a no-op: the file does
-        // not move, so a dashboard left open rewrites nothing per refresh.
-        let bytes = fs::read(temp.path(WORK)).unwrap();
+        // The same observation on a later pass still moves
+        // `last_observed_at` - the last successful observation - while
+        // `activity_at` stays put: the file rewrites and the identity's
+        // lifecycle does not change.
         store
             .sync_repo(repo, &[obs("main", false), obs("feat", false)], 1_500)
             .unwrap();
-        assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes);
+        let work = store.load().work;
+        assert_eq!(work.branch(repo, "main").unwrap().last_observed_at, 1_500);
+        assert_eq!(work.branch(repo, "main").unwrap().activity_at, None);
+        assert_eq!(work.branch(repo, "feat").unwrap().last_observed_at, 1_500);
         // A fingerprint change dates the transition at its observation.
         store
             .sync_repo(repo, &[obs("main", false), obs("feat", true)], 2_000)

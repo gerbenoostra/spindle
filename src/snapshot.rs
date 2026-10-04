@@ -1211,6 +1211,36 @@ impl Collector {
                 }
             }
         }
+        // A branch row's session counts are its incarnation's, not its
+        // location's: runtime facts count every conversation under the
+        // worktree or repo, but the row claims only the exact touches to
+        // its incarnation - closed same-name intervals count toward the
+        // excluded history they name, never toward the current row.
+        for w in &mut work {
+            let Some(id) = w.incarnation.as_ref().map(|i| i.id.as_str()) else {
+                continue;
+            };
+            w.past_sessions = self
+                .model
+                .conversations
+                .iter()
+                .filter(|c| c.touches.iter().any(|t| t.incarnation_id == id))
+                .count();
+            w.live_sessions = self
+                .model
+                .conversations
+                .iter()
+                .filter(|c| {
+                    c.running()
+                        && c.touches.iter().any(|t| {
+                            t.incarnation_id == id
+                                && t.valid_until.is_none()
+                                && t.confidence == store::Confidence::Exact
+                        })
+                })
+                .count();
+            w.live_pids = w.live_sessions;
+        }
         // Attention, section and summary are derived per publish from the
         // conversations bound to the row; sections order first, newest
         // activity inside a section, a stable identity last.

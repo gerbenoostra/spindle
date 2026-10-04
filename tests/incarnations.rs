@@ -378,6 +378,44 @@ fn a_proven_rename_moves_the_record_an_unproven_one_separates() {
 }
 
 #[test]
+fn a_stale_rename_line_never_steals_a_recreated_name() {
+    let world = world();
+    git(&world.repo, &["branch", "old"]);
+    collect(&world);
+    let old_id = record(&world, "old").unwrap().id;
+
+    // `git branch -m` moves the record, and `new`'s reflog keeps the
+    // `Branch: renamed` line forever.
+    git(&world.repo, &["branch", "-m", "old", "new"]);
+    collect(&world);
+    let moved = record(&world, "new").unwrap();
+    assert_eq!(moved.id, old_id);
+
+    // Recreate `old` beside `new`: the next pass observes BOTH names,
+    // and `new`'s stale rename evidence must not move `old`'s fresh
+    // record onto `new`'s taken destination. Two incarnations, both
+    // live, with `new`'s id untouched.
+    git(&world.repo, &["branch", "old"]);
+    collect(&world);
+    let old_now = record(&world, "old").expect("old's own incarnation");
+    let new_still = record(&world, "new").expect("new's incarnation");
+    assert_ne!(old_now.id, old_id, "recreated old is a new incarnation");
+    assert_eq!(new_still.id, old_id, "new keeps the moved record");
+    assert_ne!(old_now.id, new_still.id);
+    // The persisted lookups point the right way too.
+    let work = store(&world.home).load().work;
+    let repo = repo_id(&world.repo);
+    assert_eq!(work.branch(&repo, "old").unwrap().id, old_now.id);
+    assert_eq!(work.branch(&repo, "new").unwrap().id, old_id);
+    // One pass on, `old` was already active when the stale line showed:
+    // the observed old ref still never moves under `new`.
+    collect(&world);
+    let work = store(&world.home).load().work;
+    assert_eq!(work.branch(&repo, "old").unwrap().id, old_now.id);
+    assert_eq!(work.branch(&repo, "new").unwrap().id, old_id);
+}
+
+#[test]
 fn a_branch_switch_closes_one_touch_interval_and_opens_the_next() {
     let world = world();
     world.repo.branch_with_commits("feat", 1, true);
@@ -655,6 +693,23 @@ fn sync_repo_separates_what_it_cannot_prove_and_keeps_what_it_can() {
     assert_eq!(moved.creation_evidence.as_ref().map(|c| c.at_ms), Some(900));
     assert!(work.branch(repo, "old-name").is_none());
 
+    // A stale rename claiming a taken destination moves nothing either:
+    // `dest` keeps its own record, `gone-src` simply closes.
+    store
+        .sync_repo(
+            repo,
+            &[obs("gone-src", None, None), obs("dest", None, None)],
+            42_000,
+        )
+        .unwrap();
+    let dest_id = store.load().work.branch(repo, "dest").unwrap().id.clone();
+    store
+        .sync_repo(repo, &[obs_renamed("dest", None, None, "gone-src")], 43_000)
+        .unwrap();
+    let work = store.load().work;
+    assert_eq!(work.branch(repo, "dest").unwrap().id, dest_id);
+    assert!(work.branch(repo, "gone-src").is_none());
+
     // A retained record adopts its first proven creation value too -
     // observed at a time consistent with the record's sighting, so no
     // boundary is detected.
@@ -726,19 +781,23 @@ fn the_history_rows_render_excluded_and_scope_their_own_conversations() {
     let world = world();
     world.repo.branch_with_commits("feat", 1, true);
     let wt = world.repo.add_worktree("feat", Some("feat"));
-    // conv ONE rides feat's first incarnation.
+    // convs ONE and THREE ride feat's first incarnation.
     transcript(&world.home, CONV, &wt);
+    transcript(&world.home, THIRD, &wt);
     collect(&world);
     let inc1 = record(&world, "feat").unwrap().id;
-    // Switch the worktree away and delete: feat#1 closes with its touch.
+    // Switch the worktree away and delete: feat#1 closes with its
+    // touches. conv THREE's cwd leaves the repo entirely - its feat#1
+    // interval stays its only touch ever.
     world.repo.git(&wt, &["checkout", "-b", "other"]);
+    transcript(&world.home, THIRD, &world.home.path().join("elsewhere"));
     git(&world.repo, &["branch", "-D", "feat"]);
     // conv TWO sits on main the whole time - never on feat.
     transcript(&world.home, OTHER, &world.repo.main);
     collect(&world);
-    // Recreate and re-checkout: the second incarnation is current, and
-    // conv ONE's newest touch lands on it.
-    world.repo.git(&wt, &["checkout", "-b", "feat"]);
+    // Recreate without a checkout: the second incarnation is a
+    // branch-only row nobody touches.
+    git(&world.repo, &["branch", "feat"]);
     let snapshot = collect(&world);
     let inc2 = work(&snapshot, "feat").identity.clone().unwrap();
     assert_ne!(inc1, inc2);
@@ -746,23 +805,34 @@ fn the_history_rows_render_excluded_and_scope_their_own_conversations() {
     assert_eq!(feat.incarnation.as_ref().unwrap().number, 2);
     assert_eq!(feat.same_name_history.len(), 1);
 
-    // binds() is the exact-incarnation rule: feat's current row claims
-    // conv ONE's open touch to it, not its closed feat#1 interval nor
-    // conv TWO's elsewhere placement.
-    assert!(agent_sessions::snapshot::binds(
-        feat,
-        conversation(&snapshot, CONV)
-    ));
-    assert!(!agent_sessions::snapshot::binds(
-        feat,
-        conversation(&snapshot, OTHER)
-    ));
+    // The exact-incarnation rule: feat#2 claims no open touch and no
+    // session count - not conv ONE's closed feat#1 interval, not conv
+    // THREE's feat#1-only history, not the repository's conversations a
+    // branch-only row would count by location.
+    assert_eq!(feat.live_sessions, 0, "{feat:?}");
+    assert_eq!(feat.live_pids, 0, "{feat:?}");
+    assert_eq!(feat.past_sessions, 0, "{feat:?}");
+    for id in [CONV, OTHER, THIRD] {
+        assert!(!agent_sessions::snapshot::binds(
+            feat,
+            conversation(&snapshot, id)
+        ));
+    }
+    assert!(
+        conversation(&snapshot, THIRD)
+            .touches
+            .iter()
+            .all(|t| t.incarnation_id == inc1)
+    );
 
     // `h` reveals the excluded incarnation under feat#2; without it the
-    // history stays hidden.
+    // history stays hidden. The recreated branch-only row lands in the
+    // cleanup section - the `all` scope collapses it, so the repo scope
+    // is where the row and its history list.
     let mut app = App::new(snapshot);
     let text = render(&app, 200, 30);
     assert!(!text.contains("excluded"), "{text}");
+    press(&mut app, &[Key::Char('1'), Key::Char('j')]);
     app.key(Key::Char('h'));
     let text = render(&app, 200, 30);
     assert!(text.contains("feat#2"), "{text}");
@@ -770,14 +840,35 @@ fn the_history_rows_render_excluded_and_scope_their_own_conversations() {
     assert_eq!(text.matches("excluded").count(), 1, "{text}");
 
     // The excluded row is selectable; [3] titles it as excluded history
-    // and scopes to exactly its touches - conv ONE only.
+    // and scopes to exactly its touches - the two convs that rode feat#1.
     press(&mut app, &[Key::Char('2')]);
     let text = until_conv_title(&mut app, "feat#1 · excluded history");
     assert!(text.contains(&CONV[..8]), "{text}");
+    assert!(text.contains(&THIRD[..8]), "{text}");
     assert!(!text.contains(&OTHER[..8]), "{text}");
-    // Back on the active row: current incarnation, conv ONE bound.
+    // The active row claims its own scope: current incarnation, nothing
+    // bound - its historical namesakes stayed out.
     let text = until_conv_title_back(&mut app, "feat#2 · current incarnation");
-    assert!(text.contains(&CONV[..8]), "{text}");
+    assert!(!text.contains(&CONV[..8]), "{text}");
+
+    // `h` off while on the history row: the hidden id falls back to
+    // `all` rather than retargeting whatever row now shares its index.
+    let _ = until_conv_title(&mut app, "feat#1 · excluded history");
+    app.key(Key::Char('h'));
+    let text = render(&app, 200, 30);
+    assert!(!text.contains("excluded"), "{text}");
+    assert!(!text.contains("feat#1 · excluded history"), "{text}");
+    // `h` back on restores the row; an active selection keeps its
+    // identity across the same toggle.
+    app.key(Key::Char('h'));
+    let text = render(&app, 200, 30);
+    assert!(text.contains("feat#1"), "{text}");
+    let _ = until_conv_title(&mut app, "feat#2 · current incarnation");
+    app.key(Key::Char('h'));
+    let text = render(&app, 200, 30);
+    assert!(!text.contains("excluded"), "{text}");
+    assert!(text.contains("feat#2 · current incarnation"), "{text}");
+    app.key(Key::Char('h'));
 
     // Back on the excluded row, a refresh keeps the selection on the
     // incarnation id itself - the history row's identity is its record,
