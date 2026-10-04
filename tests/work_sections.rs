@@ -988,6 +988,12 @@ fn a_resumable_conversation_does_not_hold_finished_or_quiet_work() {
     let old = a.add_worktree("old", Some("feat-old"));
     transcript(&home, RESUME_ID, &old);
     age_transcript(&home, RESUME_ID, 30);
+    // A project space is never forgotten or cleaned, so its old
+    // resumable conversation still asks for a pick-up.
+    let notes = home.join("notes");
+    fs::create_dir_all(&notes).expect("mkdir");
+    transcript(&home, SPACE_ID, &notes);
+    age_transcript(&home, SPACE_ID, 40);
     let world = World {
         home,
         a,
@@ -1000,6 +1006,9 @@ fn a_resumable_conversation_does_not_hold_finished_or_quiet_work() {
     let old = work(&snapshot, "feat-old");
     assert_eq!(old.section, WorkSection::Forgotten, "{old:?}");
     assert!(old.summary.starts_with("idle 30d"), "{}", old.summary);
+    let notes = work(&snapshot, "notes");
+    assert_eq!(notes.section, WorkSection::FollowUp, "{notes:?}");
+    assert_eq!(notes.summary, "resumable idle · no git");
     // The conversations stay listed: only the row's section moved.
     assert!(
         snapshot

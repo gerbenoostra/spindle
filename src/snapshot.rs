@@ -1616,8 +1616,10 @@ fn section_reason(
         .is_some_and(|a| now.saturating_sub(a) > forgotten_after.as_secs());
     // A resumable conversation asks for a pick-up only while its work is
     // unfinished and recent: landed work goes on to cleanup and quiet work
-    // to `Forgotten`, with the conversation still listed in [3].
-    if let Some(reason) = follow_up(row, bound, !finished && !quiet_beyond) {
+    // to `Forgotten`, with the conversation still listed in [3]. A project
+    // space can be neither, so its resumable conversation always counts.
+    let pick_up = row.kind == WorkKind::ProjectSpace || (!finished && !quiet_beyond);
+    if let Some(reason) = follow_up(row, bound, pick_up) {
         return (WorkSection::FollowUp, reason);
     }
     // Forgotten: unfinished, nothing running, quiet strictly beyond the
