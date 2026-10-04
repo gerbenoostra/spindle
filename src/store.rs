@@ -540,6 +540,11 @@ pub struct ObservedRef {
     pub name: String,
     /// The ref's tip OID this pass, when the collector proved it.
     pub head: Option<String>,
+    /// The collector proved the tip moved off the record's last `head`
+    /// without descending from it - a rewrite such as a rebase or reset
+    /// that a force-push publishes. A fast-forward or an unprovable
+    /// comparison is `false`.
+    pub rewritten: bool,
     /// The newest null-old reflog entry's creation evidence.
     pub creation: Option<RefCreationEvidence>,
     /// The short name a `Branch: renamed` reflog line moved this ref
@@ -562,13 +567,18 @@ pub struct BranchRecord {
     pub ref_name: String,
     /// The first pass that observed the ref, epoch milliseconds.
     pub first_observed_at: u64,
-    /// The last pass that observed the ref at all, epoch milliseconds:
-    /// it moves with every successful observation, changed or not, so a
-    /// retained record rewrites the file each reconciliation. Records
-    /// written before this field existed carry `0` until their next
-    /// observation.
+    /// The last pass that observed the ref, epoch milliseconds, as of the
+    /// last write: every observation moves it, but a pass that changes
+    /// nothing else writes nothing, so a stored value lags by at most the
+    /// quiet passes since. The snapshot reports an active record's
+    /// observation from the running collector instead. Records written
+    /// before this field existed carry `0` until their next write.
     #[serde(default)]
     pub last_observed_at: u64,
+    /// The ref's tip OID as last proven - what the next observation's tip
+    /// move is judged against (fast-forward or rewritten).
+    #[serde(default)]
+    pub head: Option<String>,
     /// The ref's creation evidence as last proven - what continuity is
     /// judged against.
     #[serde(default)]
@@ -709,20 +719,23 @@ fn creation_boundary(record: &BranchRecord, obs: &ObservedRef) -> Option<Continu
     }
 }
 
-/// The continuity a confirmed-same record carries: the tip at the
-/// creation head is `same_reflog_creation`, a moved tip under unchanged
-/// creation evidence is `force_push`. `None` when the tip was not proven
-/// this pass - the record keeps its last proven reading.
-fn continuity_of(
-    creation: Option<&RefCreationEvidence>,
-    head: Option<&str>,
-) -> Option<ContinuityEvidence> {
-    let creation = creation?;
-    Some(match head {
-        Some(head) if head == creation.head => ContinuityEvidence::SameReflogCreation,
-        Some(_) => ContinuityEvidence::ForcePush,
-        None => return None,
-    })
+/// The continuity a confirmed-same record carries: a proven
+/// non-fast-forward tip move under unchanged creation evidence is
+/// `force_push`, which then holds for the record; otherwise matching
+/// creation evidence is `same_reflog_creation`, however far the tip
+/// fast-forwarded. `None` keeps the record's label: how it began
+/// (`proven_rename`, `ambiguous`) is never rewritten, and without
+/// creation evidence there is nothing to confirm.
+fn continuity_of(record: &BranchRecord, obs: &ObservedRef) -> Option<ContinuityEvidence> {
+    match record.continuity_evidence {
+        ContinuityEvidence::ProvenRename | ContinuityEvidence::Ambiguous => None,
+        _ if obs.rewritten => Some(ContinuityEvidence::ForcePush),
+        ContinuityEvidence::ForcePush => None,
+        _ => record
+            .creation_evidence
+            .as_ref()
+            .map(|_| ContinuityEvidence::SameReflogCreation),
+    }
 }
 
 /// Open a new incarnation for `obs` at `observed_ms`: new id, `parked:
@@ -743,6 +756,7 @@ fn open_incarnation(
             ref_name: obs.name.clone(),
             first_observed_at: observed_ms,
             last_observed_at: observed_ms,
+            head: obs.head.clone(),
             creation_evidence: obs.creation.clone(),
             continuity_evidence: continuity,
             ended_at: None,
@@ -1138,6 +1152,9 @@ impl Store {
             work.active_branches.remove(&old_key);
             record.ref_name = obs.name.clone();
             record.last_observed_at = observed_ms;
+            if obs.head.is_some() {
+                record.head = obs.head.clone();
+            }
             record.continuity_evidence = ContinuityEvidence::ProvenRename;
             if record.creation_evidence.is_none() {
                 record.creation_evidence = obs.creation.clone();
@@ -1208,40 +1225,38 @@ impl Store {
                     let Some(record) = work.branches.get_mut(&id) else {
                         continue; // coverage: off - the lookup only ever names a stored id
                     };
-                    // `last_observed_at` is the last successful
-                    // observation itself: it moves with every pass that
-                    // proves the ref alive, evidence changed or not - so
-                    // a successful reconciliation rewrites the file.
-                    // `activity_at` remains the transition date.
+                    // The observation itself moves `last_observed_at`
+                    // but is no reason to write: an unchanged pass
+                    // rewrites nothing, and the value lands with the
+                    // next real change.
                     record.last_observed_at = observed_ms;
-                    changed = true;
                     // Creation evidence adopts its first proven value
                     // without dating anything, like every other field.
                     if record.creation_evidence.is_none() && obs.creation.is_some() {
                         record.creation_evidence = obs.creation.clone();
+                        changed = true;
                     }
-                    let continuity =
-                        continuity_of(record.creation_evidence.as_ref(), obs.head.as_deref());
-                    // How the record began (`proven_rename`, `ambiguous`)
-                    // is not rewritten by later confirmations.
-                    if let Some(continuity) = continuity
-                        && !matches!(
-                            record.continuity_evidence,
-                            ContinuityEvidence::ProvenRename | ContinuityEvidence::Ambiguous
-                        )
+                    if let Some(continuity) = continuity_of(record, obs)
                         && record.continuity_evidence != continuity
                     {
                         record.continuity_evidence = continuity;
+                        changed = true;
+                    }
+                    if obs.head.is_some() && record.head != obs.head {
+                        record.head = obs.head.clone();
+                        changed = true;
                     }
                     // A changed proven fingerprint is a transition; first
                     // observation never lands here. A newly proven field
                     // is stored without dating anything.
                     if obs.inputs.transitions_from(&record.inputs) {
                         record.activity_at = Some(observed_ms);
+                        changed = true;
                     }
                     let inputs = obs.inputs.over(&record.inputs);
                     if record.inputs != inputs {
                         record.inputs = inputs;
+                        changed = true;
                     }
                 }
                 None => {
@@ -2796,6 +2811,7 @@ mod tests {
             head: None,
             creation: None,
             renamed_from: None,
+            rewritten: false,
             inputs: LifecycleInputs {
                 dirty: Some(dirty),
                 ..LifecycleInputs::default()
@@ -2819,17 +2835,13 @@ mod tests {
         assert_eq!(main.first_observed_at, 1_000);
         assert_eq!(main.activity_at, None, "first observation dates nothing");
         assert!(!main.parked);
-        // The same observation on a later pass still moves
-        // `last_observed_at` - the last successful observation - while
-        // `activity_at` stays put: the file rewrites and the identity's
-        // lifecycle does not change.
+        // The same observation on a later pass is a no-op: the file does
+        // not move, so a dashboard left open rewrites nothing per refresh.
+        let bytes = fs::read(temp.path(WORK)).unwrap();
         store
             .sync_repo(repo, &[obs("main", false), obs("feat", false)], 1_500)
             .unwrap();
-        let work = store.load().work;
-        assert_eq!(work.branch(repo, "main").unwrap().last_observed_at, 1_500);
-        assert_eq!(work.branch(repo, "main").unwrap().activity_at, None);
-        assert_eq!(work.branch(repo, "feat").unwrap().last_observed_at, 1_500);
+        assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes);
         // A fingerprint change dates the transition at its observation.
         store
             .sync_repo(repo, &[obs("main", false), obs("feat", true)], 2_000)
@@ -2889,6 +2901,7 @@ mod tests {
                         head: None,
                         creation: None,
                         renamed_from: None,
+                        rewritten: false,
                         inputs: inputs.clone(),
                     }],
                     at,
@@ -2941,6 +2954,7 @@ mod tests {
                         head: None,
                         creation: None,
                         renamed_from: None,
+                        rewritten: false,
                         inputs: inputs.clone(),
                     }],
                     at,

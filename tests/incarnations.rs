@@ -194,6 +194,7 @@ fn obs(name: &str, head: Option<&str>, creation: Option<RefCreationEvidence>) ->
         head: head.map(str::to_owned),
         creation,
         renamed_from: None,
+        rewritten: false,
         inputs: LifecycleInputs::default(),
     }
 }
@@ -325,11 +326,18 @@ fn a_creation_it_cannot_order_fails_closed_and_serializes_ambiguous() {
 #[test]
 fn a_force_pushed_tip_is_continuous_not_a_new_incarnation() {
     let world = world();
-    git(&world.repo, &["branch", "feat"]);
+    world.repo.branch_with_commits("feat", 1, false);
+    // The first pass is a first observation; the next confirms it.
+    collect(&world);
     collect(&world);
     let before = record(&world, "feat").unwrap();
-    // Move the tip without touching the creation line: a non-null-old
-    // reflog entry, same creation evidence.
+    assert_eq!(
+        before.continuity_evidence,
+        ContinuityEvidence::SameReflogCreation
+    );
+    // Rewrite the tip onto a commit that does not descend from it - the
+    // local shape a rebase or reset leaves for a force-push to publish -
+    // without touching the creation line.
     world.repo.commit(&world.repo.main, "new.txt", "x", "new");
     let tip = world.repo.git(&world.repo.main, &["rev-parse", "main"]);
     git(&world.repo, &["update-ref", "refs/heads/feat", tip.trim()]);
@@ -337,13 +345,70 @@ fn a_force_pushed_tip_is_continuous_not_a_new_incarnation() {
     let after = record(&world, "feat").unwrap();
     assert_eq!(after.id, before.id);
     assert_eq!(after.continuity_evidence, ContinuityEvidence::ForcePush);
-    // A quiet pass after it still reads the same creation: the label
-    // holds, no rewrite of how it began.
+    // A later fast-forward keeps the proven rewrite: the label says the
+    // identity held across one.
+    let wt = world.repo.add_worktree("feat", Some("feat"));
+    world.repo.commit(&wt, "more.txt", "y", "more");
     collect(&world);
+    let later = record(&world, "feat").unwrap();
+    assert_eq!(later.id, before.id);
+    assert_eq!(later.continuity_evidence, ContinuityEvidence::ForcePush);
+}
+
+#[test]
+fn ordinary_commits_fast_forward_under_the_same_creation() {
+    let world = world();
+    git(&world.repo, &["branch", "feat"]);
+    collect(&world);
+    let before = record(&world, "feat").unwrap();
+    // Plain work on the branch moves the tip forward: the same reflog
+    // creation, never a force-push.
+    let wt = world.repo.add_worktree("feat", Some("feat"));
+    world.repo.commit(&wt, "work.txt", "w", "plain work");
+    let snapshot = collect(&world);
+    let after = record(&world, "feat").unwrap();
+    assert_eq!(after.id, before.id);
     assert_eq!(
-        record(&world, "feat").unwrap().continuity_evidence,
-        ContinuityEvidence::ForcePush
+        after.continuity_evidence,
+        ContinuityEvidence::SameReflogCreation
     );
+    assert_eq!(
+        after.head.as_deref(),
+        Some(world.repo.git(&wt, &["rev-parse", "feat"]).trim())
+    );
+    assert_eq!(
+        work(&snapshot, "feat")
+            .incarnation
+            .as_ref()
+            .unwrap()
+            .continuity,
+        ContinuityEvidence::SameReflogCreation
+    );
+}
+
+#[test]
+fn a_quiet_pass_rewrites_nothing_yet_reports_its_observation() {
+    let world = world();
+    git(&world.repo, &["branch", "feat"]);
+    let mut collector = Collector::new(claude(&world.home)).with_store(store_dir(&world.home));
+    // The second pass settles the first observation's label; the third
+    // has nothing left to write.
+    collector.collect(&Runtime::observe_over(&[]), None);
+    collector.collect(&Runtime::observe_over(&[]), None);
+    let file = store_dir(&world.home).join("work.json");
+    let bytes = fs::read(&file).unwrap();
+    let stored = record(&world, "feat").unwrap().last_observed_at;
+    // Cross a whole second so the reported observation must move; each
+    // pass observes its own runtime instant.
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    let snapshot = collector.collect(&Runtime::observe_over(&[]), None);
+    assert!(fs::read(&file).unwrap() == bytes, "a quiet pass wrote");
+    let reported = work(&snapshot, "feat")
+        .incarnation
+        .as_ref()
+        .unwrap()
+        .last_observed_at;
+    assert!(reported > stored / 1000, "{reported} vs {stored}");
 }
 
 #[test]

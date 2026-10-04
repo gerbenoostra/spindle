@@ -549,6 +549,10 @@ struct Model {
     work: store::Work,
     /// The `work.json` stamp `work` was read at.
     work_stamp: Option<store::WorkStamp>,
+    /// Repo id -> the epoch ms of this process's last ref sync over it:
+    /// an active incarnation's last observation, which a quiet pass does
+    /// not write to `work.json`.
+    ref_observed: HashMap<String, u64>,
     errors: Vec<SourceError>,
     skipped: Vec<String>,
     stale_sockets: usize,
@@ -1046,6 +1050,7 @@ impl Collector {
         // `(repo, branch)` -> the tip the pass proved: what a touch's
         // `head` carries.
         let mut heads: HashMap<(String, String), String> = HashMap::new();
+        let mut observed = Vec::new();
         for (repo_id, model) in &self.model.repos {
             match &model.data {
                 RepoData::Git(local) => {
@@ -1061,6 +1066,7 @@ impl Collector {
                             seen.insert(name.to_owned()).then(|| store::ObservedRef {
                                 name: name.to_owned(),
                                 head: w.ref_head().map(str::to_owned),
+                                rewritten: rewritten(&self.model.work, repo_id, name, w),
                                 creation: w.ref_creation().map(|c| store::RefCreationEvidence {
                                     head: c.head.clone(),
                                     at_ms: store::epoch_ms(c.at),
@@ -1070,8 +1076,9 @@ impl Collector {
                             })
                         })
                         .collect();
-                    if let Err(e) = store.sync_repo(repo_id, &refs, observed_ms) {
-                        self.model.errors.push(work_state_error(repo_id, e));
+                    match store.sync_repo(repo_id, &refs, observed_ms) {
+                        Ok(()) => observed.push(repo_id.clone()),
+                        Err(e) => self.model.errors.push(work_state_error(repo_id, e)),
                     }
                     for w in &local.anchors {
                         if let Anchor::Worktree {
@@ -1097,6 +1104,9 @@ impl Collector {
                     }
                 }
             }
+        }
+        for repo_id in observed {
+            self.model.ref_observed.insert(repo_id, observed_ms);
         }
         // Repo reconciliation first: placements name the active
         // incarnation ids the sync just settled.
@@ -1217,6 +1227,14 @@ impl Collector {
         // its incarnation - closed same-name intervals count toward the
         // excluded history they name, never toward the current row.
         for w in &mut work {
+            // An active incarnation was observed by this process's last
+            // ref sync over its repo, even when that quiet pass wrote
+            // nothing.
+            if let Some(inc) = &mut w.incarnation
+                && let Some(ms) = self.model.ref_observed.get(&w.repo)
+            {
+                inc.last_observed_at = inc.last_observed_at.max(ms / 1000);
+            }
             let Some(id) = w.incarnation.as_ref().map(|i| i.id.as_str()) else {
                 continue;
             };
@@ -1700,6 +1718,23 @@ fn work_state_error(repo_id: &str, e: std::io::Error) -> SourceError {
         source: "work.json".to_owned(),
         detail: format!("{repo_id}: {e}"),
     }
+}
+
+/// Whether the anchor's branch tip moved off the active record's last
+/// proven head without descending from it - one `merge-base
+/// --is-ancestor` only when the tip moved. A first sighting, an unproven
+/// tip or a comparison git could not answer (the old commit pruned) is
+/// not a proven rewrite.
+fn rewritten(authored: &store::Work, repo_id: &str, name: &str, w: &vector::AnchorWork) -> bool {
+    let (Some(old), Some(new)) = (
+        authored
+            .branch(repo_id, name)
+            .and_then(|r| r.head.as_deref()),
+        w.ref_head(),
+    ) else {
+        return false;
+    };
+    old != new && w.state.repo.is_ancestor(old, new) == Evidence::Known(false)
 }
 
 /// Incarnation order within a `(repo, ref_name)`: oldest first,
@@ -2548,6 +2583,7 @@ mod tests {
             ref_name: "feat".to_owned(),
             first_observed_at: first_ms,
             last_observed_at: first_ms,
+            head: None,
             creation_evidence: None,
             continuity_evidence: store::ContinuityEvidence::FirstObservation,
             ended_at: ended_ms,
