@@ -1328,8 +1328,32 @@ impl App {
             }
         }
         push_head(out, format!("commits not on {}:", opt(&w.base)), width);
-        // The pass does not enumerate commits: `?` is the honest cell.
-        push_text(out, "  ?".to_owned(), width);
+        match &w.commits {
+            None => push_text(out, "  ?".to_owned(), width),
+            Some(commits) if commits.is_empty() => push_text(out, "  none".to_owned(), width),
+            Some(commits) => {
+                for c in commits {
+                    push_text(
+                        out,
+                        format!(
+                            "  {} {} · {} · {}",
+                            sha(&Some(c.sha.clone())),
+                            escape_text(&c.subject),
+                            age(now, Some(c.at)),
+                            c.conversation.as_deref().unwrap_or("?")
+                        ),
+                        width,
+                    );
+                }
+                // The list is capped; the ahead count says how many more.
+                let more = w
+                    .commits_ahead
+                    .map_or(0, |n| n.saturating_sub(commits.len() as u64));
+                if more > 0 {
+                    push_text(out, format!("  … {more} more"), width);
+                }
+            }
+        }
         push_head(out, "cleanup:".to_owned(), width);
         for (action, verdict) in [
             ("worktree remove", &w.worktree_removal),
@@ -1403,6 +1427,9 @@ impl App {
         } else {
             format!("{} ({})", "resumable", c.resume_argv.join(" "))
         };
+        // No provider exposes epochs (a `/clear` count, prompts per
+        // epoch) yet: the field is an honest `?`.
+        push_text(out, "epoch: ?".to_owned(), width);
         push_text(out, format!("resume: {resume}"), width);
         push_text(
             out,
@@ -1440,7 +1467,7 @@ impl App {
             push_text(
                 out,
                 format!(
-                    "  {}#{} · {} → {} · head {} · {} · {}",
+                    "  {}#{} · {} → {} · head {} · files ? · commits ? · {} · {}",
                     t.ref_name,
                     t.incarnation,
                     age(now, Some(t.valid_from)),
@@ -2717,6 +2744,7 @@ mod tests {
                     forge_label: Some("PR #191".to_owned()),
                     forge_url: Some("https://github.com/o/r/pull/191".to_owned()),
                     commits_behind: Some(0),
+                    commits: None,
                     panes: Vec::new(),
                     gone: None,
                     references: Vec::new(),
@@ -2762,6 +2790,7 @@ mod tests {
                     forge_label: None,
                     forge_url: None,
                     commits_behind: None,
+                    commits: None,
                     panes: Vec::new(),
                     gone: None,
                     references: Vec::new(),
@@ -2807,6 +2836,7 @@ mod tests {
                     forge_label: None,
                     forge_url: None,
                     commits_behind: None,
+                    commits: None,
                     panes: Vec::new(),
                     gone: None,
                     references: Vec::new(),

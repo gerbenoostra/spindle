@@ -874,6 +874,7 @@ fn missing_and_conflicting_remote_head_leave_the_base_unproven() {
         .expect("conflict leaves the base unproven");
     assert!(reason.contains("conflicting remote HEAD"), "{reason}");
     assert!(state.vector.commits_ahead_of_base.reason().is_some());
+    assert!(state.vector.commits_not_on_base.reason().is_some());
 }
 
 #[test]
@@ -1312,6 +1313,27 @@ fn an_unfetched_remote_leaves_no_local_base_evidence() {
 /// with the per-branch probes it replaces on every fixture row - verdicts,
 /// reasons and the evidence fields behind them alike.
 #[test]
+fn the_commits_not_on_the_base_are_listed_newest_first() {
+    let f = standard();
+    let states = collect_all(&f);
+    // Two commits past the base: both listed, the tip first, each with
+    // its sha, committer time and subject.
+    let reverted = &states["wt:reverted@wt-reverted"].vector;
+    let Evidence::Known(commits) = &reverted.commits_not_on_base else {
+        panic!("a proven base lists its commits: {reverted:?}");
+    };
+    assert_eq!(commits.len(), 2);
+    let tip = f.git(&f.main, &["rev-parse", "reverted"]);
+    assert_eq!(commits[0].sha, tip.trim());
+    let subject = f.git(&f.main, &["log", "-1", "--format=%s", "reverted"]);
+    assert_eq!(commits[0].subject, subject.trim());
+    assert!(commits.iter().all(|c| c.at > 0));
+    // Landed by merge: nothing on the tip the base lacks.
+    let locked = &states["wt:locked@wt-locked"].vector;
+    assert_eq!(locked.commits_not_on_base, Evidence::Known(Vec::new()));
+}
+
+#[test]
 fn the_batched_read_agrees_with_the_per_branch_probes() {
     let f = standard();
     let probed = collect_all(&f);
@@ -1364,7 +1386,7 @@ fn evidence_text(s: &WorkState) -> String {
     format!(
         "remote_url={:?} base={:?} worktree={:?} windows={:?} live_pids={} \
          live_sessions={} past_sessions={} dirty={:?} commits_ahead={:?} \
-         upstream={:?} unpushed={:?} landed={:?}",
+         commits_listed={:?} upstream={:?} unpushed={:?} landed={:?}",
         s.remote_url,
         s.base,
         s.vector.worktree,
@@ -1374,6 +1396,7 @@ fn evidence_text(s: &WorkState) -> String {
         s.vector.past_agent_sessions,
         s.vector.dirty,
         s.vector.commits_ahead_of_base,
+        s.vector.commits_not_on_base,
         s.vector.upstream_state,
         s.vector.unpushed_commits,
         s.vector.landed,

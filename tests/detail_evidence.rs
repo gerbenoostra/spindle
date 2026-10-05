@@ -10,7 +10,7 @@ use agent_sessions::forge::{Pipeline, WorkItem};
 use agent_sessions::provider::SourceError;
 use agent_sessions::runtime::{EvidenceSource, PaneSource, Provider};
 use agent_sessions::snapshot::{
-    AttachmentLiveness, AttachmentRow, ConversationRow, ConversationState, EvidenceRow,
+    AttachmentLiveness, AttachmentRow, CommitRow, ConversationRow, ConversationState, EvidenceRow,
     IncarnationRow, LatchRow, PaneRow, ReferenceKind, ReferenceRow, RelatedRow, RelationStrength,
     RepoCounts, RepoRow, SCHEMA_VERSION, Snapshot, Upstream, WorkKind, WorkRow, WorkSection,
 };
@@ -120,6 +120,7 @@ fn work() -> WorkRow {
         forge_label: Some("PR #191".to_owned()),
         forge_url: Some("https://github.com/o/r/pull/191".to_owned()),
         commits_behind: Some(2),
+        commits: None,
         panes: vec![PaneRow {
             handle: "workmux:1.2".to_owned(),
             command: "claude".to_owned(),
@@ -307,6 +308,51 @@ fn work_detail_renders_question_marks_for_unproven_fields() {
     assert!(text.contains("last change ? · last commit ?"), "{text}");
     assert!(text.contains("worktree remove: ?"), "{text}");
     assert!(text.contains("branch delete: ?"), "{text}");
+    // An unproven base lists no commits: the honest cell.
+    let at = text.find("commits not on ?:").expect("the commits head");
+    assert!(text[at..].contains("  ?"), "{text}");
+}
+
+#[test]
+fn work_detail_lists_the_commits_not_on_the_base() {
+    let mut row = work();
+    // Three ahead, two listed: the cap names the rest.
+    row.commits_ahead = Some(3);
+    row.commits = Some(vec![
+        CommitRow {
+            sha: "9ac21f0e5d3b".to_owned(),
+            subject: "fix\tlabels".to_owned(),
+            at: NOW - 600,
+            conversation: Some("8f423bbb".to_owned()),
+        },
+        CommitRow {
+            sha: "7bd22aa01c4e".to_owned(),
+            subject: "start login".to_owned(),
+            at: NOW - 7_200,
+            conversation: None,
+        },
+    ]);
+    let mut landed = work();
+    landed.name = "feat/landed".to_owned();
+    landed.commits_ahead = Some(0);
+    landed.commits = Some(Vec::new());
+    let mut snapshot = fixture();
+    snapshot.work = vec![row, landed];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    let text = render(&app, 200, 50);
+    assert!(text.contains("commits not on origin/main:"), "{text}");
+    assert!(
+        text.contains("9ac21f0 fix\\tlabels · 10m · 8f423bbb"),
+        "{text}"
+    );
+    assert!(text.contains("7bd22aa start login · 2h · ?"), "{text}");
+    assert!(text.contains("… 1 more"), "{text}");
+    press(&mut app, &[Key::Char('j')]);
+    let text = render(&app, 200, 50);
+    let at = text.find("commits not on origin/main:").expect("the head");
+    assert!(text[at..].contains("  none"), "{text}");
+    assert!(!text.contains("more"), "{text}");
 }
 
 #[test]
@@ -419,6 +465,9 @@ fn conversation_detail_lists_touches_relations_and_last_prompts() {
     assert!(text.contains("forge: PR #191"), "{text}");
     // Every touch interval: head, provenance and confidence.
     assert!(text.contains("provider_branch · exact"), "{text}");
+    // Epochs and per-touch files and commits are not exposed: `?`.
+    assert!(text.contains("epoch: ?"), "{text}");
+    assert!(text.contains("files ? · commits ?"), "{text}");
     assert!(text.contains("cwd · exact"), "{text}");
     // Related groups in strength order.
     let at = |needle: &str| text.find(needle).unwrap_or(usize::MAX);

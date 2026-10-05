@@ -691,6 +691,31 @@ impl Repo {
             .unwrap_or(false)
     }
 
+    /// `log <a>..<b>`, newest first, at most `limit` commits: what `b`
+    /// carries that `a` lacks, each with its sha, committer time and
+    /// subject.
+    pub fn log_range(
+        &self,
+        from_exclusive: &str,
+        to: &str,
+        limit: usize,
+    ) -> Result<Vec<LogCommit>, Error> {
+        let range = format!("{from_exclusive}..{to}");
+        let max = format!("--max-count={limit}");
+        let text = in_repo(
+            self,
+            &[
+                "log",
+                "-z",
+                "--no-show-signature",
+                "--format=%H%x1f%ct%x1f%s",
+                &max,
+                &range,
+            ],
+        )?;
+        Ok(parse_log(&text))
+    }
+
     /// `rev-list --count <a>..<b>`.
     pub fn rev_list_count(&self, from_exclusive: &str, to: &str) -> Result<u64, Error> {
         let range = format!("{from_exclusive}..{to}");
@@ -974,6 +999,34 @@ fn parse_ref_facts(text: &str) -> RefFacts {
         }
     }
     facts
+}
+
+/// One commit of [`Repo::log_range`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LogCommit {
+    pub sha: String,
+    /// Committer time, epoch seconds.
+    pub at: u64,
+    /// The first line of the message.
+    pub subject: String,
+}
+
+/// The `log_range` output: NUL-separated records of `sha`, committer
+/// time and subject, unit-separated. A record that does not parse is
+/// skipped.
+fn parse_log(text: &str) -> Vec<LogCommit> {
+    text.split('\0')
+        .filter_map(|record| {
+            let (sha, rest) = record.trim_start_matches('\n').split_once('\x1f')?;
+            let (at, subject) = rest.split_once('\x1f')?;
+            let at = at.parse().ok()?;
+            Some(LogCommit {
+                sha: sha.to_owned(),
+                at,
+                subject: subject.to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// The `ahead_behind` output: `refs/heads/<name>\0<ahead> <behind>` per
@@ -1759,6 +1812,28 @@ mod tests {
         assert_eq!(parse_track("[ahead 2"), None);
         assert_eq!(parse_track("[ahead]"), None);
         assert_eq!(parse_track("[ahead x]"), None);
+    }
+
+    #[test]
+    fn log_records_parse_and_skip_noise() {
+        let text = "aaa\x1f10\x1ffirst: a\x1fb\0bbb\x1f9\x1fsecond\0junk\0ddd\x1f5\0ccc\x1fnot-a-time\x1fx\0";
+        let commits = parse_log(text);
+        assert_eq!(
+            commits,
+            vec![
+                LogCommit {
+                    sha: "aaa".to_owned(),
+                    at: 10,
+                    subject: "first: a\x1fb".to_owned(),
+                },
+                LogCommit {
+                    sha: "bbb".to_owned(),
+                    at: 9,
+                    subject: "second".to_owned(),
+                },
+            ]
+        );
+        assert!(bogus_repo().log_range("a", "b", 5).is_err());
     }
 
     #[test]

@@ -428,6 +428,10 @@ pub struct WorkRow {
     pub forge_url: Option<String>,
     /// Commits on the proven base the row's tip lacks; `None` is `?`.
     pub commits_behind: Option<u64>,
+    /// The newest commits on the tip the proven base lacks, newest first,
+    /// at most `vector::COMMIT_LIST_LIMIT` (`commits_ahead` counts them
+    /// all); `None` is `?` - the base is unproven or the read failed.
+    pub commits: Option<Vec<CommitRow>>,
     /// The panes bound to the row's worktree; empty where there is no
     /// worktree or none bound.
     pub panes: Vec<PaneRow>,
@@ -454,6 +458,19 @@ pub struct WorkRow {
     /// The section reason followed by the compact evidence tail (`↑3`,
     /// `~dirty`, `no remote`, `no wt`, `merged`, a PR/MR label).
     pub summary: String,
+}
+
+/// One commit on a row's tip that its proven base lacks.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitRow {
+    pub sha: String,
+    pub subject: String,
+    /// Committer time, epoch seconds.
+    pub at: u64,
+    /// The short id of the one conversation whose touch to this
+    /// incarnation was open at the commit time; `None` (`?`) when no
+    /// touch or more than one covers it.
+    pub conversation: Option<String>,
 }
 
 /// One tmux pane bound to a worktree, for the Work detail's `tmux` line.
@@ -1509,6 +1526,7 @@ impl Collector {
                 })
                 .count();
             w.live_pids = w.live_sessions;
+            attribute_commits(&mut w.commits, id, &self.model.conversations);
         }
         // Attention, section and summary are derived per publish from the
         // conversations bound to the row; sections order first, newest
@@ -1926,6 +1944,17 @@ fn work_row(
         forge_label: state.forge.label.clone(),
         forge_url: state.forge.url.clone(),
         commits_behind: v.commits_behind_of_base.known().copied(),
+        commits: v.commits_not_on_base.known().map(|list| {
+            list.iter()
+                .map(|c| CommitRow {
+                    sha: c.sha.clone(),
+                    subject: c.subject.clone(),
+                    at: c.at,
+                    // Attributed per publish, once touches are this pass's.
+                    conversation: None,
+                })
+                .collect()
+        }),
         // Filled by the caller with the runtime's pane inventory.
         panes: Vec::new(),
         gone: None,
@@ -2293,6 +2322,33 @@ fn relate(conversations: &mut [ConversationRow], runtime: &Runtime) {
     for (c, mut rel) in conversations.iter_mut().zip(related) {
         rel.sort_by_key(|r| r.strength);
         c.related = rel;
+    }
+}
+
+/// Name the conversation behind each listed commit of incarnation `id`:
+/// the one conversation whose touch to it was open at the commit time.
+/// No covering touch, or several, leaves `?` - a guess between them is
+/// no attribution.
+fn attribute_commits(
+    commits: &mut Option<Vec<CommitRow>>,
+    id: &str,
+    conversations: &[ConversationRow],
+) {
+    let Some(commits) = commits else {
+        return;
+    };
+    for commit in commits {
+        let mut covering = conversations.iter().filter(|c| {
+            c.touches.iter().any(|t| {
+                t.incarnation_id == id
+                    && t.valid_from <= commit.at
+                    && t.valid_until.is_none_or(|until| commit.at < until)
+            })
+        });
+        commit.conversation = match (covering.next(), covering.next()) {
+            (Some(one), None) => Some(one.short_id.clone()),
+            _ => None,
+        };
     }
 }
 
@@ -2855,6 +2911,7 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         forge_label: None,
         forge_url: None,
         commits_behind: None,
+        commits: None,
         panes: Vec::new(),
         gone: None,
         references: Vec::new(),
@@ -2896,6 +2953,7 @@ fn carry_remote(new: &mut vector::WorkState, old: &vector::WorkState) {
     new.base = old.base.clone();
     new.vector.commits_ahead_of_base = old.vector.commits_ahead_of_base.clone();
     new.vector.commits_behind_of_base = old.vector.commits_behind_of_base.clone();
+    new.vector.commits_not_on_base = old.vector.commits_not_on_base.clone();
     new.vector.landed = old.vector.landed.clone();
     if pending(&new.vector.unpushed_commits) {
         new.vector.unpushed_commits = old.vector.unpushed_commits.clone();
@@ -3460,6 +3518,7 @@ mod tests {
                 dirty: Evidence::Known(false),
                 commits_ahead_of_base: Evidence::Unknown("none asked".to_owned()),
                 commits_behind_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_not_on_base: Evidence::Unknown("none asked".to_owned()),
                 upstream_state: UpstreamState::NotApplicable,
                 unpushed_commits: Evidence::Unknown("none asked".to_owned()),
                 landed: Evidence::Unknown("none asked".to_owned()),
@@ -4791,6 +4850,51 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn a_commit_names_the_one_conversation_whose_touch_covered_it() {
+        let commit = |at: u64| CommitRow {
+            sha: format!("{at:040}"),
+            subject: "s".to_owned(),
+            at,
+            conversation: None,
+        };
+        // a touched i1 over [1000, 2000), b from 1500 on, c touched only
+        // another incarnation.
+        let mut a = live_row("aaaaaaaa-1", 1);
+        a.touches = vec![TouchRow {
+            valid_until: Some(2_000),
+            ..open_touch("i1")
+        }];
+        let mut b = live_row("bbbbbbbb-1", 2);
+        b.touches = vec![TouchRow {
+            valid_from: 1_500,
+            ..open_touch("i1")
+        }];
+        let mut c = live_row("cccccccc-1", 3);
+        c.touches = vec![open_touch("i2")];
+        let convs = vec![a, b, c];
+        let mut commits = Some(vec![
+            commit(1_200),
+            commit(1_700),
+            commit(2_000),
+            commit(900),
+        ]);
+        attribute_commits(&mut commits, "i1", &convs);
+        let named: Vec<Option<&str>> = commits
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|c| c.conversation.as_deref())
+            .collect();
+        // Only a covers 1200; a and b both cover 1700 - no guess; a's
+        // interval ends before 2000, leaving b; nothing covers 900.
+        assert_eq!(named, vec![Some("aaaaaaaa"), None, Some("bbbbbbbb"), None]);
+        // An unknown list stays unknown.
+        let mut unknown = None;
+        attribute_commits(&mut unknown, "i1", &convs);
+        assert!(unknown.is_none());
     }
 
     #[test]

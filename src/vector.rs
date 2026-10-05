@@ -173,6 +173,9 @@ pub struct StateVector {
     /// Commits on the proven base the row's tip lacks - the behind half of
     /// the ahead/behind pair.
     pub commits_behind_of_base: Evidence<u64>,
+    /// The newest commits on the tip that the proven base lacks, at most
+    /// [`COMMIT_LIST_LIMIT`]; `commits_ahead_of_base` says how many exist.
+    pub commits_not_on_base: Evidence<Vec<git::LogCommit>>,
     pub upstream_state: UpstreamState,
     /// Commits not reachable from the configured upstream. For a
     /// never-pushed branch every commit past the base is unpushed by
@@ -342,6 +345,7 @@ impl AnchorWork {
         self.state.vector.upstream_state = applied.upstream_state;
         self.state.vector.commits_ahead_of_base = applied.commits_ahead;
         self.state.vector.commits_behind_of_base = applied.commits_behind;
+        self.state.vector.commits_not_on_base = applied.commits_listed;
         self.state.vector.unpushed_commits = applied.unpushed;
         self.state.vector.landed = applied.landed;
     }
@@ -354,6 +358,7 @@ pub struct RemoteApplied {
     pub base: Evidence<Base>,
     pub commits_ahead: Evidence<u64>,
     pub commits_behind: Evidence<u64>,
+    pub commits_listed: Evidence<Vec<git::LogCommit>>,
     pub unpushed: Evidence<u64>,
     pub landed: Evidence<Landed>,
 }
@@ -562,6 +567,7 @@ fn anchor_work(
             dirty: local.dirty.clone(),
             commits_ahead_of_base: Evidence::Unknown(PENDING.to_owned()),
             commits_behind_of_base: Evidence::Unknown(PENDING.to_owned()),
+            commits_not_on_base: Evidence::Unknown(PENDING.to_owned()),
             upstream_state: UpstreamState::Unknown(PENDING.to_owned()),
             unpushed_commits: local
                 .unreachable
@@ -704,8 +710,9 @@ pub fn apply_remote(
         .iter()
         .zip(resolved)
         .map(|(work, (upstream, base))| {
-            let (commits_ahead, commits_behind, landed, unpushed) = match &work.local.head {
+            let (commits_ahead, commits_behind, commits_listed, landed, unpushed) = match &work.local.head {
                 None /* // coverage: off - the unborn arm's second region is an unexecuted-instantiation edge */ => (
+                    Evidence::Unknown("unborn HEAD".to_owned()),
                     Evidence::Unknown("unborn HEAD".to_owned()),
                     Evidence::Unknown("unborn HEAD".to_owned()),
                     Evidence::Unknown("unborn HEAD".to_owned()),
@@ -719,6 +726,7 @@ pub fn apply_remote(
                     });
                     let commits = commits_ahead(repo, head, &base, counts.map(|(a, _)| a));
                     let behind = commits_behind(repo, head, &base, counts.map(|(_, b)| b));
+                    let listed = commits_listed(repo, head, &base, &commits);
                     let landed = landed(repo, head, &base, counts.map(|(a, _)| a == 0));
                     let unpushed = match &work.local.unreachable {
                         // A detached HEAD has no upstream; the unreachable
@@ -732,7 +740,7 @@ pub fn apply_remote(
                             &commits,
                         ),
                     };
-                    (commits, behind, landed, unpushed)
+                    (commits, behind, listed, landed, unpushed)
                 }
             };
             RemoteApplied {
@@ -740,6 +748,7 @@ pub fn apply_remote(
                 base,
                 commits_ahead,
                 commits_behind,
+                commits_listed,
                 unpushed,
                 landed,
             }
@@ -895,6 +904,31 @@ fn commits_ahead(
                 Err(e) => Evidence::Unknown(format!("rev-list: {e}")),
             },
         },
+    }
+}
+
+/// How many commits past the base a row lists: the detail view's
+/// recent history, not an archive - `commits_ahead_of_base` counts the
+/// rest.
+pub const COMMIT_LIST_LIMIT: usize = 20;
+
+/// `log <base>..<head>`, at most [`COMMIT_LIST_LIMIT`] - skipped when the
+/// ahead count already proved there is nothing to list.
+fn commits_listed(
+    repo: &Repo,
+    head: &str,
+    base: &Evidence<Base>,
+    ahead: &Evidence<u64>,
+) -> Evidence<Vec<git::LogCommit>> {
+    match (base, ahead) {
+        (Evidence::Unknown(reason), _) => Evidence::Unknown(format!("no proven base ({reason})")),
+        (_, Evidence::Known(0)) => Evidence::Known(Vec::new()),
+        (Evidence::Known(base), _) => {
+            match repo.log_range(&base.local_ref, head, COMMIT_LIST_LIMIT) {
+                Ok(commits) => Evidence::Known(commits),
+                Err(e) => Evidence::Unknown(format!("log: {e}")),
+            }
+        }
     }
 }
 
