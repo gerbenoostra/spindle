@@ -2013,7 +2013,6 @@ mod tests {
                     branch: Some("feat/login".to_owned()),
                     touches: vec![touch("i111", "/repos/a/.git", "feat/login")],
                     current_incarnation: Some("i111".to_owned()),
-                    trail: Vec::new(),
                 },
                 ConversationRow {
                     provider: Provider::Claude,
@@ -2048,7 +2047,6 @@ mod tests {
                     branch: Some("feat/login".to_owned()),
                     touches: vec![touch("i111", "/repos/a/.git", "feat/login")],
                     current_incarnation: Some("i111".to_owned()),
-                    trail: Vec::new(),
                 },
                 ConversationRow {
                     provider: Provider::Claude,
@@ -2079,7 +2077,6 @@ mod tests {
                     branch: None,
                     touches: Vec::new(),
                     current_incarnation: None,
-                    trail: Vec::new(),
                 },
             ],
             errors: vec![],

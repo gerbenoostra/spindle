@@ -489,21 +489,16 @@ pub struct ConversationRow {
     pub touches: Vec<TouchRow>,
     /// The incarnation the newest open interval names, if one is current.
     pub current_incarnation: Option<String>,
-    /// The provider's branch trail with each mark's repo resolved: the
-    /// evidence dated touches derive from. Not part of the snapshot
-    /// contract - the touches are.
-    #[serde(skip)]
-    pub trail: Vec<TrailMark>,
 }
 
 /// One provider branch mark, placed: from `at_ms` (epoch ms) on, the
 /// conversation's project in `repo` was on `branch`; `None` is a detached
 /// stretch with no placeable branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrailMark {
-    pub at_ms: u64,
-    pub repo: String,
-    pub branch: Option<String>,
+struct TrailMark {
+    at_ms: u64,
+    repo: String,
+    branch: Option<String>,
 }
 
 impl ConversationRow {
@@ -566,6 +561,9 @@ struct Model {
     work: store::Work,
     /// The `work.json` stamp `work` was read at.
     work_stamp: Option<store::WorkStamp>,
+    /// Conversation key -> its provider branch trail, placed in the
+    /// repository its cwd resolved to; replaced by every stage 2.
+    trails: HashMap<String, Vec<TrailMark>>,
     /// Repo id -> the epoch ms of this process's last ref sync over it:
     /// an active incarnation's last observation, which a quiet pass does
     /// not write to `work.json`.
@@ -818,15 +816,21 @@ impl Collector {
         // are many, so each resolves once per pass - a failure is one
         // error, not one per conversation.
         let placements = resolve_cwds(&inventory.conversations, &mut self.model.errors);
-        let trails = resolve_trails(&inventory.conversations, &placements);
-        for ((conv, place), trail) in self
+        // The provider trails stay in the model: the evidence dated
+        // touches derive from, not part of the published rows.
+        self.model.trails = self
             .model
             .conversations
-            .iter_mut()
-            .zip(placements.iter())
-            .zip(trails)
-        {
-            conv.trail = trail;
+            .iter()
+            .zip(resolve_trails(&inventory.conversations, &placements))
+            .map(|(c, trail)| {
+                (
+                    store::conversation_key(c.provider.as_str(), &c.session_id),
+                    trail,
+                )
+            })
+            .collect();
+        for (conv, place) in self.model.conversations.iter_mut().zip(placements.iter()) {
             let (repo, worktree, branch) = match place {
                 Some(CwdPlacement::Checkout {
                     repo_id,
@@ -1142,7 +1146,8 @@ impl Collector {
         let mut dated = Vec::new();
         for c in &self.model.conversations {
             let key = store::conversation_key(c.provider.as_str(), &c.session_id);
-            dated.extend(dated_touches(&key, &c.trail, &self.model.work));
+            let trail = self.model.trails.get(&key).map_or(&[][..], Vec::as_slice);
+            dated.extend(dated_touches(&key, trail, &self.model.work));
             // A cwd places only a live conversation: where a dead one's
             // directory points now says nothing about where it worked.
             if !c.running() {
@@ -2553,7 +2558,6 @@ fn conversation_row(
         branch,
         touches: Vec::new(),
         current_incarnation: None,
-        trail: Vec::new(),
     }
 }
 
@@ -3395,7 +3399,6 @@ mod tests {
             branch: None,
             touches: Vec::new(),
             current_incarnation: None,
-            trail: Vec::new(),
         };
         let now = SystemTime::now();
         // The inbox order is the attention rank, not the state.
