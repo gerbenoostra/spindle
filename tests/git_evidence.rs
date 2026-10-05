@@ -1308,10 +1308,6 @@ fn an_unfetched_remote_leaves_no_local_base_evidence() {
     );
 }
 
-/// The staged collector reads each repo's branch facts from one
-/// `for-each-ref` and applies remote evidence afterwards. It must agree
-/// with the per-branch probes it replaces on every fixture row - verdicts,
-/// reasons and the evidence fields behind them alike.
 #[test]
 fn the_commits_not_on_the_base_are_listed_newest_first() {
     let f = standard();
@@ -1333,6 +1329,10 @@ fn the_commits_not_on_the_base_are_listed_newest_first() {
     assert_eq!(locked.commits_not_on_base, Evidence::Known(Vec::new()));
 }
 
+/// The staged collector reads each repo's branch facts from one
+/// `for-each-ref` and applies remote evidence afterwards. It must agree
+/// with the per-branch probes it replaces on every fixture row - verdicts,
+/// reasons and the evidence fields behind them alike.
 #[test]
 fn the_batched_read_agrees_with_the_per_branch_probes() {
     let f = standard();
