@@ -492,7 +492,7 @@ pub struct ReferenceRow {
 }
 
 /// `RelatedRow.strength`, in proven-strength order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationStrength {
     /// The provider declared the relation itself.
@@ -511,7 +511,7 @@ pub struct RelatedRow {
     /// The strength group the relation belongs to.
     pub strength: RelationStrength,
     /// What the relation claims about the other conversation:
-    /// `ancestor` or `same incarnation`.
+    /// `ancestor`, `descendant` or `same incarnation`.
     pub label: String,
     /// The evidence that proved it, for the view's provenance column.
     pub provenance: String,
@@ -2248,16 +2248,23 @@ fn relate(conversations: &mut [ConversationRow], runtime: &Runtime) {
                 continue;
             }
             // Observed live process ancestry: b's process provably
-            // spawned a's.
+            // spawned a's. Both sides list it - a names its ancestor, b
+            // its descendant.
             if let (Some(pa), Some(pb)) = (pid_of(a), pid_of(b))
                 && let Some(table) = runtime.processes.as_ref()
-                && table.ancestors(pa)[1..].contains(&pb)
+                && table.ancestors(pa).iter().skip(1).any(|&p| p == pb)
             {
                 related[a].push(row(
                     RelationStrength::ProcessAncestry,
                     "ancestor",
                     "live process ancestry".to_owned(),
                     &conversations[b],
+                ));
+                related[b].push(row(
+                    RelationStrength::ProcessAncestry,
+                    "descendant",
+                    "live process ancestry".to_owned(),
+                    &conversations[a],
                 ));
             }
             // Every exact incarnation both conversations touched.
@@ -2277,7 +2284,10 @@ fn relate(conversations: &mut [ConversationRow], runtime: &Runtime) {
             }
         }
     }
-    for (c, rel) in conversations.iter_mut().zip(related) {
+    // A descendant lands on its ancestor's list out of loop order: keep
+    // the documented strongest-group-first order.
+    for (c, mut rel) in conversations.iter_mut().zip(related) {
+        rel.sort_by_key(|r| r.strength);
         c.related = rel;
     }
 }
@@ -4509,9 +4519,15 @@ mod tests {
             convs[0].related.iter().map(|r| r.strength).collect();
         assert_eq!(strengths, vec![RelationStrength::ProcessAncestry]);
         assert_eq!(convs[0].related[0].session_id, "bbbbbbbb-1");
-        // Sharing a ref name across distinct incarnations is not a
-        // relation - neither is sharing a pane at different times.
-        assert!(convs[1].related.is_empty());
+        assert_eq!(convs[0].related[0].label, "ancestor");
+        // The parent lists its child: ancestry relates both ways. Sharing
+        // a ref name across distinct incarnations adds nothing more.
+        let parent: Vec<(&str, &str)> = convs[1]
+            .related
+            .iter()
+            .map(|r| (r.session_id.as_str(), r.label.as_str()))
+            .collect();
+        assert_eq!(parent, vec![("aaaaaaaa-1", "descendant")]);
         // A shared exact incarnation is.
         b.touches = vec![open_touch("i1")];
         let mut convs = vec![a.clone(), b.clone()];
@@ -4521,6 +4537,19 @@ mod tests {
         assert!(
             strengths.contains(&RelationStrength::SameIncarnation),
             "{strengths:?}"
+        );
+        // With the parent first, its descendant arrives after its touch
+        // relation; the list still sorts strongest group first.
+        let mut convs = vec![b.clone(), a.clone()];
+        relate(&mut convs, &runtime);
+        let strengths: Vec<RelationStrength> =
+            convs[0].related.iter().map(|r| r.strength).collect();
+        assert_eq!(
+            strengths,
+            vec![
+                RelationStrength::ProcessAncestry,
+                RelationStrength::SameIncarnation
+            ]
         );
         // With no process table the first two strengths drop out; the
         // touch relation still stands. A dead or attachment-less
