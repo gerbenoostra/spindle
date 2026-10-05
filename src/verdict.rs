@@ -36,6 +36,19 @@ pub enum Verdict {
     NotApplicable,
 }
 
+impl Verdict {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Safe => "safe",
+            Verdict::SafeAfterWorktreeRemoval => "safe_after_worktree_removal",
+            Verdict::Review => "review",
+            Verdict::Blocked => "blocked",
+            Verdict::NotApplicable => "not_applicable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActionVerdict {
     pub verdict: Verdict,
@@ -291,4 +304,25 @@ pub fn cleanup(state: &WorkState, forge: &ForgeStatus) -> (ActionVerdict, Action
     let removal = worktree_removal(state, forge);
     let deletion = branch_deletion(state, &removal, forge);
     (removal, deletion)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdicts_spell_their_wire_names() {
+        for (v, word) in [
+            (Verdict::Safe, "safe"),
+            (
+                Verdict::SafeAfterWorktreeRemoval,
+                "safe_after_worktree_removal",
+            ),
+            (Verdict::Review, "review"),
+            (Verdict::Blocked, "blocked"),
+            (Verdict::NotApplicable, "not_applicable"),
+        ] {
+            assert_eq!(v.as_str(), word);
+        }
+    }
 }

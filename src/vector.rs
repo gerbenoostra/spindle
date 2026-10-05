@@ -170,6 +170,9 @@ pub struct StateVector {
     /// Tracked and untracked changes; `Known(false)` for a branch-only row.
     pub dirty: Evidence<bool>,
     pub commits_ahead_of_base: Evidence<u64>,
+    /// Commits on the proven base the row's tip lacks - the behind half of
+    /// the ahead/behind pair.
+    pub commits_behind_of_base: Evidence<u64>,
     pub upstream_state: UpstreamState,
     /// Commits not reachable from the configured upstream. For a
     /// never-pushed branch every commit past the base is unpushed by
@@ -338,6 +341,7 @@ impl AnchorWork {
         self.state.base = applied.base;
         self.state.vector.upstream_state = applied.upstream_state;
         self.state.vector.commits_ahead_of_base = applied.commits_ahead;
+        self.state.vector.commits_behind_of_base = applied.commits_behind;
         self.state.vector.unpushed_commits = applied.unpushed;
         self.state.vector.landed = applied.landed;
     }
@@ -349,6 +353,7 @@ pub struct RemoteApplied {
     pub upstream_state: UpstreamState,
     pub base: Evidence<Base>,
     pub commits_ahead: Evidence<u64>,
+    pub commits_behind: Evidence<u64>,
     pub unpushed: Evidence<u64>,
     pub landed: Evidence<Landed>,
 }
@@ -366,6 +371,14 @@ pub struct RepoLocal {
     pub anchors: Vec<AnchorWork>,
     /// The distinct remote names [`apply_remote`] will consult.
     pub asks: Vec<String>,
+}
+
+impl RepoLocal {
+    /// The configured remote names, when `git remote` answered; `None` on
+    /// the read's own error.
+    pub fn remote_names(&self) -> Option<&[String]> {
+        self.remotes.as_ref().ok().map(Vec::as_slice)
+    }
 }
 
 /// Stage 2 for one repository: worktrees, branches and every fact local
@@ -548,6 +561,7 @@ fn anchor_work(
             past_agent_sessions: runtime.past_agent_sessions,
             dirty: local.dirty.clone(),
             commits_ahead_of_base: Evidence::Unknown(PENDING.to_owned()),
+            commits_behind_of_base: Evidence::Unknown(PENDING.to_owned()),
             upstream_state: UpstreamState::Unknown(PENDING.to_owned()),
             unpushed_commits: local
                 .unreachable
@@ -690,20 +704,22 @@ pub fn apply_remote(
         .iter()
         .zip(resolved)
         .map(|(work, (upstream, base))| {
-            let (commits_ahead, landed, unpushed) = match &work.local.head {
+            let (commits_ahead, commits_behind, landed, unpushed) = match &work.local.head {
                 None /* // coverage: off - the unborn arm's second region is an unexecuted-instantiation edge */ => (
+                    Evidence::Unknown("unborn HEAD".to_owned()),
                     Evidence::Unknown("unborn HEAD".to_owned()),
                     Evidence::Unknown("unborn HEAD".to_owned()),
                     Evidence::Unknown("unborn HEAD".to_owned()),
                 ),
                 Some(head) => {
-                    let ahead = base.known().and_then(|b| {
+                    let counts = base.known().and_then(|b| {
                         head.strip_prefix("refs/heads/").and_then(|name| {
                             batches.get(&b.local_ref)?.get(name).copied() // coverage: off - every proven base was batched above
                         })
                     });
-                    let commits = commits_ahead(repo, head, &base, ahead.map(|(a, _)| a));
-                    let landed = landed(repo, head, &base, ahead.map(|(a, _)| a == 0));
+                    let commits = commits_ahead(repo, head, &base, counts.map(|(a, _)| a));
+                    let behind = commits_behind(repo, head, &base, counts.map(|(_, b)| b));
+                    let landed = landed(repo, head, &base, counts.map(|(a, _)| a == 0));
                     let unpushed = match &work.local.unreachable {
                         // A detached HEAD has no upstream; the unreachable
                         // count collected in stage 2 is what removal loses.
@@ -716,13 +732,14 @@ pub fn apply_remote(
                             &commits,
                         ),
                     };
-                    (commits, landed, unpushed)
+                    (commits, behind, landed, unpushed)
                 }
             };
             RemoteApplied {
                 upstream_state: upstream,
                 base,
                 commits_ahead,
+                commits_behind,
                 unpushed,
                 landed,
             }
@@ -874,6 +891,26 @@ fn commits_ahead(
         Evidence::Known(base) => match ahead {
             Some(count) => Evidence::Known(count),
             None => match repo.rev_list_count(&base.local_ref, head) {
+                Ok(count) => Evidence::Known(count),
+                Err(e) => Evidence::Unknown(format!("rev-list: {e}")),
+            },
+        },
+    }
+}
+
+/// `rev-list --count <head>..<base>` - the commits the base has that the
+/// tip lacks - or the batch's behind count when the branch was in one.
+fn commits_behind(
+    repo: &Repo,
+    head: &str,
+    base: &Evidence<Base>,
+    behind: Option<u64>,
+) -> Evidence<u64> {
+    match base {
+        Evidence::Unknown(reason) => Evidence::Unknown(format!("no proven base ({reason})")),
+        Evidence::Known(base) => match behind {
+            Some(count) => Evidence::Known(count),
+            None => match repo.rev_list_count(head, &base.local_ref) {
                 Ok(count) => Evidence::Known(count),
                 Err(e) => Evidence::Unknown(format!("rev-list: {e}")),
             },

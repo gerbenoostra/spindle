@@ -80,6 +80,18 @@ pub enum NormEvent {
 }
 
 impl NormEvent {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NormEvent::Start => "start",
+            NormEvent::Activity => "activity",
+            NormEvent::Awaiting => "awaiting",
+            NormEvent::End => "end",
+            NormEvent::Error => "error",
+            NormEvent::TeardownHint => "teardown_hint",
+        }
+    }
+
     /// The execution class the event claims. `TeardownHint` is none at
     /// all: it is diagnostic, not a state.
     pub fn execution(self) -> Option<Exec> {
@@ -103,13 +115,26 @@ impl NormEvent {
 }
 
 /// Effective execution state, derived - not a provider's word.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Exec {
     Busy,
     Idle,
     Waiting,
     /// No applicable evidence, or none that proves a live state.
     Unknown,
+}
+
+impl Exec {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Exec::Busy => "busy",
+            Exec::Idle => "idle",
+            Exec::Waiting => "waiting",
+            Exec::Unknown => "unknown",
+        }
+    }
 }
 
 /// One committed journal record: one hook ping. Field names stay short -
@@ -384,6 +409,11 @@ pub struct LifecycleInputs {
     /// The checkout path, when one exists - a move is a tree transition.
     #[serde(default)]
     pub worktree_path: Option<String>,
+    /// The worktree's tmux-side admin id (`@wt_adminid`), when its anchor
+    /// carried one - the edge a window's stored binding still names after
+    /// the worktree itself is gone.
+    #[serde(default)]
+    pub admin_id: Option<String>,
     /// Commits on the tip not on the proven base.
     #[serde(default)]
     pub ahead: Option<u64>,
@@ -406,13 +436,18 @@ pub struct LifecycleInputs {
 
 impl LifecycleInputs {
     /// This reading laid over `prior`: every unproven field keeps the
-    /// prior proven value. The checkout's presence and path are always
-    /// observed, never unproven.
+    /// prior proven value. The checkout's presence is always observed;
+    /// its path and admin id keep their last proven value, so a record
+    /// outliving its workspace still names where the work was.
     fn over(&self, prior: &LifecycleInputs) -> LifecycleInputs {
         LifecycleInputs {
             dirty: self.dirty.or(prior.dirty),
             worktree: self.worktree,
-            worktree_path: self.worktree_path.clone(),
+            worktree_path: self
+                .worktree_path
+                .clone()
+                .or_else(|| prior.worktree_path.clone()),
+            admin_id: self.admin_id.clone().or_else(|| prior.admin_id.clone()),
             ahead: self.ahead.or(prior.ahead),
             unpushed: self.unpushed.or(prior.unpushed),
             upstream: self.upstream.clone().or_else(|| prior.upstream.clone()),
@@ -430,8 +465,13 @@ impl LifecycleInputs {
         fn changed<T: PartialEq>(new: &Option<T>, old: &Option<T>) -> bool {
             matches!((new, old), (Some(n), Some(o)) if n != o)
         }
+        // The checkout appearing or vanishing is a transition in itself;
+        // path and admin id only transition on a proven move (Some vs
+        // Some) - adopting a first value, like losing one, dates nothing
+        // twice.
         self.worktree != prior.worktree
-            || self.worktree_path != prior.worktree_path
+            || changed(&self.worktree_path, &prior.worktree_path)
+            || changed(&self.admin_id, &prior.admin_id)
             || changed(&self.dirty, &prior.dirty)
             || changed(&self.ahead, &prior.ahead)
             || changed(&self.unpushed, &prior.unpushed)
@@ -477,6 +517,19 @@ pub enum ContinuityEvidence {
     Ambiguous,
 }
 
+impl ContinuityEvidence {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContinuityEvidence::FirstObservation => "first_observation",
+            ContinuityEvidence::SameReflogCreation => "same_reflog_creation",
+            ContinuityEvidence::ProvenRename => "proven_rename",
+            ContinuityEvidence::ForcePush => "force_push",
+            ContinuityEvidence::Ambiguous => "ambiguous",
+        }
+    }
+}
+
 /// What a touch placement was derived from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -487,12 +540,31 @@ pub enum TouchProvenance {
     ProviderBranch,
 }
 
+impl TouchProvenance {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TouchProvenance::Cwd => "cwd",
+            TouchProvenance::ProviderBranch => "provider_branch",
+        }
+    }
+}
+
 /// How exact a touch's placement claim is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
     /// Proven: the placement carries no inference.
     Exact,
+}
+
+impl Confidence {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confidence::Exact => "exact", // coverage: off - the only variant
+        }
+    }
 }
 
 /// One interval of a conversation's placement on a branch incarnation:
@@ -823,6 +895,24 @@ struct Checkpoint {
     folds: HashMap<String, Fold>,
 }
 
+/// A committed journal record the fold rejected as stale or duplicate
+/// producer evidence, plus the reason - kept for the evidence view.
+#[derive(Debug, Clone, Serialize)]
+pub struct RejectedRecord {
+    /// `conversation_key(provider, session)`.
+    pub conversation: String,
+    /// The journal commit sequence the record carries.
+    pub seq: u64,
+    /// The record's own time (`pts`, else `at`), epoch ms.
+    pub at_ms: u64,
+    /// The producer sequence the record carried, when it carried one.
+    pub pseq: Option<u64>,
+    /// The provider's native event name.
+    pub native: String,
+    /// Why the fold rejected it.
+    pub reason: String,
+}
+
 /// The whole store, read: per-conversation folds plus the authored files.
 /// A conversation's fold key is `provider\0session_id`.
 #[derive(Debug, Default)]
@@ -834,6 +924,10 @@ pub struct Loaded {
     pub marks: HashMap<String, Mark>,
     /// The authored Work state: incarnation records and parked flags.
     pub work: Work,
+    /// Committed records the folds rejected while applying, in journal
+    /// order - the stale and duplicate observations the evidence view
+    /// shows next to what won.
+    pub rejected: Vec<RejectedRecord>,
     /// Records excluded or files unreadable - isolated, never fatal.
     pub errors: Vec<SourceError>,
     /// The highest committed sequence the store knows.
@@ -985,6 +1079,7 @@ impl Store {
         }
         let mut tail = 0usize;
         let mut max_seq = through;
+        let mut rejected = Vec::new();
         let journal = self.read_journal(&mut errors);
         for record in &journal.records {
             max_seq = max_seq.max(record.seq);
@@ -992,10 +1087,31 @@ impl Store {
                 continue;
             }
             tail += 1;
-            folds
-                .entry(conversation_key(&record.provider, &record.session))
-                .or_default()
-                .apply(record);
+            let key = conversation_key(&record.provider, &record.session);
+            let fold: &mut Fold = folds.entry(key.clone()).or_default();
+            match fold.apply(record) {
+                Apply::Accepted => {}
+                outcome => {
+                    let high_water = fold.pseq_high.unwrap_or(0);
+                    let pseq = record.pseq.unwrap_or(0);
+                    rejected.push(RejectedRecord {
+                        conversation: key,
+                        seq: record.seq,
+                        at_ms: record.pts.unwrap_or(record.at),
+                        pseq: record.pseq,
+                        native: record.native.clone(),
+                        reason: match outcome {
+                            Apply::Stale => format!(
+                                "producer sequence {pseq} is below the high-water {high_water}"
+                            ),
+                            Apply::Duplicate => format!(
+                                "producer sequence {pseq} already seen; the observation refreshes the retained one"
+                            ),
+                            Apply::Accepted => unreachable!(), // coverage: off - the match guards it
+                        },
+                    });
+                }
+            }
         }
         self.report_cuts(&mut errors);
         let seen = self.read_seen(&mut errors);
@@ -1011,6 +1127,7 @@ impl Store {
                 seen,
                 marks,
                 work,
+                rejected,
                 errors,
                 max_seq,
                 ack_readable,
@@ -3340,5 +3457,74 @@ mod tests {
         let work = store.load().work;
         assert_eq!(work.branches.len(), 4);
         assert!(work.branches.values().all(|r| r.parked));
+    }
+
+    #[test]
+    fn enum_labels_spell_their_wire_names() {
+        for (v, word) in [
+            (Exec::Busy, "busy"),
+            (Exec::Idle, "idle"),
+            (Exec::Waiting, "waiting"),
+            (Exec::Unknown, "unknown"),
+        ] {
+            assert_eq!(v.as_str(), word);
+        }
+        for (v, word) in [
+            (NormEvent::Start, "start"),
+            (NormEvent::Activity, "activity"),
+            (NormEvent::Awaiting, "awaiting"),
+            (NormEvent::End, "end"),
+            (NormEvent::Error, "error"),
+            (NormEvent::TeardownHint, "teardown_hint"),
+        ] {
+            assert_eq!(v.as_str(), word);
+        }
+        for (v, word) in [
+            (ContinuityEvidence::FirstObservation, "first_observation"),
+            (
+                ContinuityEvidence::SameReflogCreation,
+                "same_reflog_creation",
+            ),
+            (ContinuityEvidence::ProvenRename, "proven_rename"),
+            (ContinuityEvidence::ForcePush, "force_push"),
+            (ContinuityEvidence::Ambiguous, "ambiguous"),
+        ] {
+            assert_eq!(v.as_str(), word);
+        }
+        assert_eq!(TouchProvenance::Cwd.as_str(), "cwd");
+        assert_eq!(TouchProvenance::ProviderBranch.as_str(), "provider_branch");
+        assert_eq!(Confidence::Exact.as_str(), "exact");
+    }
+
+    #[test]
+    fn a_load_reports_every_record_the_fold_rejected() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let mut high = record("claude", "s1", "Stop", NormEvent::End);
+        high.pseq = Some(5);
+        store.append(high).expect("append");
+        let mut dup = record("claude", "s1", "Stop", NormEvent::End);
+        dup.pseq = Some(5);
+        store.append(dup).expect("append");
+        let mut stale = record("claude", "s1", "Stop", NormEvent::End);
+        stale.pseq = Some(3);
+        store.append(stale).expect("append");
+        let loaded = store.load();
+        assert_eq!(loaded.rejected.len(), 2, "{:?}", loaded.rejected);
+        assert!(
+            loaded
+                .rejected
+                .iter()
+                .all(|r| r.conversation == conversation_key("claude", "s1"))
+        );
+        let reasons: Vec<&str> = loaded.rejected.iter().map(|r| r.reason.as_str()).collect();
+        assert!(
+            reasons.iter().any(|r| r.contains("below the high-water")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("already seen")),
+            "{reasons:?}"
+        );
     }
 }

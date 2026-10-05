@@ -25,9 +25,9 @@ use crate::forge::{self, ForgeStatus, Pipeline, WorkItem};
 use crate::git::{self, Head, RemoteHead, RemoteListing, Resolved};
 use crate::process::{Liveness, ProcessInstance, ProcessStart};
 use crate::provider::{SourceError, StateEvidence};
-use crate::runtime::{PaneSource, Placement, Provider, Runtime};
+use crate::runtime::{EvidenceSource, PaneSource, Placement, Provider, Runtime};
 use crate::store::{self, Exec, Store};
-use crate::tmux::PaneRef;
+use crate::tmux::{self, PaneRef};
 use crate::vector::{
     self, Anchor, Landed as LandedVerdict, RemoteCache, RuntimeFacts, UpstreamState, WindowCount,
 };
@@ -107,12 +107,32 @@ pub struct RepoRow {
     pub clean: usize,
     /// Latest meaningful activity across its work rows; `None` renders `?`.
     pub last_activity: Option<u64>,
+    /// The proven default branch: the remote's HEAD that every probed
+    /// base agreed on, `None` when nothing proves it (`?`).
+    pub default_branch: Option<String>,
+    /// The remote the repo's work anchors on, when proven or lone; `None`
+    /// is `?`.
+    pub remote: Option<String>,
+    /// The repo's work rows per section.
+    pub counts: RepoCounts,
+}
+
+/// `RepoRow.counts`: the section breakdown the detail view prints.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepoCounts {
+    pub needs_you: usize,
+    pub active: usize,
+    pub follow_up: usize,
+    pub forgotten: usize,
+    pub ready_to_clean: usize,
+    pub cleanup_review: usize,
 }
 
 impl RepoRow {
     /// Recompute the rollup from the repo's rows in `work` - attention,
-    /// the `N open · M clean` counts and the latest activity. The emit
-    /// path and a `p` reclassification share it, so both read the same way.
+    /// the `N open · M clean` counts, the section breakdown and the
+    /// latest activity. The emit path and a `p` reclassification share
+    /// it, so both read the same way.
     pub fn roll_up(&mut self, work: &[WorkRow]) {
         let rows: Vec<&WorkRow> = work.iter().filter(|w| w.repo == self.id).collect();
         self.work = rows.len();
@@ -120,6 +140,18 @@ impl RepoRow {
         self.open = rows.iter().filter(|w| w.section.open()).count();
         self.clean = rows.len() - self.open;
         self.last_activity = rows.iter().filter_map(|w| w.last_activity).max();
+        let mut counts = RepoCounts::default();
+        for w in &rows {
+            match w.section {
+                WorkSection::NeedsYou => counts.needs_you += 1,
+                WorkSection::Active => counts.active += 1,
+                WorkSection::FollowUp => counts.follow_up += 1,
+                WorkSection::Forgotten => counts.forgotten += 1,
+                WorkSection::ReadyToClean => counts.ready_to_clean += 1,
+                WorkSection::CleanupReview => counts.cleanup_review += 1,
+            }
+        }
+        self.counts = counts;
     }
 }
 
@@ -301,6 +333,8 @@ pub struct IncarnationRow {
     pub creation_head: Option<String>,
     /// When the ref was created, when the reflog proved it.
     pub creation_at: Option<u64>,
+    /// The tip the ref last proved, when it carried one.
+    pub head: Option<String>,
     pub ended_at: Option<u64>,
     /// The evidence that last established or separated this identity.
     pub continuity: store::ContinuityEvidence,
@@ -392,6 +426,24 @@ pub struct WorkRow {
     pub forge_label: Option<String>,
     /// The work item's URL when known.
     pub forge_url: Option<String>,
+    /// Commits on the proven base the row's tip lacks; `None` is `?`.
+    pub commits_behind: Option<u64>,
+    /// The panes bound to the row's worktree; empty where there is no
+    /// worktree or none bound.
+    pub panes: Vec<PaneRow>,
+    /// What vanished, when the row is a gone-work row: its branch or
+    /// folder no longer exists but something live still references it.
+    pub gone: Option<String>,
+    /// The live references retaining a gone row - every pane, window,
+    /// session, process and agent session that still names it. Empty on
+    /// live rows.
+    pub references: Vec<ReferenceRow>,
+    /// The authored record's last proven lifecycle transition, epoch
+    /// seconds; `None` is `?`.
+    pub transition_at: Option<u64>,
+    /// The newest real work the row's reflogs recorded, epoch seconds;
+    /// `None` is `?`.
+    pub git_activity_at: Option<u64>,
     /// `git worktree remove` verdict and reasons; `None` for project
     /// spaces, which carry no cleanup verdicts at all.
     pub worktree_removal: Option<verdict::ActionVerdict>,
@@ -402,6 +454,120 @@ pub struct WorkRow {
     /// The section reason followed by the compact evidence tail (`↑3`,
     /// `~dirty`, `no remote`, `no wt`, `merged`, a PR/MR label).
     pub summary: String,
+}
+
+/// One tmux pane bound to a worktree, for the Work detail's `tmux` line.
+#[derive(Debug, Clone, Serialize)]
+pub struct PaneRow {
+    /// `session_name:@window.%pane` - the handle shape a provider
+    /// publishes.
+    pub handle: String,
+    /// `pane_current_command`.
+    pub command: String,
+}
+
+/// `ReferenceRow.kind`: which shape of live entity still names the gone
+/// work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceKind {
+    Pane,
+    Window,
+    /// A tmux session.
+    TmuxSession,
+    /// A live process.
+    Process,
+    /// A live agent session.
+    AgentSession,
+}
+
+/// One live reference retaining a gone work row - what it is and how it
+/// identifies itself. Read-only; dismissal is not this surface.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReferenceRow {
+    pub kind: ReferenceKind,
+    /// `workmux:@149.%162`, `workmux:@149`, `workmux`, `pid 4200`,
+    /// `claude:8f423bbb`.
+    pub label: String,
+}
+
+/// `RelatedRow.strength`, in proven-strength order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationStrength {
+    /// The provider declared the relation itself.
+    ProviderLineage,
+    /// One live process sits in the other's ancestor chain.
+    ProcessAncestry,
+    /// One live process provably created the pane hosting the other -
+    /// inferred, labeled as such.
+    PaneCorrelation,
+    /// Both conversations touched the same exact incarnation.
+    SameIncarnation,
+}
+
+/// One conversation related to this row, with the evidence that proved
+/// the relation. Only proven relations exist: a shared ref name, a pane
+/// shared at different times, or mere time proximity never produces one.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedRow {
+    /// The strength group the relation belongs to.
+    pub strength: RelationStrength,
+    /// What the relation claims about the other conversation:
+    /// `ancestor`, `descendant`, `pane creator`, `created pane` or
+    /// `same incarnation`.
+    pub label: String,
+    /// The evidence that proved it, for the view's provenance column.
+    pub provenance: String,
+    pub provider: Provider,
+    pub session_id: String,
+    /// First eight of the related session's id.
+    pub short_id: String,
+    pub title: Option<String>,
+    /// The related row's attention glyph.
+    pub attention: Attention,
+    /// Its effective-state age basis, epoch seconds.
+    pub state_since: Option<u64>,
+}
+
+/// One retained latch event with its acknowledgement state.
+#[derive(Debug, Clone, Serialize)]
+pub struct LatchRow {
+    /// The journal commit sequence.
+    pub seq: u64,
+    pub kind: store::NormEvent,
+    /// The observation's own time, epoch ms.
+    pub at_ms: u64,
+    /// The record's reason or native name.
+    pub reason: Option<String>,
+    /// Whether seen-state already acknowledges it.
+    pub acknowledged: bool,
+}
+
+/// The conversation's arbitration and store evidence, for the `e` view:
+/// what claimed the state, what lost and why, and what the journal and
+/// the authored files recorded.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EvidenceRow {
+    /// The execution claims considered, in evaluation order.
+    pub claims: Vec<attention::ClaimRow>,
+    /// Every retained latch event and its acknowledgement state.
+    pub latches: Vec<LatchRow>,
+    /// Committed records the fold rejected as stale or duplicate, with
+    /// the fold's reason.
+    pub rejected: Vec<store::RejectedRecord>,
+    /// What acknowledgement the user has recorded: retained events
+    /// through `seen_seq`, and the newest seen wait episode's `since`.
+    pub seen_seq: Option<u64>,
+    pub seen_wait_ms: Option<u64>,
+    /// The authored not-busy mark, when one applies.
+    pub mark: Option<store::Mark>,
+    /// Whether the mark suppressed a live `Busy` claim.
+    pub mark_suppressed: bool,
+    /// The newest journal commit sequence on the conversation.
+    pub journal_seq: Option<u64>,
+    /// The producer-sequence high-water records are ordered against.
+    pub producer_seq: Option<u64>,
 }
 
 /// What a conversation's process claim resolved to this refresh.
@@ -420,6 +586,16 @@ pub struct AttachmentRow {
     /// Why the pane is unbound, when it is (`dead`, `superseded`, or the
     /// failed-closed reason).
     pub placement_detail: Option<String>,
+    /// Where the claim was observed - a published file, a lock, a hook or
+    /// derivation.
+    pub source: EvidenceSource,
+    /// When the claim's evidence was produced, epoch seconds.
+    pub observed_at: u64,
+    /// The bound pane's identity, kept for relation evidence the display
+    /// string cannot carry. Not serialized - a `PaneRef` has no wire
+    /// shape.
+    #[serde(skip)]
+    pub pane_ref: Option<PaneRef>,
 }
 
 /// One conversation in the snapshot - live, restorable or transcript-only.
@@ -489,6 +665,15 @@ pub struct ConversationRow {
     pub touches: Vec<TouchRow>,
     /// The incarnation the newest open interval names, if one is current.
     pub current_incarnation: Option<String>,
+    /// When the conversation began as its own records date it: the
+    /// transcript's first record, else the live process's start; `None`
+    /// is `?`.
+    pub started_at: Option<u64>,
+    /// The conversations proven related to this one, strongest group
+    /// first - lineage, then shared incarnations.
+    pub related: Vec<RelatedRow>,
+    /// The arbitration and store evidence the `e` view renders.
+    pub evidence: EvidenceRow,
 }
 
 /// One provider branch mark, placed: from `at_ms` (epoch ms) on, the
@@ -740,7 +925,7 @@ impl Collector {
         let mut conversations: Vec<ConversationRow> = Vec::new();
         for (i, conv) in inventory.conversations.iter().enumerate() {
             let resolved_claim = attachment_of[i].map(|slot| &resolved[slot]);
-            let attachment = resolved_claim.map(attachment_row);
+            let attachment = resolved_claim.map(|r| attachment_row(r, &runtime.panes));
             let key = store::conversation_key("claude", &conv.session_id);
             // The published claim applies only while it is bound to a live
             // attachment; a dead `(pid, pid_start)` leaves it as history.
@@ -801,7 +986,23 @@ impl Collector {
                 .map(|c| (c.repo.clone(), c.worktree.clone(), c.branch.clone()))
                 .unwrap_or_default();
             conversations.push(conversation_row(
-                conv, attachment, derived, repo, worktree, branch,
+                conv,
+                attachment,
+                derived,
+                repo,
+                worktree,
+                branch,
+                EvidenceIn {
+                    fold: loaded.folds.get(&key),
+                    seen: loaded.seen.get(&key).copied().unwrap_or_default(),
+                    mark: loaded.marks.get(&key).copied(),
+                    rejected: loaded
+                        .rejected
+                        .iter()
+                        .filter(|r| r.conversation == key)
+                        .cloned()
+                        .collect(),
+                },
             ));
         }
         self.model.conversations = conversations;
@@ -1250,12 +1451,15 @@ impl Collector {
                 .max_by_key(|t| t.valid_from)
                 .map(|t| t.incarnation_id.clone());
         }
+        relate(&mut self.model.conversations, runtime);
         let mut work = Vec::new();
         for (id, model) in &self.model.repos {
             match &model.data {
                 RepoData::Git(local) => {
                     for anchor in &local.anchors {
-                        work.push(work_row(id, &model.name, &anchor.state, authored));
+                        let mut row = work_row(id, &model.name, &anchor.state, authored);
+                        row.panes = anchor_panes(&anchor.state.anchor, &runtime.panes);
+                        work.push(row);
                     }
                 }
                 RepoData::Space(row) => {
@@ -1265,6 +1469,14 @@ impl Collector {
                 }
             }
         }
+        // The paths the live rows still anchor: a closed record whose
+        // last workspace is one of them leaves its references to the live
+        // row, and produces no gone row at all.
+        let live_paths: HashSet<String> = work
+            .iter()
+            .filter_map(|w| w.worktree.as_ref().map(|p| p.display().to_string()))
+            .collect();
+        work.extend(gone_rows(&self.model, authored, runtime, &live_paths));
         // A branch row's session counts are its incarnation's, not its
         // location's: runtime facts count every conversation under the
         // worktree or repo, but the row claims only the exact touches to
@@ -1318,6 +1530,7 @@ impl Collector {
                 .iter()
                 .filter(|c| c.running() && c.repo.as_deref() == Some(id.as_str()))
                 .count();
+            let (default_branch, remote) = repo_default(model);
             let mut row = RepoRow {
                 id: id.clone(),
                 name: model.name.clone(),
@@ -1329,6 +1542,9 @@ impl Collector {
                 open: 0,
                 clean: 0,
                 last_activity: None,
+                default_branch,
+                remote,
+                counts: RepoCounts::default(),
             };
             row.roll_up(&work);
             repos.push(row);
@@ -1714,6 +1930,13 @@ fn work_row(
         pipeline: state.forge.pipeline,
         forge_label: state.forge.label.clone(),
         forge_url: state.forge.url.clone(),
+        commits_behind: v.commits_behind_of_base.known().copied(),
+        // Filled by the caller with the runtime's pane inventory.
+        panes: Vec::new(),
+        gone: None,
+        references: Vec::new(),
+        transition_at: authored_ms.map(|ms| ms / 1000),
+        git_activity_at: v.last_git_activity.map(epoch),
         worktree_removal: Some(removal),
         branch_deletion: Some(deletion),
         section: WorkSection::FollowUp,
@@ -1757,6 +1980,10 @@ fn lifecycle_inputs(state: &vector::WorkState) -> store::LifecycleInputs {
         dirty: v.dirty.known().copied(),
         worktree: v.worktree.is_some(),
         worktree_path: v.worktree.as_ref().map(|p| p.display().to_string()),
+        admin_id: match &state.anchor {
+            Anchor::Worktree { admin_id, .. } => admin_id.clone(),
+            Anchor::Branch { .. } => None,
+        },
         ahead: v.commits_ahead_of_base.known().copied(),
         unpushed: v.unpushed_commits.known().copied(),
         upstream: (upstream != Upstream::Unknown).then(|| match detail {
@@ -1905,6 +2132,7 @@ fn incarnation_row(record: &store::BranchRecord, number: usize) -> IncarnationRo
         last_observed_at: record.last_observed_at / 1000,
         creation_head: record.creation_evidence.as_ref().map(|c| c.head.clone()),
         creation_at: record.creation_evidence.as_ref().map(|c| c.at_ms / 1000),
+        head: record.head.clone(),
         ended_at: record.ended_at.map(|ms| ms / 1000),
         continuity: record.continuity_evidence,
         excluded: record.ended_at.is_some(),
@@ -1949,6 +2177,315 @@ fn apply_path_record(row: &mut WorkRow, authored: &store::Work) {
     }
 }
 
+/// The panes bound to an anchor's worktree - a branch-only anchor binds
+/// nothing by path.
+fn anchor_panes(anchor: &Anchor, panes: &tmux::PaneInventory) -> Vec<PaneRow> {
+    let Anchor::Worktree { path, admin_id, .. } = anchor else {
+        return Vec::new();
+    };
+    panes
+        .panes
+        .iter()
+        .filter(|p| p.binds_worktree(admin_id.as_deref(), path))
+        .map(|p| PaneRow {
+            handle: format!("{}:{}.{}", p.session_name, p.window, p.id),
+            command: p.command.clone(),
+        })
+        .collect()
+}
+
+/// The repo's proven default branch and remote: the remote HEAD every
+/// anchor's proven base agreed on - disagreeing or unprobed anchors
+/// prove nothing and read `?`. A lone configured remote still names
+/// itself for the `remote` field.
+fn repo_default(model: &RepoModel) -> (Option<String>, Option<String>) {
+    let RepoData::Git(local) = &model.data else {
+        return (None, None);
+    };
+    let mut bases: HashSet<(String, String)> = HashSet::new();
+    for anchor in &local.anchors {
+        if let Some(base) = anchor.state.base.known() {
+            bases.insert((base.remote.clone(), base.branch.clone()));
+        }
+    }
+    let (branch, remote) = match bases.len() {
+        1 => {
+            let (remote, branch) = bases.into_iter().next().unwrap_or_default();
+            (Some(branch), Some(remote))
+        }
+        _ => (None, None),
+    };
+    let remote = remote.or_else(|| match local.remote_names() {
+        Some([one]) => Some(one.clone()),
+        _ => None,
+    });
+    (branch, remote)
+}
+
+/// Fill every conversation's `related` from this pass's own evidence:
+/// live process ancestry, pane-creation correlation and shared exact
+/// incarnations. A shared ref name, a pane shared at different times or
+/// mere time proximity is no relation - and an inference the process
+/// table cannot prove is not one either.
+fn relate(conversations: &mut [ConversationRow], runtime: &Runtime) {
+    let n = conversations.len();
+    let pid_of = |i: usize| -> Option<u32> {
+        let c = &conversations[i];
+        c.running()
+            .then(|| c.attachment.as_ref().map(|a| a.pid))
+            .flatten()
+    };
+    let pane_pid_of = |i: usize| -> Option<u32> {
+        let pref = conversations[i].attachment.as_ref()?.pane_ref.as_ref()?;
+        runtime
+            .panes
+            .panes
+            .iter()
+            .find(|p| p.id == pref.pane && p.socket == pref.socket)
+            .map(|p| p.pid)
+    };
+    let row = |strength: RelationStrength,
+               label: &str,
+               provenance: String,
+               other: &ConversationRow| RelatedRow {
+        strength,
+        label: label.to_owned(),
+        provenance,
+        provider: other.provider,
+        session_id: other.session_id.clone(),
+        short_id: other.short_id.clone(),
+        title: other.title.clone(),
+        attention: other.attention,
+        state_since: other.state_since,
+    };
+    let mut related: Vec<Vec<RelatedRow>> = (0..n).map(|_| Vec::new()).collect();
+    for a in 0..n {
+        for b in 0..n {
+            if a == b {
+                continue;
+            }
+            // Observed live process ancestry: b's process provably
+            // spawned a's.
+            if let (Some(pa), Some(pb)) = (pid_of(a), pid_of(b))
+                && let Some(table) = runtime.processes.as_ref()
+                && table.ancestors(pa)[1..].contains(&pb)
+            {
+                related[a].push(row(
+                    RelationStrength::ProcessAncestry,
+                    "ancestor",
+                    "live process ancestry".to_owned(),
+                    &conversations[b],
+                ));
+            }
+            // Pane-creation correlation: b's process provably created
+            // the pane hosting a - inferred, and labeled as such.
+            if let (Some(root), Some(pb)) = (pane_pid_of(a), pid_of(b))
+                && pb != root
+                && let Some(table) = runtime.processes.as_ref()
+                && table.ancestors(root).contains(&pb)
+            {
+                related[a].push(row(
+                    RelationStrength::PaneCorrelation,
+                    "pane creator",
+                    "pane-creation correlation (inferred)".to_owned(),
+                    &conversations[b],
+                ));
+            }
+            // Every exact incarnation both conversations touched.
+            for t in &conversations[a].touches {
+                if conversations[b]
+                    .touches
+                    .iter()
+                    .any(|s| s.incarnation_id == t.incarnation_id)
+                {
+                    related[a].push(row(
+                        RelationStrength::SameIncarnation,
+                        "same incarnation",
+                        format!("touch {}#{}", t.ref_name, t.incarnation),
+                        &conversations[b],
+                    ));
+                }
+            }
+        }
+    }
+    for (c, rel) in conversations.iter_mut().zip(related) {
+        c.related = rel;
+    }
+}
+
+/// Gone work still referenced by something live: a closed branch
+/// incarnation whose last proven workspace no longer anchors a live row,
+/// or a path record whose directory lost every claim. It stays under
+/// `Cleanup review` only while a pane, window, tmux session, live
+/// process or live agent session still names it - a restorable or
+/// transcript-only conversation is never a reference.
+fn gone_rows(
+    model: &Model,
+    authored: &store::Work,
+    runtime: &Runtime,
+    live_paths: &HashSet<String>,
+) -> Vec<WorkRow> {
+    let mut rows = Vec::new();
+    let numbers = incarnation_numbers(authored);
+    for record in authored.branches.values().filter(|r| r.ended_at.is_some()) {
+        // A branch-only incarnation records nothing a reference could
+        // name; a still-anchored workspace's references belong to the
+        // live row, not to this closed incarnation.
+        let Some(path_str) = record.inputs.worktree_path.clone() else {
+            continue;
+        };
+        if live_paths.contains(&path_str) {
+            continue;
+        }
+        let path = PathBuf::from(&path_str);
+        let refs = references(
+            &runtime.panes,
+            record.inputs.admin_id.as_deref(),
+            &path,
+            &model.conversations,
+        );
+        if refs.is_empty() {
+            continue;
+        }
+        let gone = if path.is_dir() {
+            "branch deleted".to_owned()
+        } else {
+            "branch and worktree gone".to_owned()
+        };
+        let number = numbers.get(&record.id).copied().unwrap_or(0); // coverage: off - numbering covers every stored record
+        rows.push(WorkRow {
+            repo: record.repo.clone(),
+            repo_name: display_name(Path::new(&record.repo)),
+            kind: WorkKind::Branch,
+            name: record.ref_name.clone(),
+            worktree: Some(path.clone()),
+            branch: Some(record.ref_name.clone()),
+            identity: Some(record.id.clone()),
+            incarnation: Some(incarnation_row(record, number)),
+            last_activity: record
+                .ended_at
+                .map(|ms| ms / 1000)
+                .or_else(|| record.activity_at.map(|ms| ms / 1000)), // coverage: off - the loop's `ended_at.is_some()` filter proves the map
+            gone: Some(gone.clone()),
+            summary: format!("{gone} · {}", reference_summary(&refs)),
+            references: refs,
+            section: WorkSection::CleanupReview,
+            ..space_row(&record.repo, &path)
+        });
+    }
+    for (path_str, record) in &authored.paths {
+        if live_paths.contains(path_str) {
+            continue;
+        }
+        let path = PathBuf::from(path_str);
+        let refs = references(&runtime.panes, None, &path, &model.conversations);
+        if refs.is_empty() {
+            continue;
+        }
+        let (kind, gone) = match record.inputs.worktree {
+            true => (WorkKind::Detached, "worktree gone"),
+            false => (WorkKind::ProjectSpace, "project folder gone"),
+        };
+        rows.push(WorkRow {
+            kind,
+            gone: Some(gone.to_owned()),
+            summary: format!("{gone} · {}", reference_summary(&refs)),
+            references: refs,
+            last_activity: record.activity_at.map(|ms| ms / 1000),
+            section: WorkSection::CleanupReview,
+            ..space_row(path_str, &path)
+        });
+    }
+    rows
+}
+
+/// The live references retaining a gone workspace `path`: every pane
+/// bound to it - by a stored `wt_adminid` edge or a cwd inside it - the
+/// windows and tmux sessions containing them, and the live agent
+/// sessions (and their processes) still anchored inside it.
+fn references(
+    panes: &tmux::PaneInventory,
+    admin_id: Option<&str>,
+    path: &Path,
+    conversations: &[ConversationRow],
+) -> Vec<ReferenceRow> {
+    let mut refs = Vec::new();
+    let mut windows = std::collections::BTreeSet::new();
+    let mut sessions = std::collections::BTreeSet::new();
+    for pane in &panes.panes {
+        if !pane.binds_worktree(admin_id, path) {
+            continue;
+        }
+        refs.push(ReferenceRow {
+            kind: ReferenceKind::Pane,
+            label: format!("{}:{}.{}", pane.session_name, pane.window, pane.id),
+        });
+        windows.insert((
+            pane.socket.clone(),
+            pane.session_name.clone(),
+            pane.window.to_string(),
+        ));
+        sessions.insert((pane.socket.clone(), pane.session_name.clone()));
+    }
+    refs.extend(
+        windows
+            .into_iter()
+            .map(|(_, session, window)| ReferenceRow {
+                kind: ReferenceKind::Window,
+                label: format!("{session}:{window}"),
+            }),
+    );
+    refs.extend(sessions.into_iter().map(|(_, session)| ReferenceRow {
+        kind: ReferenceKind::TmuxSession,
+        label: session,
+    }));
+    for c in conversations.iter().filter(|c| c.running()) {
+        let inside = c.cwd.as_deref().is_some_and(|cwd| inside_path(cwd, path))
+            || c.worktree.as_deref().is_some_and(|w| inside_path(w, path));
+        if !inside {
+            continue;
+        }
+        if let Some(a) = &c.attachment {
+            refs.push(ReferenceRow {
+                kind: ReferenceKind::Process,
+                label: format!("pid {}", a.pid),
+            });
+        } // coverage: off - the `None` edge: `running()` proves the attachment
+        refs.push(ReferenceRow {
+            kind: ReferenceKind::AgentSession,
+            label: format!("{}:{}", c.provider.as_str(), c.short_id),
+        });
+    }
+    refs
+}
+
+/// Whether `cwd` sits at or below `root`, canonicalizing each side when
+/// it can - a gone path falls back to its literal spelling, matching how
+/// pane bindings read.
+fn inside_path(cwd: &Path, root: &Path) -> bool {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    cwd.starts_with(&root)
+}
+
+/// The reference counts a gone row's summary names.
+fn reference_summary(refs: &[ReferenceRow]) -> String {
+    [
+        (ReferenceKind::Pane, "pane"),
+        (ReferenceKind::Window, "window"),
+        (ReferenceKind::TmuxSession, "session"),
+        (ReferenceKind::Process, "process"),
+        (ReferenceKind::AgentSession, "agent session"),
+    ]
+    .into_iter()
+    .filter_map(|(kind, word)| {
+        let n = refs.iter().filter(|r| r.kind == kind).count();
+        (n > 0).then(|| format!("{n} {word}{}", if n == 1 { "" } else { "s" }))
+    })
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
 /// Whether the conversation is bound to the work row: an open exact
 /// touch to the row's incarnation for a branch-bearing row - the name
 /// and the worktree path are only labels, the touch is the binding - a
@@ -1990,6 +2527,12 @@ pub fn classify_work(
     row.attention = attention::rollup(bound.iter().map(|c| &c.attention));
     for c in &bound {
         row.last_activity = row.last_activity.max(c.last_activity);
+    }
+    // A gone row keeps its own placement: it sits in `Cleanup review`
+    // for as long as something live references it, and no lifecycle
+    // verdict moves it.
+    if row.gone.is_some() {
+        return;
     }
     let (section, reason) = section_reason(row, &bound, forgotten_after, now);
     row.section = section;
@@ -2304,6 +2847,12 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         pipeline: Pipeline::Unknown,
         forge_label: None,
         forge_url: None,
+        commits_behind: None,
+        panes: Vec::new(),
+        gone: None,
+        references: Vec::new(),
+        transition_at: None,
+        git_activity_at: None,
         worktree_removal: None,
         branch_deletion: None,
         section: WorkSection::FollowUp,
@@ -2339,6 +2888,7 @@ fn carry_remote(new: &mut vector::WorkState, old: &vector::WorkState) {
     new.vector.upstream_state = old.vector.upstream_state.clone();
     new.base = old.base.clone();
     new.vector.commits_ahead_of_base = old.vector.commits_ahead_of_base.clone();
+    new.vector.commits_behind_of_base = old.vector.commits_behind_of_base.clone();
     new.vector.landed = old.vector.landed.clone();
     if pending(&new.vector.unpushed_commits) {
         new.vector.unpushed_commits = old.vector.unpushed_commits.clone();
@@ -2369,7 +2919,10 @@ fn process_start(start: ProcessStart) -> Option<u64> {
 }
 
 /// `resolved` -> the row's attachment view.
-fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
+fn attachment_row(
+    r: &crate::runtime::ResolvedAttachment,
+    panes: &tmux::PaneInventory,
+) -> AttachmentRow {
     let (liveness, liveness_detail) = match &r.liveness {
         Liveness::Instance => (AttachmentLiveness::Instance, None),
         Liveness::PidOnly(reason) => (AttachmentLiveness::PidOnly, Some(reason.clone())),
@@ -2386,16 +2939,25 @@ fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
         pid_start: process_start(r.attachment.process.pid_start),
         liveness,
         liveness_detail,
-        pane: r.attachment.pane.as_ref().map(display_pane),
+        pane: r.attachment.pane.as_ref().map(|p| display_pane(p, panes)),
         pane_source,
         placement_detail,
+        source: r.attachment.source,
+        observed_at: epoch(r.attachment.observed_at),
+        pane_ref: r.attachment.pane.clone(),
     }
 }
 
 /// A resolved attachment's pane as `session:window.pane` - the handle shape
-/// a provider would publish - when the pane record is findable.
-fn display_pane(pane: &PaneRef) -> String {
-    pane.to_string()
+/// a provider would publish - when the pane record is findable; the
+/// socket-qualified id otherwise.
+fn display_pane(pane: &PaneRef, panes: &tmux::PaneInventory) -> String {
+    panes
+        .panes
+        .iter()
+        .find(|p| p.id == pane.pane && p.socket == pane.socket)
+        .map(|p| format!("{}:{}.{}", p.session_name, p.window, p.id))
+        .unwrap_or_else(|| pane.to_string())
 }
 
 /// A focus acknowledgement the store refused, reported for the evidence
@@ -2496,6 +3058,20 @@ fn is_own_pane(own_pane: Option<&PaneRef>, pane: &PaneRef) -> bool {
         && (own.socket == pane.socket || canonical(&own.socket) == canonical(&pane.socket))
 }
 
+/// The store evidence a conversation row carries into its `e` view,
+/// bundled so `conversation_row`'s parameter list stays readable.
+#[derive(Default)]
+struct EvidenceIn<'a> {
+    /// The journal fold for the conversation.
+    fold: Option<&'a store::Fold>,
+    /// Its acknowledgement state.
+    seen: store::Seen,
+    /// The authored not-busy mark.
+    mark: Option<store::Mark>,
+    /// Records the fold rejected while loading this pass.
+    rejected: Vec<store::RejectedRecord>,
+}
+
 fn conversation_row(
     conv: &Conversation,
     attachment: Option<AttachmentRow>,
@@ -2503,6 +3079,7 @@ fn conversation_row(
     repo: Option<String>,
     worktree: Option<PathBuf>,
     branch: Option<String>,
+    evidence: EvidenceIn<'_>,
 ) -> ConversationRow {
     let state = match derived.exec {
         Exec::Busy => ConversationState::Busy,
@@ -2514,6 +3091,10 @@ fn conversation_row(
         StateEvidence::Published(p) => p.raw,
         StateEvidence::Absent => None,
     };
+    // Read before `derived.claims` and `attachment` move into the row.
+    let marked = derived.marked;
+    let jseq = (derived.journal_seq > 0).then_some(derived.journal_seq);
+    let process_start = attachment.as_ref().and_then(|a| a.pid_start);
     ConversationRow {
         provider: Provider::Claude,
         session_id: conv.session_id.clone(),
@@ -2533,7 +3114,7 @@ fn conversation_row(
         attention_detail: derived.attention_detail,
         attention_seq: (derived.ack_through > 0).then_some(derived.ack_through),
         attention_wait_ms: derived.wait_ms,
-        journal_seq: (derived.journal_seq > 0).then_some(derived.journal_seq),
+        journal_seq: jseq,
         last_activity: conv.last_activity().map(epoch),
         live: conv.live.is_some(),
         attachment,
@@ -2558,6 +3139,37 @@ fn conversation_row(
         branch,
         touches: Vec::new(),
         current_incarnation: None,
+        started_at: conv
+            .transcript
+            .as_ref()
+            .and_then(|t| t.first_at)
+            .map(epoch)
+            .or(process_start),
+        // Filled per publish by `relate`, once every row's touches are
+        // this pass's.
+        related: Vec::new(),
+        evidence: EvidenceRow {
+            claims: derived.claims,
+            latches: evidence.fold.map_or(Vec::new(), |f| {
+                f.retained
+                    .iter()
+                    .map(|r| LatchRow {
+                        seq: r.seq,
+                        kind: r.kind,
+                        at_ms: r.at_ms,
+                        reason: r.reason.clone(),
+                        acknowledged: r.seq <= evidence.seen.seq,
+                    })
+                    .collect()
+            }),
+            rejected: evidence.rejected,
+            seen_seq: (evidence.seen.seq > 0).then_some(evidence.seen.seq),
+            seen_wait_ms: evidence.seen.wait_ms,
+            mark: evidence.mark,
+            mark_suppressed: marked,
+            journal_seq: jseq,
+            producer_seq: evidence.fold.and_then(|f| f.pseq_high),
+        },
     }
 }
 
@@ -2746,6 +3358,7 @@ mod tests {
             wait_ms: None,
             journal_seq: 0,
             marked: false,
+            claims: Vec::new(),
         }
     }
 
@@ -2840,6 +3453,7 @@ mod tests {
                 past_agent_sessions: 0,
                 dirty: Evidence::Known(false),
                 commits_ahead_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_behind_of_base: Evidence::Unknown("none asked".to_owned()),
                 upstream_state: UpstreamState::NotApplicable,
                 unpushed_commits: Evidence::Unknown("none asked".to_owned()),
                 landed: Evidence::Unknown("none asked".to_owned()),
@@ -2878,6 +3492,7 @@ mod tests {
                 None,
                 None,
                 None,
+                EvidenceIn::default(),
             );
             assert_eq!(row.state, want, "{want:?}");
             assert!(row.live);
@@ -2889,6 +3504,7 @@ mod tests {
             None,
             None,
             None,
+            EvidenceIn::default(),
         );
         assert_eq!(row.state, ConversationState::Unknown);
         assert!(!row.live);
@@ -2910,6 +3526,7 @@ mod tests {
             None,
             None,
             None,
+            EvidenceIn::default(),
         );
         assert_eq!(row.state_since, Some(1_800_000_000));
         // A not-busy mark names only an arbitrated `since`.
@@ -2923,6 +3540,7 @@ mod tests {
             None,
             None,
             None,
+            EvidenceIn::default(),
         );
         assert_eq!(row.state_since, Some(1_800_000_060));
         // An arbitrated `since` wins over the provider's.
@@ -2935,6 +3553,7 @@ mod tests {
             None,
             None,
             None,
+            EvidenceIn::default(),
         );
         assert_eq!(row.state_since, Some(1_700_000_000));
     }
@@ -2979,30 +3598,42 @@ mod tests {
                 None,
             ),
         ] {
-            let row = attachment_row(&attachment(liveness, placement, true));
+            let row = attachment_row(
+                &attachment(liveness, placement, true),
+                &tmux::PaneInventory::default(),
+            );
             assert_eq!(row.liveness, want_state);
             assert_eq!(row.pane_source, want_source);
         }
         // A bound pane renders its handle; a dead one renders the reason.
-        let dead = attachment_row(&attachment(
-            Liveness::Dead("gone".to_owned()),
-            Placement::Dead("gone".to_owned()),
-            true,
-        ));
+        let dead = attachment_row(
+            &attachment(
+                Liveness::Dead("gone".to_owned()),
+                Placement::Dead("gone".to_owned()),
+                true,
+            ),
+            &tmux::PaneInventory::default(),
+        );
         assert_eq!(dead.placement_detail.as_deref(), Some("gone"));
         assert!(dead.pane.is_some(), "the pane ref stays for evidence");
-        let bare = attachment_row(&attachment(
-            Liveness::Instance,
-            Placement::Bound(PaneSource::Ancestry),
-            false,
-        ));
+        let bare = attachment_row(
+            &attachment(
+                Liveness::Instance,
+                Placement::Bound(PaneSource::Ancestry),
+                false,
+            ),
+            &tmux::PaneInventory::default(),
+        );
         assert!(bare.pane.is_none());
         assert_eq!(bare.pid_start, Some(1_800_000_000));
-        let undated = attachment_row(&attachment(
-            Liveness::Instance,
-            Placement::Bound(PaneSource::Ancestry),
-            false,
-        ));
+        let undated = attachment_row(
+            &attachment(
+                Liveness::Instance,
+                Placement::Bound(PaneSource::Ancestry),
+                false,
+            ),
+            &tmux::PaneInventory::default(),
+        );
         let _ = undated;
     }
 
@@ -3023,6 +3654,7 @@ mod tests {
                 Some("/r/.git".to_owned()),
                 None,
                 Some("feat".to_owned()),
+                EvidenceIn::default(),
             );
             c.state = state;
             // The fabricated row's identity is its path; the touch to it
@@ -3309,6 +3941,9 @@ mod tests {
             open: 0,
             clean: 0,
             last_activity: last,
+            default_branch: None,
+            remote: None,
+            counts: RepoCounts::default(),
         };
         let mut repos = vec![
             row("b", "/z", Some(2)),
@@ -3399,6 +4034,9 @@ mod tests {
             branch: None,
             touches: Vec::new(),
             current_incarnation: None,
+            started_at: None,
+            related: Vec::new(),
+            evidence: EvidenceRow::default(),
         };
         let now = SystemTime::now();
         // The inbox order is the attention rank, not the state.
@@ -3805,5 +4443,309 @@ mod tests {
         assert!(is_own_pane(Some(&own), &pref(link.join("default"))));
         assert!(!is_own_pane(Some(&own), &pref(link.join("other"))));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A minimal pane for fabricated inventories.
+    fn tmux_pane(socket: &str, id: &str, pid: u32) -> tmux::Pane {
+        tmux::Pane {
+            socket: PathBuf::from(socket),
+            id: PaneId::parse(id).unwrap(),
+            window: tmux::WindowId::parse("@1").unwrap(),
+            session: tmux::SessionId::parse("$1").unwrap(),
+            session_name: "s".to_owned(),
+            pid,
+            command: "claude".to_owned(),
+            cwd: None,
+            tty: None,
+            active: true,
+            last: false,
+            window_active: true,
+            window_activity: None,
+            session_attached: 1,
+            wt_adminid: None,
+            wt_handle: None,
+        }
+    }
+
+    /// A process table row: `pid` under `ppid`.
+    fn prow(pid: u32, ppid: u32) -> ProcessRow {
+        ProcessRow {
+            pid,
+            ppid,
+            start: ProcessStart::At(1_700_000_000),
+            exe: Some("claude".to_owned()),
+            tty: None,
+            state: 'S',
+        }
+    }
+
+    /// A fabricated conversation row: live, attached to `pid`, bound to
+    /// `pane` when given.
+    fn live_row(session: &str, pid: u32, pane: Option<PaneRef>) -> ConversationRow {
+        let mut row = conversation_row(
+            &conversation(Some(live()), None),
+            None,
+            derived(Exec::Busy, Attention::None),
+            None,
+            None,
+            None,
+            EvidenceIn::default(),
+        );
+        row.session_id = session.to_owned();
+        row.short_id = session.chars().take(8).collect();
+        row.attachment = Some(AttachmentRow {
+            pid,
+            pid_start: Some(1_700_000_000),
+            liveness: AttachmentLiveness::Instance,
+            liveness_detail: None,
+            pane: pane.as_ref().map(|p| p.to_string()),
+            pane_source: Some(PaneSource::Published),
+            placement_detail: None,
+            source: EvidenceSource::Published,
+            observed_at: 1_800_000_000,
+            pane_ref: pane,
+        });
+        row
+    }
+
+    /// A runtime over fabricated processes and panes.
+    fn runtime(rows: Vec<ProcessRow>, panes: Vec<tmux::Pane>) -> Runtime {
+        Runtime {
+            processes: Some(ProcessTable::from_rows(rows)),
+            panes: tmux::PaneInventory {
+                panes,
+                servers: Vec::new(),
+                warnings: Vec::new(),
+                stale_sockets: 0,
+            },
+            observed_at: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn relations_follow_proven_strengths_and_never_guess() {
+        // b's pid is a's parent - observed ancestry. The pane a sits in
+        // was created under b's process - inferred correlation. A shared
+        // ref name with different incarnation ids proves nothing.
+        let pane_ref = PaneRef {
+            socket: PathBuf::from("/sock/a"),
+            pane: PaneId::parse("%7").unwrap(),
+        };
+        let mut a = live_row("aaaaaaaa-1", 101, Some(pane_ref.clone()));
+        let mut b = live_row("bbbbbbbb-1", 100, None);
+        a.touches = vec![open_touch("i1")];
+        b.touches = vec![open_touch("i2")];
+        let mut pane = tmux_pane("/sock/a", "%7", 50);
+        pane.command = "claude".to_owned();
+        let runtime = runtime(
+            vec![prow(101, 100), prow(100, 1), prow(50, 100)],
+            vec![pane],
+        );
+        let mut convs = vec![a.clone(), b.clone()];
+        relate(&mut convs, &runtime);
+        let strengths: Vec<RelationStrength> =
+            convs[0].related.iter().map(|r| r.strength).collect();
+        assert_eq!(
+            strengths,
+            vec![
+                RelationStrength::ProcessAncestry,
+                RelationStrength::PaneCorrelation
+            ]
+        );
+        assert_eq!(convs[0].related[0].session_id, "bbbbbbbb-1");
+        // Sharing a ref name across distinct incarnations is not a
+        // relation - neither is sharing a pane at different times.
+        assert!(convs[1].related.is_empty());
+        // A shared exact incarnation is.
+        b.touches = vec![open_touch("i1")];
+        let mut convs = vec![a.clone(), b.clone()];
+        relate(&mut convs, &runtime);
+        let strengths: Vec<RelationStrength> =
+            convs[0].related.iter().map(|r| r.strength).collect();
+        assert!(
+            strengths.contains(&RelationStrength::SameIncarnation),
+            "{strengths:?}"
+        );
+        // With no process table the first two strengths drop out; the
+        // touch relation still stands. A dead or attachment-less
+        // conversation relates through nothing live.
+        let runtime = Runtime {
+            processes: None,
+            panes: tmux::PaneInventory::default(),
+            observed_at: SystemTime::now(),
+        };
+        let mut convs = vec![a, b];
+        relate(&mut convs, &runtime);
+        let strengths: Vec<RelationStrength> =
+            convs[0].related.iter().map(|r| r.strength).collect();
+        assert_eq!(strengths, vec![RelationStrength::SameIncarnation]);
+    }
+
+    #[test]
+    fn gone_rows_name_every_live_reference_and_drop_the_unreferenced() {
+        // A closed incarnation whose proven workspace a pane's stored
+        // edge and a live agent session still name: every reference kind.
+        let root =
+            std::env::temp_dir().join(format!("agent-sessions-gone-{}-a", std::process::id()));
+        let missing = format!("{}/missing", root.display());
+        // A second, still-existing workspace: the branch is gone but the
+        // directory is not, so the row says `branch deleted`.
+        let still = root.join("still");
+        fs::create_dir_all(&still).unwrap();
+        let still = format!("{}", still.display());
+        let mut work = store::Work::default();
+        let mut record = branch_record("i1", 1_000, Some(3_000));
+        record.inputs.worktree_path = Some(missing.clone());
+        record.inputs.admin_id = Some("adm1".to_owned());
+        work.branches.insert("i1".to_owned(), record);
+        let mut kept = branch_record("i2", 1_000, Some(3_000));
+        kept.ref_name = "kept".to_owned();
+        kept.inputs.worktree_path = Some(still.clone());
+        kept.inputs.admin_id = Some("adm2".to_owned());
+        work.branches.insert("i2".to_owned(), kept);
+        // A branch-only close records nothing a reference could name.
+        let mut bare = branch_record("i0", 1_000, Some(3_000));
+        bare.ref_name = "bare".to_owned();
+        work.branches.insert("i0".to_owned(), bare);
+        // Two live panes bound by their stored worktree edges - the
+        // summary says `2 panes` - plus one that binds nowhere.
+        let mut pane = tmux_pane("/sock/a", "%9", 50);
+        pane.wt_adminid = Some("adm1".to_owned());
+        let mut pane2 = tmux_pane("/sock/a", "%10", 51);
+        pane2.wt_adminid = Some("adm1".to_owned());
+        let mut pane3 = tmux_pane("/sock/a", "%11", 52);
+        pane3.wt_adminid = Some("adm2".to_owned());
+        let stray = tmux_pane("/sock/a", "%12", 53);
+        // A live agent session anchored inside the gone path, one inside
+        // it without an attachment, and one somewhere else entirely.
+        let mut c = live_row("cccccccc-1", 99, None);
+        c.cwd = Some(PathBuf::from(&missing));
+        let mut no_attach = conversation_row(
+            &conversation(Some(live()), None),
+            None,
+            derived(Exec::Busy, Attention::None),
+            None,
+            None,
+            None,
+            EvidenceIn::default(),
+        );
+        no_attach.cwd = Some(PathBuf::from(&missing));
+        let mut outside = live_row("dddddddd-1", 88, None);
+        outside.cwd = Some(PathBuf::from("/elsewhere"));
+        let model = Model {
+            conversations: vec![c, no_attach, outside],
+            ..Default::default()
+        };
+        let live_rt = runtime(
+            vec![prow(99, 50), prow(88, 1)],
+            vec![pane, pane2, pane3, stray],
+        );
+        let live_paths = HashSet::new();
+        let rows = gone_rows(&model, &work, &live_rt, &live_paths);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.gone.as_deref(), Some("branch and worktree gone"));
+        let kinds: Vec<ReferenceKind> = row.references.iter().map(|r| r.kind).collect();
+        for kind in [
+            ReferenceKind::Pane,
+            ReferenceKind::Window,
+            ReferenceKind::TmuxSession,
+            ReferenceKind::Process,
+            ReferenceKind::AgentSession,
+        ] {
+            assert!(kinds.contains(&kind), "{kind:?} missing: {kinds:?}");
+        }
+        assert_eq!(row.section, WorkSection::CleanupReview);
+        assert!(row.summary.contains("2 panes"), "{}", row.summary);
+        assert!(row.summary.contains("1 agent session"), "{}", row.summary);
+        // The still-present workspace reads `branch deleted`.
+        let row = rows.iter().find(|r| r.name == "kept").unwrap();
+        assert_eq!(row.gone.as_deref(), Some("branch deleted"));
+        // Nothing referencing it: the record stays retained in the store
+        // but lists nowhere.
+        let quiet = runtime(vec![], vec![]);
+        let model = Model::default();
+        assert!(gone_rows(&model, &work, &quiet, &live_paths).is_empty());
+        // The same workspace live under a new anchor: the closed record
+        // does not resurrect as gone.
+        let live_paths: HashSet<String> = [missing.clone()].into_iter().collect();
+        assert!(gone_rows(&model, &work, &quiet, &live_paths).is_empty());
+        // A vanished project space follows the same rule.
+        let space =
+            std::env::temp_dir().join(format!("agent-sessions-gone-{}-b", std::process::id()));
+        let space = format!("{}", space.display());
+        let mut paths = store::Work::default();
+        paths.paths.insert(
+            space.clone(),
+            store::PathRecord {
+                parked: false,
+                activity_at: Some(2_000),
+                inputs: store::LifecycleInputs {
+                    worktree: false,
+                    ..Default::default()
+                },
+            },
+        );
+        let detached = format!("{}/detached", root.display());
+        paths.paths.insert(
+            detached.clone(),
+            store::PathRecord {
+                parked: false,
+                activity_at: Some(2_000),
+                inputs: store::LifecycleInputs {
+                    worktree: true,
+                    ..Default::default()
+                },
+            },
+        );
+        let mut c = live_row("cccccccc-2", 77, None);
+        c.cwd = Some(PathBuf::from(&space));
+        let mut c2 = live_row("eeeeeeee-2", 76, None);
+        c2.cwd = Some(PathBuf::from(&detached));
+        let model = Model {
+            conversations: vec![c, c2],
+            ..Default::default()
+        };
+        let rows = gone_rows(&model, &paths, &quiet, &live_paths);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, WorkKind::Detached);
+        assert_eq!(rows[0].gone.as_deref(), Some("worktree gone"));
+        assert_eq!(rows[1].gone.as_deref(), Some("project folder gone"));
+        assert_eq!(rows[1].kind, WorkKind::ProjectSpace);
+    }
+
+    #[test]
+    fn a_gone_row_keeps_its_own_placement_in_classification() {
+        let mut row = space_row("/r", Path::new("/r"));
+        row.gone = Some("project folder gone".to_owned());
+        row.summary = "project folder gone · 1 process".to_owned();
+        let summary = row.summary.clone();
+        classify_work(&mut row, &[], Duration::from_secs(1), 2_000_000_000);
+        assert_eq!(row.summary, summary);
+        assert_eq!(row.section, WorkSection::FollowUp);
+        row.section = WorkSection::CleanupReview;
+        classify_work(&mut row, &[], Duration::from_secs(1), 2_000_000_000);
+        assert_eq!(row.section, WorkSection::CleanupReview);
+    }
+
+    #[test]
+    fn inside_path_matches_canonicalized_descent() {
+        let root =
+            std::env::temp_dir().join(format!("agent-sessions-inside-{}", std::process::id()));
+        let real = root.join("real");
+        fs::create_dir_all(real.join("sub")).unwrap();
+        let link = root.join("link");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // A symlinked spelling of the same directory still binds.
+        assert!(inside_path(&link.join("sub"), &real));
+        assert!(inside_path(&real.join("sub"), &link));
+        assert!(inside_path(&real, &real));
+        assert!(!inside_path(&real, &real.join("sub")));
+        fs::remove_dir_all(&root).unwrap();
+        // A path that no longer exists compares by literal spelling.
+        let gone = root.join("gone");
+        assert!(inside_path(&gone.join("x"), &gone));
+        assert!(!inside_path(&gone, &gone.join("x")));
     }
 }

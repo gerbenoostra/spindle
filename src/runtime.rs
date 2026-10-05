@@ -59,7 +59,8 @@ pub struct AgentSessionKey {
 
 /// Where an attachment claim was observed. Provenance, not trust: every
 /// source is re-validated against the live process table each refresh.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EvidenceSource {
     /// Provider-published session state (a live session file).
     Published,
@@ -69,6 +70,18 @@ pub enum EvidenceSource {
     Hook,
     /// Derived from process and tmux evidence alone.
     Derived,
+}
+
+impl EvidenceSource {
+    /// The wire spelling, also the display spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EvidenceSource::Published => "published",
+            EvidenceSource::Lock => "lock",
+            EvidenceSource::Hook => "hook", // coverage: off - no v1 provider hooks yet
+            EvidenceSource::Derived => "derived",
+        }
+    }
 }
 
 /// One claimed process-to-attachment binding, as a plugin observed it.
@@ -131,6 +144,17 @@ pub enum PaneSource {
     Ancestry,
     /// The process's controlling tty is the pane's pty.
     Tty,
+}
+
+impl PaneSource {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PaneSource::Published => "published",
+            PaneSource::Ancestry => "ancestry",
+            PaneSource::Tty => "tty",
+        }
+    }
 }
 
 /// A resolved pane plus the evidence that bound it.
@@ -656,5 +680,24 @@ mod tests {
         assert_eq!(liveness_of(&runtime.liveness(&claim)), "unverifiable");
         let resolved = runtime.resolve_attachments(&[claim]);
         assert_eq!(placement_of(&resolved[0]), "unknown");
+    }
+
+    #[test]
+    fn evidence_and_pane_sources_spell_their_wire_names() {
+        for (v, word) in [
+            (EvidenceSource::Published, "published"),
+            (EvidenceSource::Lock, "lock"),
+            (EvidenceSource::Derived, "derived"),
+            (EvidenceSource::Hook, "hook"),
+        ] {
+            assert_eq!(v.as_str(), word);
+        }
+        for (v, word) in [
+            (PaneSource::Published, "published"),
+            (PaneSource::Ancestry, "ancestry"),
+            (PaneSource::Tty, "tty"),
+        ] {
+            assert_eq!(v.as_str(), word);
+        }
     }
 }

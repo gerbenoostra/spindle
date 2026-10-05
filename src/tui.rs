@@ -22,11 +22,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use crate::attention::Attention;
+use crate::attention::{Attention, ClaimOutcome};
 use crate::config;
+use crate::forge::{Pipeline, WorkItem};
 use crate::snapshot::{
-    ConversationRow, ConversationState, IncarnationRow, RepoRow, Snapshot, WorkKind, WorkRow,
-    WorkSection, to_json,
+    AttachmentLiveness, AttachmentRow, ConversationRow, ConversationState, IncarnationRow,
+    ReferenceKind, RelationStrength, RepoRow, Snapshot, Upstream, WorkKind, WorkRow, WorkSection,
+    to_json,
 };
 use crate::store::{self, Store};
 use crate::tmux::{self, PaneRef};
@@ -149,6 +151,14 @@ pub struct App {
     /// `h`: whether [2] also lists the retained earlier same-name
     /// incarnations below their active rows, marked excluded.
     history: bool,
+    /// `e`: the read-only evidence overlay over the detail pane.
+    evidence: bool,
+    /// The list the detail pane last followed: `4` focuses the pane to
+    /// scroll it without losing the row it renders.
+    detail_list: List,
+    /// The detail/evidence pane's vertical scroll offset. `Cell` because
+    /// a draw is `&self` and clamps the value against the current size.
+    detail_scroll: std::cell::Cell<usize>,
     quit: bool,
     /// The collector thread died: the last snapshot stays on screen and the
     /// footer says so instead of letting the dashboard look live.
@@ -205,6 +215,9 @@ impl App {
             editing: None,
             help: false,
             history: false,
+            evidence: false,
+            detail_list: List::Conversations,
+            detail_scroll: std::cell::Cell::new(0),
             quit: false,
             collector_dead: false,
             store: None,
@@ -236,7 +249,12 @@ impl App {
     pub fn refresh(&mut self, snapshot: Snapshot) {
         let keys = self.selection_keys();
         self.snapshot = snapshot;
-        self.reseat(keys);
+        self.reseat(keys.clone());
+        // A selection that survived the swap keeps its scroll; a moved
+        // one re-anchors the detail at the top.
+        if self.selection_keys() != keys {
+            self.detail_scroll.set(0);
+        }
     }
 
     /// Each list cursor's selected row key, `None` on `all`.
@@ -482,16 +500,28 @@ impl App {
         match key {
             Key::Char('q') => self.quit = true,
             Key::Char('?') => self.help = true,
-            Key::Char('1') => self.focus = Pane::Repos,
-            Key::Char('2') => self.focus = Pane::Work,
-            Key::Char('3') => self.focus = Pane::Conversations,
-            Key::Char('4') => self.focus = Pane::Detail,
-            Key::Tab => self.focus = self.focus.next(),
+            Key::Char('1') => self.set_focus(Pane::Repos),
+            Key::Char('2') => self.set_focus(Pane::Work),
+            Key::Char('3') => self.set_focus(Pane::Conversations),
+            Key::Char('4') => self.set_focus(Pane::Detail),
+            Key::Tab => self.set_focus(self.focus.next()),
             Key::Char('j') | Key::Down => self.move_cursor(1),
             Key::Char('k') | Key::Up => self.move_cursor(-1),
             Key::Char('/') => {
                 if let Some(list) = self.focused_list() {
                     self.editing = Some((list, self.filter_raw[list_index(list)].clone()));
+                }
+            }
+            // The read-only evidence overlay: `e` opens and closes it,
+            // `Esc` only closes.
+            Key::Char('e') => {
+                self.evidence = !self.evidence;
+                self.detail_scroll.set(0);
+            }
+            Key::Esc => {
+                if self.evidence {
+                    self.evidence = false;
+                    self.detail_scroll.set(0);
                 }
             }
             Key::Char(' ') => self.space(),
@@ -591,7 +621,19 @@ impl App {
     fn toggle_history(&mut self) {
         let keys = self.selection_keys();
         self.history = !self.history;
-        self.reseat(keys);
+        self.reseat(keys.clone());
+        if self.selection_keys() != keys {
+            self.detail_scroll.set(0);
+        }
+    }
+
+    /// Move focus, remembering the list the detail pane follows - the
+    /// detail pane itself is not a list, so `4` keeps the last one.
+    fn set_focus(&mut self, pane: Pane) {
+        self.focus = pane;
+        if let Some(list) = pane.list() {
+            self.detail_list = list;
+        }
     }
 
     /// `p` on a concrete Work row: flip the authored `parked` on its exact
@@ -615,6 +657,11 @@ impl App {
         let Some(Row::Work(w)) = view.work.get(cursor - 1) else {
             return; // coverage: off - the get-miss arm is unreachable: cursors clamp before a view
         };
+        // A gone row is read-only: its record closed with the work it
+        // names, and `parked` has no live record to land on.
+        if w.gone.is_some() {
+            return;
+        }
         let Some(id) = w.identity.clone() else {
             return;
         };
@@ -653,15 +700,26 @@ impl App {
 
     /// `j`/`k` on the focused list: move, clamp, and reset the cursors below
     /// when the scope itself changed - the scoped list's cursor has no
-    /// meaning carried over from the previous scope.
+    /// meaning carried over from the previous scope. On the detail pane
+    /// they scroll its body instead; the render clamps the offset.
     fn move_cursor(&mut self, delta: i64) {
         let Some(list) = self.focused_list() else {
+            self.detail_scroll.set(
+                self.detail_scroll
+                    .get()
+                    .saturating_add_signed(delta as isize),
+            );
             return;
         };
         let rows = self.view().rows(list).len();
         let cursor = &mut self.cursor[list_index(list)];
         // `all` plus rows: cursor range is 0..=rows.
-        *cursor = (*cursor as i64 + delta).clamp(0, rows as i64) as usize;
+        let next = (*cursor as i64 + delta).clamp(0, rows as i64) as usize;
+        if next != *cursor {
+            // A new selection means new detail content: re-anchor at top.
+            self.detail_scroll.set(0);
+        }
+        *cursor = next;
         match list {
             List::Repos => {
                 self.cursor[list_index(List::Work)] = 0;
@@ -932,11 +990,30 @@ impl App {
         ])
     }
 
-    /// The detail pane: header-only for now - glyph, target, what it is and
-    /// its state age. The full field set is the detail task's, not this
-    /// one's; an honest `?` still renders where the header cannot be filled.
+    /// The detail pane: a pinned `glyph target - what · state age`
+    /// header, then the wrapped body - every field read from the
+    /// snapshot, every unknown an honest `?`. `e` swaps the body for the
+    /// evidence view. `j`/`k` scroll the body while the pane is focused;
+    /// the stored offset clamps against the content's current length.
     fn detail_panel(&self, f: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         let (title, header) = self.detail_header(view);
+        let title = if self.evidence {
+            match self.detail_target(view) {
+                Some((List::Repos, Row::Repo(r))) => format!("[4] Evidence - {}", r.name),
+                Some((List::Work, Row::Work(w))) => {
+                    format!("[4] Evidence - {}", numbered_name(w))
+                }
+                Some((List::Work, Row::History(_, h))) => {
+                    format!("[4] Evidence - {}#{}", h.ref_name, h.number)
+                }
+                Some((List::Conversations, Row::Conversation(c))) => {
+                    format!("[4] Evidence - {}", c.short_id)
+                }
+                _ => "[4] Evidence".to_owned(),
+            }
+        } else {
+            title
+        };
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
@@ -947,26 +1024,42 @@ impl App {
             });
         let inner = block.inner(area);
         f.render_widget(block, area);
-        f.render_widget(Paragraph::new(vec![header]), inner);
+        let [head, body] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+        f.render_widget(Paragraph::new(header), head);
+        let width = body.width.max(1) as usize;
+        let lines = if self.evidence {
+            self.evidence_lines(view, width)
+        } else {
+            self.detail_lines(view, width)
+        };
+        let max_scroll = lines.len().saturating_sub(body.height as usize);
+        let scroll = self.detail_scroll.get().min(max_scroll);
+        self.detail_scroll.set(scroll);
+        let visible: Vec<Line> = lines
+            .into_iter()
+            .skip(scroll)
+            .take(body.height as usize)
+            .collect();
+        f.render_widget(Paragraph::new(visible), body);
     }
 
-    /// `[4] <what>` plus the `glyph target - what · state age` header, taken
-    /// from whatever the focused list's cursor sits on.
+    /// The row the detail pane renders: the cursor of the list the pane
+    /// last followed - focusing `[4]` to scroll never loses the target.
+    fn detail_target<'a>(&self, view: &'a View<'a>) -> Option<(List, &'a Row<'a>)> {
+        let list = self.detail_list;
+        let cursor = self.cursor[list_index(list)];
+        if cursor == 0 {
+            return None;
+        }
+        view.rows(list).get(cursor - 1).map(|row| (list, row))
+    }
+
+    /// `[4] <what>` plus the `glyph target - what · state age` header,
+    /// taken from the row the detail pane follows.
     fn detail_header(&self, view: &View<'_>) -> (String, Line<'static>) {
-        let (list, row) = match self.focused_list() {
-            Some(list) => {
-                let cursor = self.cursor[list_index(list)];
-                let row = if cursor == 0 {
-                    None
-                } else {
-                    view.rows(list).get(cursor - 1)
-                };
-                (Some(list), row)
-            }
-            None => (None, None),
-        };
-        match (list, row) {
-            (Some(List::Repos), Some(Row::Repo(r))) => (
+        match self.detail_target(view) {
+            Some((List::Repos, Row::Repo(r))) => (
                 format!("[4] Repo - {}", r.name),
                 Line::from(format!(
                     "{} {} - repo · {}",
@@ -975,7 +1068,7 @@ impl App {
                     age(self.now(), r.last_activity)
                 )),
             ),
-            (Some(List::Work), Some(Row::Work(w))) => (
+            Some((List::Work, Row::Work(w))) => (
                 format!("[4] Work - {}", numbered_name(w)),
                 Line::from(format!(
                     "{} {} - {} · {}",
@@ -985,7 +1078,7 @@ impl App {
                     age(self.now(), w.last_activity)
                 )),
             ),
-            (Some(List::Work), Some(Row::History(_, h))) => (
+            Some((List::Work, Row::History(_, h))) => (
                 format!("[4] Work - {}#{}", h.ref_name, h.number),
                 Line::from(format!(
                     "  {}#{} - incarnation · excluded · observed {} · ended {}",
@@ -995,7 +1088,7 @@ impl App {
                     age(self.now(), h.ended_at)
                 )),
             ),
-            (Some(List::Conversations), Some(Row::Conversation(c))) => (
+            Some((List::Conversations, Row::Conversation(c))) => (
                 format!("[4] Conversation - {}", c.title.as_deref().unwrap_or("?")),
                 Line::from(vec![
                     Span::styled(
@@ -1011,18 +1104,576 @@ impl App {
                     )),
                 ]),
             ),
-            (Some(_), None) => (
+            _ => (
                 "[4] Detail".to_owned(),
                 Line::from(Span::styled("all", Style::default().fg(Color::DarkGray))),
             ),
-            (None, _) => (
-                "[4] Detail".to_owned(), // coverage: off - the arm's second region is an instantiation edge
-                Line::from(Span::styled(
-                    "cursor is on the detail pane",
-                    Style::default().fg(Color::DarkGray),
-                )), // coverage: off - the arm's second region is an instantiation edge
-            ), // coverage: off - same
-            _ => ("[4] Detail".to_owned(), Line::from("")), // coverage: off - list+row kinds pair up by construction
+        }
+    }
+
+    /// The detail body for the selected row, already wrapped to the
+    /// panel's width: lines the renderer never has to clip.
+    fn detail_lines(&self, view: &View<'_>, width: usize) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        match self.detail_target(view) {
+            Some((List::Repos, Row::Repo(r))) => self.repo_body(r, &mut out, width),
+            Some((List::Work, Row::Work(w))) => self.work_body(w, &mut out, width),
+            Some((List::Work, Row::History(_, h))) => {
+                incarnation_body(h, self.now(), &mut out, width)
+            }
+            Some((List::Conversations, Row::Conversation(c))) => {
+                self.conversation_body(c, &mut out, width)
+            }
+            _ => push_text(&mut out, "everything in scope".to_owned(), width),
+        }
+        out
+    }
+
+    /// The evidence body for the selected row: a conversation's claims,
+    /// latches, marks and rejected records, or an incarnation's
+    /// continuity evidence - then the collector's errors and skips.
+    fn evidence_lines(&self, view: &View<'_>, width: usize) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        match self.detail_target(view) {
+            Some((List::Conversations, Row::Conversation(c))) => {
+                self.conversation_evidence(c, &mut out, width)
+            }
+            Some((List::Work, Row::Work(w))) => match &w.incarnation {
+                Some(i) => incarnation_body(i, self.now(), &mut out, width),
+                None => push_text(&mut out, "no incarnation evidence".to_owned(), width),
+            },
+            Some((List::Work, Row::History(_, h))) => {
+                incarnation_body(h, self.now(), &mut out, width)
+            }
+            _ => {}
+        }
+        let s = &self.snapshot;
+        push_head(
+            &mut out,
+            format!(
+                "collector: {} errors · {} skipped · {} stale sockets",
+                s.errors.len(),
+                s.skipped.len(),
+                s.stale_sockets
+            ),
+            width,
+        );
+        for e in &s.errors {
+            push_text(&mut out, format!("  {}: {}", e.source, e.detail), width);
+        }
+        for skip in &s.skipped {
+            push_text(&mut out, format!("  skipped: {skip}"), width);
+        }
+        out
+    }
+
+    /// A Repo row's fields: path, proven default branch or `?`, remote,
+    /// the section counts and the live conversation count.
+    fn repo_body(&self, r: &RepoRow, out: &mut Vec<Line<'static>>, width: usize) {
+        push_text(out, format!("path: {}", r.path.display()), width);
+        push_text(
+            out,
+            format!("default branch: {}", opt(&r.default_branch)),
+            width,
+        );
+        push_text(out, format!("remote: {}", opt(&r.remote)), width);
+        push_text(out, format!("work rows: {}", r.work), width);
+        push_text(out, format!("live conversations: {}", r.live), width);
+        let c = &r.counts;
+        push_text(
+            out,
+            format!(
+                "needs you {} · active {} · follow up {}",
+                c.needs_you, c.active, c.follow_up
+            ),
+            width,
+        );
+        push_text(
+            out,
+            format!(
+                "forgotten {} · ready to clean {} · review {}",
+                c.forgotten, c.ready_to_clean, c.cleanup_review
+            ),
+            width,
+        );
+    }
+
+    /// A Work row's fields - the incarnation's evidence, worktree, the
+    /// delivery readings against the proven base, upstream, forge, tmux,
+    /// activity, same-name history, and both independent cleanup
+    /// verdicts with their blockers. A gone row leads with what vanished
+    /// and everything still referencing it.
+    fn work_body(&self, w: &WorkRow, out: &mut Vec<Line<'static>>, width: usize) {
+        let now = self.now();
+        push_text(out, format!("repo: {}", w.repo_name), width);
+        if let Some(i) = &w.incarnation {
+            push_head(out, "incarnation:".to_owned(), width);
+            push_text(
+                out,
+                format!("  {}#{} · id {}", i.ref_name, i.number, i.id),
+                width,
+            );
+            let ended = i
+                .ended_at
+                .map_or_else(|| "open".to_owned(), |_| age(now, i.ended_at));
+            push_text(
+                out,
+                format!(
+                    "  observed {} - {} · ended {}",
+                    age(now, Some(i.first_observed_at)),
+                    age(now, Some(i.last_observed_at)),
+                    ended
+                ),
+                width,
+            );
+            push_text(
+                out,
+                format!(
+                    "  ref creation {} · tip {} · created {}",
+                    sha(&i.creation_head),
+                    sha(&i.head),
+                    age(now, i.creation_at)
+                ),
+                width,
+            );
+            push_text(
+                out,
+                format!("  continuity: {}", i.continuity.as_str()),
+                width,
+            );
+        }
+        if let Some(gone) = &w.gone {
+            push_text(out, format!("gone: {gone}"), width);
+            push_head(out, "references:".to_owned(), width);
+            for r in &w.references {
+                push_text(out, format!("  {} {}", ref_kind(r.kind), r.label), width);
+            }
+        }
+        let worktree = w
+            .worktree
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        push_text(out, format!("worktree: {worktree}"), width);
+        let local = match &w.base {
+            Some(base) => {
+                let ahead = num(w.commits_ahead);
+                let behind = num(w.commits_behind);
+                let dirty = match w.dirty {
+                    Some(true) => "~dirty",
+                    Some(false) => "clean",
+                    None => "~?",
+                };
+                format!("↑{ahead} ↓{behind} {dirty} vs {base}")
+            }
+            None => "?".to_owned(),
+        };
+        push_text(out, format!("local: {local}"), width);
+        let remote = match w.upstream {
+            Upstream::Tracked => format!("{} · tracked", opt(&w.upstream_detail)),
+            Upstream::NeverPushed => "no remote".to_owned(),
+            Upstream::RemoteGone => format!("{} · remote gone", opt(&w.upstream_detail)),
+            Upstream::NotApplicable => "n/a".to_owned(),
+            Upstream::Unknown => format!("? ({})", opt(&w.upstream_detail)),
+        };
+        push_text(
+            out,
+            format!("remote: {remote} · unpushed {}", num(w.unpushed)),
+            width,
+        );
+        let forge = match w.forge {
+            WorkItem::Unknown => "?".to_owned(),
+            WorkItem::NotExisting => "no work item".to_owned(),
+            item => {
+                let pipeline = match (item, w.pipeline) {
+                    (WorkItem::Open, Pipeline::Unknown) => String::new(),
+                    (WorkItem::Open, p) => format!(" · {}", p.as_str()),
+                    _ => String::new(),
+                };
+                format!("{} · {}{}", opt(&w.forge_label), item.as_str(), pipeline)
+            }
+        };
+        push_text(out, format!("forge: {forge}"), width);
+        let landed = w.landed.map(|l| l.as_str()).unwrap_or("?");
+        push_text(out, format!("landed: {landed}"), width);
+        if !w.panes.is_empty() {
+            push_head(out, "tmux:".to_owned(), width);
+            for p in &w.panes {
+                push_text(out, format!("  {} {}", p.handle, p.command), width);
+            }
+        }
+        push_text(
+            out,
+            format!(
+                "activity: last change {} · last commit {}",
+                age(now, w.transition_at),
+                age(now, w.git_activity_at)
+            ),
+            width,
+        );
+        if !w.same_name_history.is_empty() {
+            push_head(out, "same-name history:".to_owned(), width);
+            for h in &w.same_name_history {
+                push_text(
+                    out,
+                    format!(
+                        "  {}#{} · ended {}",
+                        h.ref_name,
+                        h.number,
+                        age(now, h.ended_at)
+                    ),
+                    width,
+                );
+            }
+        }
+        push_head(out, format!("commits not on {}:", opt(&w.base)), width);
+        // The pass does not enumerate commits: `?` is the honest cell.
+        push_text(out, "  ?".to_owned(), width);
+        push_head(out, "cleanup:".to_owned(), width);
+        for (action, verdict) in [
+            ("worktree remove", &w.worktree_removal),
+            ("branch delete", &w.branch_deletion),
+        ] {
+            match verdict {
+                Some(v) => {
+                    push_text(
+                        out,
+                        format!("  {action}: {}", v.verdict.as_str().replace('_', " ")),
+                        width,
+                    );
+                    for reason in &v.reasons {
+                        push_text(out, format!("    - {reason}"), width);
+                    }
+                }
+                None => push_text(out, format!("  {action}: ?"), width),
+            }
+        }
+    }
+
+    /// A conversation's fields: identity, cwd, pane, state, resumability,
+    /// activity, forge, every touch interval with its evidence, related
+    /// conversations in proven-strength order, and the last prompts.
+    fn conversation_body(&self, c: &ConversationRow, out: &mut Vec<Line<'static>>, width: usize) {
+        let now = self.now();
+        push_text(
+            out,
+            format!(
+                "provider: {} · session {}",
+                c.provider.as_str(),
+                c.session_id
+            ),
+            width,
+        );
+        push_text(out, format!("title: {}", opt(&c.title)), width);
+        let cwd = c
+            .cwd
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        push_text(out, format!("cwd: {cwd}"), width);
+        let pane = match &c.attachment {
+            Some(a) => match &a.pane {
+                Some(p) => format!("{p} · {}", a.pane_source.map(|s| s.as_str()).unwrap_or("?")),
+                None => {
+                    if c.live && !c.running() {
+                        "process exited".to_owned()
+                    } else {
+                        format!("unbound: {}", a.placement_detail.as_deref().unwrap_or("?"))
+                    }
+                }
+            },
+            None => "?".to_owned(),
+        };
+        push_text(out, format!("pane: {pane}"), width);
+        let mut state = format!(
+            "state: {} · since {}",
+            c.state.as_str(),
+            age(now, c.state_since)
+        );
+        if let Some(raw) = &c.state_raw {
+            state.push_str(&format!(" · raw \"{}\"", escape_text(raw)));
+        }
+        push_text(out, state, width);
+        if let Some(reason) = &c.waiting_for {
+            push_text(out, format!("waiting for: {}", escape_text(reason)), width);
+        }
+        let resume = if c.resume_argv.is_empty() {
+            "?".to_owned()
+        } else {
+            format!("{} ({})", "resumable", c.resume_argv.join(" "))
+        };
+        push_text(out, format!("resume: {resume}"), width);
+        push_text(
+            out,
+            format!(
+                "activity: started {} · last turn {}",
+                age(now, c.started_at),
+                age(now, c.last_activity)
+            ),
+            width,
+        );
+        // The forge state of the incarnation the newest open touch names.
+        let forge = c
+            .current_incarnation
+            .as_ref()
+            .and_then(|id| {
+                self.snapshot
+                    .work
+                    .iter()
+                    .find(|w| w.incarnation.as_ref().is_some_and(|i| &i.id == id))
+            })
+            .and_then(|w| w.forge_label.clone());
+        push_text(
+            out,
+            format!("forge: {}", forge.unwrap_or_else(|| "?".to_owned())),
+            width,
+        );
+        push_head(out, "branch incarnations touched:".to_owned(), width);
+        if c.touches.is_empty() {
+            push_text(out, "  none".to_owned(), width);
+        }
+        for t in &c.touches {
+            let until = t
+                .valid_until
+                .map_or_else(|| "open".to_owned(), |u| age(now, Some(u)));
+            push_text(
+                out,
+                format!(
+                    "  {}#{} · {} → {} · head {} · {} · {}",
+                    t.ref_name,
+                    t.incarnation,
+                    age(now, Some(t.valid_from)),
+                    until,
+                    sha(&t.head),
+                    t.provenance.as_str(),
+                    t.confidence.as_str()
+                ),
+                width,
+            );
+        }
+        push_head(out, "related conversations:".to_owned(), width);
+        if c.related.is_empty() {
+            push_text(out, "  none proven".to_owned(), width);
+        }
+        for (strength, header) in [
+            (
+                RelationStrength::ProviderLineage,
+                "  lineage - provider declared:",
+            ),
+            (
+                RelationStrength::ProcessAncestry,
+                "  lineage - observed process ancestry:",
+            ),
+            (
+                RelationStrength::PaneCorrelation,
+                "  lineage - pane-creation correlation (inferred):",
+            ),
+            (RelationStrength::SameIncarnation, "  same incarnation:"),
+        ] {
+            let mut group = c
+                .related
+                .iter()
+                .filter(|r| r.strength == strength)
+                .peekable();
+            if group.peek().is_none() {
+                continue;
+            }
+            push_head(out, header.to_owned(), width);
+            for r in group {
+                push_text(
+                    out,
+                    format!(
+                        "    {} {} {} - {} · {} · {}",
+                        r.attention.glyph(),
+                        r.short_id,
+                        r.title.as_deref().unwrap_or("?"),
+                        r.label,
+                        r.provenance,
+                        age(now, r.state_since)
+                    ),
+                    width,
+                );
+            }
+        }
+        push_head(out, "last prompts:".to_owned(), width);
+        for (label, text) in [("prompt", &c.latest_prompt), ("reply", &c.latest_reply)] {
+            let text = text
+                .as_ref()
+                .map(|t| fit(&escape_text(t), width.saturating_sub(10)))
+                .unwrap_or_else(|| "?".to_owned());
+            push_text(out, format!("  {label}: {text}"), width);
+        }
+    }
+
+    /// A conversation's evidence view: the attachment's identity and
+    /// verdicts, every arbitration claim with its outcome, the retained
+    /// latches and their acknowledgement, the mark, the sequences, and
+    /// every record the fold rejected.
+    fn conversation_evidence(
+        &self,
+        c: &ConversationRow,
+        out: &mut Vec<Line<'static>>,
+        width: usize,
+    ) {
+        let now_ms = self.now() * 1000;
+        push_text(
+            out,
+            format!(
+                "provider: {} · session {}",
+                c.provider.as_str(),
+                c.session_id
+            ),
+            width,
+        );
+        match &c.attachment {
+            Some(a) => {
+                let mut process = format!(
+                    "process: pid {} · started {} · {}",
+                    a.pid,
+                    age(self.now(), a.pid_start),
+                    liveness_word(a)
+                );
+                if let Some(detail) = &a.liveness_detail {
+                    process.push_str(&format!(" ({})", escape_text(detail)));
+                }
+                push_text(out, process, width);
+                let pane = match (&a.pane, &a.placement_detail) {
+                    (Some(p), _) => {
+                        format!(
+                            "pane: {p} · {}",
+                            a.pane_source.map(|s| s.as_str()).unwrap_or("?")
+                        )
+                    }
+                    (None, Some(d)) => format!("pane: unbound: {}", escape_text(d)),
+                    (None, None) => "pane: ?".to_owned(),
+                };
+                push_text(out, pane, width);
+                push_text(
+                    out,
+                    format!(
+                        "claim source: {} · observed {}",
+                        a.source.as_str(),
+                        age(self.now(), Some(a.observed_at))
+                    ),
+                    width,
+                );
+            }
+            None => push_text(out, "attachment: no claim".to_owned(), width),
+        }
+        let e = &c.evidence;
+        push_head(out, "claims:".to_owned(), width);
+        if e.claims.is_empty() {
+            push_text(out, "  none".to_owned(), width);
+        }
+        for claim in &e.claims {
+            let marker = match claim.outcome {
+                ClaimOutcome::Winner => "*",
+                _ => " ",
+            };
+            let mut line = format!(
+                "  {marker} {} {} · observed {}",
+                claim.source.as_str(),
+                claim.exec.as_str(),
+                age_ms(now_ms, claim.observed_ms)
+            );
+            if let Some(since) = claim.since_ms {
+                line.push_str(&format!(" · since {}", age_ms(now_ms, since)));
+            }
+            if let Some(seq) = claim.seq {
+                line.push_str(&format!(" · seq {seq}"));
+            }
+            if let Some(detail) = &claim.detail {
+                line.push_str(&format!(" · \"{}\"", escape_text(detail)));
+            }
+            line.push_str(&format!(" - {}", claim.outcome.as_str()));
+            push_text(out, line, width);
+            if let Some(note) = &claim.note {
+                push_text(out, format!("      {note}"), width);
+            }
+        }
+        let ack = match (e.seen_seq, e.seen_wait_ms) {
+            (None, None) => "nothing".to_owned(),
+            (seq, wait) => format!(
+                "through seq {} · wait seen at {}",
+                seq.map(|s| s.to_string()).unwrap_or_else(|| "?".to_owned()),
+                wait.map(|ms| age_ms(now_ms, ms))
+                    .unwrap_or_else(|| "?".to_owned())
+            ),
+        };
+        push_text(out, format!("acknowledged: {ack}"), width);
+        if !e.latches.is_empty() {
+            push_head(out, "latches:".to_owned(), width);
+            for l in &e.latches {
+                let acked = if l.acknowledged { "acked" } else { "unacked" };
+                push_text(
+                    out,
+                    format!(
+                        "  seq {} {} · {} · {} · {acked}",
+                        l.seq,
+                        l.kind.as_str(),
+                        age_ms(now_ms, l.at_ms),
+                        l.reason.as_deref().unwrap_or("?")
+                    ),
+                    width,
+                );
+            }
+        }
+        if let Some(mark) = &e.mark {
+            let mut line = format!(
+                "mark: not-busy · seq {} · since {} · written {}",
+                mark.seq,
+                age_ms(now_ms, mark.since_ms),
+                age_ms(now_ms, mark.at_ms)
+            );
+            if e.mark_suppressed {
+                line.push_str(" · suppressed the busy claim");
+            }
+            push_text(out, line, width);
+        }
+        push_text(
+            out,
+            format!(
+                "sequences: journal {} · producer {}",
+                e.journal_seq
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "?".to_owned()),
+                e.producer_seq
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "?".to_owned())
+            ),
+            width,
+        );
+        if !e.rejected.is_empty() {
+            push_head(out, "rejected / stale:".to_owned(), width);
+            for r in &e.rejected {
+                push_text(
+                    out,
+                    format!(
+                        "  seq {} {} · {} · pseq {} · {}",
+                        r.seq,
+                        r.native,
+                        age_ms(now_ms, r.at_ms),
+                        r.pseq
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "?".to_owned()),
+                        r.reason
+                    ),
+                    width,
+                );
+            }
+        }
+        if let Some(t) = &c.transcript {
+            push_text(
+                out,
+                format!(
+                    "transcript: {} · malformed lines {}",
+                    t.display(),
+                    c.malformed_lines
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "?".to_owned())
+                ),
+                width,
+            );
         }
     }
 
@@ -1042,19 +1693,21 @@ impl App {
             } else if area.width < 60 {
                 match self.focused_list() {
                     Some(List::Work) => {
-                        "1-4 | tab | j/k | p park | h | / filter | ? | q quit".to_owned()
+                        "1-4 | tab | j/k | e | p park | h | / filter | ? | q quit".to_owned()
                     }
-                    Some(_) => "1-4 | tab | j/k | / filter | ? | q quit".to_owned(),
-                    None => "1-4 | tab | j/k | ? | q quit".to_owned(),
+                    Some(_) => "1-4 | tab | j/k | e | / filter | ? | q quit".to_owned(),
+                    None => "1-4 | tab | j/k scroll | e | ? | q quit".to_owned(),
                 }
             } else {
                 let hints = match self.focused_list() {
-                    Some(List::Repos) => "1-4 focus | tab next | j/k move | / filter",
+                    Some(List::Repos) => "1-4 focus | tab next | j/k move | e evidence | / filter",
                     Some(List::Work) => {
-                        "1-4 focus | tab next | j/k move | / filter | space ack | p park | h history"
+                        "1-4 focus | tab next | j/k move | e evidence | / filter | space ack | p park | h history"
                     }
-                    Some(_) => "1-4 focus | tab next | j/k move | / filter | space ack",
-                    None => "1-4 focus | tab next | j/k move",
+                    Some(_) => {
+                        "1-4 focus | tab next | j/k move | e evidence | / filter | space ack"
+                    }
+                    None => "1-4 focus | tab next | j/k scroll | e evidence | esc close",
                 };
                 format!("{hints} | ? keys | q quit")
             };
@@ -1096,12 +1749,16 @@ impl App {
                 Line::from(""),
                 Line::from(match list {
                     List::Work => {
-                        "j/k move   / filter   space ack/mark   p park   h history   enter/jump (later)"
+                        "j/k move   / filter   e evidence   space ack/mark   p park   h history   enter/jump (later)"
                     }
-                    _ => "j/k move   / filter   space ack/mark   enter/jump (later)",
+                    _ => "j/k move   / filter   e evidence   space ack/mark   enter/jump (later)",
                 }),
             ],
-            None => vec![Line::from("[4] Detail - follows the focused list")],
+            None => vec![
+                Line::from("[4] Detail - follows the focused list"),
+                Line::from(""),
+                Line::from("j/k scroll   e evidence   esc close"),
+            ],
         };
         let mut lines = vec![
             Line::from("keys"),
@@ -1230,7 +1887,8 @@ fn scope_of(w: &WorkRow) -> WorkScope {
                 Some(i) => format!("{}#{}", branch, i.number),
                 None => branch.clone(),
             },
-            excluded: false,
+            // A gone row's incarnation is closed: it scopes like history.
+            excluded: w.gone.is_some(),
         },
         _ /* // coverage: off - an anchor always names one of these */ => WorkScope::Space {
             id: String::new(),               // coverage: off - same
@@ -1544,6 +2202,148 @@ fn detail_state(c: &ConversationRow) -> String {
     }
 }
 
+/// A wrapped content line into the detail body.
+fn push_text(out: &mut Vec<Line<'static>>, text: String, width: usize) {
+    for line in wrap_text(&text, width) {
+        out.push(Line::from(line));
+    }
+}
+
+/// A wrapped section header into the detail body, dimmed.
+fn push_head(out: &mut Vec<Line<'static>>, text: String, width: usize) {
+    for line in wrap_text(&text, width) {
+        out.push(Line::from(Span::styled(
+            line,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+}
+
+/// `text` as lines that never exceed `width` cells: the detail pane wraps
+/// rather than clips or scrolls sideways.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if current.chars().count() >= width {
+            lines.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    } // coverage: off - the skip edge: non-empty input always leaves a partial line, empty input leaves none
+    lines
+}
+
+/// Provider text made printable on one line: control characters become
+/// visible escapes so a prompt or reason cannot paint over the pane.
+fn escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The string, or `?` where the field never proved one.
+fn opt(s: &Option<String>) -> String {
+    s.clone().unwrap_or_else(|| "?".to_owned())
+}
+
+/// The count, or `?` where the evidence never produced one.
+fn num(n: Option<u64>) -> String {
+    n.map(|n| n.to_string()).unwrap_or_else(|| "?".to_owned())
+}
+
+/// The head's first seven characters, or `?` where unrecorded.
+fn sha(head: &Option<String>) -> String {
+    head.as_ref()
+        .map(|h| h.chars().take(7).collect())
+        .unwrap_or_else(|| "?".to_owned())
+}
+
+/// The attachment's liveness as a word for the evidence view.
+fn liveness_word(a: &AttachmentRow) -> &'static str {
+    match a.liveness {
+        AttachmentLiveness::Instance => "instance",
+        AttachmentLiveness::PidOnly => "pid only",
+        AttachmentLiveness::Unverifiable => "unverifiable",
+        AttachmentLiveness::Dead => "dead",
+    }
+}
+
+/// A gone-row reference's kind word, in the detail's `references:` block.
+fn ref_kind(kind: ReferenceKind) -> &'static str {
+    match kind {
+        ReferenceKind::Pane => "pane",
+        ReferenceKind::Window => "window",
+        ReferenceKind::TmuxSession => "session",
+        ReferenceKind::Process => "process",
+        ReferenceKind::AgentSession => "agent",
+    }
+}
+
+/// An epoch-ms evidence timestamp as an age against `now_ms`.
+fn age_ms(now_ms: u64, then_ms: u64) -> String {
+    age(now_ms / 1000, Some(then_ms / 1000))
+}
+
+/// An incarnation's evidence block: the record's dates, creation
+/// evidence, tip and continuity decision - the same block a work row
+/// embeds and a history row's whole body.
+fn incarnation_body(i: &IncarnationRow, now: u64, out: &mut Vec<Line<'static>>, width: usize) {
+    push_head(out, "incarnation:".to_owned(), width);
+    push_text(
+        out,
+        format!("  {}#{} · id {}", i.ref_name, i.number, i.id),
+        width,
+    );
+    push_text(
+        out,
+        format!("  ref: {} · repo {}", i.ref_name, i.repo),
+        width,
+    );
+    let ended = i
+        .ended_at
+        .map_or_else(|| "open".to_owned(), |_| age(now, i.ended_at));
+    push_text(
+        out,
+        format!(
+            "  observed {} - {} · ended {}",
+            age(now, Some(i.first_observed_at)),
+            age(now, Some(i.last_observed_at)),
+            ended
+        ),
+        width,
+    );
+    push_text(
+        out,
+        format!(
+            "  ref creation {} · at {} · tip {}",
+            sha(&i.creation_head),
+            age(now, i.creation_at),
+            sha(&i.head)
+        ),
+        width,
+    );
+    push_text(
+        out,
+        format!("  continuity: {}", i.continuity.as_str()),
+        width,
+    );
+    if i.excluded {
+        push_text(out, "  excluded from the current row".to_owned(), width);
+    }
+}
+
 /// The keys the input loop translates; `Tab`, `Esc`, `Enter`, `Backspace`
 /// and the arrows keep their own variants so no key ever aliases a byte the
 /// terminal might also send for something else.
@@ -1782,9 +2582,11 @@ pub fn list_json() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::EvidenceSource;
     use crate::runtime::{PaneSource, Provider};
     use crate::snapshot::{
-        AttachmentLiveness, AttachmentRow, Landed, RepoRow, SCHEMA_VERSION, Upstream, WorkRow,
+        AttachmentLiveness, AttachmentRow, EvidenceRow, Landed, RepoCounts, RepoRow,
+        SCHEMA_VERSION, Upstream, WorkRow,
     };
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
@@ -1801,6 +2603,7 @@ mod tests {
             last_observed_at: 1_800_000_000 - 120,
             creation_head: None,
             creation_at: None,
+            head: None,
             ended_at: None,
             continuity: crate::store::ContinuityEvidence::FirstObservation,
             excluded: false,
@@ -1842,6 +2645,9 @@ mod tests {
                     open: 2,
                     clean: 0,
                     last_activity: Some(1_800_000_000 - 120),
+                    default_branch: Some("main".to_owned()),
+                    remote: Some("origin".to_owned()),
+                    counts: RepoCounts::default(),
                 },
                 RepoRow {
                     id: "/spaces/notes".to_owned(),
@@ -1854,6 +2660,9 @@ mod tests {
                     open: 1,
                     clean: 0,
                     last_activity: None,
+                    default_branch: None,
+                    remote: None,
+                    counts: RepoCounts::default(),
                 },
             ],
             work: vec![
@@ -1885,6 +2694,12 @@ mod tests {
                     pipeline: crate::forge::Pipeline::Unknown,
                     forge_label: Some("PR #191".to_owned()),
                     forge_url: Some("https://github.com/o/r/pull/191".to_owned()),
+                    commits_behind: Some(0),
+                    panes: Vec::new(),
+                    gone: None,
+                    references: Vec::new(),
+                    transition_at: Some(1_800_000_000 - 3600),
+                    git_activity_at: Some(1_800_000_000 - 300),
                     worktree_removal: Some(crate::verdict::ActionVerdict {
                         verdict: crate::verdict::Verdict::Blocked,
                         reasons: vec!["uncommitted changes".to_owned()],
@@ -1924,6 +2739,12 @@ mod tests {
                     pipeline: crate::forge::Pipeline::Unknown,
                     forge_label: None,
                     forge_url: None,
+                    commits_behind: None,
+                    panes: Vec::new(),
+                    gone: None,
+                    references: Vec::new(),
+                    transition_at: None,
+                    git_activity_at: None,
                     worktree_removal: Some(crate::verdict::ActionVerdict {
                         verdict: crate::verdict::Verdict::NotApplicable,
                         reasons: vec![],
@@ -1963,6 +2784,12 @@ mod tests {
                     pipeline: crate::forge::Pipeline::Unknown,
                     forge_label: None,
                     forge_url: None,
+                    commits_behind: None,
+                    panes: Vec::new(),
+                    gone: None,
+                    references: Vec::new(),
+                    transition_at: None,
+                    git_activity_at: None,
                     worktree_removal: None,
                     branch_deletion: None,
                     section: crate::snapshot::WorkSection::FollowUp,
@@ -1995,6 +2822,9 @@ mod tests {
                         pane: Some("workmux:@149.%162".to_owned()),
                         pane_source: Some(PaneSource::Published),
                         placement_detail: None,
+                        source: EvidenceSource::Published,
+                        observed_at: 1_800_000_000,
+                        pane_ref: None,
                     }),
                     cwd: Some(PathBuf::from("/repos/a-login")),
                     transcript: Some(PathBuf::from(
@@ -2013,6 +2843,9 @@ mod tests {
                     branch: Some("feat/login".to_owned()),
                     touches: vec![touch("i111", "/repos/a/.git", "feat/login")],
                     current_incarnation: Some("i111".to_owned()),
+                    started_at: Some(1_800_000_000 - 7200),
+                    related: Vec::new(),
+                    evidence: EvidenceRow::default(),
                 },
                 ConversationRow {
                     provider: Provider::Claude,
@@ -2047,6 +2880,9 @@ mod tests {
                     branch: Some("feat/login".to_owned()),
                     touches: vec![touch("i111", "/repos/a/.git", "feat/login")],
                     current_incarnation: Some("i111".to_owned()),
+                    started_at: Some(1_800_000_000 - 7200),
+                    related: Vec::new(),
+                    evidence: EvidenceRow::default(),
                 },
                 ConversationRow {
                     provider: Provider::Claude,
@@ -2077,6 +2913,9 @@ mod tests {
                     branch: None,
                     touches: Vec::new(),
                     current_incarnation: None,
+                    started_at: None,
+                    related: Vec::new(),
+                    evidence: EvidenceRow::default(),
                 },
             ],
             errors: vec![],
@@ -2615,7 +3454,6 @@ mod tests {
             &mut app,
             &[
                 Key::Char('p'),
-                Key::Char('e'),
                 Key::Char('o'),
                 Key::Char('x'),
                 Key::Char('d'),
@@ -2855,10 +3693,11 @@ mod tests {
         press(&mut app, &[Key::Char('3'), Key::Char('j')]);
         let text = render_to(&app, 200, 24);
         assert!(text.contains("waiting: permission prompt"), "{text}");
-        // On [4] itself the pane owns no list.
+        // On [4] itself the pane keeps the last list's target: focus
+        // moved to scroll the same detail, not to clear it.
         press(&mut app, &[Key::Char('4')]);
         let text = render_to(&app, 55, 24);
-        assert!(text.contains("cursor is on the detail pane"), "{text}");
+        assert!(text.contains("[4] Conversation"), "{text}");
     }
 
     #[test]
@@ -2902,18 +3741,21 @@ mod tests {
         press(&mut app, &[Key::Char('4'), Key::Char('/')]);
         assert!(app.editing.is_none());
         // A narrow pane on [4] gets the no-filter footer variant, and the
-        // detail header names a cursor that owns no list.
+        // detail keeps the last list's target: `all`, not a cleared pane.
         press(&mut app, &[Key::Char('4')]);
         let text = render_to(&app, 55, 24);
-        assert!(text.contains("1-4 | tab | j/k | ? | q quit"), "{text}");
-        assert!(text.contains("cursor is on the detail pane"), "{text}");
+        assert!(
+            text.contains("1-4 | tab | j/k scroll | e | ? | q quit"),
+            "{text}"
+        );
+        assert!(text.contains("everything in scope"), "{text}");
         // Narrow help: the popup clamps to the pane width.
         press(&mut app, &[Key::Char('?')]);
         let text = render_to(&app, 55, 24);
         assert!(text.contains("[4] Detail"), "{text}");
         let text = render_to(&app, 200, 24);
         assert!(
-            text.contains("1-4 focus | tab next | j/k move | ? keys"),
+            text.contains("1-4 focus | tab next | j/k scroll | e evidence"),
             "{text}"
         );
     }
@@ -3220,5 +4062,46 @@ mod tests {
         assert!(tmux::pane_ref_from_env(tmux("/tmp/sock,1,0"), None).is_none());
         assert!(tmux::pane_ref_from_env(tmux(",1,0"), Some("%12")).is_none());
         assert!(tmux::pane_ref_from_env(tmux("/tmp/sock,1,0"), Some("junk")).is_none());
+    }
+
+    #[test]
+    fn the_detail_helpers_wrap_escape_and_name() {
+        // An empty body line still emits one line so sections keep their
+        // spacing; a width of zero never panics.
+        assert_eq!(wrap_text("", 4), vec![String::new()]);
+        assert_eq!(wrap_text("abcdef", 2), vec!["ab", "cd", "ef"]);
+        // Control characters become visible escapes.
+        assert_eq!(escape_text("a\rb\x1fc"), "a\\rb\\u001fc");
+        // Liveness and reference kinds render a word each.
+        let attachment = |l| AttachmentRow {
+            pid: 1,
+            pid_start: None,
+            liveness: l,
+            liveness_detail: None,
+            pane: None,
+            pane_source: None,
+            placement_detail: None,
+            source: EvidenceSource::Derived,
+            observed_at: 0,
+            pane_ref: None,
+        };
+        assert_eq!(
+            liveness_word(&attachment(AttachmentLiveness::Instance)),
+            "instance"
+        );
+        assert_eq!(
+            liveness_word(&attachment(AttachmentLiveness::PidOnly)),
+            "pid only"
+        );
+        assert_eq!(
+            liveness_word(&attachment(AttachmentLiveness::Unverifiable)),
+            "unverifiable"
+        );
+        assert_eq!(liveness_word(&attachment(AttachmentLiveness::Dead)), "dead");
+        assert_eq!(ref_kind(ReferenceKind::Pane), "pane");
+        assert_eq!(ref_kind(ReferenceKind::Window), "window");
+        assert_eq!(ref_kind(ReferenceKind::TmuxSession), "session");
+        assert_eq!(ref_kind(ReferenceKind::Process), "process");
+        assert_eq!(ref_kind(ReferenceKind::AgentSession), "agent");
     }
 }

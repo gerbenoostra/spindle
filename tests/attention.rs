@@ -630,6 +630,9 @@ fn cursor_movement_writes_no_seen_state() {
             branch: None,
             touches: Vec::new(),
             current_incarnation: None,
+            started_at: None,
+            related: Vec::new(),
+            evidence: agent_sessions::snapshot::EvidenceRow::default(),
         });
     let mut app = agent_sessions::tui::App::new(snapshot).with_store(store);
     for key in [

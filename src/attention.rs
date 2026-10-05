@@ -129,6 +129,77 @@ pub struct Inputs<'a> {
     pub idle: &'a mut WeakIdle,
 }
 
+/// Where an execution claim came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimSource {
+    /// The provider's published record, bound to a live attachment.
+    Published,
+    /// A mapped journal event.
+    Journal,
+    /// An unmapped journal record's weak `Busy` lease.
+    Ping,
+}
+
+impl ClaimSource {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClaimSource::Published => "published",
+            ClaimSource::Journal => "journal",
+            ClaimSource::Ping => "ping",
+        }
+    }
+}
+
+/// How arbitration ruled on one claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimOutcome {
+    /// It produced the effective state.
+    Winner,
+    /// A newer applicable observation won instead.
+    Outranked,
+    /// It would win once its weak `Busy -> Idle` transition confirms;
+    /// until then the busy claim stands.
+    Confirming,
+}
+
+impl ClaimOutcome {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClaimOutcome::Winner => "winner",
+            ClaimOutcome::Outranked => "outranked",
+            ClaimOutcome::Confirming => "confirming",
+        }
+    }
+}
+
+/// One execution claim arbitration considered, and how it ruled. The
+/// evidence view renders these verbatim: what claimed the state, when it
+/// was observed, and why it did or did not win.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimRow {
+    /// `published` | `journal` | `ping`.
+    pub source: ClaimSource,
+    /// The execution state it claimed.
+    pub exec: Exec,
+    /// When the claim's evidence was observed, epoch ms.
+    pub observed_ms: u64,
+    /// When the claimed state began, epoch ms; the provider's own
+    /// `since` or the event's, `None` when the claim does not carry one.
+    pub since_ms: Option<u64>,
+    /// The journal commit sequence a journal-sourced claim rode in on.
+    pub seq: Option<u64>,
+    /// The claim's detail: a wait reason or the event's reason.
+    pub detail: Option<String>,
+    /// How arbitration ruled on it.
+    pub outcome: ClaimOutcome,
+    /// Why a non-winner lost, or what a winner is still conditional on.
+    pub note: Option<String>,
+}
+
 /// One pass's verdict for one conversation.
 #[derive(Debug, Clone)]
 pub struct Derived {
@@ -152,6 +223,9 @@ pub struct Derived {
     pub journal_seq: u64,
     /// Whether the not-busy mark suppressed a live `Busy`.
     pub marked: bool,
+    /// Every execution claim considered, in evaluation order, each with
+    /// its verdict - the evidence view's arbitration trace.
+    pub claims: Vec<ClaimRow>,
 }
 
 /// The unmapped ping's weak `Busy` lease.
@@ -254,43 +328,79 @@ pub fn derive(inputs: Inputs<'_>) -> Derived {
     let mut waiting_for = None;
     let mut winner_seq = 0u64;
     let mut marked = false;
+    let mut claims: Vec<ClaimRow> = Vec::new();
     if let Some(live) = inputs.live {
         let mut candidates: Vec<Candidate> = Vec::new();
         if let Some(p) = &inputs.published
             && let Some(status) = p.status
         {
+            let exec = match status {
+                PublishedStatus::Busy => Exec::Busy,
+                PublishedStatus::Idle => Exec::Idle,
+                PublishedStatus::Waiting => Exec::Waiting,
+            };
             candidates.push(Candidate {
                 rank: 1,
                 observed_ms: p.observed_ms,
                 since_ms: p.since_ms.unwrap_or(p.observed_ms),
-                exec: match status {
-                    PublishedStatus::Busy => Exec::Busy,
-                    PublishedStatus::Idle => Exec::Idle,
-                    PublishedStatus::Waiting => Exec::Waiting,
-                },
+                exec,
                 waiting_for: p.waiting_for.clone(),
                 seq: 0,
+            });
+            claims.push(ClaimRow {
+                source: ClaimSource::Published,
+                exec,
+                observed_ms: p.observed_ms,
+                since_ms: p.since_ms,
+                seq: None,
+                detail: p.waiting_for.clone(),
+                outcome: ClaimOutcome::Outranked,
+                note: None,
             });
         }
         if let Some(event) = &fold.last_event
             && same_instance(event.pid, event.pid_start, live)
         {
+            let exec = event.kind.execution().unwrap_or(Exec::Unknown);
             candidates.push(Candidate {
                 rank: 2,
                 observed_ms: event.observed_ms,
                 since_ms: event.since_ms,
-                exec: event.kind.execution().unwrap_or(Exec::Unknown),
+                exec,
                 waiting_for: event.reason.clone(),
                 seq: event.seq,
+            });
+            claims.push(ClaimRow {
+                source: ClaimSource::Journal,
+                exec,
+                observed_ms: event.observed_ms,
+                since_ms: Some(event.since_ms),
+                seq: Some(event.seq),
+                detail: event.reason.clone(),
+                outcome: ClaimOutcome::Outranked,
+                note: None,
             });
         }
         // The newest applicable strong claim wins; a mapped event that
         // outdates the provider's file still publishes immediately.
-        if let Some(winner) = candidates.iter().max_by_key(|c| c.observed_ms) {
+        let winner_idx = candidates
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, c)| c.observed_ms)
+            .map(|(i, _)| i);
+        if let Some(wi) = winner_idx {
+            let winner = &candidates[wi];
             exec = winner.exec;
             since_ms = Some(winner.since_ms);
             waiting_for = winner.waiting_for.clone();
             winner_seq = winner.seq;
+            for (i, claim) in claims.iter_mut().enumerate() {
+                if i == wi {
+                    claim.outcome = ClaimOutcome::Winner;
+                } else {
+                    claim.note = Some("a newer observation wins".to_owned());
+                }
+            }
         } else {
             // No strong claim: the unmapped ping's weak lease applies only
             // outside the startup grace and only while it is fresh.
@@ -300,9 +410,22 @@ pub fn derive(inputs: Inputs<'_>) -> Derived {
             let pinged = fold
                 .ping
                 .is_some_and(|(_, at)| inputs.now_ms.saturating_sub(at) < PING_LEASE_MS);
-            if pinged && !in_grace {
+            if pinged
+                && !in_grace
+                && let Some((seq, at)) = fold.ping
+            {
                 exec = Exec::Busy;
-                since_ms = fold.ping.map(|(_, at)| at);
+                since_ms = Some(at);
+                claims.push(ClaimRow {
+                    source: ClaimSource::Ping,
+                    exec: Exec::Busy,
+                    observed_ms: at,
+                    since_ms: Some(at),
+                    seq: Some(seq),
+                    detail: None,
+                    outcome: ClaimOutcome::Winner,
+                    note: Some("unmapped ping weak lease".to_owned()),
+                });
             }
         }
 
@@ -318,6 +441,16 @@ pub fn derive(inputs: Inputs<'_>) -> Derived {
             // the cap.
             exec = Exec::Busy;
             since_ms = fold.last_event.as_ref().map(|e| e.since_ms).or(since_ms);
+            if let Some(wi) = winner_idx {
+                claims[wi].outcome = ClaimOutcome::Confirming;
+                claims[wi].note = Some("weak idle still confirming".to_owned());
+                for (i, claim) in claims.iter_mut().enumerate() {
+                    if i != wi && claim.exec == Exec::Busy {
+                        claim.outcome = ClaimOutcome::Winner;
+                        claim.note = Some("stands while the weak idle confirms".to_owned());
+                    }
+                }
+            } // coverage: off - the `None` edge: a weak idle implies a winner claim exists
         } else if !weak_idle {
             inputs.idle.reset();
         }
@@ -335,6 +468,14 @@ pub fn derive(inputs: Inputs<'_>) -> Derived {
         {
             exec = Exec::Idle;
             marked = true;
+            // The mark suppresses the state, not the claim: the winning
+            // Busy stays the arbitration winner with a note.
+            for claim in &mut claims {
+                if claim.outcome == ClaimOutcome::Winner && claim.exec == Exec::Busy {
+                    claim.note = Some("suppressed by the not-busy mark".to_owned());
+                    break;
+                }
+            } // coverage: off - the no-match edge: `exec == Busy` means a winning Busy claim exists
         }
     } else {
         inputs.idle.reset();
@@ -402,6 +543,7 @@ pub fn derive(inputs: Inputs<'_>) -> Derived {
         wait_ms,
         journal_seq: fold.last_seq,
         marked,
+        claims,
     }
 }
 
@@ -863,5 +1005,131 @@ mod tests {
         let d = derive(inputs(&fold, Some((7, Some(0))), &mut idle));
         assert_eq!(d.attention, Attention::Waiting);
         assert_eq!(d.attention_detail.as_deref(), Some("permission prompt"));
+    }
+
+    #[test]
+    fn claim_labels_spell_their_wire_names() {
+        for (v, word) in [
+            (ClaimSource::Published, "published"),
+            (ClaimSource::Journal, "journal"),
+            (ClaimSource::Ping, "ping"),
+        ] {
+            assert_eq!(v.as_str(), word);
+        }
+        for (v, word) in [
+            (ClaimOutcome::Winner, "winner"),
+            (ClaimOutcome::Outranked, "outranked"),
+            (ClaimOutcome::Confirming, "confirming"),
+        ] {
+            assert_eq!(v.as_str(), word);
+        }
+    }
+
+    #[test]
+    fn the_mark_notes_the_suppressed_busy_claim() {
+        let mut idle = WeakIdle::default();
+        // The journal's `Busy` is the arbitration winner; the mark
+        // suppresses the state but the claim keeps its note.
+        let fold = fold_with(&[(NormEvent::Start, 50_000)]);
+        let mark = Mark {
+            since_ms: 50_000,
+            seq: 1,
+            at_ms: 90_000,
+        };
+        let mut in_ = inputs(&fold, Some((7, Some(0))), &mut idle);
+        in_.mark = Some(&mark);
+        let d = derive(in_);
+        assert!(d.marked);
+        let winner = d
+            .claims
+            .iter()
+            .find(|c| c.outcome == ClaimOutcome::Winner)
+            .expect("a winner claim");
+        assert_eq!(winner.source, ClaimSource::Journal);
+        assert_eq!(
+            winner.note.as_deref(),
+            Some("suppressed by the not-busy mark")
+        );
+
+        // The same suppression with an outranked claim ahead of the
+        // winner in the list: the loop skips it before marking the Busy.
+        let mut idle = WeakIdle::default();
+        let fold = fold_with(&[(NormEvent::Start, 70_000)]);
+        let mark = Mark {
+            since_ms: 70_000,
+            seq: 1,
+            at_ms: 90_000,
+        };
+        let mut in_ = inputs(&fold, Some((7, Some(0))), &mut idle);
+        in_.mark = Some(&mark);
+        in_.published = Some(Published {
+            status: Some(PublishedStatus::Busy),
+            waiting_for: None,
+            observed_ms: 60_000,
+            since_ms: Some(50_000),
+        });
+        let d = derive(in_);
+        assert!(d.marked);
+        let winner = d
+            .claims
+            .iter()
+            .find(|c| c.outcome == ClaimOutcome::Winner)
+            .expect("a winner claim");
+        assert_eq!(
+            winner.note.as_deref(),
+            Some("suppressed by the not-busy mark")
+        );
+    }
+
+    #[test]
+    fn a_confirming_weak_idle_labels_its_claims() {
+        let mut idle = WeakIdle::default();
+        // Published `idle` over a live journal `Busy`: the idle would win
+        // once confirmed, and the busy stands meanwhile - both notes.
+        let fold = fold_with(&[(NormEvent::Start, 50_000)]);
+        let mut in_ = inputs(&fold, Some((7, Some(0))), &mut idle);
+        in_.published = Some(Published {
+            status: Some(PublishedStatus::Idle),
+            waiting_for: None,
+            observed_ms: 90_000,
+            since_ms: Some(90_000),
+        });
+        let d = derive(in_);
+        let confirming = d
+            .claims
+            .iter()
+            .find(|c| c.outcome == ClaimOutcome::Confirming)
+            .expect("a confirming claim");
+        assert_eq!(confirming.source, ClaimSource::Published);
+        assert_eq!(
+            confirming.note.as_deref(),
+            Some("weak idle still confirming")
+        );
+        let busy = d
+            .claims
+            .iter()
+            .find(|c| c.outcome == ClaimOutcome::Winner)
+            .expect("the standing busy claim");
+        assert_eq!(busy.exec, Exec::Busy);
+        assert_eq!(
+            busy.note.as_deref(),
+            Some("stands while the weak idle confirms")
+        );
+        // The ping claim labels too: no strong claim, a fresh ping.
+        let mut idle = WeakIdle::default();
+        let mut fold = Fold::default();
+        let mut r = crate::store::Record::new("claude", "s1", "Bogus");
+        r.seq = 1;
+        r.at = 100_000;
+        fold.apply(&r);
+        let mut in_ = inputs(&fold, Some((7, Some(0))), &mut idle);
+        in_.now_ms = 101_000;
+        let d = derive(in_);
+        let ping = d
+            .claims
+            .iter()
+            .find(|c| c.source == ClaimSource::Ping)
+            .expect("a ping claim");
+        assert_eq!(ping.outcome, ClaimOutcome::Winner);
     }
 }
