@@ -1101,7 +1101,8 @@ impl Collector {
                             })
                         })
                         .collect();
-                    match store.sync_repo(repo_id, &refs, observed_ms) {
+                    let previous = self.model.ref_observed.get(repo_id).copied();
+                    match store.sync_repo_after(repo_id, &refs, observed_ms, previous) {
                         Ok(()) => observed.push(repo_id.clone()),
                         Err(e) => self.model.errors.push(work_state_error(repo_id, e)),
                     }

@@ -586,12 +586,12 @@ pub struct BranchRecord {
     pub ref_name: String,
     /// The first pass that observed the ref, epoch milliseconds.
     pub first_observed_at: u64,
-    /// The last pass that observed the ref, epoch milliseconds, as of the
-    /// last write: every observation moves it, but a pass that changes
-    /// nothing else writes nothing, so a stored value lags by at most the
-    /// quiet passes since. The snapshot reports an active record's
-    /// observation from the running collector instead. Records written
-    /// before this field existed carry `0` until their next write.
+    /// The last pass that observed the ref, epoch milliseconds. Every
+    /// observation moves it, but a pass that changes nothing else writes
+    /// nothing: an active record's stored value lags by the quiet passes
+    /// since, and the snapshot reports its observation from the running
+    /// collector instead. Closing stamps the pass before the close. Records
+    /// written before this field existed carry `0` until their next write.
     #[serde(default)]
     pub last_observed_at: u64,
     /// The ref's tip OID as last proven - what the next observation's tip
@@ -1118,8 +1118,9 @@ impl Store {
     /// Continuity: a proven `Branch: renamed` line moves the record with
     /// its id; reflog creation evidence that no longer matches proves a
     /// boundary the ref's continued presence hid (a missed
-    /// delete/recreate); a tip move under unchanged creation evidence is
-    /// continuous (`force_push`), never a boundary; and evidence that
+    /// delete/recreate); a proven non-fast-forward tip move under
+    /// unchanged creation evidence is continuous (`force_push`), never a
+    /// boundary; and evidence that
     /// detects a boundary it cannot explain separates rather than merges
     /// (`ambiguous`). Closing a record closes its open touch intervals at
     /// the same time, and closed records are pruned only past
@@ -1128,6 +1129,25 @@ impl Store {
     /// One lock and at most one rewrite; a sync that changes nothing -
     /// no refs to record and none to close - touches no file.
     pub fn sync_repo(&self, repo: &str, refs: &[ObservedRef], observed_ms: u64) -> io::Result<()> {
+        self.sync_repo_after(repo, refs, observed_ms, None)
+    }
+
+    /// [`Self::sync_repo`] for a caller that knows `previous_ms`, the
+    /// last pass that observed this repository's refs: a record this pass
+    /// closes was last seen then, so its `last_observed_at` lands there
+    /// even when the quiet passes in between wrote nothing.
+    pub fn sync_repo_after(
+        &self,
+        repo: &str,
+        refs: &[ObservedRef],
+        observed_ms: u64,
+        previous_ms: Option<u64>,
+    ) -> io::Result<()> {
+        let last_seen = |record: &mut BranchRecord| {
+            if let Some(ms) = previous_ms {
+                record.last_observed_at = record.last_observed_at.max(ms);
+            }
+        };
         // No refs to record and no file to close records in: the sync
         // touches nothing.
         if refs.is_empty() && !self.dir.join(WORK).exists() {
@@ -1205,6 +1225,7 @@ impl Store {
                 continue; // coverage: off - the same lookup just answered it
             };
             record.ended_at = Some(observed_ms);
+            last_seen(record);
             work.active_branches.remove(&key);
             close_touches(&mut work, &id, observed_ms);
             changed = true;
@@ -1235,6 +1256,7 @@ impl Store {
                             continue; // coverage: off - the same lookup just answered it
                         };
                         record.ended_at = Some(observed_ms);
+                        last_seen(record);
                         work.active_branches.remove(&key);
                         close_touches(&mut work, &id, observed_ms);
                         open_incarnation(&mut work, repo, obs, observed_ms, continuity);

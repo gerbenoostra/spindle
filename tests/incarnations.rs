@@ -1244,3 +1244,48 @@ fn a_live_conversation_off_any_recorded_branch_opens_no_cwd_interval() {
         assert!(conv.touches.is_empty(), "{id}: {:?}", conv.touches);
     }
 }
+
+#[test]
+fn a_closed_record_was_last_seen_by_the_pass_before_its_close() {
+    let dir = TempDir::new("incarnation-last-seen");
+    let store = Store::open(dir.join("store"));
+    let repo = "/repo/.git";
+    let creation = |head: &str, at_ms: u64| {
+        Some(RefCreationEvidence {
+            head: head.to_owned(),
+            at_ms,
+        })
+    };
+    let refs = [
+        obs("gone", Some("g"), creation("g", 500)),
+        obs("split", Some("s"), creation("s", 500)),
+    ];
+    store.sync_repo(repo, &refs, 1_000).unwrap();
+    store.sync_repo(repo, &refs, 1_500).unwrap();
+    let work = store.load().work;
+    let gone = work.branch(repo, "gone").unwrap().id.clone();
+    let split = work.branch(repo, "split").unwrap().id.clone();
+    // A week of quiet passes writes nothing...
+    let bytes = fs::read(dir.join("store/work.json")).unwrap();
+    store
+        .sync_repo_after(repo, &refs, 600_000, Some(1_500))
+        .unwrap();
+    assert!(fs::read(dir.join("store/work.json")).unwrap() == bytes);
+    // ...yet the pass that closes a record - the ref gone, or a proven
+    // boundary under the same name - dates its last sighting to the pass
+    // before it, not to the last write.
+    store
+        .sync_repo_after(
+            repo,
+            &[obs("split", Some("t"), creation("t", 650_000))],
+            700_000,
+            Some(600_000),
+        )
+        .unwrap();
+    let work = store.load().work;
+    for id in [&gone, &split] {
+        let record = &work.branches[id];
+        assert_eq!(record.ended_at, Some(700_000), "{id}");
+        assert_eq!(record.last_observed_at, 600_000, "{id}");
+    }
+}
