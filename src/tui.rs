@@ -3021,6 +3021,74 @@ mod tests {
         assert_eq!(app.cursor[list_index(List::Conversations)], 0);
     }
 
+    /// Every detail and evidence body line, for every target the lists
+    /// offer, fits the width it was built for. The body is a list of
+    /// `Line`s the renderer would otherwise clip silently, so the width
+    /// is asserted on the lines themselves, not on a rendered buffer that
+    /// is always exactly as wide as the terminal.
+    #[test]
+    fn every_detail_and_evidence_line_fits_its_width() {
+        let mut snapshot = fixture();
+        let long = "ペインのラベルを更新する ".repeat(12);
+        let path = PathBuf::from(format!("/repos/{}", "deeply-nested-segment/".repeat(10)));
+        for c in &mut snapshot.conversations {
+            c.title = Some(long.clone());
+            c.latest_prompt = Some(format!("{long}\n\t{long}"));
+            c.latest_reply = Some(long.clone());
+            c.waiting_for = Some(long.clone());
+            c.cwd = Some(path.clone());
+            c.evidence.claims.push(crate::attention::ClaimRow {
+                source: crate::attention::ClaimSource::Journal,
+                exec: crate::store::Exec::Busy,
+                observed_ms: 1_800_000_000_000,
+                since_ms: Some(1_800_000_000_000),
+                seq: Some(7),
+                detail: Some(long.clone()),
+                outcome: crate::attention::ClaimOutcome::Outranked,
+                note: Some(long.clone()),
+            });
+            c.evidence.rejected.push(crate::store::RejectedRecord {
+                conversation: c.session_id.clone(),
+                seq: 3,
+                at_ms: 1_800_000_000_000,
+                pseq: Some(1),
+                native: long.clone(),
+                reason: long.clone(),
+            });
+        }
+        for w in &mut snapshot.work {
+            w.worktree = Some(path.clone());
+            w.summary = long.clone();
+            w.gone = Some(long.clone());
+            w.references = vec![crate::snapshot::ReferenceRow {
+                kind: ReferenceKind::Pane,
+                label: long.clone(),
+            }];
+        }
+        let mut app = App::new(snapshot);
+        app.history = true;
+        let mut checked = 0;
+        for list in [List::Repos, List::Work, List::Conversations] {
+            app.detail_list = list;
+            let rows = app.view().rows(list).len();
+            for cursor in 0..=rows {
+                app.cursor[list_index(list)] = cursor;
+                let view = app.view();
+                for width in [2usize, 9, 53, 198] {
+                    for line in app
+                        .detail_lines(&view, width)
+                        .into_iter()
+                        .chain(app.evidence_lines(&view, width))
+                    {
+                        assert!(line.width() <= width, "{width}: {line:?}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 0);
+    }
+
     #[test]
     fn a_double_width_label_never_overflows_its_row() {
         let app = App::new(fixture());
@@ -3045,8 +3113,10 @@ mod tests {
         for width in [55u16, 200] {
             let app = App::new(fixture());
             let text = render_to(&app, width, 24);
-            // The four-panel frame is there, unclipped, with no horizontal
-            // scroll - every line is exactly `width` cells wide.
+            // The four-panel frame is there with no horizontal scroll -
+            // every buffer line is exactly `width` cells wide. A buffer
+            // cannot show clipping; row and detail line widths are asserted
+            // on the built lines instead.
             for line in text.lines() {
                 assert_eq!(line.chars().count(), width as usize, "{line}");
             }

@@ -3,7 +3,7 @@
 //! never landed, escaped and truncated prompts, related conversations in
 //! proven-strength order, gone work and its live references, and the
 //! claim/latch/rejected-record evidence - at both the narrow and the
-//! wide terminal widths.
+//! wide terminal widths. Line widths are asserted in the TUI's unit tests.
 
 use agent_sessions::attention::{Attention, ClaimOutcome, ClaimRow, ClaimSource};
 use agent_sessions::forge::{Pipeline, WorkItem};
@@ -46,14 +46,6 @@ fn press(app: &mut App, keys: &[Key]) {
     for &key in keys {
         app.key(key);
     }
-}
-
-/// Every rendered line fits the terminal: wrapping, never clipping.
-fn assert_fits(text: &str, width: u16) {
-    assert!(
-        text.lines().all(|l| l.chars().count() <= width as usize),
-        "a line exceeded {width}:\n{text}"
-    );
 }
 
 fn repo(git: bool) -> RepoRow {
@@ -244,7 +236,6 @@ fn repo_detail_shows_path_counts_and_unknowns_at_both_widths() {
     press(&mut app, &[Key::Char('1'), Key::Char('j')]);
     for width in [55, 200] {
         let text = render(&app, width, 30);
-        assert_fits(&text, width);
         assert!(text.contains("path: /repos/a"), "{text}");
         assert!(text.contains("default branch: main"), "{text}");
         assert!(text.contains("remote: origin"), "{text}");
@@ -268,7 +259,6 @@ fn work_detail_shows_incarnation_delivery_upstream_forge_and_cleanup() {
     press(&mut app, &[Key::Char('2'), Key::Char('j')]);
     for width in [55, 200] {
         let text = render(&app, width, 40);
-        assert_fits(&text, width);
         assert!(text.contains("incarnation:"), "{text}");
         assert!(text.contains("feat/login#1"), "{text}");
         assert!(text.contains("worktree:"), "{text}");
@@ -308,7 +298,6 @@ fn work_detail_renders_question_marks_for_unproven_fields() {
     let mut app = App::new(snapshot);
     press(&mut app, &[Key::Char('2'), Key::Char('j')]);
     let text = render(&app, 200, 40);
-    assert_fits(&text, 200);
     assert!(text.contains("local: ?"), "{text}");
     assert!(
         text.contains("remote: ? (probe timed out) · unpushed 3"),
@@ -363,7 +352,6 @@ fn gone_work_names_what_vanished_and_every_live_reference() {
     );
     for width in [55, 200] {
         let text = render(&app, width, 40);
-        assert_fits(&text, width);
         assert!(text.contains("branch and worktree gone"), "{text}");
         for label in [
             "pane workmux:1.2",
@@ -446,7 +434,6 @@ fn conversation_detail_lists_touches_relations_and_last_prompts() {
     // Prompts are escaped and truncated to one line each.
     assert!(text.contains("rename\\tthese\\npanes\\u0001"), "{text}");
     let text55 = render(&app, 55, 50);
-    assert_fits(&text55, 55);
     assert!(!text55.contains('\t'), "{text55}");
     // Unknown values stay `?` where the transcript carried nothing.
     let mut snapshot = fixture();
@@ -532,7 +519,6 @@ fn the_evidence_overlay_shows_claims_latches_marks_and_rejects() {
     press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char('e')]);
     for width in [55, 200] {
         let text = render(&app, width, 50);
-        assert_fits(&text, width);
         assert!(text.contains("[4] Evidence"), "{text}");
         assert!(text.contains("claims:"), "{text}");
         assert!(text.contains("published waiting"), "{text}");
@@ -649,9 +635,11 @@ fn fixture_with_gone() -> Snapshot {
 }
 
 #[test]
-fn every_detail_renders_within_the_terminal_width() {
-    // A stress pass over every target kind at both widths: no clipping,
-    // no horizontal scroll - wrapped lines and honest `?`s only.
+fn every_detail_target_renders_at_both_widths() {
+    // Every target kind, detail and evidence, draws at both widths. Line
+    // widths are asserted where the lines are built, in the TUI's unit
+    // tests: a rendered buffer is always exactly the terminal's width, so
+    // it cannot show a clipped line.
     for keys in [
         &[Key::Char('1'), Key::Char('j')][..],
         &[Key::Char('2'), Key::Char('j')][..],
@@ -662,10 +650,10 @@ fn every_detail_renders_within_the_terminal_width() {
         press(&mut app, keys);
         for width in [55, 200] {
             let text = render(&app, width, 30);
-            assert_fits(&text, width);
+            assert!(text.contains("[4] "), "{text}");
             press(&mut app, &[Key::Char('e')]);
             let text = render(&app, width, 30);
-            assert_fits(&text, width);
+            assert!(text.contains("[4] Evidence"), "{text}");
             press(&mut app, &[Key::Char('e')]);
         }
     }
