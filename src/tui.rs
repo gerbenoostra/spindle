@@ -1467,7 +1467,7 @@ impl App {
             push_text(
                 out,
                 format!(
-                    "  {}#{} · {} → {} · head {} · files ? · commits ? · {} · {}",
+                    "  {}#{} · {} → {} · head {} · files ? · commits ? · created repo ? · {} · {}",
                     t.ref_name,
                     t.incarnation,
                     age(now, Some(t.valid_from)),

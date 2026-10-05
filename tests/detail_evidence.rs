@@ -467,7 +467,10 @@ fn conversation_detail_lists_touches_relations_and_last_prompts() {
     assert!(text.contains("provider_branch · exact"), "{text}");
     // Epochs and per-touch files and commits are not exposed: `?`.
     assert!(text.contains("epoch: ?"), "{text}");
-    assert!(text.contains("files ? · commits ?"), "{text}");
+    assert!(
+        text.contains("files ? · commits ? · created repo ?"),
+        "{text}"
+    );
     assert!(text.contains("cwd · exact"), "{text}");
     // Related groups in strength order.
     let at = |needle: &str| text.find(needle).unwrap_or(usize::MAX);
