@@ -66,19 +66,6 @@ fn session_file(root: &TempDir, pid: u32, id: &str, status: &str, extra: &str) {
     .expect("session file writes");
 }
 
-/// `procStart` as Claude writes it: a UTC ctime (`Tue Sep 22 16:18:53 2026`).
-/// Read from the kernel through `ps -o lstart` so the `(pid, pid_start)`
-/// pair validates as the same instance.
-fn proc_start(pid: u32) -> String {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC0")
-        .output()
-        .expect("ps runs");
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
 /// `<root>/projects/<slug>/<uuid>.jsonl`.
 fn transcript(root: &TempDir, slug: &str, id: &str, cwd: &Path, texts: &[(&str, &str)]) {
     let projects = root.join(format!(".claude/projects/{slug}"));
@@ -183,7 +170,7 @@ fn world() -> World {
             ",\"waitingFor\":\"permission prompt\",\"cwd\":\"{}\",\"tmux\":\"{}\",\"name\":\"fix login\",\"procStart\":\"{}\"",
             worktree.display(),
             handle,
-            proc_start(pid)
+            support::proc_start(pid)
         ),
     );
     transcript(

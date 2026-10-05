@@ -90,7 +90,7 @@ fn fake_agent(dir: &TempDir) -> String {
 fn session_file(home: &TempDir, pid: u32, id: &str, status: &str, worktree: &Path) {
     let sessions = home.join(".claude/sessions");
     fs::create_dir_all(&sessions).expect("mkdir");
-    let start = proc_start(pid);
+    let start = support::proc_start(pid);
     fs::write(
         sessions.join(format!("{pid}.json")),
         format!(
@@ -113,17 +113,6 @@ fn transcript(home: &TempDir, slug: &str, id: &str, cwd: &Path) {
         ),
     )
     .expect("transcript writes");
-}
-
-/// The live process's start as Claude's `procStart` ctime (UTC).
-fn proc_start(pid: u32) -> String {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC0")
-        .output()
-        .expect("ps runs");
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
 /// The world: one repo, one worktree, one fake agent in its own tmux
@@ -566,7 +555,7 @@ fn an_undated_published_wait_stays_acknowledged_across_polls() {
             "{{\"pid\":{},\"sessionId\":\"{LIVE_ID}\",\"status\":\"waiting\",\"waitingFor\":\"permission prompt\",\"cwd\":\"{}\",\"procStart\":\"{}\"}}",
             world.pid,
             world.worktree.display(),
-            proc_start(world.pid)
+            support::proc_start(world.pid)
         ),
     )
     .expect("session file writes");
