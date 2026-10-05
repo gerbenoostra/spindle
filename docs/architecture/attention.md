@@ -68,6 +68,10 @@ User-visible behavior is in [attention](../attention.md).
 - Compaction drops latches seen-state has acknowledged - because Vibe
   publishes no `start`, so its turn-end latches would otherwise accumulate
   forever.
+- Compaction carries the newest 16 rejected (stale or duplicate) records
+  per conversation into the checkpoint - because the evidence view shows
+  what the winning state outranked, and compaction runs every 128 records;
+  bounded so a stuck producer cannot grow the checkpoint.
 - Compaction defers while the journal holds a frame the reduction cannot
   carry - because rewriting would lose those bytes; the cost is a journal
   that grows until the frame is repaired. Rewriting only the retained tail

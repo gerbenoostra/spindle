@@ -45,6 +45,11 @@ pub const SCHEMA: u32 = 1;
 /// scan stays trivial.
 const COMPACT_AFTER: usize = 128;
 
+/// How many rejected records per conversation a checkpoint carries:
+/// enough to diagnose a misbehaving producer, bounded so a stuck one
+/// cannot grow the checkpoint.
+const REJECTED_KEPT: usize = 16;
+
 /// How long `acquire` waits for the holder before giving up - long enough
 /// for a real append (milliseconds) many times over, short enough that a
 /// hook never stalls its agent.
@@ -899,11 +904,15 @@ struct Checkpoint {
     through: u64,
     #[serde(default)]
     folds: HashMap<String, Fold>,
+    /// The newest rejected records per conversation, in journal order,
+    /// so the evidence view keeps them past compaction.
+    #[serde(default)]
+    rejected: Vec<RejectedRecord>,
 }
 
 /// A committed journal record the fold rejected as stale or duplicate
 /// producer evidence, plus the reason - kept for the evidence view.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RejectedRecord {
     /// `conversation_key(provider, session)`.
     pub conversation: String,
@@ -958,6 +967,26 @@ struct JournalRead {
     /// Where an incomplete trailing frame begins - the end of the last
     /// whole frame - when the file ends in one.
     torn_at: Option<usize>,
+}
+
+/// The newest `REJECTED_KEPT` of each conversation's rejected records,
+/// still in journal order - what a checkpoint carries forward.
+fn newest_rejected(rejected: &[RejectedRecord]) -> Vec<RejectedRecord> {
+    let mut left: HashMap<&str, usize> = HashMap::new();
+    for r in rejected {
+        *left.entry(r.conversation.as_str()).or_default() += 1;
+    }
+    rejected
+        .iter()
+        .filter(|r| {
+            let n = left
+                .get_mut(r.conversation.as_str())
+                .expect("counted above");
+            *n -= 1;
+            *n < REJECTED_KEPT
+        })
+        .cloned()
+        .collect()
 }
 
 /// The journal record key a conversation's events fold under.
@@ -1048,7 +1077,12 @@ impl Store {
                 if tail > COMPACT_AFTER && compactable && loaded.checkpoint_ok {
                     // A failed compaction is reported; the unfolded tail
                     // simply answers again next read.
-                    let compacted = self.compact(&loaded.folds, &loaded.seen, loaded.max_seq);
+                    let compacted = self.compact(
+                        &loaded.folds,
+                        &loaded.seen,
+                        &loaded.rejected,
+                        loaded.max_seq,
+                    );
                     loaded.errors.extend(compacted.err().map(compaction_error));
                 }
                 loaded
@@ -1070,10 +1104,14 @@ impl Store {
         let mut checkpoint_ok = true;
         let mut folds = HashMap::new();
         let mut through = 0u64;
+        // The checkpoint's carried rejections first; the tail's follow in
+        // journal order.
+        let mut rejected = Vec::new();
         match self.read_checkpoint(&mut errors) {
             Some(c) => {
                 through = c.through;
                 folds = c.folds;
+                rejected = c.rejected;
             }
             None if self.dir.join(CHECKPOINT).exists() => {
                 // A checkpoint that exists but cannot be used (malformed
@@ -1085,7 +1123,6 @@ impl Store {
         }
         let mut tail = 0usize;
         let mut max_seq = through;
-        let mut rejected = Vec::new();
         let journal = self.read_journal(&mut errors);
         for record in &journal.records {
             max_seq = max_seq.max(record.seq);
@@ -1687,6 +1724,7 @@ impl Store {
         &self,
         folds: &HashMap<String, Fold>,
         seen: &HashMap<String, Seen>,
+        rejected: &[RejectedRecord],
         through: u64,
     ) -> io::Result<()> {
         let mut folds = folds.clone();
@@ -1699,6 +1737,7 @@ impl Store {
             v: SCHEMA,
             through,
             folds,
+            rejected: newest_rejected(rejected),
         };
         let bytes = serde_json::to_vec_pretty(&checkpoint)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?; // coverage: off - a checkpoint always serializes
@@ -3538,6 +3577,47 @@ mod tests {
         assert_eq!(TouchProvenance::Cwd.as_str(), "cwd");
         assert_eq!(TouchProvenance::ProviderBranch.as_str(), "provider_branch");
         assert_eq!(Confidence::Exact.as_str(), "exact");
+    }
+
+    #[test]
+    fn rejected_records_survive_compaction_bounded_per_conversation() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let mut high = record("claude", "s1", "Stop", NormEvent::End);
+        high.pseq = Some(1_000);
+        store.append(high).expect("append");
+        // More stale records than a conversation keeps, then enough
+        // traffic elsewhere to compact the tail.
+        for pseq in 0..(REJECTED_KEPT as u64 + 4) {
+            let mut stale = record("claude", "s1", "Stop", NormEvent::End);
+            stale.pseq = Some(pseq);
+            store.append(stale).expect("append");
+        }
+        for _ in 0..=COMPACT_AFTER {
+            store
+                .append(record("claude", "s2", "Stop", NormEvent::End))
+                .expect("append");
+        }
+        let before = store.load();
+        assert_eq!(before.rejected.len(), REJECTED_KEPT + 4);
+        assert_eq!(
+            fs::metadata(temp.path(JOURNAL)).unwrap().len(),
+            0,
+            "the tail compacted"
+        );
+        // The checkpoint carries the newest of them, in journal order.
+        let after = store.load();
+        assert_eq!(after.rejected.len(), REJECTED_KEPT, "{:?}", after.rejected);
+        let kept: Vec<u64> = after.rejected.iter().filter_map(|r| r.pseq).collect();
+        let want: Vec<u64> = (4..(REJECTED_KEPT as u64 + 4)).collect();
+        assert_eq!(kept, want);
+        // A later rejection appends after the carried ones.
+        let mut stale = record("claude", "s1", "Stop", NormEvent::End);
+        stale.pseq = Some(7);
+        store.append(stale).expect("append");
+        let later = store.load();
+        assert_eq!(later.rejected.len(), REJECTED_KEPT + 1);
+        assert_eq!(later.rejected.last().and_then(|r| r.pseq), Some(7));
     }
 
     #[test]
