@@ -551,7 +551,12 @@ fn parked_suppresses_forgotten_and_nothing_else() {
             ..LifecycleInputs::default()
         };
         store(&world.home)
-            .sync_path(&notes_path.display().to_string(), &inputs, now() * 1000)
+            .sync_path(
+                &notes_path.display().to_string(),
+                &notes_path.display().to_string(),
+                &inputs,
+                now() * 1000,
+            )
             .expect("seeds");
     }
     let snapshot = collect(&world);

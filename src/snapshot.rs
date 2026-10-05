@@ -1310,6 +1310,7 @@ impl Collector {
                         } = &w.state.anchor
                             && let Err(e) = store.sync_path(
                                 &path.display().to_string(),
+                                repo_id,
                                 &lifecycle_inputs(&w.state),
                                 observed_ms,
                             )
@@ -1319,9 +1320,12 @@ impl Collector {
                     }
                 }
                 RepoData::Space(row) => {
-                    if let Err(e) =
-                        store.sync_path(&row.repo, &store::LifecycleInputs::default(), observed_ms)
-                    {
+                    if let Err(e) = store.sync_path(
+                        &row.repo,
+                        &row.repo,
+                        &store::LifecycleInputs::default(),
+                        observed_ms,
+                    ) {
                         self.model.errors.push(work_state_error(repo_id, e));
                     }
                 }
@@ -2384,8 +2388,13 @@ fn gone_rows(
             true => (WorkKind::Detached, "worktree gone"),
             false => (WorkKind::ProjectSpace, "project folder gone"),
         };
+        // The repo the record carries, so a detached row lists under its
+        // repository; a record from before the field names itself.
+        let repo = record.repo.as_deref().unwrap_or(path_str);
         rows.push(WorkRow {
             kind,
+            repo: repo.to_owned(),
+            repo_name: display_name(Path::new(repo)),
             gone: Some(gone.to_owned()),
             summary: format!("{gone} · {}", reference_summary(&refs)),
             references: refs,
@@ -4682,6 +4691,7 @@ mod tests {
         paths.paths.insert(
             space.clone(),
             store::PathRecord {
+                repo: None,
                 parked: false,
                 activity_at: Some(2_000),
                 inputs: store::LifecycleInputs {
@@ -4694,6 +4704,7 @@ mod tests {
         paths.paths.insert(
             detached.clone(),
             store::PathRecord {
+                repo: Some("/r/.git".to_owned()),
                 parked: false,
                 activity_at: Some(2_000),
                 inputs: store::LifecycleInputs {
@@ -4714,8 +4725,13 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind, WorkKind::Detached);
         assert_eq!(rows[0].gone.as_deref(), Some("worktree gone"));
+        // The detached row lists under the repo its record carries; a
+        // legacy record without one falls back to its own path.
+        assert_eq!(rows[0].repo, "/r/.git");
+        assert_eq!(rows[0].repo_name, "r");
         assert_eq!(rows[1].gone.as_deref(), Some("project folder gone"));
         assert_eq!(rows[1].kind, WorkKind::ProjectSpace);
+        assert_eq!(rows[1].repo, space);
     }
 
     #[test]
@@ -4744,6 +4760,7 @@ mod tests {
         work.paths.insert(
             path.clone(),
             store::PathRecord {
+                repo: None,
                 parked: false,
                 activity_at: Some(2_000),
                 inputs: store::LifecycleInputs {

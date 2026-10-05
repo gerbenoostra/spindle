@@ -697,6 +697,12 @@ pub struct BranchRecord {
 /// keyed by its canonical path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PathRecord {
+    /// The repository the path belongs to - a detached worktree's repo,
+    /// a project space's own path - so a row outliving the directory
+    /// still lists under its repo. `None` on a record written before the
+    /// field existed, until the next sync.
+    #[serde(default)]
+    pub repo: Option<String>,
     #[serde(default)]
     pub parked: bool,
     #[serde(default)]
@@ -1555,12 +1561,13 @@ impl Store {
     }
 
     /// Synchronize the record for `path` - a detached worktree or a
-    /// project space - with the fingerprint a pass observed at
+    /// project space, owned by `repo` - with the fingerprint a pass observed at
     /// `observed_ms`. Creates it absent, dates a changed fingerprint as a
     /// transition, and writes nothing when nothing changed.
     pub fn sync_path(
         &self,
         path: &str,
+        repo: &str,
         inputs: &LifecycleInputs,
         observed_ms: u64,
     ) -> io::Result<()> {
@@ -1570,6 +1577,11 @@ impl Store {
         let mut changed = false;
         match work.paths.get_mut(path) {
             Some(record) => {
+                // A record written before it carried its repo adopts it.
+                if record.repo.as_deref() != Some(repo) {
+                    record.repo = Some(repo.to_owned());
+                    changed = true;
+                }
                 if inputs.transitions_from(&record.inputs) {
                     record.activity_at = Some(observed_ms);
                     changed = true;
@@ -1584,6 +1596,7 @@ impl Store {
                 work.paths.insert(
                     path.to_owned(),
                     PathRecord {
+                        repo: Some(repo.to_owned()),
                         parked: false,
                         activity_at: None,
                         inputs: inputs.clone(),
@@ -3145,8 +3158,10 @@ mod tests {
             Some("tracked origin/feat")
         );
         // The same holds for a path record.
-        store.sync_path("/space", &proven, 1_000).unwrap();
-        store.sync_path("/space", &offline, 2_000).unwrap();
+        store.sync_path("/space", "/space", &proven, 1_000).unwrap();
+        store
+            .sync_path("/space", "/space", &offline, 2_000)
+            .unwrap();
         let work = store.load().work;
         assert_eq!(work.path("/space").unwrap().activity_at, None);
 
@@ -3176,12 +3191,41 @@ mod tests {
         assert_eq!(record.activity_at, None);
         assert_eq!(record.inputs, proven);
         assert_eq!(first(&merged, 3_000).activity_at, Some(3_000));
-        store.sync_path("/fresh-space", &offline, 1_000).unwrap();
-        store.sync_path("/fresh-space", &proven, 2_000).unwrap();
+        store
+            .sync_path("/fresh-space", "/fresh-space", &offline, 1_000)
+            .unwrap();
+        store
+            .sync_path("/fresh-space", "/fresh-space", &proven, 2_000)
+            .unwrap();
         let work = store.load().work;
         let space = work.path("/fresh-space").unwrap();
         assert_eq!(space.activity_at, None);
         assert_eq!(space.inputs, proven);
+    }
+
+    #[test]
+    fn a_path_record_carries_its_repo_and_a_legacy_one_adopts_it() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        store
+            .sync_path("/wt", "/r/.git", &LifecycleInputs::default(), 1_000)
+            .unwrap();
+        assert_eq!(
+            store.load().work.paths["/wt"].repo.as_deref(),
+            Some("/r/.git")
+        );
+        // A record from before the field reads `None`, then adopts the
+        // repo on the next sync without dating a transition.
+        let mut work = store.load().work;
+        work.paths.get_mut("/wt").unwrap().repo = None;
+        store.write_work(&work).unwrap();
+        assert_eq!(store.load().work.paths["/wt"].repo, None);
+        store
+            .sync_path("/wt", "/r/.git", &LifecycleInputs::default(), 2_000)
+            .unwrap();
+        let record = &store.load().work.paths["/wt"];
+        assert_eq!(record.repo.as_deref(), Some("/r/.git"));
+        assert_eq!(record.activity_at, None);
     }
 
     #[test]
@@ -3190,12 +3234,12 @@ mod tests {
         let store = temp.store();
         assert_eq!(store.work_stamp(), None, "no file, no stamp");
         store
-            .sync_path("/p", &LifecycleInputs::default(), 1_000)
+            .sync_path("/p", "/p", &LifecycleInputs::default(), 1_000)
             .unwrap();
         let first = store.work_stamp().expect("the file exists");
         // A no-op sync leaves the file, and so the stamp, alone.
         store
-            .sync_path("/p", &LifecycleInputs::default(), 2_000)
+            .sync_path("/p", "/p", &LifecycleInputs::default(), 2_000)
             .unwrap();
         assert_eq!(store.work_stamp(), Some(first));
         // A same-length rewrite still moves it: the rename is a new inode.
@@ -3220,11 +3264,11 @@ mod tests {
         assert!(!temp.0.exists());
         // Identical fingerprints likewise: the file stays byte-identical.
         store
-            .sync_path("/space", &LifecycleInputs::default(), 1_000)
+            .sync_path("/space", "/space", &LifecycleInputs::default(), 1_000)
             .unwrap();
         let bytes = fs::read(temp.path(WORK)).unwrap();
         store
-            .sync_path("/space", &LifecycleInputs::default(), 2_000)
+            .sync_path("/space", "/space", &LifecycleInputs::default(), 2_000)
             .unwrap();
         assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes);
         // A changed proven fingerprint is a transition: it lands
@@ -3233,12 +3277,12 @@ mod tests {
             dirty: Some(false),
             ..LifecycleInputs::default()
         };
-        store.sync_path("/space", &clean, 2_500).unwrap();
+        store.sync_path("/space", "/space", &clean, 2_500).unwrap();
         let inputs = LifecycleInputs {
             dirty: Some(true),
             ..LifecycleInputs::default()
         };
-        store.sync_path("/space", &inputs, 3_000).unwrap();
+        store.sync_path("/space", "/space", &inputs, 3_000).unwrap();
         let work = store.load().work;
         assert_eq!(work.path("/space").unwrap().activity_at, Some(3_000));
         // Toggling an identity no file can name is NotFound before a
@@ -3259,7 +3303,7 @@ mod tests {
             .sync_repo(repo, &[obs("main", false), obs("feat", true)], 1_000)
             .unwrap();
         store
-            .sync_path("/space", &LifecycleInputs::default(), 1_000)
+            .sync_path("/space", "/space", &LifecycleInputs::default(), 1_000)
             .unwrap();
         let work = store.load().work;
         let id = work.branch(repo, "feat").unwrap().id.clone();
@@ -3328,7 +3372,7 @@ mod tests {
         // A record exists so the toggle reaches the lock rather than
         // answering NotFound off the missing file.
         store
-            .sync_path("/p", &LifecycleInputs::default(), 1_000)
+            .sync_path("/p", "/p", &LifecycleInputs::default(), 1_000)
             .unwrap();
         // A held lock fails every work mutation rather than clobbering.
         let held = Lock::acquire(&temp.path(LOCK)).unwrap();
@@ -3341,7 +3385,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .sync_path("/p", &LifecycleInputs::default(), 1)
+                .sync_path("/p", "/p", &LifecycleInputs::default(), 1)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
@@ -3383,7 +3427,7 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             let err = store
-                .sync_path("/p", &LifecycleInputs::default(), 1_000)
+                .sync_path("/p", "/p", &LifecycleInputs::default(), 1_000)
                 .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             let err = store
