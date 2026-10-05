@@ -2306,17 +2306,33 @@ fn gone_rows(
 ) -> Vec<WorkRow> {
     let mut rows = Vec::new();
     let numbers = incarnation_numbers(authored);
+    // One vanished workspace is one row, however many closed records
+    // name it - a same-name branch recreated there, a pooled directory
+    // other branches reused. The newest closed record speaks for it. A
+    // branch-only incarnation records nothing a reference could name; a
+    // still-anchored workspace's references belong to the live row.
+    let mut newest: std::collections::BTreeMap<&str, &store::BranchRecord> =
+        std::collections::BTreeMap::new();
     for record in authored.branches.values().filter(|r| r.ended_at.is_some()) {
-        // A branch-only incarnation records nothing a reference could
-        // name; a still-anchored workspace's references belong to the
-        // live row, not to this closed incarnation.
-        let Some(path_str) = record.inputs.worktree_path.clone() else {
+        let Some(path) = record.inputs.worktree_path.as_deref() else {
             continue;
         };
-        if live_paths.contains(&path_str) {
+        if live_paths.contains(path) {
             continue;
         }
-        let path = PathBuf::from(&path_str);
+        let key = |r: &store::BranchRecord| (r.ended_at, r.last_observed_at, r.id.clone());
+        newest
+            .entry(path)
+            .and_modify(|kept| {
+                if key(record) > key(kept) {
+                    *kept = record;
+                }
+            })
+            .or_insert(record);
+    }
+    let mut emitted: HashSet<&str> = HashSet::new();
+    for (path_str, record) in newest {
+        let path = PathBuf::from(path_str);
         let refs = references(
             &runtime.panes,
             record.inputs.admin_id.as_deref(),
@@ -2351,9 +2367,12 @@ fn gone_rows(
             section: WorkSection::CleanupReview,
             ..space_row(&record.repo, &path)
         });
+        emitted.insert(path_str);
     }
+    // A path record for a workspace a closed branch already speaks for
+    // adds no second row.
     for (path_str, record) in &authored.paths {
-        if live_paths.contains(path_str) {
+        if live_paths.contains(path_str) || emitted.contains(path_str.as_str()) {
             continue;
         }
         let path = PathBuf::from(path_str);
@@ -4697,6 +4716,64 @@ mod tests {
         assert_eq!(rows[0].gone.as_deref(), Some("worktree gone"));
         assert_eq!(rows[1].gone.as_deref(), Some("project folder gone"));
         assert_eq!(rows[1].kind, WorkKind::ProjectSpace);
+    }
+
+    #[test]
+    fn one_vanished_path_is_one_gone_row_whatever_closed_there() {
+        // A same-name branch recreated at the same worktree path, a pooled
+        // directory another branch reused, and a detached checkout there
+        // too: once the path is gone, one pane still in it is one dangling
+        // workspace - one row, attributed to the newest closed record.
+        let path = format!(
+            "{}/agent-sessions-gone-{}-dup",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let mut work = store::Work::default();
+        for (id, name, ended) in [
+            ("i1", "feat", 3_000),
+            ("i2", "feat", 9_000),
+            ("i3", "other", 6_000),
+        ] {
+            let mut r = branch_record(id, 1_000, Some(ended));
+            r.ref_name = name.to_owned();
+            r.inputs.worktree_path = Some(path.clone());
+            r.inputs.admin_id = Some("adm".to_owned());
+            work.branches.insert(id.to_owned(), r);
+        }
+        work.paths.insert(
+            path.clone(),
+            store::PathRecord {
+                parked: false,
+                activity_at: Some(2_000),
+                inputs: store::LifecycleInputs {
+                    worktree: true,
+                    ..Default::default()
+                },
+            },
+        );
+        let mut pane = tmux_pane("/sock/a", "%9", 50);
+        pane.wt_adminid = Some("adm".to_owned());
+        let rt = runtime(vec![], vec![pane]);
+        // A live agent session inside the path references the detached
+        // record too.
+        let mut agent = live_row("cccccccc-3", 99);
+        agent.cwd = Some(PathBuf::from(&path));
+        let model = Model {
+            conversations: vec![agent],
+            ..Default::default()
+        };
+        let rows = gone_rows(&model, &work, &rt, &HashSet::new());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].identity.as_deref(), Some("i2"));
+        assert_eq!(
+            rows[0]
+                .references
+                .iter()
+                .filter(|r| r.kind == ReferenceKind::Pane)
+                .count(),
+            1
+        );
     }
 
     #[test]
