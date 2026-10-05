@@ -1464,10 +1464,6 @@ impl App {
                 RelationStrength::ProcessAncestry,
                 "  lineage - observed process ancestry:",
             ),
-            (
-                RelationStrength::PaneCorrelation,
-                "  lineage - pane-creation correlation (inferred):",
-            ),
             (RelationStrength::SameIncarnation, "  same incarnation:"),
         ] {
             let mut group = c
@@ -2824,7 +2820,6 @@ mod tests {
                         placement_detail: None,
                         source: EvidenceSource::Published,
                         observed_at: 1_800_000_000,
-                        pane_ref: None,
                     }),
                     cwd: Some(PathBuf::from("/repos/a-login")),
                     transcript: Some(PathBuf::from(
@@ -4083,7 +4078,6 @@ mod tests {
             placement_detail: None,
             source: EvidenceSource::Derived,
             observed_at: 0,
-            pane_ref: None,
         };
         assert_eq!(
             liveness_word(&attachment(AttachmentLiveness::Instance)),

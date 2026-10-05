@@ -160,7 +160,6 @@ fn attachment() -> AttachmentRow {
         placement_detail: None,
         source: EvidenceSource::Published,
         observed_at: NOW - 30,
-        pane_ref: None,
     }
 }
 
@@ -407,17 +406,6 @@ fn conversation_detail_lists_touches_relations_and_last_prompts() {
             state_since: Some(NOW - 700),
         },
         RelatedRow {
-            strength: RelationStrength::PaneCorrelation,
-            label: "pane creator".to_owned(),
-            provenance: "pane-creation correlation (inferred)".to_owned(),
-            provider: Provider::Claude,
-            session_id: "creator-1".to_owned(),
-            short_id: "creat001".to_owned(),
-            title: None,
-            attention: Attention::None,
-            state_since: Some(NOW - 800),
-        },
-        RelatedRow {
             strength: RelationStrength::SameIncarnation,
             label: "same incarnation".to_owned(),
             provenance: "touch feat/login#1".to_owned(),
@@ -448,15 +436,11 @@ fn conversation_detail_lists_touches_relations_and_last_prompts() {
     let at = |needle: &str| text.find(needle).unwrap_or(usize::MAX);
     assert!(text.contains("lineage - provider declared:"), "{text}");
     assert!(text.contains("observed process ancestry"), "{text}");
-    assert!(
-        text.contains("pane-creation correlation (inferred)"),
-        "{text}"
-    );
+    assert!(!text.contains("pane-creation"), "{text}");
     assert!(text.contains("same incarnation:"), "{text}");
     assert!(
         at("lineage - provider declared:") < at("observed process ancestry")
-            && at("observed process ancestry") < at("pane-creation correlation")
-            && at("pane-creation correlation") < at("same incarnation:"),
+            && at("observed process ancestry") < at("same incarnation:"),
         "{text}"
     );
     // Prompts are escaped and truncated to one line each.
@@ -746,7 +730,6 @@ fn the_variant_arms_render_honestly() {
         placement_detail: Some("no pane evidence".to_owned()),
         source: EvidenceSource::Derived,
         observed_at: NOW - 30,
-        pane_ref: None,
     });
     conv.evidence.seen_seq = None;
     conv.evidence.seen_wait_ms = Some(NOW_MS - 600_000);
@@ -816,7 +799,6 @@ fn the_variant_arms_render_honestly() {
         placement_detail: Some("process exited".to_owned()),
         source: EvidenceSource::Lock,
         observed_at: NOW - 30,
-        pane_ref: None,
     });
     let mut bare = conversation("44dd0bbb", None);
     bare.attachment = Some(AttachmentRow {
@@ -829,7 +811,6 @@ fn the_variant_arms_render_honestly() {
         placement_detail: None,
         source: EvidenceSource::Published,
         observed_at: NOW - 30,
-        pane_ref: None,
     });
     let mut snapshot = fixture();
     snapshot.conversations = vec![dead, bare];

@@ -499,9 +499,6 @@ pub enum RelationStrength {
     ProviderLineage,
     /// One live process sits in the other's ancestor chain.
     ProcessAncestry,
-    /// One live process provably created the pane hosting the other -
-    /// inferred, labeled as such.
-    PaneCorrelation,
     /// Both conversations touched the same exact incarnation.
     SameIncarnation,
 }
@@ -514,8 +511,7 @@ pub struct RelatedRow {
     /// The strength group the relation belongs to.
     pub strength: RelationStrength,
     /// What the relation claims about the other conversation:
-    /// `ancestor`, `descendant`, `pane creator`, `created pane` or
-    /// `same incarnation`.
+    /// `ancestor` or `same incarnation`.
     pub label: String,
     /// The evidence that proved it, for the view's provenance column.
     pub provenance: String,
@@ -591,11 +587,6 @@ pub struct AttachmentRow {
     pub source: EvidenceSource,
     /// When the claim's evidence was produced, epoch seconds.
     pub observed_at: u64,
-    /// The bound pane's identity, kept for relation evidence the display
-    /// string cannot carry. Not serialized - a `PaneRef` has no wire
-    /// shape.
-    #[serde(skip)]
-    pub pane_ref: Option<PaneRef>,
 }
 
 /// One conversation in the snapshot - live, restorable or transcript-only.
@@ -2223,10 +2214,11 @@ fn repo_default(model: &RepoModel) -> (Option<String>, Option<String>) {
 }
 
 /// Fill every conversation's `related` from this pass's own evidence:
-/// live process ancestry, pane-creation correlation and shared exact
-/// incarnations. A shared ref name, a pane shared at different times or
-/// mere time proximity is no relation - and an inference the process
-/// table cannot prove is not one either.
+/// live process ancestry and shared exact incarnations. A shared ref
+/// name, a pane shared at different times or mere time proximity is no
+/// relation. Neither is pane-creation correlation: a tmux pane's root
+/// process is a child of the daemonized tmux server, never of the agent
+/// that asked for the pane, so the process table cannot prove it.
 fn relate(conversations: &mut [ConversationRow], runtime: &Runtime) {
     let n = conversations.len();
     let pid_of = |i: usize| -> Option<u32> {
@@ -2234,15 +2226,6 @@ fn relate(conversations: &mut [ConversationRow], runtime: &Runtime) {
         c.running()
             .then(|| c.attachment.as_ref().map(|a| a.pid))
             .flatten()
-    };
-    let pane_pid_of = |i: usize| -> Option<u32> {
-        let pref = conversations[i].attachment.as_ref()?.pane_ref.as_ref()?;
-        runtime
-            .panes
-            .panes
-            .iter()
-            .find(|p| p.id == pref.pane && p.socket == pref.socket)
-            .map(|p| p.pid)
     };
     let row = |strength: RelationStrength,
                label: &str,
@@ -2274,20 +2257,6 @@ fn relate(conversations: &mut [ConversationRow], runtime: &Runtime) {
                     RelationStrength::ProcessAncestry,
                     "ancestor",
                     "live process ancestry".to_owned(),
-                    &conversations[b],
-                ));
-            }
-            // Pane-creation correlation: b's process provably created
-            // the pane hosting a - inferred, and labeled as such.
-            if let (Some(root), Some(pb)) = (pane_pid_of(a), pid_of(b))
-                && pb != root
-                && let Some(table) = runtime.processes.as_ref()
-                && table.ancestors(root).contains(&pb)
-            {
-                related[a].push(row(
-                    RelationStrength::PaneCorrelation,
-                    "pane creator",
-                    "pane-creation correlation (inferred)".to_owned(),
                     &conversations[b],
                 ));
             }
@@ -2944,7 +2913,6 @@ fn attachment_row(
         placement_detail,
         source: r.attachment.source,
         observed_at: epoch(r.attachment.observed_at),
-        pane_ref: r.attachment.pane.clone(),
     }
 }
 
@@ -4479,9 +4447,8 @@ mod tests {
         }
     }
 
-    /// A fabricated conversation row: live, attached to `pid`, bound to
-    /// `pane` when given.
-    fn live_row(session: &str, pid: u32, pane: Option<PaneRef>) -> ConversationRow {
+    /// A fabricated conversation row: live, attached to `pid`.
+    fn live_row(session: &str, pid: u32) -> ConversationRow {
         let mut row = conversation_row(
             &conversation(Some(live()), None),
             None,
@@ -4498,12 +4465,11 @@ mod tests {
             pid_start: Some(1_700_000_000),
             liveness: AttachmentLiveness::Instance,
             liveness_detail: None,
-            pane: pane.as_ref().map(|p| p.to_string()),
+            pane: None,
             pane_source: Some(PaneSource::Published),
             placement_detail: None,
             source: EvidenceSource::Published,
             observed_at: 1_800_000_000,
-            pane_ref: pane,
         });
         row
     }
@@ -4524,34 +4490,24 @@ mod tests {
 
     #[test]
     fn relations_follow_proven_strengths_and_never_guess() {
-        // b's pid is a's parent - observed ancestry. The pane a sits in
-        // was created under b's process - inferred correlation. A shared
-        // ref name with different incarnation ids proves nothing.
-        let pane_ref = PaneRef {
-            socket: PathBuf::from("/sock/a"),
-            pane: PaneId::parse("%7").unwrap(),
-        };
-        let mut a = live_row("aaaaaaaa-1", 101, Some(pane_ref.clone()));
-        let mut b = live_row("bbbbbbbb-1", 100, None);
+        // b's pid is a's parent - observed ancestry. A pane a sits in
+        // whose root process descends from b relates nothing: real pane
+        // roots descend from the tmux server, so such a chain proves no
+        // creation. A shared ref name with different incarnation ids
+        // proves nothing either.
+        let mut a = live_row("aaaaaaaa-1", 101);
+        let mut b = live_row("bbbbbbbb-1", 100);
         a.touches = vec![open_touch("i1")];
         b.touches = vec![open_touch("i2")];
-        let mut pane = tmux_pane("/sock/a", "%7", 50);
-        pane.command = "claude".to_owned();
         let runtime = runtime(
             vec![prow(101, 100), prow(100, 1), prow(50, 100)],
-            vec![pane],
+            vec![tmux_pane("/sock/a", "%7", 50)],
         );
         let mut convs = vec![a.clone(), b.clone()];
         relate(&mut convs, &runtime);
         let strengths: Vec<RelationStrength> =
             convs[0].related.iter().map(|r| r.strength).collect();
-        assert_eq!(
-            strengths,
-            vec![
-                RelationStrength::ProcessAncestry,
-                RelationStrength::PaneCorrelation
-            ]
-        );
+        assert_eq!(strengths, vec![RelationStrength::ProcessAncestry]);
         assert_eq!(convs[0].related[0].session_id, "bbbbbbbb-1");
         // Sharing a ref name across distinct incarnations is not a
         // relation - neither is sharing a pane at different times.
@@ -4618,7 +4574,7 @@ mod tests {
         let stray = tmux_pane("/sock/a", "%12", 53);
         // A live agent session anchored inside the gone path, one inside
         // it without an attachment, and one somewhere else entirely.
-        let mut c = live_row("cccccccc-1", 99, None);
+        let mut c = live_row("cccccccc-1", 99);
         c.cwd = Some(PathBuf::from(&missing));
         let mut no_attach = conversation_row(
             &conversation(Some(live()), None),
@@ -4630,7 +4586,7 @@ mod tests {
             EvidenceIn::default(),
         );
         no_attach.cwd = Some(PathBuf::from(&missing));
-        let mut outside = live_row("dddddddd-1", 88, None);
+        let mut outside = live_row("dddddddd-1", 88);
         outside.cwd = Some(PathBuf::from("/elsewhere"));
         let model = Model {
             conversations: vec![c, no_attach, outside],
@@ -4698,9 +4654,9 @@ mod tests {
                 },
             },
         );
-        let mut c = live_row("cccccccc-2", 77, None);
+        let mut c = live_row("cccccccc-2", 77);
         c.cwd = Some(PathBuf::from(&space));
-        let mut c2 = live_row("eeeeeeee-2", 76, None);
+        let mut c2 = live_row("eeeeeeee-2", 76);
         c2.cwd = Some(PathBuf::from(&detached));
         let model = Model {
             conversations: vec![c, c2],
