@@ -21,6 +21,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::attention::{Attention, ClaimOutcome};
 use crate::config;
@@ -965,17 +966,17 @@ impl App {
         // readable minimum.
         let show_fields = width >= 24;
         let age = if show_fields { cells.age } else { "" };
-        let age_w = age.chars().count();
+        let age_w = cell_width(age);
         let middle = if show_fields {
             fit(cells.middle, width.saturating_sub(glyph_w + age_w + 12))
         } else {
             String::new()
         };
-        let middle_w = middle.chars().count();
+        let middle_w = cell_width(&middle);
         let label_w = width.saturating_sub(glyph_w + middle_w + age_w + 4);
         let label = fit(cells.label, label_w);
         let pad = width
-            .saturating_sub(glyph_w + label.chars().count() + middle_w + age_w + 2)
+            .saturating_sub(glyph_w + cell_width(&label) + middle_w + age_w + 2)
             .max(1);
         Line::from(vec![
             Span::styled(
@@ -1948,15 +1949,35 @@ fn age(now: u64, then: Option<u64>) -> String {
     }
 }
 
-/// `label` clipped to `w` chars with an ellipsis when it loses a character.
+/// The terminal cells `text` occupies: a double-width character takes
+/// two, a control character none.
+fn cell_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// One character's terminal cells.
+fn char_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// `label` clipped to `w` cells with an ellipsis when it loses a character.
 fn fit(label: &str, w: usize) -> String {
-    if label.chars().count() <= w {
+    if cell_width(label) <= w {
         return label.to_owned();
     }
     if w == 0 {
         return String::new();
     }
-    let mut out: String = label.chars().take(w.saturating_sub(1)).collect();
+    let mut out = String::new();
+    let mut used = 0;
+    for c in label.chars() {
+        let cw = char_width(c);
+        if used + cw > w - 1 {
+            break;
+        }
+        used += cw;
+        out.push(c);
+    }
     out.push('…');
     out
 }
@@ -2216,16 +2237,21 @@ fn push_head(out: &mut Vec<Line<'static>>, text: String, width: usize) {
 }
 
 /// `text` as lines that never exceed `width` cells: the detail pane wraps
-/// rather than clips or scrolls sideways.
+/// rather than clips or scrolls sideways. A double-width character that
+/// would straddle the edge moves to the next line.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut used = 0;
     for ch in text.chars() {
-        if current.chars().count() >= width {
+        let cw = char_width(ch);
+        if used + cw > width && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
+            used = 0;
         }
         current.push(ch);
+        used += cw;
     }
     if !current.is_empty() || lines.is_empty() {
         lines.push(current);
@@ -2993,6 +3019,25 @@ mod tests {
         next.conversations.retain(|c| c.session_id != IDLE_ID);
         app.refresh(next);
         assert_eq!(app.cursor[list_index(List::Conversations)], 0);
+    }
+
+    #[test]
+    fn a_double_width_label_never_overflows_its_row() {
+        let app = App::new(fixture());
+        for width in [20u16, 55] {
+            let line = app.render_row(
+                width,
+                &RowCells {
+                    glyph: "!",
+                    label: "ペインのラベルを更新する長いタイトル",
+                    middle: "日本語 · 要約",
+                    age: "2m",
+                    selected: false,
+                    dim_label: false,
+                },
+            );
+            assert!(line.width() <= width as usize, "{line:?}");
+        }
     }
 
     #[test]
@@ -4065,6 +4110,16 @@ mod tests {
         // spacing; a width of zero never panics.
         assert_eq!(wrap_text("", 4), vec![String::new()]);
         assert_eq!(wrap_text("abcdef", 2), vec!["ab", "cd", "ef"]);
+        // Wrapping and truncation count terminal cells, not chars: a
+        // double-width character takes two.
+        assert_eq!(wrap_text("日本語テ", 4), vec!["日本", "語テ"]);
+        assert_eq!(wrap_text("a日b", 2), vec!["a", "日", "b"]);
+        // A double-width character in a one-cell pane still lands (on its
+        // own line) rather than looping.
+        assert_eq!(wrap_text("日", 1), vec!["日"]);
+        assert_eq!(fit("日本語", 4), "日…");
+        assert_eq!(fit("日本", 4), "日本");
+        assert_eq!(fit("日本語", 0), "");
         // Control characters become visible escapes.
         assert_eq!(escape_text("a\rb\x1fc"), "a\\rb\\u001fc");
         // Liveness and reference kinds render a word each.
