@@ -1256,6 +1256,15 @@ impl App {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "?".to_owned());
         push_text(out, format!("worktree: {worktree}"), width);
+        if let Some(broken) = &w.broken {
+            push_text(out, format!("state: broken - {broken}"), width);
+            let dirty = match w.dirty {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "?",
+            };
+            push_text(out, format!("dirty: {dirty}"), width);
+        }
         let local = match &w.base {
             Some(base) => {
                 let ahead = num(w.commits_ahead);
@@ -1312,6 +1321,44 @@ impl App {
             ),
             width,
         );
+        if !w.updates.is_empty() {
+            let mut groups: std::collections::BTreeMap<
+                store::UpdateSource,
+                Vec<&store::UpdateEvent>,
+            > = std::collections::BTreeMap::new();
+            for event in &w.updates {
+                groups.entry(event.source).or_default().push(event);
+            }
+            let mut groups: Vec<_> = groups.into_iter().collect();
+            groups.sort_by(|(a_source, a), (b_source, b)| {
+                let newest =
+                    |events: &Vec<&store::UpdateEvent>| events.iter().map(|e| e.at_ms).max();
+                newest(b).cmp(&newest(a)).then(a_source.cmp(b_source))
+            });
+            push_head(out, "updates:".to_owned(), width);
+            for (source, mut events) in groups {
+                let label = serde_json::to_value(source)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default()
+                    .replace('_', " ");
+                push_text(out, format!("  {label}:"), width);
+                events.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then(b.reasons.cmp(&a.reasons)));
+                for event in events.iter().take(UPDATE_DISPLAY_PER_SOURCE) {
+                    for reason in &event.reasons {
+                        push_text(
+                            out,
+                            format!(
+                                "    {} {}",
+                                age_ms(now.saturating_mul(1000), event.at_ms),
+                                escape_text(reason)
+                            ),
+                            width,
+                        );
+                    }
+                }
+            }
+        }
         if !w.same_name_history.is_empty() {
             push_head(out, "same-name history:".to_owned(), width);
             for h in &w.same_name_history {
@@ -2340,6 +2387,8 @@ fn ref_kind(kind: ReferenceKind) -> &'static str {
     }
 }
 
+const UPDATE_DISPLAY_PER_SOURCE: usize = 7;
+
 /// An epoch-ms evidence timestamp as an age against `now_ms`.
 fn age_ms(now_ms: u64, then_ms: u64) -> String {
     age(now_ms / 1000, Some(then_ms / 1000))
@@ -2723,6 +2772,8 @@ mod tests {
                     worktree: Some(PathBuf::from("/repos/a-login")),
                     branch: Some("feat/login".to_owned()),
                     dirty: Some(true),
+                    broken: None,
+                    updates: Vec::new(),
                     commits_ahead: Some(3),
                     unpushed: Some(3),
                     upstream: Upstream::Tracked,
@@ -2769,6 +2820,8 @@ mod tests {
                     worktree: None,
                     branch: Some("feat/old".to_owned()),
                     dirty: Some(false),
+                    broken: None,
+                    updates: Vec::new(),
                     commits_ahead: Some(7),
                     unpushed: Some(7),
                     upstream: Upstream::NeverPushed,
@@ -2815,6 +2868,8 @@ mod tests {
                     worktree: Some(PathBuf::from("/spaces/notes")),
                     branch: None,
                     dirty: None,
+                    broken: None,
+                    updates: Vec::new(),
                     commits_ahead: None,
                     unpushed: None,
                     upstream: Upstream::NotApplicable,

@@ -16,6 +16,7 @@ use agent_sessions::snapshot::{
 };
 use agent_sessions::store::{
     Confidence, ContinuityEvidence, Exec, Mark, NormEvent, RejectedRecord, TouchProvenance,
+    UpdateEvent, UpdateSource,
 };
 use agent_sessions::tui::{App, Key};
 use agent_sessions::verdict::{ActionVerdict, Verdict};
@@ -99,6 +100,8 @@ fn work() -> WorkRow {
         worktree: Some(PathBuf::from("/repos/a-login")),
         branch: Some("feat/login".to_owned()),
         dirty: Some(true),
+        broken: None,
+        updates: Vec::new(),
         commits_ahead: Some(3),
         unpushed: Some(3),
         upstream: Upstream::Tracked,
@@ -281,6 +284,70 @@ fn work_detail_shows_incarnation_delivery_upstream_forge_and_cleanup() {
 }
 
 #[test]
+fn update_history_groups_sources_by_newest_and_caps_at_seven() {
+    let mut snapshot = fixture();
+    let mut updates = Vec::new();
+    for i in 0..8u64 {
+        updates.push(UpdateEvent {
+            source: UpdateSource::Commit,
+            at_ms: (NOW - 600 - i * 60) * 1000,
+            reasons: vec![format!("commit{i:02} subject {i}")],
+        });
+    }
+    updates.push(UpdateEvent {
+        source: UpdateSource::WorkingTree,
+        at_ms: (NOW - 60) * 1000,
+        reasons: vec!["deleted README.md".to_owned()],
+    });
+    updates.push(UpdateEvent {
+        source: UpdateSource::Session,
+        at_ms: (NOW - 30) * 1000,
+        reasons: vec!["8f423bbb update pane labels".to_owned()],
+    });
+    updates.push(UpdateEvent {
+        source: UpdateSource::Lifecycle,
+        at_ms: (NOW - 90) * 1000,
+        reasons: vec!["upstream: a -> b".to_owned(), "ahead: 1 -> 2".to_owned()],
+    });
+    snapshot.work[0].updates = updates;
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        assert!(text.contains("updates:"), "{text}");
+        let session = text.find("  session:").expect("session group");
+        let working = text.find("  working tree:").expect("working tree group");
+        let lifecycle = text.find("  lifecycle:").expect("lifecycle group");
+        let commit = text.find("  commit:").expect("commit group");
+        assert!(
+            session < working && working < lifecycle && lifecycle < commit,
+            "sources order by their newest event: {text}"
+        );
+        assert!(
+            text.find("commit00").unwrap() < text.find("commit01").unwrap(),
+            "newest event first inside the source: {text}"
+        );
+        assert!(
+            !text.contains("commit07"),
+            "the eighth commit event is past the display cap: {text}"
+        );
+        assert!(text.contains("deleted README.md"), "{text}");
+        assert!(text.contains("upstream: a -> b"), "{text}");
+        assert!(text.contains("ahead: 1 -> 2"), "{text}");
+    }
+    let text = render(&app, 200, 50);
+    assert!(text.contains("8f423bbb update pane labels"), "{text}");
+
+    let mut quiet = App::new(fixture());
+    press(&mut quiet, &[Key::Char('2'), Key::Char('j')]);
+    let text = render(&quiet, 200, 40);
+    assert!(
+        !text.contains("updates:"),
+        "a row with no events renders no section: {text}"
+    );
+}
+
+#[test]
 fn work_detail_renders_question_marks_for_unproven_fields() {
     let mut row = work();
     row.base = None;
@@ -353,6 +420,53 @@ fn work_detail_lists_the_commits_not_on_the_base() {
     let at = text.find("commits not on origin/main:").expect("the head");
     assert!(text[at..].contains("  none"), "{text}");
     assert!(!text.contains("more"), "{text}");
+}
+
+#[test]
+fn a_broken_worktree_row_states_its_broken_link_and_dirty_flag() {
+    let mut row = work();
+    row.broken = Some(".git missing; metadata retained by a".to_owned());
+    let mut snapshot = fixture();
+    snapshot.work = vec![row];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    let text = render(&app, 55, 40);
+    assert!(text.contains("state: broken - .git missi"), "{text}");
+    assert!(text.contains("dirty: yes"), "{text}");
+    let text = render(&app, 200, 40);
+    assert!(text.contains("worktree: /repos/a-login"), "{text}");
+    assert!(
+        text.contains("state: broken - .git missing; metadata retained by a"),
+        "{text}"
+    );
+    assert!(text.contains("dirty: yes"), "{text}");
+
+    let mut row = work();
+    row.broken = Some("checkout moved".to_owned());
+    row.dirty = None;
+    let mut snapshot = fixture();
+    snapshot.work = vec![row];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    let text = render(&app, 200, 40);
+    assert!(text.contains("state: broken - checkout moved"), "{text}");
+    assert!(text.contains("dirty: ?"), "{text}");
+
+    let mut row = work();
+    row.broken = Some("checkout moved".to_owned());
+    row.dirty = Some(false);
+    let mut snapshot = fixture();
+    snapshot.work = vec![row];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    let text = render(&app, 200, 40);
+    assert!(text.contains("dirty: no"), "{text}");
+
+    let mut app = App::new(fixture());
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    let text = render(&app, 200, 40);
+    assert!(!text.contains("state: broken"), "{text}");
+    assert!(!text.contains("dirty:"), "{text}");
 }
 
 #[test]

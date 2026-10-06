@@ -316,6 +316,14 @@ _ci-snapshot repo commit dir os:
     # shellcheck disable=SC2086
     just $jobs
 
+# Run the debug binary; arguments pass through, e.g. `just dev list --json`.
+dev *args:
+    cargo run -- {{args}}
+
+# Run the release binary; arguments pass through, e.g. `just run list --json`.
+run *args:
+    cargo run --release -- {{args}}
+
 # Build the release binary.
 build:
     cargo build --release

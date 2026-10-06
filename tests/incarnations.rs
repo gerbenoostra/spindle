@@ -11,10 +11,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_sessions::runtime::Runtime;
-use agent_sessions::snapshot::{Collector, Snapshot, WorkRow, to_json};
+use agent_sessions::snapshot::{Collector, Snapshot, WorkKind, WorkRow, to_json};
 use agent_sessions::store::{
     BranchRecord, Confidence, ContinuityEvidence, DatedTouch, LifecycleInputs, ObservedRef,
-    RefCreationEvidence, Store, TouchPlacement, TouchProvenance,
+    RefCreationEvidence, Store, TouchPlacement, TouchProvenance, UpdateSource,
 };
 use agent_sessions::tui::{App, Key};
 use ratatui::Terminal;
@@ -111,6 +111,38 @@ fn transcript(home: &TempDir, id: &str, cwd: &Path) {
 /// working, from `cwd` in a session whose project is `cwd` too.
 fn turn(home: &TempDir, id: &str, cwd: &Path) {
     turn_from(home, id, cwd, cwd);
+}
+
+fn turn_at(home: &TempDir, id: &str, cwd: &Path, at: std::time::SystemTime) {
+    use std::io::Write;
+    let path = home.join(format!(".claude/projects/t/{id}.jsonl"));
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("the transcript");
+    let line = format!(
+        "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"{}\",\"timestamp\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"more\"}}}}\n",
+        cwd.display(),
+        support::iso(at),
+    );
+    f.write_all(line.as_bytes()).expect("the turn appends");
+}
+
+fn assistant_turn_at(home: &TempDir, id: &str, cwd: &Path, at: std::time::SystemTime) {
+    use std::io::Write;
+    let projects = home.join(".claude/projects/t");
+    fs::create_dir_all(&projects).expect("mkdir");
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(projects.join(format!("{id}.jsonl")))
+        .expect("the transcript");
+    let line = format!(
+        "{{\"type\":\"assistant\",\"sessionId\":\"{id}\",\"cwd\":\"{}\",\"timestamp\":\"{}\",\"message\":{{\"role\":\"assistant\",\"content\":\"done\"}}}}\n",
+        cwd.display(),
+        support::iso(at),
+    );
+    f.write_all(line.as_bytes()).expect("the turn appends");
 }
 
 /// The same, run from `cwd` while the session's project is `project`.
@@ -237,6 +269,7 @@ fn obs(name: &str, head: Option<&str>, creation: Option<RefCreationEvidence>) ->
         creation,
         renamed_from: None,
         rewritten: false,
+        commit: None,
         inputs: LifecycleInputs::default(),
     }
 }
@@ -1246,6 +1279,286 @@ fn a_live_conversation_off_any_recorded_branch_opens_no_cwd_interval() {
 }
 
 #[test]
+fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
+    let world = world();
+    let wt = world.repo.add_worktree("stuck", None);
+    fs::write(wt.join("untracked.txt"), "x").expect("write");
+    transcript(&world.home, CONV, &wt);
+    assistant_turn_at(&world.home, OTHER, &wt, std::time::SystemTime::now());
+    let wt = wt.canonicalize().expect("the worktree resolves");
+    let first = collect(&world);
+    let row = first
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .expect("the worktree row");
+    assert_eq!(row.kind, WorkKind::Detached);
+    assert_eq!(row.repo, repo_id(&world.repo));
+    assert_eq!(row.broken, None);
+    assert!(agent_sessions::snapshot::binds(
+        row,
+        conversation(&first, CONV)
+    ));
+
+    fs::remove_file(wt.join(".git")).expect("the .git file");
+    let second = collect(&world);
+    let rows: Vec<&WorkRow> = second
+        .work
+        .iter()
+        .filter(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .collect();
+    assert_eq!(rows.len(), 1, "{:?}", rows.iter().map(|r| &r.repo));
+    let row = rows[0];
+    assert_eq!(row.repo, repo_id(&world.repo), "the repo keeps the row");
+    assert_eq!(row.kind, WorkKind::Detached);
+    assert!(
+        row.broken
+            .as_deref()
+            .is_some_and(|b| b.contains(".git missing")),
+        "{:?}",
+        row.broken
+    );
+    assert_eq!(row.dirty, Some(true));
+    assert_eq!(row.commits_ahead, Some(0));
+    assert_eq!(row.commits_behind, Some(0));
+    assert!(
+        !second.repos.iter().any(|r| !r.git && r.path == wt),
+        "{:?}",
+        second.repos
+    );
+    let conv = conversation(&second, CONV);
+    assert_eq!(conv.repo.as_deref(), Some(repo_id(&world.repo).as_str()));
+    assert_eq!(conv.worktree.as_deref(), Some(wt.as_path()));
+    assert!(agent_sessions::snapshot::binds(row, conv));
+    // First detection dated the find; the `.git` loss adds a second
+    // lifecycle event without touching `worktree`.
+    assert_eq!(row.updates.len(), 2, "{:?}", row.updates);
+    assert_eq!(
+        row.updates[0].reasons,
+        ["worktree found", ".git present"],
+        "{:?}",
+        row.updates[0]
+    );
+    assert_eq!(row.updates[1].source, UpdateSource::Lifecycle);
+    assert_eq!(
+        row.updates[1].reasons,
+        [
+            ".git missing".to_owned(),
+            "worktree state: healthy -> broken: gitdir file points to non-existent location"
+                .to_owned()
+        ],
+        "{:?}",
+        row.updates[1].reasons
+    );
+    assert_eq!(
+        first
+            .work
+            .iter()
+            .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+            .expect("the first row")
+            .updates
+            .len(),
+        1,
+        "first observation dates the find, nothing else"
+    );
+
+    let third = collect(&world);
+    let again = third
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .expect("the worktree row");
+    assert_eq!(again.transition_at, row.transition_at);
+    assert_eq!(
+        again.updates, row.updates,
+        "a repeated broken scan appends nothing"
+    );
+    turn_at(
+        &world.home,
+        CONV,
+        &wt,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(90),
+    );
+    let fourth = collect(&world);
+    let row = fourth
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .expect("the worktree row");
+    let sessions: Vec<_> = row
+        .updates
+        .iter()
+        .filter(|e| e.source == UpdateSource::Session)
+        .collect();
+    assert_eq!(sessions.len(), 1, "{:?}", row.updates);
+    assert_eq!(sessions[0].reasons, ["8f423bbb more"]);
+    assert_eq!(row.updates.len(), 3, "{:?}", row.updates);
+    assistant_turn_at(
+        &world.home,
+        OTHER,
+        &wt,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(180),
+    );
+    let fifth = collect(&world);
+    let row = fifth
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .expect("the worktree row");
+    assert_eq!(row.updates.len(), 4, "{:?}", row.updates);
+    assert!(
+        row.updates
+            .iter()
+            .filter(|e| e.source == UpdateSource::Session)
+            .any(|e| e.reasons == ["02aa0bbb"]),
+        "an untitled conversation's reason is its short id alone: {:?}",
+        row.updates
+    );
+    let sixth = collect(&world);
+    let again = sixth
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .expect("the worktree row");
+    assert_eq!(
+        again.updates, row.updates,
+        "the same transcript turn never replays"
+    );
+    let work = store(&world.home).load().work;
+    let record = work
+        .path(&wt.display().to_string())
+        .expect("the path record is the repo's");
+    assert_eq!(record.repo.as_deref(), Some(repo_id(&world.repo).as_str()));
+    assert!(
+        record
+            .session_activity
+            .contains_key(&agent_sessions::store::conversation_key("claude", CONV)),
+        "the cursor survives the retained events"
+    );
+}
+
+#[test]
+fn a_row_records_commit_working_tree_and_session_updates() {
+    let world = world();
+    world.repo.branch_with_commits("feat-login", 1, false);
+    let wt = world.repo.add_worktree("feat", Some("feat-login"));
+    transcript(&world.home, CONV, &wt);
+    let first = collect(&world);
+    let row = work(&first, "feat-login");
+    assert_eq!(
+        row.updates
+            .iter()
+            .map(|e| e.reasons.as_slice())
+            .collect::<Vec<_>>(),
+        [&["worktree found".to_owned(), ".git present".to_owned()][..]],
+        "first observation dates only the find: {:?}",
+        row.updates
+    );
+
+    world.repo.commit(&wt, "a.txt", "x", "retry handling");
+    fs::write(wt.join("loose change.txt"), "y").expect("write");
+    turn_at(
+        &world.home,
+        CONV,
+        &wt,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(90),
+    );
+    let second = collect(&world);
+    let row = work(&second, "feat-login");
+    let commits: Vec<_> = row
+        .updates
+        .iter()
+        .filter(|e| e.source == UpdateSource::Commit)
+        .collect();
+    assert_eq!(commits.len(), 1, "{:?}", row.updates);
+    assert!(
+        commits[0].reasons[0].ends_with(" retry handling"),
+        "{:?}",
+        commits[0].reasons
+    );
+    assert_eq!(commits[0].reasons[0].split(' ').next().unwrap().len(), 7);
+    let trees: Vec<_> = row
+        .updates
+        .iter()
+        .filter(|e| e.source == UpdateSource::WorkingTree)
+        .collect();
+    assert_eq!(trees.len(), 1, "{:?}", row.updates);
+    assert_eq!(trees[0].reasons, ["untracked loose change.txt"]);
+    let sessions: Vec<_> = row
+        .updates
+        .iter()
+        .filter(|e| e.source == UpdateSource::Session)
+        .collect();
+    assert_eq!(sessions.len(), 1, "{:?}", row.updates);
+    assert_eq!(sessions[0].reasons, ["8f423bbb more"]);
+    let lifecycle: Vec<_> = row
+        .updates
+        .iter()
+        .filter(|e| e.source == UpdateSource::Lifecycle)
+        .collect();
+    assert_eq!(lifecycle.len(), 2, "{:?}", row.updates);
+    assert_eq!(lifecycle[0].reasons, ["worktree found", ".git present"]);
+    assert_eq!(lifecycle[1].reasons, ["ahead: 1 -> 2", "unpushed: 1 -> 2"]);
+
+    let third = collect(&world);
+    let row = work(&third, "feat-login");
+    let again = work(&second, "feat-login");
+    assert_eq!(row.updates, again.updates, "unchanged polls append nothing");
+}
+
+#[test]
+fn a_second_dirty_edit_emits_again_when_porcelain_is_identical() {
+    let world = world();
+    world.repo.branch_with_commits("feat-login", 1, false);
+    let wt = world.repo.add_worktree("feat", Some("feat-login"));
+    collect(&world);
+
+    let tracked = wt.join("feat-login-0.txt");
+    fs::write(&tracked, "12345").expect("edit");
+    let loose = wt.join("loose.txt");
+    fs::write(&loose, "x").expect("edit");
+    let second = collect(&world);
+    let row = work(&second, "feat-login");
+    let trees: Vec<_> = row
+        .updates
+        .iter()
+        .filter(|e| e.source == UpdateSource::WorkingTree)
+        .collect();
+    assert_eq!(trees.len(), 1, "{:?}", row.updates);
+    assert_eq!(
+        trees[0].reasons,
+        ["modified feat-login-0.txt", "untracked loose.txt"]
+    );
+
+    let stamp = |path: &Path| {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .expect("mtime");
+    };
+    fs::write(&tracked, "67890").expect("same-size second edit");
+    fs::write(&loose, "y").expect("same-size second edit");
+    stamp(&tracked);
+    stamp(&loose);
+    let third = collect(&world);
+    let row = work(&third, "feat-login");
+    let trees: Vec<_> = row
+        .updates
+        .iter()
+        .filter(|e| e.source == UpdateSource::WorkingTree)
+        .collect();
+    assert_eq!(
+        trees.len(),
+        2,
+        "byte-identical porcelain over re-edited files still emits: {:?}",
+        row.updates
+    );
+    assert_eq!(trees[1].reasons, trees[0].reasons);
+}
+
+#[test]
 fn a_closed_record_was_last_seen_by_the_pass_before_its_close() {
     let dir = TempDir::new("incarnation-last-seen");
     let store = Store::open(dir.join("store"));
@@ -1288,4 +1601,106 @@ fn a_closed_record_was_last_seen_by_the_pass_before_its_close() {
         assert_eq!(record.ended_at, Some(700_000), "{id}");
         assert_eq!(record.last_observed_at, 600_000, "{id}");
     }
+}
+
+#[test]
+fn a_worktree_without_git_stays_present_while_its_repo_is_out_of_scope() {
+    // A registered worktree whose `.git` file was deleted is still a
+    // worktree - `git worktree list` lists it, prunable. A conversation
+    // sitting in it resolves as a project space (no `.git` to discover
+    // through), and a pass that does not collect the owning repo writes
+    // that space unclaimed. The space's sync proves nothing about the
+    // worktree claim, so the record must not flip present -> gone and
+    // back when the repo returns to scope.
+    let world = world();
+    let wt = world.repo.add_worktree("stuck", None);
+    transcript(&world.home, CONV, &wt);
+    fs::remove_file(wt.join(".git")).expect("the .git file");
+    let wt = wt.canonicalize().expect("the worktree resolves");
+    let first = collect(&world);
+    let row = first
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .expect("the worktree row");
+    assert_eq!(row.kind, WorkKind::Detached);
+    assert_eq!(
+        row.updates
+            .iter()
+            .map(|e| e.reasons.as_slice())
+            .collect::<Vec<_>>(),
+        [&["worktree found".to_owned(), ".git missing".to_owned()][..]],
+        "{:?}",
+        row.updates
+    );
+
+    // The repo leaves scope - its only anchoring conversation's project
+    // moves - while the broken worktree's conversation stays put.
+    let space = world.repo.dir.join("elsewhere");
+    fs::create_dir_all(&space).expect("mkdir");
+    transcript(&world.home, ANCHOR, &space);
+    let second = collect(&world);
+    let row = second
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .expect("the space row");
+    assert_eq!(
+        row.updates
+            .iter()
+            .map(|e| e.reasons.as_slice())
+            .collect::<Vec<_>>(),
+        [&["worktree found".to_owned(), ".git missing".to_owned()][..]],
+        "an unproven pass revokes nothing: {:?}",
+        row.updates
+    );
+    let work = store(&world.home).load().work;
+    let record = work
+        .path(&wt.display().to_string())
+        .expect("the path record");
+    assert_eq!(record.inputs.worktree, Some(true));
+    assert_eq!(record.inputs.git_dir, Some(false));
+
+    // Back in scope: still present, still `.git`-missing - no
+    // gone -> present flip, no second find.
+    transcript(&world.home, ANCHOR, &world.repo.main);
+    let third = collect(&world);
+    let row = third
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .expect("the worktree row");
+    assert_eq!(row.kind, WorkKind::Detached);
+    assert_eq!(
+        row.updates
+            .iter()
+            .map(|e| e.reasons.as_slice())
+            .collect::<Vec<_>>(),
+        [&["worktree found".to_owned(), ".git missing".to_owned()][..]],
+        "the repo returning to scope is no transition: {:?}",
+        row.updates
+    );
+
+    // And `.git` returning is its own transition - the file names the
+    // worktree's admin dir, which the registration never dropped.
+    let admin = world.repo.main.join(".git/worktrees/wt-stuck");
+    fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}\n", admin.canonicalize().unwrap().display()),
+    )
+    .expect("the .git file");
+    let fourth = collect(&world);
+    let row = fourth
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .expect("the worktree row");
+    assert_eq!(row.broken, None, "{:?}", row.broken);
+    assert!(
+        row.updates
+            .iter()
+            .any(|e| e.reasons.contains(&".git restored".to_owned())),
+        "{:?}",
+        row.updates
+    );
 }

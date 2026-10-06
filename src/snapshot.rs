@@ -380,6 +380,7 @@ pub struct WorkRow {
     /// The checked-out branch name, when any.
     pub branch: Option<String>,
     pub dirty: Option<bool>,
+    pub broken: Option<String>,
     /// Commits on the row's tip not on the proven base; `None` is `?`.
     pub commits_ahead: Option<u64>,
     pub unpushed: Option<u64>,
@@ -448,6 +449,7 @@ pub struct WorkRow {
     /// The newest real work the row's reflogs recorded, epoch seconds;
     /// `None` is `?`.
     pub git_activity_at: Option<u64>,
+    pub updates: Vec<store::UpdateEvent>,
     /// `git worktree remove` verdict and reasons; `None` for project
     /// spaces, which carry no cleanup verdicts at all.
     pub worktree_removal: Option<verdict::ActionVerdict>,
@@ -1024,7 +1026,7 @@ impl Collector {
         // nothing still on disk. Distinct cwds are few while conversations
         // are many, so each resolves once per pass - a failure is one
         // error, not one per conversation.
-        let placements = resolve_cwds(&inventory.conversations, &mut self.model.errors);
+        let mut placements = resolve_cwds(&inventory.conversations, &mut self.model.errors);
         // The provider trails stay in the model: the evidence dated
         // touches derive from, not part of the published rows.
         self.model.trails = self
@@ -1121,6 +1123,12 @@ impl Collector {
                 return;
             }
         }
+        self.reconcile_worktree_spaces(
+            runtime,
+            &inventory.conversations,
+            &running,
+            &mut placements,
+        );
         // Stage 3 - remote evidence, one `ls-remote --symref` per repo and
         // remote per deadline, fanned out; then the local probes each
         // remote answer unlocks (bases, ahead/behind, landed, unpushed).
@@ -1288,6 +1296,22 @@ impl Collector {
         // `(repo, branch)` -> the tip the pass proved: what a touch's
         // `head` carries.
         let mut heads: HashMap<(String, String), String> = HashMap::new();
+        let git_worktrees: HashSet<PathBuf> = self
+            .model
+            .repos
+            .values()
+            .flat_map(|model| match &model.data {
+                RepoData::Git(local) => local
+                    .anchors
+                    .iter()
+                    .filter_map(|w| match &w.state.anchor {
+                        Anchor::Worktree { path, .. } => Some(path.clone()),
+                        Anchor::Branch { .. } => None,
+                    })
+                    .collect::<Vec<_>>(),
+                RepoData::Space(_) => Vec::new(),
+            })
+            .collect();
         let mut observed = Vec::new();
         for (repo_id, model) in &self.model.repos {
             match &model.data {
@@ -1310,6 +1334,7 @@ impl Collector {
                                     at_ms: store::epoch_ms(c.at),
                                 }),
                                 renamed_from: w.renamed_from().map(str::to_owned),
+                                commit: observed_commit(&w.state, w.ref_head()),
                                 inputs: lifecycle_inputs(&w.state),
                             })
                         })
@@ -1337,12 +1362,15 @@ impl Collector {
                     }
                 }
                 RepoData::Space(row) => {
-                    if let Err(e) = store.sync_path(
-                        &row.repo,
-                        &row.repo,
-                        &store::LifecycleInputs::default(),
-                        observed_ms,
-                    ) {
+                    let claimed = git_worktrees.iter().any(|wt| inside_path(&model.path, wt));
+                    if !claimed
+                        && let Err(e) = store.sync_path(
+                            &row.repo,
+                            &row.repo,
+                            &store::LifecycleInputs::default(),
+                            observed_ms,
+                        )
+                    {
                         self.model.errors.push(work_state_error(repo_id, e));
                     }
                 }
@@ -1391,6 +1419,46 @@ impl Collector {
                 source: "work.json".to_owned(),
                 detail: format!("touches: {e}"),
             });
+        }
+        let mut errors = self.refresh_work();
+        self.model.errors.append(&mut errors);
+        let mut bound: HashMap<String, store::UpdateIdentity> = HashMap::new();
+        for touch in &self.model.work.touches {
+            if touch.valid_until.is_none() && touch.confidence == store::Confidence::Exact {
+                bound.insert(
+                    touch.conversation.clone(),
+                    store::UpdateIdentity::Branch(touch.branch.clone()),
+                );
+            }
+        }
+        let mut updates = Vec::new();
+        for conv in &self.model.conversations {
+            let key = store::conversation_key(conv.provider.as_str(), &conv.session_id);
+            let identity = bound.get(&key).cloned().or_else(|| {
+                if conv.branch.is_some() {
+                    return None;
+                }
+                conv.worktree
+                    .as_ref()
+                    .map(|path| store::UpdateIdentity::Path(path.display().to_string()))
+                    .or_else(|| conv.repo.clone().map(store::UpdateIdentity::Path))
+            });
+            let (Some(identity), Some(at)) = (identity, conv.last_activity) else {
+                continue;
+            };
+            updates.push(store::SessionUpdate {
+                identity,
+                conversation: key,
+                at_ms: at.saturating_mul(1000),
+                reason: conv.title.as_ref().map_or_else(
+                    || conv.short_id.clone(),
+                    |title| format!("{} {}", conv.short_id, title),
+                ),
+            });
+        }
+        match store.sync_session_updates(&updates) {
+            Ok(()) => {}
+            Err(e) => self.model.errors.push(work_state_error("sessions", e)), // coverage: off - a refused write needs a filesystem fault
         }
         let mut errors = self.refresh_work();
         self.model.errors.append(&mut errors);
@@ -1606,6 +1674,100 @@ impl Collector {
     /// A repo whose local read failed keeps its error and drops its row.
     #[rustfmt::skip]
     fn fail_repo(&mut self, repo_id: &str, error: SourceError) { self.model.errors.push(error); self.model.repos.remove(repo_id); } // coverage: off - the caller's arm needs a gitdir to vanish mid-pass
+
+    fn reconcile_worktree_spaces(
+        &mut self,
+        runtime: &Runtime,
+        conversations: &[Conversation],
+        running: &[bool],
+        placements: &mut [Option<CwdPlacement>],
+    ) {
+        let mut claimed: Vec<(PathBuf, String, Option<String>)> = Vec::new();
+        for (repo_id, model) in &self.model.repos {
+            let RepoData::Git(local) = &model.data else {
+                continue;
+            };
+            for w in &local.anchors {
+                let Anchor::Worktree { path, head, .. } = &w.state.anchor else {
+                    continue;
+                };
+                let branch = match head {
+                    Head::Branch(name) | Head::Unborn(name) => Some(name.clone()),
+                    Head::Detached(_) => None,
+                };
+                claimed.push((path.clone(), repo_id.clone(), branch));
+            }
+        }
+        if claimed.is_empty() {
+            return;
+        }
+        self.model.repos.retain(|_, model| match &model.data {
+            RepoData::Space(_) => !claimed
+                .iter()
+                .any(|(path, ..)| inside_path(&model.path, path)),
+            RepoData::Git(_) => true,
+        });
+        let mut touched: HashSet<String> = HashSet::new();
+        for (conv, place) in self
+            .model
+            .conversations
+            .iter_mut()
+            .zip(placements.iter_mut())
+        {
+            let Some(CwdPlacement::ProjectSpace { path }) = place else {
+                continue;
+            };
+            let Some((root, repo_id, branch)) = claimed
+                .iter()
+                .filter(|(root, ..)| inside_path(path, root))
+                .max_by_key(|(root, ..)| root.components().count())
+            else {
+                continue;
+            };
+            *place = Some(CwdPlacement::Checkout {
+                repo_id: repo_id.clone(),
+                root: root.clone(),
+                branch: branch.clone(),
+            });
+            conv.repo = Some(repo_id.clone());
+            conv.worktree = Some(root.clone());
+            conv.branch = branch.clone();
+            touched.insert(repo_id.clone());
+        }
+        if touched.is_empty() {
+            return;
+        }
+        let trails = resolve_trails(conversations, placements);
+        for (conv, trail) in self.model.conversations.iter().zip(trails) {
+            self.model.trails.insert(
+                store::conversation_key(conv.provider.as_str(), &conv.session_id),
+                trail,
+            );
+        }
+        for repo_id in &touched {
+            let Some(RepoModel {
+                data: RepoData::Git(local),
+                ..
+            }) = self.model.repos.get_mut(repo_id)
+            else {
+                continue; // coverage: off - touched only ever names a collected Git repo
+            };
+            for work in &mut local.anchors {
+                let facts = runtime_facts(
+                    runtime,
+                    conversations,
+                    running,
+                    placements,
+                    &work.state.anchor,
+                    repo_id,
+                );
+                work.state.vector.windows = facts.windows;
+                work.state.vector.live_pids = facts.live_pids;
+                work.state.vector.live_agent_sessions = facts.live_agent_sessions;
+                work.state.vector.past_agent_sessions = facts.past_agent_sessions;
+            }
+        }
+    }
 
     /// Merge one finished repository into the model. Remote-owned fields
     /// carry their last-pass values over into the fresh local state - they
@@ -1872,16 +2034,21 @@ fn work_row(
     // Work identity: an active incarnation's id for a branch row, the
     // canonical path for a detached one. A branch whose record the sync
     // has not written yet carries no identity rather than a guess.
-    let (identity, parked, authored_ms) = match &branch {
+    let (identity, parked, authored_ms, authored_updates) = match &branch {
         Some(name) => match authored.branch(repo_id, name) {
-            Some(r) => (Some(r.id.clone()), r.parked, r.activity_at),
-            None => (None, false, None),
+            Some(r) => (
+                Some(r.id.clone()),
+                r.parked,
+                r.activity_at,
+                r.updates.clone(),
+            ),
+            None => (None, false, None, Vec::new()),
         },
         None => {
             let path = v.worktree.as_ref().map(|p| p.display().to_string());
             match path.as_deref().and_then(|p| authored.path(p)) {
-                Some(r) => (path, r.parked, r.activity_at),
-                None => (path, false, None),
+                Some(r) => (path, r.parked, r.activity_at, r.updates.clone()),
+                None => (path, false, None, Vec::new()),
             }
         }
     };
@@ -1915,6 +2082,12 @@ fn work_row(
         worktree: v.worktree.clone(),
         branch,
         dirty: v.dirty.known().copied(),
+        broken: state.broken.as_ref().map(|reason| match &v.worktree {
+            Some(path) if !path.join(".git").exists() => {
+                format!(".git missing; metadata retained by {repo_name}")
+            }
+            _ => reason.clone(),
+        }),
         commits_ahead: v.commits_ahead_of_base.known().copied(),
         unpushed: v.unpushed_commits.known().copied(),
         upstream,
@@ -1961,6 +2134,7 @@ fn work_row(
         references: Vec::new(),
         transition_at: authored_ms.map(|ms| ms / 1000),
         git_activity_at: v.last_git_activity.map(epoch),
+        updates: authored_updates,
         worktree_removal: Some(removal),
         branch_deletion: Some(deletion),
         section: WorkSection::FollowUp,
@@ -2000,15 +2174,27 @@ fn landed_of(v: &vector::StateVector) -> Option<Landed> {
 fn lifecycle_inputs(state: &vector::WorkState) -> store::LifecycleInputs {
     let v = &state.vector;
     let (upstream, detail) = upstream_of(&v.upstream_state);
+    let head = match &state.anchor {
+        Anchor::Worktree {
+            head: Head::Detached(sha),
+            ..
+        } => Some(sha.clone()),
+        _ => None,
+    };
     store::LifecycleInputs {
         dirty: v.dirty.known().copied(),
-        worktree: v.worktree.is_some(),
+        worktree: Some(v.worktree.is_some()),
+        git_dir: match &state.anchor {
+            Anchor::Worktree { path, .. } => Some(path.join(".git").exists()),
+            Anchor::Branch { .. } => None,
+        },
         worktree_path: v.worktree.as_ref().map(|p| p.display().to_string()),
         admin_id: match &state.anchor {
             Anchor::Worktree { admin_id, .. } => admin_id.clone(),
             Anchor::Branch { .. } => None,
         },
         ahead: v.commits_ahead_of_base.known().copied(),
+        behind: v.commits_behind_of_base.known().copied(),
         unpushed: v.unpushed_commits.known().copied(),
         upstream: (upstream != Upstream::Unknown).then(|| match detail {
             Some(detail) => format!("{} {detail}", upstream.as_str()),
@@ -2019,7 +2205,41 @@ fn lifecycle_inputs(state: &vector::WorkState) -> store::LifecycleInputs {
             .then(|| state.forge.item.as_str().to_owned()),
         pipeline: (state.forge.pipeline != Pipeline::Unknown)
             .then(|| state.forge.pipeline.as_str().to_owned()),
+        worktree_state: match &state.anchor {
+            Anchor::Worktree { prunable, .. } => Some(match prunable {
+                Some(reason) => format!("broken: {reason}"),
+                None => "healthy".to_owned(),
+            }),
+            Anchor::Branch { .. } => None,
+        },
+        commit: observed_commit(state, head.as_deref()),
+        head,
+        working_tree: v
+            .worktree
+            .as_deref()
+            .zip(v.working_tree.known())
+            .map(|(root, bytes)| {
+                let status = git::status(bytes, root);
+                store::WorkingTreeSnapshot {
+                    fingerprint: status.fingerprint,
+                    reasons: status.reasons,
+                }
+            }),
     }
+}
+
+fn observed_commit(state: &vector::WorkState, head: Option<&str>) -> Option<store::ObservedCommit> {
+    let sha = head?;
+    let listed = state
+        .vector
+        .commits_not_on_base
+        .known()
+        .and_then(|commits| commits.iter().find(|c| c.sha == sha));
+    Some(store::ObservedCommit {
+        sha: sha.to_owned(),
+        subject: listed.map(|c| c.subject.clone()),
+        at_ms: listed.map(|c| c.at.saturating_mul(1000)),
+    })
 }
 
 /// The `Unknown` forge status anchors without a forge remote settle to.
@@ -2193,6 +2413,7 @@ fn apply_path_record(row: &mut WorkRow, authored: &store::Work) {
     };
     if let Some(record) = authored.path(identity) {
         row.parked = record.parked;
+        row.updates = record.updates.clone();
         row.last_activity = row
             .last_activity
             .into_iter()
@@ -2424,6 +2645,7 @@ fn gone_rows(
             gone: Some(gone.clone()),
             summary: format!("{gone} · {}", reference_summary(&refs)),
             references: refs,
+            updates: record.updates.clone(),
             section: WorkSection::CleanupReview,
             ..space_row(&record.repo, &path)
         });
@@ -2441,8 +2663,8 @@ fn gone_rows(
             continue;
         }
         let (kind, gone) = match record.inputs.worktree {
-            true => (WorkKind::Detached, "worktree gone"),
-            false => (WorkKind::ProjectSpace, "project folder gone"),
+            Some(true) => (WorkKind::Detached, "worktree gone"),
+            _ => (WorkKind::ProjectSpace, "project folder gone"),
         };
         // The repo the record carries, so a detached row lists under its
         // repository; a record from before the field names itself.
@@ -2454,6 +2676,7 @@ fn gone_rows(
             gone: Some(gone.to_owned()),
             summary: format!("{gone} · {}", reference_summary(&refs)),
             references: refs,
+            updates: record.updates.clone(),
             last_activity: record.activity_at.map(|ms| ms / 1000),
             section: WorkSection::CleanupReview,
             ..space_row(path_str, &path)
@@ -2890,6 +3113,7 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         worktree: Some(path.to_owned()),
         branch: None,
         dirty: None,
+        broken: None,
         commits_ahead: None,
         unpushed: None,
         upstream: Upstream::NotApplicable,
@@ -2917,6 +3141,7 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         references: Vec::new(),
         transition_at: None,
         git_activity_at: None,
+        updates: Vec::new(),
         worktree_removal: None,
         branch_deletion: None,
         section: WorkSection::FollowUp,
@@ -3391,6 +3616,8 @@ mod tests {
             parked: false,
             activity_at: None,
             inputs: store::LifecycleInputs::default(),
+            updates: Vec::new(),
+            session_activity: Default::default(),
         }
     }
 
@@ -3509,6 +3736,7 @@ mod tests {
                 url: None,
                 reason: None,
             },
+            broken: None,
             vector: vector::StateVector {
                 worktree: None,
                 windows: WindowCount::default(),
@@ -3516,6 +3744,7 @@ mod tests {
                 live_agent_sessions: 0,
                 past_agent_sessions: 0,
                 dirty: Evidence::Known(false),
+                working_tree: Evidence::Unknown("no worktree".to_owned()),
                 commits_ahead_of_base: Evidence::Unknown("none asked".to_owned()),
                 commits_behind_of_base: Evidence::Unknown("none asked".to_owned()),
                 commits_not_on_base: Evidence::Unknown("none asked".to_owned()),
@@ -3538,6 +3767,66 @@ mod tests {
         assert_eq!(ids, ["i-1", "i-2"]);
         assert!(row.same_name_history.iter().all(|h| h.excluded));
         assert_eq!(row.identity.as_deref(), Some("i-3"));
+    }
+
+    #[test]
+    fn a_broken_worktree_row_describes_its_break() {
+        let dir = std::env::temp_dir().join(format!("asd-broken-wt-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let state = |broken: &str| vector::WorkState {
+            repo: git::Repo {
+                common_dir: PathBuf::from("/r/.git"),
+            },
+            anchor: Anchor::Worktree {
+                path: dir.clone(),
+                admin_id: Some("wt".to_owned()),
+                head: Head::Detached("deadbeef".to_owned()),
+                locked: false,
+                main: false,
+                prunable: Some(broken.to_owned()),
+            },
+            remote_url: None,
+            base: Evidence::Unknown("no base asked".to_owned()),
+            forge: ForgeStatus {
+                item: WorkItem::Unknown,
+                pipeline: Pipeline::Unknown,
+                label: None,
+                url: None,
+                reason: None,
+            },
+            broken: Some(broken.to_owned()),
+            vector: vector::StateVector {
+                worktree: Some(dir.clone()),
+                windows: WindowCount::default(),
+                live_pids: 0,
+                live_agent_sessions: 0,
+                past_agent_sessions: 0,
+                dirty: Evidence::Known(false),
+                working_tree: Evidence::Unknown("no worktree".to_owned()),
+                commits_ahead_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_behind_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_not_on_base: Evidence::Unknown("none asked".to_owned()),
+                upstream_state: UpstreamState::NotApplicable,
+                unpushed_commits: Evidence::Unknown("none asked".to_owned()),
+                landed: Evidence::Unknown("none asked".to_owned()),
+                last_git_activity: None,
+            },
+        };
+        let authored = store::Work::default();
+        let row = work_row(
+            "/r/.git",
+            "r",
+            &state("gitdir file points to non-existent location"),
+            &authored,
+        );
+        assert_eq!(
+            row.broken.as_deref(),
+            Some(".git missing; metadata retained by r")
+        );
+        fs::write(dir.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let row = work_row("/r/.git", "r", &state("checkout moved"), &authored);
+        assert_eq!(row.broken.as_deref(), Some("checkout moved"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -4038,6 +4327,7 @@ mod tests {
             head: Head::Branch("main".to_owned()),
             locked: false,
             main: true,
+            prunable: None,
         }];
         assert_eq!(
             repo_display(anchors.iter(), &repo),
@@ -4753,10 +5043,9 @@ mod tests {
                 repo: None,
                 parked: false,
                 activity_at: Some(2_000),
-                inputs: store::LifecycleInputs {
-                    worktree: false,
-                    ..Default::default()
-                },
+                inputs: store::LifecycleInputs::default(),
+                updates: Vec::new(),
+                session_activity: Default::default(),
             },
         );
         let detached = format!("{}/detached", root.display());
@@ -4767,9 +5056,11 @@ mod tests {
                 parked: false,
                 activity_at: Some(2_000),
                 inputs: store::LifecycleInputs {
-                    worktree: true,
+                    worktree: Some(true),
                     ..Default::default()
                 },
+                updates: Vec::new(),
+                session_activity: Default::default(),
             },
         );
         let mut c = live_row("cccccccc-2", 77);
@@ -4823,9 +5114,11 @@ mod tests {
                 parked: false,
                 activity_at: Some(2_000),
                 inputs: store::LifecycleInputs {
-                    worktree: true,
+                    worktree: Some(true),
                     ..Default::default()
                 },
+                updates: Vec::new(),
+                session_activity: Default::default(),
             },
         );
         let mut pane = tmux_pane("/sock/a", "%9", 50);

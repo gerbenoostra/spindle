@@ -28,6 +28,7 @@ pub enum Anchor {
         locked: bool,
         /// The repository's own checkout; `git worktree remove` refuses it.
         main: bool,
+        prunable: Option<String>,
     },
     /// A local branch with no worktree anywhere.
     Branch { name: String },
@@ -65,6 +66,7 @@ pub fn anchors(repo: &Repo) -> Result<Vec<Anchor>, git::Error> {
             head: wt.head,
             locked: wt.locked,
             main: wt.main,
+            prunable: wt.prunable,
         });
     }
     let names = repo.local_branches()?; // coverage: off - needs refs broken where worktree list succeeded
@@ -156,6 +158,7 @@ pub struct WorkState {
     /// The forge work-item overlay: `Unknown(PENDING)` until the forge
     /// stage lands an answer, like every remote-owned field.
     pub forge: ForgeStatus,
+    pub broken: Option<String>,
     pub vector: StateVector,
 }
 
@@ -169,6 +172,7 @@ pub struct StateVector {
     pub past_agent_sessions: usize,
     /// Tracked and untracked changes; `Known(false)` for a branch-only row.
     pub dirty: Evidence<bool>,
+    pub working_tree: Evidence<Vec<u8>>,
     pub commits_ahead_of_base: Evidence<u64>,
     /// Commits on the proven base the row's tip lacks - the behind half of
     /// the ahead/behind pair.
@@ -291,6 +295,7 @@ struct AnchorLocal {
     /// A detached anchor's unreachable-commit count - already collected,
     /// since it is a local `rev-list`, not remote evidence.
     unreachable: Option<Evidence<u64>>,
+    working_tree: Evidence<Vec<u8>>,
     dirty: Evidence<bool>,
     last_git_activity: Option<SystemTime>,
     /// The branch tip's OID, from the batch or the old-git fallback.
@@ -417,6 +422,7 @@ pub fn collect_local_repo(
             head: wt.head,
             locked: wt.locked,
             main: wt.main,
+            prunable: wt.prunable,
         });
     }
     match facts.as_ref() {
@@ -517,6 +523,21 @@ fn anchor_work(
         fact.and_then(|f| f.head.clone())
             .or_else(|| tips.and_then(|m| m.get(name).cloned()))
     });
+    let working_tree = match &anchor {
+        Anchor::Worktree {
+            path,
+            admin_id,
+            prunable: Some(_),
+            ..
+        } => match admin_id {
+            Some(id) => repo.admin_status(id, path),
+            None => Evidence::Unknown(
+                "git status: prunable worktree has no resolvable admin dir".to_owned(),
+            ),
+        },
+        Anchor::Worktree { path, .. } => repo.status(path),
+        Anchor::Branch { .. } => Evidence::Unknown("no worktree".to_owned()),
+    };
     let local = AnchorLocal {
         remote_url: remote_url(repo, &config),
         config,
@@ -535,9 +556,10 @@ fn anchor_work(
             _ => None,
         },
         dirty: match &anchor {
-            Anchor::Worktree { path, .. } => repo.dirty(path),
+            Anchor::Worktree { .. } => working_tree.clone().map(|bytes| !bytes.is_empty()),
             Anchor::Branch { .. } => Evidence::Known(false),
         },
+        working_tree,
         last_git_activity: last_git_activity(repo, &anchor, fact),
         head_oid,
         creation: lifecycle.as_ref().and_then(|l| l.creation.clone()),
@@ -555,6 +577,10 @@ fn anchor_work(
             url: None,
             reason: Some(PENDING.to_owned()),
         },
+        broken: match &anchor {
+            Anchor::Worktree { prunable, .. } => prunable.clone(),
+            Anchor::Branch { .. } => None,
+        },
         vector: StateVector {
             worktree: match &anchor {
                 Anchor::Worktree { path, .. } => Some(path.clone()),
@@ -565,6 +591,7 @@ fn anchor_work(
             live_agent_sessions: runtime.live_agent_sessions,
             past_agent_sessions: runtime.past_agent_sessions,
             dirty: local.dirty.clone(),
+            working_tree: local.working_tree.clone(),
             commits_ahead_of_base: Evidence::Unknown(PENDING.to_owned()),
             commits_behind_of_base: Evidence::Unknown(PENDING.to_owned()),
             commits_not_on_base: Evidence::Unknown(PENDING.to_owned()),
@@ -1142,6 +1169,31 @@ mod tests {
     }
 
     #[test]
+    fn a_prunable_anchor_with_no_admin_dir_fails_closed_on_dirty() {
+        let repo = broken_repo();
+        let state = collect(
+            &repo,
+            &Anchor::Worktree {
+                path: PathBuf::from("/nonexistent"),
+                admin_id: None,
+                head: Head::Detached("deadbeef".to_owned()),
+                locked: false,
+                main: false,
+                prunable: Some("gitdir file points to non-existent location".to_owned()),
+            },
+            RuntimeFacts::default(),
+        );
+        assert_eq!(
+            state.broken.as_deref(),
+            Some("gitdir file points to non-existent location")
+        );
+        assert!(matches!(
+            &state.vector.dirty,
+            Evidence::Unknown(r) if r.contains("no resolvable admin dir")
+        ));
+    }
+
+    #[test]
     fn a_detached_anchor_on_a_broken_repo_collects_unknowns() {
         // The unreachable-commit count needs no upstream and no base, but
         // it still needs git to answer - on a broken repo it is Unknown,
@@ -1155,6 +1207,7 @@ mod tests {
                 head: Head::Detached("deadbeef".to_owned()),
                 locked: false,
                 main: false,
+                prunable: None,
             },
             RuntimeFacts::default(),
         );

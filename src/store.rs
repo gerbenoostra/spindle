@@ -26,7 +26,8 @@
 //! derivation, retained on disk and reported for the evidence view, and a
 //! corrupt journal tail never hides the valid prefix.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -408,9 +409,20 @@ pub struct LifecycleInputs {
     /// The worktree's dirty flag; `None` when unproven or not applicable.
     #[serde(default)]
     pub dirty: Option<bool>,
-    /// Whether the anchor's checkout exists at all this pass.
+    /// Whether the anchor's checkout exists at all this pass: `Some` when
+    /// the reader is the repository's own worktree inventory - `true` for
+    /// a listed worktree, `false` for a branch with none - and `None` for
+    /// a project-space sync, which cannot tell whether an uncollected
+    /// repository still registers the path, so it never revokes a proven
+    /// worktree.
     #[serde(default)]
-    pub worktree: bool,
+    pub worktree: Option<bool>,
+    /// Whether the worktree's `.git` exists this pass; `None` without a
+    /// worktree anchor. A registered worktree whose `.git` file vanished
+    /// stays a worktree - `git worktree list` still lists it, prunable -
+    /// so presence and linkage are separate facts.
+    #[serde(default)]
+    pub git_dir: Option<bool>,
     /// The checkout path, when one exists - a move is a tree transition.
     #[serde(default)]
     pub worktree_path: Option<String>,
@@ -437,17 +449,74 @@ pub struct LifecycleInputs {
     /// The open item's pipeline state.
     #[serde(default)]
     pub pipeline: Option<String>,
+    #[serde(default)]
+    pub behind: Option<u64>,
+    #[serde(default)]
+    pub worktree_state: Option<String>,
+    #[serde(default)]
+    pub head: Option<String>,
+    #[serde(default)]
+    pub commit: Option<ObservedCommit>,
+    #[serde(default)]
+    pub working_tree: Option<WorkingTreeSnapshot>,
+}
+
+pub const UPDATE_RETAIN_PER_SOURCE: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateSource {
+    Commit,
+    WorkingTree,
+    Session,
+    Lifecycle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateEvent {
+    pub source: UpdateSource,
+    pub at_ms: u64,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedCommit {
+    pub sha: String,
+    pub subject: Option<String>,
+    pub at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkingTreeSnapshot {
+    pub fingerprint: String,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum UpdateIdentity {
+    Branch(String),
+    Path(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionUpdate {
+    pub identity: UpdateIdentity,
+    pub conversation: String,
+    pub at_ms: u64,
+    pub reason: String,
 }
 
 impl LifecycleInputs {
     /// This reading laid over `prior`: every unproven field keeps the
-    /// prior proven value. The checkout's presence is always observed;
-    /// its path and admin id keep their last proven value, so a record
-    /// outliving its workspace still names where the work was.
+    /// prior proven value. The checkout's presence is proven only by the
+    /// repository's own inventory; its path and admin id keep their last
+    /// proven value, so a record outliving its workspace still names
+    /// where the work was.
     fn over(&self, prior: &LifecycleInputs) -> LifecycleInputs {
         LifecycleInputs {
             dirty: self.dirty.or(prior.dirty),
-            worktree: self.worktree,
+            worktree: self.worktree.or(prior.worktree),
+            git_dir: self.git_dir.or(prior.git_dir),
             worktree_path: self
                 .worktree_path
                 .clone()
@@ -459,6 +528,17 @@ impl LifecycleInputs {
             landed: self.landed.clone().or_else(|| prior.landed.clone()),
             forge: self.forge.clone().or_else(|| prior.forge.clone()),
             pipeline: self.pipeline.clone().or_else(|| prior.pipeline.clone()),
+            behind: self.behind.or(prior.behind),
+            worktree_state: self
+                .worktree_state
+                .clone()
+                .or_else(|| prior.worktree_state.clone()),
+            head: self.head.clone().or_else(|| prior.head.clone()),
+            commit: self.commit.clone().or_else(|| prior.commit.clone()),
+            working_tree: self
+                .working_tree
+                .clone()
+                .or_else(|| prior.working_tree.clone()),
         }
     }
 
@@ -466,24 +546,121 @@ impl LifecycleInputs {
     /// checkout appeared, vanished or moved, or a field proven on both
     /// sides changed. A field's first proven value - unproven when the
     /// record was made - is adopted without dating anything.
-    fn transitions_from(&self, prior: &LifecycleInputs) -> bool {
+    fn transitions_from(&self, prior: &LifecycleInputs) -> Vec<String> {
         fn changed<T: PartialEq>(new: &Option<T>, old: &Option<T>) -> bool {
             matches!((new, old), (Some(n), Some(o)) if n != o)
+        }
+        fn opt<T: fmt::Display>(v: &Option<T>) -> String {
+            v.as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_owned()) // coverage: off - a changed() pair is always Some
         }
         // The checkout appearing or vanishing is a transition in itself;
         // path and admin id only transition on a proven move (Some vs
         // Some) - adopting a first value, like losing one, dates nothing
-        // twice.
-        self.worktree != prior.worktree
-            || changed(&self.worktree_path, &prior.worktree_path)
-            || changed(&self.admin_id, &prior.admin_id)
-            || changed(&self.dirty, &prior.dirty)
-            || changed(&self.ahead, &prior.ahead)
-            || changed(&self.unpushed, &prior.unpushed)
-            || changed(&self.upstream, &prior.upstream)
-            || changed(&self.landed, &prior.landed)
-            || changed(&self.forge, &prior.forge)
-            || changed(&self.pipeline, &prior.pipeline)
+        // twice. Presence is the exception: a record's first proven claim
+        // is worth the event, so a found worktree (and its `.git` link)
+        // dates its detection, and an unproven pass never revokes them.
+        let mut reasons = Vec::new();
+        match (prior.worktree, self.worktree) {
+            (Some(true), Some(false)) => reasons.push("worktree gone".to_owned()),
+            (old, Some(true)) if old != Some(true) => reasons.push("worktree found".to_owned()),
+            _ => {}
+        }
+        match (prior.git_dir, self.git_dir) {
+            (Some(false), Some(true)) => reasons.push(".git restored".to_owned()),
+            (None, Some(true)) => reasons.push(".git present".to_owned()),
+            (old, Some(false)) if old != Some(false) => reasons.push(".git missing".to_owned()),
+            _ => {}
+        }
+        if changed(&self.worktree_path, &prior.worktree_path) {
+            reasons.push(format!(
+                "path: {} -> {}",
+                opt(&prior.worktree_path),
+                opt(&self.worktree_path)
+            ));
+        }
+        if changed(&self.admin_id, &prior.admin_id) {
+            reasons.push(format!(
+                "admin id: {} -> {}",
+                opt(&prior.admin_id),
+                opt(&self.admin_id)
+            ));
+        }
+        if self.working_tree.is_none()
+            && prior.working_tree.is_none()
+            && changed(&self.dirty, &prior.dirty)
+        {
+            let word = |dirty: Option<bool>| {
+                if dirty == Some(true) {
+                    "dirty"
+                } else {
+                    "clean"
+                }
+            };
+            reasons.push(format!(
+                "dirty: {} -> {}",
+                word(prior.dirty),
+                word(self.dirty)
+            ));
+        }
+        if changed(&self.ahead, &prior.ahead) {
+            reasons.push(format!(
+                "ahead: {} -> {}",
+                opt(&prior.ahead),
+                opt(&self.ahead)
+            ));
+        }
+        if changed(&self.behind, &prior.behind) {
+            reasons.push(format!(
+                "behind: {} -> {}",
+                opt(&prior.behind),
+                opt(&self.behind)
+            ));
+        }
+        if changed(&self.unpushed, &prior.unpushed) {
+            reasons.push(format!(
+                "unpushed: {} -> {}",
+                opt(&prior.unpushed),
+                opt(&self.unpushed)
+            ));
+        }
+        if changed(&self.upstream, &prior.upstream) {
+            reasons.push(format!(
+                "upstream: {} -> {}",
+                opt(&prior.upstream),
+                opt(&self.upstream)
+            ));
+        }
+        if changed(&self.landed, &prior.landed) {
+            reasons.push(format!(
+                "landed: {} -> {}",
+                opt(&prior.landed),
+                opt(&self.landed)
+            ));
+        }
+        if changed(&self.forge, &prior.forge) {
+            reasons.push(format!(
+                "forge: {} -> {}",
+                opt(&prior.forge),
+                opt(&self.forge)
+            ));
+        }
+        if changed(&self.pipeline, &prior.pipeline) {
+            reasons.push(format!(
+                "pipeline: {} -> {}",
+                opt(&prior.pipeline),
+                opt(&self.pipeline)
+            ));
+        }
+        if changed(&self.worktree_state, &prior.worktree_state) {
+            reasons.push(format!(
+                "worktree state: {} -> {}",
+                opt(&prior.worktree_state),
+                opt(&self.worktree_state)
+            ));
+        }
+        reasons
     }
 }
 
@@ -646,6 +823,7 @@ pub struct ObservedRef {
     /// The short name a `Branch: renamed` reflog line moved this ref
     /// from - the exact evidence that preserves identity across names.
     pub renamed_from: Option<String>,
+    pub commit: Option<ObservedCommit>,
     pub inputs: LifecycleInputs,
 }
 
@@ -696,6 +874,10 @@ pub struct BranchRecord {
     /// The inputs `activity_at` was judged against.
     #[serde(default)]
     pub inputs: LifecycleInputs,
+    #[serde(default)]
+    pub updates: Vec<UpdateEvent>,
+    #[serde(default)]
+    pub session_activity: BTreeMap<String, u64>,
 }
 
 /// A path-anchored record: a detached worktree or a non-Git project space,
@@ -714,6 +896,10 @@ pub struct PathRecord {
     pub activity_at: Option<u64>,
     #[serde(default)]
     pub inputs: LifecycleInputs,
+    #[serde(default)]
+    pub updates: Vec<UpdateEvent>,
+    #[serde(default)]
+    pub session_activity: BTreeMap<String, u64>,
 }
 
 /// The `work.json` payload: the authored Work state.
@@ -840,6 +1026,14 @@ fn continuity_of(record: &BranchRecord, obs: &ObservedRef) -> Option<ContinuityE
     }
 }
 
+/// The lifecycle facts a record's first observation is worth an event
+/// for: a found worktree and its `.git` state. Run against an empty
+/// prior, so only the presence claims fire - the rest of the fields are
+/// adopted silently, as always.
+fn first_observation(inputs: &LifecycleInputs) -> Vec<String> {
+    inputs.transitions_from(&LifecycleInputs::default())
+}
+
 /// Open a new incarnation for `obs` at `observed_ms`: new id, `parked:
 /// false`, the observation's evidence and fingerprint stored.
 fn open_incarnation(
@@ -850,6 +1044,20 @@ fn open_incarnation(
     continuity: ContinuityEvidence,
 ) {
     let id = incarnation_id(repo, &obs.name, observed_ms);
+    let mut updates = Vec::new();
+    let reasons = first_observation(&obs.inputs);
+    if !reasons.is_empty() {
+        // The find is an event but not work: it dates itself, it does not
+        // make a just-discovered record look recently active.
+        append_update(
+            &mut updates,
+            UpdateEvent {
+                source: UpdateSource::Lifecycle,
+                at_ms: observed_ms,
+                reasons,
+            },
+        );
+    }
     work.branches.insert(
         id.clone(),
         BranchRecord {
@@ -865,9 +1073,162 @@ fn open_incarnation(
             parked: false,
             activity_at: None,
             inputs: obs.inputs.clone(),
+            updates,
+            session_activity: BTreeMap::new(),
         },
     );
     work.active_branches.insert(branch_key(repo, &obs.name), id);
+}
+
+fn short_sha(sha: &str) -> &str {
+    let end = sha
+        .char_indices()
+        .nth(7)
+        .map(|(i, _)| i)
+        .unwrap_or(sha.len());
+    &sha[..end]
+}
+
+fn append_update(updates: &mut Vec<UpdateEvent>, event: UpdateEvent) -> bool {
+    if updates.contains(&event) {
+        return false;
+    }
+    updates.push(event);
+    updates.sort_by(|a, b| {
+        a.at_ms
+            .cmp(&b.at_ms)
+            .then(a.source.cmp(&b.source))
+            .then(a.reasons.cmp(&b.reasons))
+    });
+    for source in [
+        UpdateSource::Commit,
+        UpdateSource::WorkingTree,
+        UpdateSource::Session,
+        UpdateSource::Lifecycle,
+    ] {
+        let mut drop = updates
+            .iter()
+            .filter(|e| e.source == source)
+            .count()
+            .saturating_sub(UPDATE_RETAIN_PER_SOURCE);
+        updates.retain(|e| {
+            if e.source == source && drop > 0 {
+                drop -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    true
+}
+
+fn bump_activity(activity_at: &mut Option<u64>, at_ms: u64) -> bool {
+    let next = activity_at.map_or(at_ms, |a| a.max(at_ms));
+    if *activity_at != Some(next) {
+        *activity_at = Some(next);
+        true
+    } else {
+        false
+    }
+}
+
+fn commit_update(
+    updates: &mut Vec<UpdateEvent>,
+    prior: &Option<String>,
+    head: &Option<String>,
+    commit: &Option<ObservedCommit>,
+    observed_ms: u64,
+) -> Option<u64> {
+    let (Some(new), Some(old)) = (head, prior) else {
+        return None;
+    };
+    if new == old {
+        return None;
+    }
+    let (reason, at_ms) = match commit {
+        Some(c) if &c.sha == new => (
+            match &c.subject {
+                Some(subject) => format!("{} {}", short_sha(new), subject),
+                None => short_sha(new).to_owned(),
+            },
+            c.at_ms.unwrap_or(observed_ms),
+        ),
+        _ => (short_sha(new).to_owned(), observed_ms),
+    };
+    append_update(
+        updates,
+        UpdateEvent {
+            source: UpdateSource::Commit,
+            at_ms,
+            reasons: vec![reason],
+        },
+    )
+    .then_some(at_ms)
+}
+
+fn working_tree_update(
+    updates: &mut Vec<UpdateEvent>,
+    prior: &Option<WorkingTreeSnapshot>,
+    current: &Option<WorkingTreeSnapshot>,
+    observed_ms: u64,
+) -> Option<u64> {
+    let (Some(new), Some(old)) = (current, prior) else {
+        return None;
+    };
+    if new.fingerprint == old.fingerprint {
+        return None;
+    }
+    append_update(
+        updates,
+        UpdateEvent {
+            source: UpdateSource::WorkingTree,
+            at_ms: observed_ms,
+            reasons: new.reasons.clone(),
+        },
+    )
+    .then_some(observed_ms)
+}
+
+fn session_update(
+    updates: &mut Vec<UpdateEvent>,
+    cursors: &mut BTreeMap<String, u64>,
+    activity_at: &mut Option<u64>,
+    update: &SessionUpdate,
+) -> bool {
+    match cursors.get_mut(&update.conversation) {
+        None => {
+            cursors.insert(update.conversation.clone(), update.at_ms);
+            true
+        }
+        Some(cursor) if update.at_ms <= *cursor => false,
+        Some(cursor) => {
+            *cursor = update.at_ms;
+            match updates
+                .iter_mut()
+                .find(|e| e.source == UpdateSource::Session && e.at_ms == update.at_ms)
+            {
+                Some(event) if !event.reasons.contains(&update.reason) => {
+                    event.reasons.push(update.reason.clone());
+                    event.reasons.sort_unstable();
+                    event.reasons.dedup();
+                }
+                Some(_) => {}
+                None => {
+                    append_update(
+                        updates,
+                        UpdateEvent {
+                            source: UpdateSource::Session,
+                            at_ms: update.at_ms,
+                            reasons: vec![update.reason.clone()],
+                        },
+                    );
+                }
+            }
+            bump_activity(activity_at, update.at_ms);
+            true
+        }
+    }
 }
 
 /// Close every open touch interval naming `branch` at `at_ms`: an
@@ -1351,6 +1712,15 @@ impl Store {
             work.active_branches.remove(&old_key);
             record.ref_name = obs.name.clone();
             record.last_observed_at = observed_ms;
+            if let Some(at) = commit_update(
+                &mut record.updates,
+                &record.head,
+                &obs.head,
+                &obs.commit,
+                observed_ms,
+            ) {
+                bump_activity(&mut record.activity_at, at);
+            }
             if obs.head.is_some() {
                 record.head = obs.head.clone();
             }
@@ -1443,15 +1813,40 @@ impl Store {
                         record.continuity_evidence = continuity;
                         changed = true;
                     }
+                    let mut newest = commit_update(
+                        &mut record.updates,
+                        &record.head,
+                        &obs.head,
+                        &obs.commit,
+                        observed_ms,
+                    );
                     if obs.head.is_some() && record.head != obs.head {
                         record.head = obs.head.clone();
                         changed = true;
                     }
+                    newest = newest.max(working_tree_update(
+                        &mut record.updates,
+                        &record.inputs.working_tree,
+                        &obs.inputs.working_tree,
+                        observed_ms,
+                    ));
                     // A changed proven fingerprint is a transition; first
                     // observation never lands here. A newly proven field
                     // is stored without dating anything.
-                    if obs.inputs.transitions_from(&record.inputs) {
-                        record.activity_at = Some(observed_ms);
+                    let reasons = obs.inputs.transitions_from(&record.inputs);
+                    if !reasons.is_empty() {
+                        append_update(
+                            &mut record.updates,
+                            UpdateEvent {
+                                source: UpdateSource::Lifecycle,
+                                at_ms: observed_ms,
+                                reasons,
+                            },
+                        );
+                        newest = newest.max(Some(observed_ms));
+                    }
+                    if let Some(at) = newest {
+                        bump_activity(&mut record.activity_at, at);
                         changed = true;
                     }
                     let inputs = obs.inputs.over(&record.inputs);
@@ -1615,12 +2010,40 @@ impl Store {
         match work.paths.get_mut(path) {
             Some(record) => {
                 // A record written before it carried its repo adopts it.
-                if record.repo.as_deref() != Some(repo) {
+                // A project space names only itself - where a repository
+                // already claimed the record, the space does not displace
+                // it; a repo always reasserts its own claim.
+                if record.repo.as_deref() != Some(repo) && (repo != path || record.repo.is_none()) {
                     record.repo = Some(repo.to_owned());
                     changed = true;
                 }
-                if inputs.transitions_from(&record.inputs) {
-                    record.activity_at = Some(observed_ms);
+                let mut newest = commit_update(
+                    &mut record.updates,
+                    &record.inputs.head,
+                    &inputs.head,
+                    &inputs.commit,
+                    observed_ms,
+                );
+                newest = newest.max(working_tree_update(
+                    &mut record.updates,
+                    &record.inputs.working_tree,
+                    &inputs.working_tree,
+                    observed_ms,
+                ));
+                let reasons = inputs.transitions_from(&record.inputs);
+                if !reasons.is_empty() {
+                    append_update(
+                        &mut record.updates,
+                        UpdateEvent {
+                            source: UpdateSource::Lifecycle,
+                            at_ms: observed_ms,
+                            reasons,
+                        },
+                    );
+                    newest = newest.max(Some(observed_ms));
+                }
+                if let Some(at) = newest {
+                    bump_activity(&mut record.activity_at, at);
                     changed = true;
                 }
                 let inputs = inputs.over(&record.inputs);
@@ -1630,6 +2053,18 @@ impl Store {
                 }
             }
             None => {
+                let mut updates = Vec::new();
+                let reasons = first_observation(inputs);
+                if !reasons.is_empty() {
+                    append_update(
+                        &mut updates,
+                        UpdateEvent {
+                            source: UpdateSource::Lifecycle,
+                            at_ms: observed_ms,
+                            reasons,
+                        },
+                    );
+                }
                 work.paths.insert(
                     path.to_owned(),
                     PathRecord {
@@ -1637,10 +2072,46 @@ impl Store {
                         parked: false,
                         activity_at: None,
                         inputs: inputs.clone(),
+                        updates,
+                        session_activity: BTreeMap::new(),
                     },
                 );
                 changed = true;
             }
+        }
+        if changed {
+            self.write_work(&work)?; // coverage: off - the error edge needs the atomic write to fail
+        }
+        Ok(())
+    }
+
+    pub fn sync_session_updates(&self, updates: &[SessionUpdate]) -> io::Result<()> {
+        if updates.is_empty() || !self.dir.join(WORK).exists() {
+            return Ok(());
+        }
+        let _lock = Lock::acquire(&self.dir.join(LOCK))?; // coverage: off - the error edge needs a filesystem fault
+        let mut work = self.read_work_for_update()?; // coverage: off - the error edge needs an unreadable work.json
+        let mut changed = false;
+        for update in updates {
+            let applied = match &update.identity {
+                UpdateIdentity::Branch(id) => work.branches.get_mut(id).map(|record| {
+                    session_update(
+                        &mut record.updates,
+                        &mut record.session_activity,
+                        &mut record.activity_at,
+                        update,
+                    )
+                }),
+                UpdateIdentity::Path(path) => work.paths.get_mut(path).map(|record| {
+                    session_update(
+                        &mut record.updates,
+                        &mut record.session_activity,
+                        &mut record.activity_at,
+                        update,
+                    )
+                }),
+            };
+            changed |= applied.unwrap_or(false);
         }
         if changed {
             self.write_work(&work)?; // coverage: off - the error edge needs the atomic write to fail
@@ -3073,6 +3544,7 @@ mod tests {
             creation: None,
             renamed_from: None,
             rewritten: false,
+            commit: None,
             inputs: LifecycleInputs {
                 dirty: Some(dirty),
                 ..LifecycleInputs::default()
@@ -3163,6 +3635,7 @@ mod tests {
                         creation: None,
                         renamed_from: None,
                         rewritten: false,
+                        commit: None,
                         inputs: inputs.clone(),
                     }],
                     at,
@@ -3218,6 +3691,7 @@ mod tests {
                         creation: None,
                         renamed_from: None,
                         rewritten: false,
+                        commit: None,
                         inputs: inputs.clone(),
                     }],
                     at,
@@ -3265,6 +3739,27 @@ mod tests {
         let record = &store.load().work.paths["/wt"];
         assert_eq!(record.repo.as_deref(), Some("/r/.git"));
         assert_eq!(record.activity_at, None);
+        // A project-space sync names only itself: a repo-less record
+        // adopts it, but where a repo already claimed the record the
+        // space displaces nothing.
+        let mut work = store.load().work;
+        work.paths.get_mut("/wt").unwrap().repo = None;
+        store.write_work(&work).unwrap();
+        store
+            .sync_path("/wt", "/wt", &LifecycleInputs::default(), 3_000)
+            .unwrap();
+        assert_eq!(store.load().work.paths["/wt"].repo.as_deref(), Some("/wt"));
+        store
+            .sync_path("/wt", "/r/.git", &LifecycleInputs::default(), 4_000)
+            .unwrap();
+        store
+            .sync_path("/wt", "/wt", &LifecycleInputs::default(), 5_000)
+            .unwrap();
+        assert_eq!(
+            store.load().work.paths["/wt"].repo.as_deref(),
+            Some("/r/.git"),
+            "the space did not displace the repo's claim"
+        );
     }
 
     #[test]
@@ -3650,5 +4145,565 @@ mod tests {
             reasons.iter().any(|r| r.contains("already seen")),
             "{reasons:?}"
         );
+    }
+
+    fn obs_with_inputs(head: Option<&str>, inputs: LifecycleInputs) -> ObservedRef {
+        ObservedRef {
+            name: "feat".to_owned(),
+            head: head.map(str::to_owned),
+            creation: None,
+            renamed_from: None,
+            rewritten: false,
+            commit: head.map(|sha| ObservedCommit {
+                sha: sha.to_owned(),
+                subject: Some("landed subject".to_owned()),
+                at_ms: Some(7_777),
+            }),
+            inputs,
+        }
+    }
+
+    #[test]
+    fn first_observation_dates_the_find_and_seeds_every_other_source() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        store
+            .sync_repo(
+                repo,
+                &[obs_with_inputs(
+                    Some("aaaaaaabbbbbbbb"),
+                    LifecycleInputs {
+                        dirty: Some(true),
+                        worktree: Some(true),
+                        worktree_state: Some("healthy".to_owned()),
+                        working_tree: Some(WorkingTreeSnapshot {
+                            fingerprint: "ab".to_owned(),
+                            reasons: vec!["modified a.rs".to_owned()],
+                        }),
+                        ..LifecycleInputs::default()
+                    },
+                )],
+                1_000,
+            )
+            .unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("active");
+        assert_eq!(
+            record.updates,
+            vec![UpdateEvent {
+                source: UpdateSource::Lifecycle,
+                at_ms: 1_000,
+                reasons: vec!["worktree found".to_owned()],
+            }],
+            "first detection of the worktree dates the event"
+        );
+        assert_eq!(record.activity_at, None, "the find is no work activity");
+        let stamp = fs::metadata(temp.path(WORK)).unwrap().modified().unwrap();
+        store
+            .sync_repo(
+                repo,
+                &[obs_with_inputs(
+                    Some("aaaaaaabbbbbbbb"),
+                    LifecycleInputs {
+                        dirty: Some(true),
+                        worktree: Some(true),
+                        worktree_state: Some("healthy".to_owned()),
+                        working_tree: Some(WorkingTreeSnapshot {
+                            fingerprint: "ab".to_owned(),
+                            reasons: vec!["modified a.rs".to_owned()],
+                        }),
+                        ..LifecycleInputs::default()
+                    },
+                )],
+                2_000,
+            )
+            .unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("active");
+        assert_eq!(
+            record.updates.len(),
+            1,
+            "an unchanged poll appends nothing past the find event"
+        );
+        assert_eq!(
+            fs::metadata(temp.path(WORK)).unwrap().modified().unwrap(),
+            stamp,
+            "an unchanged poll writes nothing"
+        );
+    }
+
+    #[test]
+    fn each_changed_source_lands_its_own_event() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        let inputs = |dirty: bool, fingerprint: &str, state: &str| LifecycleInputs {
+            dirty: Some(dirty),
+            worktree: Some(true),
+            worktree_state: Some(state.to_owned()),
+            working_tree: Some(WorkingTreeSnapshot {
+                fingerprint: fingerprint.to_owned(),
+                reasons: vec![format!("modified {fingerprint}.rs")],
+            }),
+            ..LifecycleInputs::default()
+        };
+        store
+            .sync_repo(
+                repo,
+                &[obs_with_inputs(
+                    Some("aaaaaaabbbbbbbb"),
+                    inputs(true, "aa", "healthy"),
+                )],
+                1_000,
+            )
+            .unwrap();
+        store
+            .sync_repo(
+                repo,
+                &[obs_with_inputs(
+                    Some("bbbbbbbbcccccccc"),
+                    inputs(true, "bb", "broken: .git missing"),
+                )],
+                2_000,
+            )
+            .unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("active");
+        assert_eq!(
+            record.updates,
+            vec![
+                UpdateEvent {
+                    source: UpdateSource::Lifecycle,
+                    at_ms: 1_000,
+                    reasons: vec!["worktree found".to_owned()],
+                },
+                UpdateEvent {
+                    source: UpdateSource::WorkingTree,
+                    at_ms: 2_000,
+                    reasons: vec!["modified bb.rs".to_owned()],
+                },
+                UpdateEvent {
+                    source: UpdateSource::Lifecycle,
+                    at_ms: 2_000,
+                    reasons: vec!["worktree state: healthy -> broken: .git missing".to_owned()],
+                },
+                UpdateEvent {
+                    source: UpdateSource::Commit,
+                    at_ms: 7_777,
+                    reasons: vec!["bbbbbbb landed subject".to_owned()],
+                },
+            ]
+        );
+        assert_eq!(record.activity_at, Some(7_777));
+        store
+            .sync_repo(
+                repo,
+                &[obs_with_inputs(
+                    Some("bbbbbbbbcccccccc"),
+                    inputs(true, "bb", "broken: .git missing"),
+                )],
+                3_000,
+            )
+            .unwrap();
+        let work = store.load().work;
+        assert_eq!(
+            work.branch(repo, "feat").expect("active").updates.len(),
+            4,
+            "unchanged polls append no duplicate"
+        );
+    }
+
+    #[test]
+    fn a_path_record_drives_the_same_events_from_its_inputs() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let path = "/repos/detached";
+        let inputs = |head: &str, fingerprint: &str| LifecycleInputs {
+            worktree: Some(true),
+            head: Some(head.to_owned()),
+            commit: Some(ObservedCommit {
+                sha: head.to_owned(),
+                subject: None,
+                at_ms: None,
+            }),
+            working_tree: Some(WorkingTreeSnapshot {
+                fingerprint: fingerprint.to_owned(),
+                reasons: vec![format!("modified {fingerprint}.rs")],
+            }),
+            ..LifecycleInputs::default()
+        };
+        store
+            .sync_path(path, path, &inputs("aaaaaaa1", "aa"), 1_000)
+            .unwrap();
+        store
+            .sync_path(path, path, &inputs("bbbbbbb2", "bb"), 2_000)
+            .unwrap();
+        let work = store.load().work;
+        let record = work.path(path).expect("the record");
+        assert_eq!(
+            record.updates,
+            vec![
+                UpdateEvent {
+                    source: UpdateSource::Lifecycle,
+                    at_ms: 1_000,
+                    reasons: vec!["worktree found".to_owned()],
+                },
+                UpdateEvent {
+                    source: UpdateSource::Commit,
+                    at_ms: 2_000,
+                    reasons: vec!["bbbbbbb".to_owned()],
+                },
+                UpdateEvent {
+                    source: UpdateSource::WorkingTree,
+                    at_ms: 2_000,
+                    reasons: vec!["modified bb.rs".to_owned()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn append_update_dedupes_orders_and_retains_per_source() {
+        let mut updates = Vec::new();
+        let event = |source: UpdateSource, at_ms: u64, reason: &str| UpdateEvent {
+            source,
+            at_ms,
+            reasons: vec![reason.to_owned()],
+        };
+        let commit = event(UpdateSource::Commit, 5_000, "c");
+        assert!(append_update(&mut updates, commit.clone()));
+        assert!(!append_update(&mut updates, commit));
+        assert_eq!(updates.len(), 1);
+        assert!(append_update(
+            &mut updates,
+            event(UpdateSource::Session, 1_000, "s")
+        ));
+        assert_eq!(updates[0].source, UpdateSource::Session);
+        for i in 0..101u64 {
+            append_update(
+                &mut updates,
+                event(UpdateSource::Commit, 10_000 + i, &format!("c{i}")),
+            );
+            append_update(
+                &mut updates,
+                event(UpdateSource::WorkingTree, 10_000 + i, &format!("w{i}")),
+            );
+        }
+        let commits = updates
+            .iter()
+            .filter(|e| e.source == UpdateSource::Commit)
+            .count();
+        let trees = updates
+            .iter()
+            .filter(|e| e.source == UpdateSource::WorkingTree)
+            .count();
+        assert_eq!(commits, UPDATE_RETAIN_PER_SOURCE);
+        assert_eq!(trees, UPDATE_RETAIN_PER_SOURCE);
+        assert!(
+            updates
+                .iter()
+                .any(|e| e.source == UpdateSource::Commit && e.at_ms == 10_100),
+            "the newest commit survives"
+        );
+        assert!(
+            !updates
+                .iter()
+                .any(|e| e.source == UpdateSource::Commit && e.at_ms == 5_000),
+            "the oldest commit ages out"
+        );
+    }
+
+    #[test]
+    fn a_lifecycle_transition_names_every_changed_field() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        let inputs = |worktree: bool,
+                      path: &str,
+                      admin: &str,
+                      dirty: bool,
+                      ahead: u64,
+                      behind: u64,
+                      unpushed: u64,
+                      upstream: &str,
+                      landed: &str,
+                      forge: &str,
+                      pipeline: &str,
+                      state: &str| {
+            LifecycleInputs {
+                dirty: Some(dirty),
+                worktree: Some(worktree),
+                worktree_path: Some(path.to_owned()),
+                admin_id: Some(admin.to_owned()),
+                ahead: Some(ahead),
+                behind: Some(behind),
+                unpushed: Some(unpushed),
+                upstream: Some(upstream.to_owned()),
+                landed: Some(landed.to_owned()),
+                forge: Some(forge.to_owned()),
+                pipeline: Some(pipeline.to_owned()),
+                worktree_state: Some(state.to_owned()),
+                ..LifecycleInputs::default()
+            }
+        };
+        let first = |inputs: LifecycleInputs, at: u64| {
+            let mut o = obs("feat", false);
+            o.inputs = inputs;
+            store.sync_repo(repo, &[o], at)
+        };
+        first(
+            inputs(
+                true,
+                "/a",
+                "a1",
+                false,
+                1,
+                0,
+                2,
+                "tracked origin/feat",
+                "no",
+                "open",
+                "success",
+                "healthy",
+            ),
+            1_000,
+        )
+        .unwrap();
+        first(
+            inputs(
+                false,
+                "/b",
+                "a2",
+                true,
+                3,
+                1,
+                0,
+                "gone",
+                "merged",
+                "merged",
+                "failed",
+                "broken: missing",
+            ),
+            2_000,
+        )
+        .unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("the record");
+        assert_eq!(
+            record.updates,
+            vec![
+                UpdateEvent {
+                    source: UpdateSource::Lifecycle,
+                    at_ms: 1_000,
+                    reasons: vec!["worktree found".to_owned()],
+                },
+                UpdateEvent {
+                    source: UpdateSource::Lifecycle,
+                    at_ms: 2_000,
+                    reasons: vec![
+                        "worktree gone".to_owned(),
+                        "path: /a -> /b".to_owned(),
+                        "admin id: a1 -> a2".to_owned(),
+                        "dirty: clean -> dirty".to_owned(),
+                        "ahead: 1 -> 3".to_owned(),
+                        "behind: 0 -> 1".to_owned(),
+                        "unpushed: 2 -> 0".to_owned(),
+                        "upstream: tracked origin/feat -> gone".to_owned(),
+                        "landed: no -> merged".to_owned(),
+                        "forge: open -> merged".to_owned(),
+                        "pipeline: success -> failed".to_owned(),
+                        "worktree state: healthy -> broken: missing".to_owned(),
+                    ],
+                },
+            ]
+        );
+        assert_eq!(record.activity_at, Some(2_000));
+    }
+
+    #[test]
+    fn a_proven_rename_with_a_moved_tip_writes_the_commit_event() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        let mut o = obs("feat", false);
+        o.head = Some("aaaaaaa0000000".to_owned());
+        store.sync_repo(repo, &[o], 1_000).unwrap();
+        let mut renamed = obs("feat2", false);
+        renamed.head = Some("bbbbbbb1111111".to_owned());
+        renamed.renamed_from = Some("feat".to_owned());
+        store.sync_repo(repo, &[renamed], 2_000).unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat2").expect("the record");
+        assert_eq!(
+            record.updates,
+            vec![UpdateEvent {
+                source: UpdateSource::Commit,
+                at_ms: 2_000,
+                reasons: vec!["bbbbbbb".to_owned()],
+            }],
+            "a head move without commit metadata dates at the pass"
+        );
+        assert_eq!(record.activity_at, Some(2_000));
+    }
+
+    #[test]
+    fn session_updates_backfill_then_emit_once_per_newer_turn() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        store.sync_repo(repo, &[obs("feat", false)], 1_000).unwrap();
+        store
+            .sync_path("/spaces/a", "/spaces/a", &LifecycleInputs::default(), 1_000)
+            .unwrap();
+        let id = store
+            .load()
+            .work
+            .branch(repo, "feat")
+            .expect("active")
+            .id
+            .clone();
+        let absent = TempStore::new();
+        absent
+            .store()
+            .sync_session_updates(&[SessionUpdate {
+                identity: UpdateIdentity::Path("/never".to_owned()),
+                conversation: "c".to_owned(),
+                at_ms: 1,
+                reason: "r".to_owned(),
+            }])
+            .unwrap();
+        let conv = conversation_key("claude", "s1");
+        let update = |at_ms: u64, reason: &str, identity: &UpdateIdentity| SessionUpdate {
+            identity: identity.clone(),
+            conversation: conv.clone(),
+            at_ms,
+            reason: reason.to_owned(),
+        };
+        let branch = UpdateIdentity::Branch(id.clone());
+        let path = UpdateIdentity::Path("/spaces/a".to_owned());
+        store
+            .sync_session_updates(&[update(5_000, "8f423bbb old", &branch)])
+            .unwrap();
+        let work = store.load().work;
+        let record = work.branches.get(&id).expect("the record");
+        assert_eq!(record.session_activity.get(&conv), Some(&5_000));
+        assert!(record.updates.is_empty(), "backfill emits no event");
+        store
+            .sync_session_updates(&[update(6_000, "8f423bbb new", &branch)])
+            .unwrap();
+        let work = store.load().work;
+        let record = work.branches.get(&id).expect("the record");
+        assert_eq!(
+            record.updates,
+            vec![UpdateEvent {
+                source: UpdateSource::Session,
+                at_ms: 6_000,
+                reasons: vec!["8f423bbb new".to_owned()],
+            }]
+        );
+        assert_eq!(record.activity_at, Some(6_000));
+        store
+            .sync_session_updates(&[
+                update(6_000, "8f423bbb new", &branch),
+                update(5_500, "stale", &branch),
+            ])
+            .unwrap();
+        let work = store.load().work;
+        assert_eq!(
+            work.branches.get(&id).expect("the record").updates.len(),
+            1,
+            "equal or older turns append nothing"
+        );
+        let conv2 = conversation_key("claude", "s2");
+        let update2 = |at_ms: u64, reason: &str| SessionUpdate {
+            identity: path.clone(),
+            conversation: conv2.clone(),
+            at_ms,
+            reason: reason.to_owned(),
+        };
+        let conv3 = conversation_key("claude", "s3");
+        let update3 = |at_ms: u64, reason: &str| SessionUpdate {
+            identity: path.clone(),
+            conversation: conv3.clone(),
+            at_ms,
+            reason: reason.to_owned(),
+        };
+        store
+            .sync_session_updates(&[
+                update(6_500, "first", &path),
+                update2(6_500, "first"),
+                update3(6_500, "first"),
+            ])
+            .unwrap();
+        assert!(
+            store
+                .load()
+                .work
+                .path("/spaces/a")
+                .expect("the record")
+                .updates
+                .is_empty(),
+            "first observations adopt the cursor only"
+        );
+        store
+            .sync_session_updates(&[
+                update(7_000, "bbbb", &path),
+                update2(7_000, "aaaa"),
+                update3(7_000, "aaaa"),
+            ])
+            .unwrap();
+        let work = store.load().work;
+        let record = work.path("/spaces/a").expect("the record");
+        assert_eq!(
+            record.updates,
+            vec![UpdateEvent {
+                source: UpdateSource::Session,
+                at_ms: 7_000,
+                reasons: vec!["aaaa".to_owned(), "bbbb".to_owned()],
+            }],
+            "one event per identity and timestamp, reasons sorted and deduped"
+        );
+        store.sync_session_updates(&[]).unwrap();
+        store
+            .sync_session_updates(&[update(
+                9_000,
+                "gone",
+                &UpdateIdentity::Branch("nope".to_owned()),
+            )])
+            .unwrap();
+    }
+
+    #[test]
+    fn records_written_before_updates_deserialize() {
+        let temp = TempStore::new();
+        fs::create_dir_all(&temp.0).unwrap();
+        fs::write(
+            temp.path(WORK),
+            serde_json::json!({
+                "v": SCHEMA,
+                "data": {
+                    "branches": {
+                        "i1": {
+                            "id": "i1",
+                            "repo": "/r/.git",
+                            "ref_name": "feat",
+                            "first_observed_at": 1,
+                            "last_observed_at": 1,
+                            "continuity_evidence": "first_observation"
+                        }
+                    },
+                    "paths": {"/p": {}}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (work, errors) = temp.store().work();
+        assert!(errors.is_empty(), "{errors:?}");
+        let record = work.branches.get("i1").expect("the record");
+        assert!(record.updates.is_empty());
+        assert!(record.session_activity.is_empty());
+        assert!(work.path("/p").expect("the path").updates.is_empty());
     }
 }

@@ -207,6 +207,10 @@ fn in_dir(dir: &Path, args: &[&str]) -> Result<String, Error> {
     git(&[OsString::from("-C"), dir.as_os_str().to_owned()], args)
 }
 
+fn in_dir_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
+    git_bytes(&[OsString::from("-C"), dir.as_os_str().to_owned()], args)
+}
+
 /// `-C <repo_dir>` makes repo reads behave as if launched inside the
 /// repository: remote names, `.` remotes and relative-path remote URLs
 /// resolve against it, not against whatever directory launched the tool.
@@ -257,6 +261,7 @@ fn parse_worktrees(bytes: &[u8], common_dir: &Path) -> Vec<Worktree> {
                 main: found.is_empty(),
                 bare: false,
                 locked: false,
+                prunable: None,
             });
         } else if let Some(wt) = current.as_mut() {
             let line = String::from_utf8_lossy(field);
@@ -280,6 +285,8 @@ fn parse_worktrees(bytes: &[u8], common_dir: &Path) -> Vec<Worktree> {
                 wt.bare = true;
             } else if line.starts_with("locked") {
                 wt.locked = true;
+            } else if let Some(reason) = line.strip_prefix("prunable") {
+                wt.prunable = Some(reason.trim().to_owned());
             }
         } // coverage: off - porcelain fields only follow a worktree record
     }
@@ -321,6 +328,7 @@ pub struct Worktree {
     pub main: bool,
     pub bare: bool,
     pub locked: bool,
+    pub prunable: Option<String>,
 }
 
 /// The resolved meaning of an input path.
@@ -798,9 +806,26 @@ impl Repo {
     /// untracked changes, so configuration hiding untracked files cannot make
     /// a dirty tree look disposable. // coverage: off - the unexecuted instantiation's region edge
     #[rustfmt::skip]
+    pub fn status(&self, checkout: &Path) -> Evidence<Vec<u8>> {
+        match in_dir_bytes(checkout, &["status", "--porcelain=v1", "-z", "--untracked-files=all"]) {
+            Ok(bytes) => Evidence::Known(bytes),
+            Err(e) => Evidence::Unknown(format!("git status: {e}")),
+        }
+    }
+
+    #[rustfmt::skip]
     pub fn dirty(&self, checkout: &Path) -> Evidence<bool> {
-        match in_dir(checkout, &["status", "--porcelain", "--untracked-files=all"]) { // coverage: off - the unexecuted instantiation's region edge
-            Ok(text) => Evidence::Known(!text.trim().is_empty()),
+        self.status(checkout).map(|bytes| !bytes.is_empty())
+    }
+
+    #[rustfmt::skip]
+    pub fn admin_status(&self, admin_id: &str, checkout: &Path) -> Evidence<Vec<u8>> {
+        let gitdir = self.common_dir.join("worktrees").join(admin_id);
+        match git_bytes(
+            &admin_globals(&gitdir, checkout),
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        ) {
+            Ok(bytes) => Evidence::Known(bytes),
             Err(e) => Evidence::Unknown(format!("git status: {e}")),
         }
     }
@@ -1080,7 +1105,7 @@ fn parse_track(field: &str) -> Option<Track> {
 fn admin_id(path: &Path, common_dir: &Path) -> Option<String> {
     let dotgit = path.join(".git");
     if !dotgit.is_file() {
-        return None;
+        return admin_id_retained(path, common_dir);
     }
     let text = fs::read_to_string(&dotgit).ok()?;
     let target = text.trim().strip_prefix("gitdir:")?.trim();
@@ -1089,6 +1114,116 @@ fn admin_id(path: &Path, common_dir: &Path) -> Option<String> {
         admin.file_name().map(|n| n.to_string_lossy().into_owned())
     } else {
         None
+    }
+}
+
+fn admin_id_retained(path: &Path, common_dir: &Path) -> Option<String> {
+    let want = path.join(".git");
+    let mut found = None;
+    for entry in fs::read_dir(common_dir.join("worktrees")).ok()?.flatten() {
+        let admin = entry.path();
+        if !admin.is_dir() {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let target = Path::new(text.trim());
+        let same = target == want
+            || (target.file_name() == Some(std::ffi::OsStr::new(".git"))
+                && target
+                    .parent()
+                    .is_some_and(|p| p.canonicalize().as_deref().ok() == Some(path)));
+        if !same {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = admin.file_name().map(|n| n.to_string_lossy().into_owned());
+    }
+    found
+}
+
+pub struct Status {
+    pub fingerprint: String,
+    pub reasons: Vec<String>,
+}
+
+pub fn status(bytes: &[u8], root: &Path) -> Status {
+    let mut reasons = Vec::new();
+    let mut material = bytes.to_vec();
+    let mut records = bytes.split(|b| *b == 0);
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+        let (x, y) = (record[0], record[1]);
+        let path = &record[3..];
+        let text = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+        if x == b'!' {
+            continue;
+        }
+        fingerprint_path(&mut material, root, path);
+        if x == b'?' {
+            reasons.push(format!("untracked {}", text(path)));
+        } else if x == b'R' || y == b'R' || x == b'C' || y == b'C' {
+            let verb = if x == b'R' || y == b'R' {
+                "renamed"
+            } else {
+                "copied"
+            };
+            let old = records.next().unwrap_or_default();
+            if !old.is_empty() {
+                fingerprint_path(&mut material, root, old);
+            }
+            reasons.push(format!("{verb} {} -> {}", text(old), text(path)));
+        } else if x == b'A' || y == b'A' {
+            reasons.push(format!("added {}", text(path)));
+        } else if x == b'D' || y == b'D' {
+            reasons.push(format!("deleted {}", text(path)));
+        } else {
+            reasons.push(format!("modified {}", text(path)));
+        }
+    }
+    reasons.sort_unstable();
+    reasons.dedup();
+    if reasons.len() > 10 {
+        let more = reasons.len() - 10;
+        reasons.truncate(10);
+        reasons.push(format!("{more} more changes"));
+    }
+    if reasons.is_empty() {
+        reasons.push("working tree clean".to_owned());
+    }
+    Status {
+        fingerprint: material.iter().map(|b| format!("{b:02x}")).collect(),
+        reasons,
+    }
+}
+
+fn admin_globals(gitdir: &Path, checkout: &Path) -> [OsString; 2] {
+    let mut gitdir_arg = OsString::from("--git-dir=");
+    gitdir_arg.push(gitdir.as_os_str());
+    let mut worktree_arg = OsString::from("--work-tree=");
+    worktree_arg.push(checkout.as_os_str());
+    [gitdir_arg, worktree_arg]
+}
+
+fn fingerprint_path(out: &mut Vec<u8>, root: &Path, raw: &[u8]) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    out.push(0);
+    out.extend_from_slice(raw);
+    match fs::symlink_metadata(root.join(std::ffi::OsStr::from_bytes(raw))) {
+        Ok(meta) => {
+            out.push(1);
+            out.extend_from_slice(&meta.mode().to_be_bytes());
+            out.extend_from_slice(&meta.size().to_be_bytes());
+            out.extend_from_slice(&meta.mtime().to_be_bytes());
+            out.extend_from_slice(&meta.mtime_nsec().to_be_bytes());
+        }
+        Err(_) => out.push(0),
     }
 }
 
@@ -1241,15 +1376,25 @@ mod tests {
             b"worktree /tmp/main\nrepo\0HEAD deadbeef\0branch refs/heads/main\0\0",
         );
         bytes.extend_from_slice(b"worktree /tmp/wt-\xff x\0HEAD cafef00d\0detached\0\0");
+        bytes.extend_from_slice(
+            b"worktree /tmp/gone\0HEAD bee5dead\0branch refs/heads/lost\0prunable gitdir file points to non-existent location\0\0",
+        );
         let found = parse_worktrees(&bytes, Path::new("/tmp/.git"));
 
-        assert_eq!(found.len(), 2);
+        assert_eq!(found.len(), 3);
         assert!(found[0].main);
         assert_eq!(found[0].path.as_os_str().as_bytes(), b"/tmp/main\nrepo");
         assert_eq!(found[0].head, Head::Branch("main".to_owned()));
+        assert_eq!(found[0].prunable, None);
         assert!(!found[1].main);
         assert_eq!(found[1].path.as_os_str().as_bytes(), b"/tmp/wt-\xff x");
         assert_eq!(found[1].head, Head::Detached("cafef00d".to_owned()));
+        assert_eq!(found[1].prunable, None);
+        assert_eq!(found[2].head, Head::Branch("lost".to_owned()));
+        assert_eq!(
+            found[2].prunable.as_deref(),
+            Some("gitdir file points to non-existent location")
+        );
     }
 
     /// `check_argv` without inlining, so its unfired arms stay in their own
@@ -1550,6 +1695,105 @@ mod tests {
             assert_eq!(admin_id(&unreadable, &common), None);
             fs::set_permissions(&dotgit, fs::Permissions::from_mode(0o644)).unwrap();
         }
+    }
+
+    #[test]
+    fn the_admin_id_falls_back_to_the_retained_gitdir_files() {
+        let temp = Temp::new();
+        let common = temp.0.join("repo").join(".git");
+        let admin = common.join("worktrees").join("wt1");
+        let linked = temp.0.join("linked");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(admin_id(&linked, &common).as_deref(), Some("wt1"));
+
+        let admin2 = common.join("worktrees").join("wt2");
+        fs::create_dir_all(&admin2).unwrap();
+        fs::write(
+            admin2.join("gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(admin_id(&linked, &common), None);
+        fs::remove_dir_all(&admin2).unwrap();
+
+        let other = temp.0.join("other");
+        fs::create_dir_all(&other).unwrap();
+        assert_eq!(admin_id(&other, &common), None);
+        let admin3 = common.join("worktrees").join("wt3");
+        fs::create_dir_all(&admin3).unwrap();
+        fs::write(admin3.join("gitdir"), "/plain/dir\n").unwrap();
+        assert_eq!(admin_id(&other, &common), None);
+        fs::write(common.join("worktrees").join("stray"), "x").unwrap();
+        assert_eq!(admin_id(&other, &common), None);
+
+        let gone = temp.0.join("gone-checkout");
+        fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", gone.join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(admin_id(&gone, &common).as_deref(), Some("wt1"));
+
+        let bare = temp.0.join("bare");
+        fs::create_dir_all(&bare).unwrap();
+        assert_eq!(admin_id(&bare, &common.join("elsewhere")), None);
+    }
+
+    #[test]
+    fn a_prunable_worktree_reads_dirty_through_its_admin_dir() {
+        let temp = Temp::new();
+        let dir = temp.0.join("repo");
+        git_ok(&temp.0, &["init", dir.to_str().unwrap()]);
+        fs::write(dir.join("f.txt"), "x").unwrap();
+        git_ok(&dir, &["add", "f.txt"]);
+        git_ok(&dir, &["commit", "-qm", "c"]);
+        let linked = temp.0.join("linked");
+        git_ok(
+            &dir,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+        fs::write(linked.join("untracked.txt"), "new").unwrap();
+        fs::remove_file(linked.join(".git")).unwrap();
+        let repo = Repo::discover(&dir).unwrap().expect("a repo");
+
+        let worktrees = repo.worktrees().unwrap();
+        let wt = worktrees
+            .iter()
+            .find(|w| w.path == linked)
+            .expect("the linked worktree is still listed");
+        assert!(wt.prunable.is_some(), "{:?}", wt.prunable);
+        let id = wt
+            .admin_id
+            .as_deref()
+            .expect("the retained admin dir resolves");
+        let status = repo.admin_status(id, &linked);
+        assert!(status.is_known(), "{status:?}");
+        assert!(!status.known().expect("known").is_empty(), "dirty shows");
+        assert!(!repo.dirty(&linked).is_known());
+    }
+
+    #[test]
+    fn admin_status_globals_preserve_non_utf8_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let checkout = Path::new(OsStr::from_bytes(b"co\xffwt"));
+        let [gitdir_arg, worktree_arg] = admin_globals(Path::new("/common/worktrees/id"), checkout);
+        assert_eq!(
+            gitdir_arg.as_os_str().as_bytes(),
+            b"--git-dir=/common/worktrees/id"
+        );
+        assert_eq!(
+            worktree_arg.as_os_str().as_bytes(),
+            b"--work-tree=co\xffwt",
+            "a lossy display() would smuggle in a replacement character"
+        );
     }
 
     #[test]
@@ -1855,5 +2099,134 @@ mod tests {
         assert!(!counts.contains_key("bad"));
         assert!(!counts.contains_key("origin/main"));
         assert_eq!(counts.len(), 2);
+    }
+
+    #[test]
+    fn status_parses_every_porcelain_record_shape() {
+        let s = status(
+            b" M src/a.rs\0D  gone.txt\0?? new file.txt\0A  staged.rs\0R  new name.txt\0old name.txt\0C  copy.rs\0orig.rs\0!! ignored.log\0R  orphan.txt",
+            Path::new("/missing"),
+        );
+        assert_eq!(
+            s.reasons,
+            [
+                "added staged.rs",
+                "copied orig.rs -> copy.rs",
+                "deleted gone.txt",
+                "modified src/a.rs",
+                "renamed  -> orphan.txt",
+                "renamed old name.txt -> new name.txt",
+                "untracked new file.txt",
+            ]
+        );
+        assert!(
+            s.fingerprint
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
+        let clean = status(b"", Path::new("/missing"));
+        assert_eq!(clean.reasons, ["working tree clean"]);
+        assert_eq!(clean.fingerprint, "");
+    }
+
+    #[test]
+    fn a_status_named_source_path_is_still_the_rename_origin() {
+        let s = status(
+            b"R  new.txt\0 M old.txt\0C  copy.txt\0A  orig.txt\0 M plain.rs\0",
+            Path::new("/missing"),
+        );
+        assert_eq!(
+            s.reasons,
+            [
+                "copied A  orig.txt -> copy.txt",
+                "modified plain.rs",
+                "renamed  M old.txt -> new.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn status_fingerprints_metadata_past_identical_porcelain() {
+        let temp = Temp::new();
+        let dir = temp.0.join("wt");
+        fs::create_dir(&dir).unwrap();
+        let tracked = dir.join("a.txt");
+        fs::write(&tracked, "12345").unwrap();
+        let bytes = b" M a.txt\0";
+        let first = status(bytes, &dir).fingerprint;
+        fs::write(&tracked, "67890").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&tracked)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        assert_ne!(
+            status(bytes, &dir).fingerprint,
+            first,
+            "identical porcelain over a re-edited file must re-fingerprint"
+        );
+
+        let untracked = dir.join("loose.txt");
+        fs::write(&untracked, "x").unwrap();
+        let bytes = b"?? loose.txt\0";
+        let first = status(bytes, &dir).fingerprint;
+        fs::write(&untracked, "y").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&untracked)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(120))
+            .unwrap();
+        assert_ne!(status(bytes, &dir).fingerprint, first);
+
+        let bytes = b" D gone.txt\0";
+        assert_eq!(
+            status(bytes, &dir).fingerprint,
+            status(bytes, &dir).fingerprint,
+            "a missing path fingerprints deterministically"
+        );
+    }
+
+    #[test]
+    fn status_fingerprints_the_exact_bytes_past_utf8() {
+        let utf8 = status("?? caf\u{e9}.txt\0".as_bytes(), Path::new("/missing"));
+        let latin = status(b"?? caf\xe9.txt\0", Path::new("/missing"));
+        assert_ne!(utf8.fingerprint, latin.fingerprint);
+        assert_eq!(latin.reasons, ["untracked caf\u{fffd}.txt"]);
+        assert_ne!(
+            status(b"?? a.txt\0", Path::new("/missing")).fingerprint,
+            status(b"?? b.txt\0", Path::new("/missing")).fingerprint
+        );
+        assert_eq!(
+            status(b"?? a.txt\0", Path::new("/missing")).fingerprint,
+            status(b"?? a.txt\0", Path::new("/missing")).fingerprint
+        );
+    }
+
+    #[test]
+    fn status_caps_reasons_and_counts_the_rest() {
+        let mut bytes = Vec::new();
+        for i in 0..12u8 {
+            bytes.extend_from_slice(format!("?? f{i:02}.txt\0").as_bytes());
+        }
+        let s = status(&bytes, Path::new("/missing"));
+        assert_eq!(s.reasons.len(), 11, "{:?}", s.reasons);
+        assert_eq!(s.reasons[10], "2 more changes");
+        assert!(s.fingerprint.len() > bytes.len() * 2);
+    }
+
+    #[test]
+    fn status_reports_a_healthy_worktrees_porcelain_bytes() {
+        let temp = Temp::new();
+        let dir = temp.0.join("repo");
+        git_ok(&temp.0, &["init", dir.to_str().unwrap()]);
+        fs::write(dir.join("dirty file.txt"), "x").unwrap();
+        let repo = Repo::discover(&dir).unwrap().expect("a repo");
+        let bytes = repo.status(&dir);
+        let bytes = bytes.known().expect("status");
+        assert_eq!(status(bytes, &dir).reasons, ["untracked dirty file.txt"]);
+        assert_eq!(repo.dirty(&dir), Evidence::Known(true));
+        assert!(repo.status(&dir.join("missing")).known().is_none());
     }
 }
