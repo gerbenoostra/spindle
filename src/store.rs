@@ -39,7 +39,12 @@ use crate::provider::SourceError;
 
 /// The record schema this build reads and writes. `0` - an unversioned
 /// record from before the field existed - reads as the previous schema.
-pub const SCHEMA: u32 = 1;
+/// v1 -> v2: records gained `updates`, session cursors and per-anchor
+/// probes (`git_dir`, `worktree_state`, `head`, `commit`, `working_tree`,
+/// `behind`), and `worktree` turned into a proven-or-`None` tri-state - a
+/// v1 build rewrites the file without all of that, so its writes must
+/// refuse rather than clobber what it cannot read.
+pub const SCHEMA: u32 = 2;
 
 /// Compact once the journal's un-checkpointed tail passes this many
 /// records: enough that a busy day never rewrites, small enough that a
