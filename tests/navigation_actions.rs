@@ -827,12 +827,17 @@ fn exec_resume_chdirs_acks_then_execs() {
     let store_dir = dir.join("state");
     let store = Store::open(store_dir.clone());
     let key = store::conversation_key("claude", STOPPED_ID);
-    let _restore = RestoreCwd(std::env::current_dir().expect("a cwd"));
+    let launch = std::env::current_dir().expect("a cwd");
+    let _restore = RestoreCwd(launch.clone());
+    let exe = stub(&dir, "claude", "");
+    let argv = vec![OsString::from("--resume"), OsString::from(STOPPED_ID)];
+    let cwd_is = |dir: &Path| assert_eq!(std::env::current_dir().expect("a cwd"), dir);
 
-    // A missing work root fails before anything is recorded.
+    // A missing work root fails before anything moves - nothing
+    // recorded, cwd untouched.
     let plan = ResumePlan {
-        executable: OsString::from("claude"),
-        argv: vec![OsString::from("--resume"), OsString::from(STOPPED_ID)],
+        executable: exe.clone().into_os_string(),
+        argv: argv.clone(),
         cwd: dir.join("missing"),
         acknowledgement: Some((key.clone(), 3, Some(7))),
     };
@@ -840,18 +845,46 @@ fn exec_resume_chdirs_acks_then_execs() {
         exec_resume_err(&plan, Some(&store)).contains("cannot enter"),
         "a missing root refuses"
     );
+    cwd_is(&launch);
     assert!(Store::open(store_dir.clone()).load().seen.is_empty());
 
-    // Preflight passed: the ack lands, then exec fails on the missing
-    // executable - exactly the ordering `space` would want too.
+    // An executable that is missing or not runnable fails preflight:
+    // before the acknowledgement, and with the dashboard's cwd restored.
+    let no_exec = dir.join("claude-not-executable");
+    fs::write(&no_exec, "#!/bin/sh\nexit 0\n").expect("a regular file");
+    for executable in [
+        dir.join("missing-exe").into_os_string(),
+        no_exec.clone().into_os_string(),
+    ] {
+        let plan = ResumePlan {
+            executable,
+            argv: argv.clone(),
+            cwd: dir.path().to_path_buf(),
+            acknowledgement: Some((key.clone(), 3, Some(7))),
+        };
+        let err = exec_resume_err(&plan, Some(&store));
+        assert!(err.contains("not executable"), "{err}");
+        cwd_is(&launch);
+        assert!(
+            Store::open(store_dir.clone()).load().seen.is_empty(),
+            "a preflight failure preserves seen-state"
+        );
+    }
+
+    // The one refusal preflight cannot rule out is execve's own - here
+    // E2BIG, an argv the kernel cannot carry (ENOEXEC would shell
+    // fallback and replace this test process instead of erroring). By
+    // then the acknowledgement has landed; the failure still reports
+    // and restores the cwd - it cannot un-write the ack.
     let plan = ResumePlan {
-        executable: dir.join("missing-exe").into_os_string(),
-        argv: vec![OsString::from("--resume"), OsString::from(STOPPED_ID)],
+        executable: exe.clone().into_os_string(),
+        argv: vec![OsString::from("x".repeat(2 * 1024 * 1024))],
         cwd: dir.path().to_path_buf(),
         acknowledgement: Some((key.clone(), 3, Some(7))),
     };
     let err = exec_resume_err(&plan, Some(&store));
-    assert!(err.contains("missing-exe"), "{err}");
+    assert!(err.contains("claude"), "{err}");
+    cwd_is(&launch);
     let seen = Store::open(store_dir.clone()).load().seen;
     assert_eq!(
         seen.get(&key).copied(),
@@ -859,31 +892,143 @@ fn exec_resume_chdirs_acks_then_execs() {
             seq: 3,
             wait_ms: Some(7)
         }),
-        "the authored ack landed before exec: {seen:?}"
+        "the authored ack lands once preflight passes: {seen:?}"
     );
 
-    // A store that refuses the ack reports it instead of exec'ing.
+    // A store that refuses the ack reports it instead of exec'ing - and
+    // still puts the cwd back.
     let not_a_dir = dir.join("a-file");
     fs::write(&not_a_dir, "x").unwrap();
     let bad = Store::open(not_a_dir);
     let err = exec_resume_err(&plan, Some(&bad));
     assert!(err.contains("seen-state"), "{err}");
+    cwd_is(&launch);
 
-    // A plan carrying no acknowledgement skips the write entirely - the
-    // exec failure reports just the same.
+    // A plan carrying no acknowledgement - or no store - reaches exec
+    // with nothing to write and reports the same refusal.
     let quiet = ResumePlan {
         acknowledgement: None,
         ..plan.clone()
     };
     let err = exec_resume_err(&quiet, Some(&store));
-    assert!(err.contains("missing-exe"), "{err}");
+    assert!(err.contains("claude"), "{err}");
+    cwd_is(&launch);
     let err = exec_resume_err(&plan, None);
-    assert!(err.contains("missing-exe"), "{err}");
+    assert!(err.contains("claude"), "{err}");
+    cwd_is(&launch);
+
+    // A deleted cwd fails before anything moves - and resolving with no
+    // cwd to anchor on leaves a relative candidate unresolved.
+    let gone = TempDir::new("nav-cwd");
+    let gone_path = gone.path().to_path_buf();
+    std::env::set_current_dir(&gone_path).expect("the dir exists");
+    drop(gone);
+    let err = exec_resume_err(&plan, Some(&store));
+    assert!(err.contains("current directory"), "{err}");
+    let mut row = conversation(STOPPED_ID);
+    row.resume_argv = vec![
+        "./claude".to_owned(),
+        "--resume".to_owned(),
+        STOPPED_ID.to_owned(),
+    ];
+    row.worktree = Some(dir.path().to_path_buf());
+    let outcome = run(
+        &ActionRequest::EnterConversation {
+            provider: Provider::Claude,
+            session_id: STOPPED_ID.to_owned(),
+        },
+        &snapshot_of(Vec::new(), vec![row]),
+        None,
+        None,
+    );
+    assert!(matches!(outcome, ActionOutcome::Failed(_)), "{outcome:?}");
+    std::env::set_current_dir(&launch).expect("the launch dir still exists");
+    cwd_is(&launch);
 }
 
 /// `exec_resume`'s error string; the success side never returns.
 fn exec_resume_err(plan: &ResumePlan, store: Option<&Store>) -> String {
     agent_sessions::action::exec_resume(plan, store).expect_err("exec only fails here")
+}
+
+#[test]
+fn relative_executables_anchor_on_the_dashboard_cwd() {
+    let _locked = locked();
+    // The launch cwd holds the real stubs; the Work root holds a decoy
+    // with the same name that would fail if it were ever run.
+    let launch_dir = TempDir::new("nav-launch");
+    let work_dir = TempDir::new("nav-work");
+    let launch = launch_dir.path().to_path_buf();
+    let _restore = RestoreCwd(std::env::current_dir().expect("a cwd"));
+    let real = stub(&launch_dir, "claude", "");
+    let bin = launch_dir.join("bin");
+    fs::create_dir_all(&bin).expect("bin");
+    let bin_stub = bin.join("claude");
+    fs::write(&bin_stub, "#!/bin/sh\nexit 9\n").expect("a second claude");
+    fs::set_permissions(&bin_stub, fs::Permissions::from_mode(0o755)).unwrap();
+    let decoy = work_dir.join("claude");
+    fs::write(&decoy, "#!/bin/sh\nexit 9\n").expect("the decoy");
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    std::env::set_current_dir(&launch).expect("the launch dir exists");
+
+    // `./claude` resolves to the file the resolver saw under the launch
+    // cwd - not the decoy waiting under the Work root.
+    let mut row = conversation(STOPPED_ID);
+    row.resume_argv = vec![
+        "./claude".to_owned(),
+        "--resume".to_owned(),
+        STOPPED_ID.to_owned(),
+    ];
+    row.worktree = Some(work_dir.path().to_path_buf());
+    let snap = snapshot_of(Vec::new(), vec![row]);
+    let request = ActionRequest::EnterConversation {
+        provider: Provider::Claude,
+        session_id: STOPPED_ID.to_owned(),
+    };
+    let outcome = run(&request, &snap, None, None);
+    let ActionOutcome::Resume(plan) = outcome else {
+        panic!("`./claude` resolves: {outcome:?}")
+    };
+    assert_eq!(
+        plan.executable,
+        real.as_os_str(),
+        "anchored to the launch cwd"
+    );
+    let out = enact(&plan);
+    assert!(out.status.success(), "the launch stub ran, not the decoy");
+    assert_eq!(
+        fs::read_to_string(launch.join("argv")).expect("argv recorded"),
+        format!("--resume\n{STOPPED_ID}\n")
+    );
+    assert_eq!(
+        fs::read_to_string(launch.join("cwd"))
+            .expect("cwd recorded")
+            .trim(),
+        work_dir.path().display().to_string(),
+        "the Work root is still the resumed process's cwd"
+    );
+
+    // A relative PATH entry anchors on the launch cwd the same way -
+    // this resume_argv keeps the bare name so PATH search runs.
+    let mut bare = conversation(STOPPED_ID);
+    bare.worktree = Some(work_dir.path().to_path_buf());
+    let snap = snapshot_of(Vec::new(), vec![bare]);
+    let outcome = run(&request, &snap, None, Some(OsStr::new("bin")));
+    let ActionOutcome::Resume(plan) = outcome else {
+        panic!("`bin/claude` resolves: {outcome:?}")
+    };
+    assert_eq!(
+        plan.executable,
+        bin_stub.as_os_str(),
+        "a relative PATH dir anchored to the launch cwd"
+    );
+    let out = enact(&plan);
+    assert_eq!(
+        out.status.code(),
+        Some(9),
+        "the bin stub ran, not the launch stub's exit 0"
+    );
 }
 
 #[test]

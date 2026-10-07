@@ -231,19 +231,34 @@ fn forge(snapshot: &Snapshot, key: &str, path: Option<&OsStr>) -> ActionOutcome 
     }
 }
 
-/// The resume's terminal half: enter the Work root, write the authored
-/// acknowledgement, then `exec` - the process is replaced, so this
-/// returns only a failure. The acknowledgement is deliberately the last
-/// thing before exec: a resume that cannot launch acknowledges nothing.
+/// The resume's terminal half: enter the Work root, re-check the
+/// executable, write the authored acknowledgement, then `exec` - the
+/// process is replaced, so this returns only a failure. Every failure
+/// path leaves the dashboard's cwd as it was; `exec` never returns on
+/// success, so the guard only ever fires on failure. The
+/// acknowledgement lands once preflight is passed - execve's own
+/// refusal can still follow it, a race no preflight can close; the
+/// report and the cwd restore are the same either way.
 pub fn exec_resume(plan: &ResumePlan, store: Option<&Store>) -> Result<Infallible, String> {
     use std::os::unix::process::CommandExt;
 
+    let original_cwd =
+        std::env::current_dir().map_err(|e| format!("cannot read current directory: {e}"))?;
+    let _restore = RestoreOnReturn(original_cwd);
     std::env::set_current_dir(&plan.cwd)
         .map_err(|e| format!("cannot enter {}: {e}", plan.cwd.display()))?;
-    if let (Some(store), Some((key, seq, wait_ms))) = (store, &plan.acknowledgement) {
-        store
-            .acknowledge(key, *seq, *wait_ms)
-            .map_err(|e| format!("seen-state not saved: {e}"))?;
+    if !runnable(Path::new(&plan.executable)) {
+        // The resolver's check may already be stale, and an executable
+        // that cannot run must refuse before seen-state moves.
+        return Err(format!(
+            "{}: not executable",
+            plan.executable.to_string_lossy()
+        ));
+    }
+    if let (Some(store), Some((key, seq, wait_ms))) = (store, &plan.acknowledgement)
+        && let Err(e) = store.acknowledge(key, *seq, *wait_ms)
+    {
+        return Err(format!("seen-state not saved: {e}"));
     }
     let mut command = Command::new(&plan.executable);
     command.args(&plan.argv);
@@ -252,6 +267,17 @@ pub fn exec_resume(plan: &ResumePlan, store: Option<&Store>) -> Result<Infallibl
         plan.executable.to_string_lossy(),
         command.exec()
     ))
+}
+
+/// Put the original working directory back when `exec_resume` returns.
+/// A successful `exec` never returns - it replaces the process - so the
+/// guard restores on failure paths only.
+struct RestoreOnReturn(PathBuf);
+
+impl Drop for RestoreOnReturn {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
 }
 
 /// The seen-state tuple a deliberate action writes: the journal
@@ -272,19 +298,32 @@ fn acknowledgement(row: &ConversationRow) -> Option<(String, u64, Option<u64>)> 
 /// `/`) must itself be a regular executable; a bare name is searched on
 /// `path` - the inherited PATH when `None` - first match winning.
 /// Anything else resolves to nothing, and the caller reports rather
-/// than guesses.
+/// than guesses. Relative candidates anchor on the dashboard's cwd, not
+/// the Work root - `exec` changes into that root only after the plan is
+/// already built, so a relative path must name the file the resolver
+/// saw.
 fn executable(argv0: &str, path: Option<&OsStr>) -> Option<OsString> {
     if argv0.contains('/') {
-        let candidate = Path::new(argv0);
-        return runnable(candidate).then(|| candidate.as_os_str().to_owned());
+        let candidate = absolute(Path::new(argv0));
+        return runnable(&candidate).then(|| candidate.into_os_string());
     }
     let search = path
         .map(OsStr::to_owned)
         .or_else(|| std::env::var_os("PATH"))?; // coverage: off - the `?` needs an environment without PATH
     std::env::split_paths(&search)
-        .map(|dir| dir.join(argv0))
+        .map(|dir| absolute(&dir.join(argv0)))
         .find(|candidate| runnable(candidate))
         .map(|candidate| candidate.into_os_string())
+}
+
+/// `path` made absolute: absolute paths pass through, relative ones
+/// anchor on the process's current directory - the cwd the resolver is
+/// standing in, before any exec-time change into the Work root. The
+/// components round strips the `.` a `./tool` argv0 would leave behind.
+fn absolute(path: &Path) -> PathBuf {
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path).components().collect())
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Whether `candidate` is a regular file with an execute bit - the only
