@@ -16,9 +16,10 @@ needs you takes a glance instead of a window tour.
 > and `list --json` prints the same complete snapshot. Attention works end
 > to end for Claude: `agent-sessions hook` records agent events, and rows
 > needing you sit under `Needs you` until you have seen them (see
-> [attention](docs/attention.md)). Navigation actions, cleanup and hook
-> registration still land piecemeal; any subcommand that has not shipped is
-> a usage error.
+> [attention](docs/attention.md)). `enter` jumps to a conversation's live
+> pane - or resumes a stopped one in place - and `o` opens a work row's
+> pull or merge request; cleanup and hook registration still land
+> piecemeal, and any subcommand that has not shipped is a usage error.
 
 `agent-sessions` is the binary and the state directory; `spindle` is this
 repository.
