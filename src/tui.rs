@@ -205,19 +205,19 @@ struct RowCells<'a> {
 }
 
 impl App {
-    /// An app on a snapshot; focus opens on [3], the attention inbox, which
-    /// is the global list while both upper cursors sit on `all`.
+    /// An app on a snapshot; focus opens on [1], the topmost list, and the
+    /// detail pane follows it.
     pub fn new(snapshot: Snapshot) -> App {
         App {
             snapshot,
-            focus: Pane::Conversations,
+            focus: Pane::Repos,
             cursor: [0, 0, 0],
             filter_raw: [String::new(), String::new(), String::new()],
             editing: None,
             help: false,
             history: false,
             evidence: false,
-            detail_list: List::Conversations,
+            detail_list: List::Repos,
             detail_scroll: std::cell::Cell::new(0),
             quit: false,
             collector_dead: false,
@@ -3299,6 +3299,7 @@ mod tests {
         assert!(text.contains("● 8f423bbb"), "{text}");
         // The detail header reads `working` for a Working latch, and the
         // retained-error-over-waiting shape keeps both words.
+        app.key(Key::Char('3'));
         app.key(Key::Char('j'));
         let text = render_to(&app, 200, 24);
         assert!(text.contains("working"), "{text}");
@@ -3307,6 +3308,7 @@ mod tests {
         snapshot.conversations[0].attention = Attention::Error;
         snapshot.conversations[0].attention_detail = Some("StopFailure".to_owned());
         let mut app = App::new(snapshot);
+        app.key(Key::Char('3'));
         app.key(Key::Char('j'));
         let text = render_to(&app, 200, 24);
         assert!(text.contains("error: StopFailure · waiting"), "{text}");
@@ -4024,10 +4026,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         run_loop(&mut terminal, &mut app, &mut next_snapshot, &mut poll).unwrap();
         assert!(app.quit());
-        // `j` moved the focused (Conversations) cursor one row; release and
+        // `j` moved the focused (Repos) cursor one row; release and
         // unmapped keys did not. The worker's finished snapshots swapped in
         // - the newer of the two queued won.
-        assert_eq!(app.cursor[list_index(List::Conversations)], 1);
+        assert_eq!(app.cursor[list_index(List::Repos)], 1);
         assert_eq!(app.snapshot.observed_at, 42);
 
         // With no snapshot pending, an idle tick changes nothing at all.
