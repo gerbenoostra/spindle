@@ -547,10 +547,11 @@ impl LifecycleInputs {
         }
     }
 
-    /// Whether this reading is a lifecycle transition from `prior`: the
-    /// checkout appeared, vanished or moved, or a field proven on both
-    /// sides changed. A field's first proven value - unproven when the
-    /// record was made - is adopted without dating anything.
+    /// Whether this reading is a lifecycle transition from `prior`: a
+    /// field proven on both sides changed - the checkout appeared,
+    /// vanished or moved, a probe's answer moved. A field's first proven
+    /// value is adopted without an event or a date; only proven-to-
+    /// proven transitions emit, at their observation time.
     fn transitions_from(&self, prior: &LifecycleInputs) -> Vec<String> {
         fn changed<T: PartialEq>(new: &Option<T>, old: &Option<T>) -> bool {
             matches!((new, old), (Some(n), Some(o)) if n != o)
@@ -560,22 +561,18 @@ impl LifecycleInputs {
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "?".to_owned()) // coverage: off - a changed() pair is always Some
         }
-        // The checkout appearing or vanishing is a transition in itself;
-        // path and admin id only transition on a proven move (Some vs
-        // Some) - adopting a first value, like losing one, dates nothing
-        // twice. Presence is the exception: a record's first proven claim
-        // is worth the event, so a found worktree (and its `.git` link)
-        // dates its detection, and an unproven pass never revokes them.
+        // Presence changes are events only when both sides were proven.
+        // A first proven value establishes the baseline without pretending
+        // that the state began when this pass observed it.
         let mut reasons = Vec::new();
         match (prior.worktree, self.worktree) {
             (Some(true), Some(false)) => reasons.push("worktree gone".to_owned()),
-            (old, Some(true)) if old != Some(true) => reasons.push("worktree found".to_owned()),
+            (Some(false), Some(true)) => reasons.push("worktree found".to_owned()),
             _ => {}
         }
         match (prior.git_dir, self.git_dir) {
             (Some(false), Some(true)) => reasons.push(".git restored".to_owned()),
-            (None, Some(true)) => reasons.push(".git present".to_owned()),
-            (old, Some(false)) if old != Some(false) => reasons.push(".git missing".to_owned()),
+            (Some(true), Some(false)) => reasons.push(".git missing".to_owned()),
             _ => {}
         }
         if changed(&self.worktree_path, &prior.worktree_path) {
@@ -1031,14 +1028,6 @@ fn continuity_of(record: &BranchRecord, obs: &ObservedRef) -> Option<ContinuityE
     }
 }
 
-/// The lifecycle facts a record's first observation is worth an event
-/// for: a found worktree and its `.git` state. Run against an empty
-/// prior, so only the presence claims fire - the rest of the fields are
-/// adopted silently, as always.
-fn first_observation(inputs: &LifecycleInputs) -> Vec<String> {
-    inputs.transitions_from(&LifecycleInputs::default())
-}
-
 /// Open a new incarnation for `obs` at `observed_ms`: new id, `parked:
 /// false`, the observation's evidence and fingerprint stored.
 fn open_incarnation(
@@ -1049,20 +1038,7 @@ fn open_incarnation(
     continuity: ContinuityEvidence,
 ) {
     let id = incarnation_id(repo, &obs.name, observed_ms);
-    let mut updates = Vec::new();
-    let reasons = first_observation(&obs.inputs);
-    if !reasons.is_empty() {
-        // The find is an event but not work: it dates itself, it does not
-        // make a just-discovered record look recently active.
-        append_update(
-            &mut updates,
-            UpdateEvent {
-                source: UpdateSource::Lifecycle,
-                at_ms: observed_ms,
-                reasons,
-            },
-        );
-    }
+    let updates = Vec::new();
     work.branches.insert(
         id.clone(),
         BranchRecord {
@@ -2058,18 +2034,6 @@ impl Store {
                 }
             }
             None => {
-                let mut updates = Vec::new();
-                let reasons = first_observation(inputs);
-                if !reasons.is_empty() {
-                    append_update(
-                        &mut updates,
-                        UpdateEvent {
-                            source: UpdateSource::Lifecycle,
-                            at_ms: observed_ms,
-                            reasons,
-                        },
-                    );
-                }
                 work.paths.insert(
                     path.to_owned(),
                     PathRecord {
@@ -2077,7 +2041,7 @@ impl Store {
                         parked: false,
                         activity_at: None,
                         inputs: inputs.clone(),
-                        updates,
+                        updates: Vec::new(),
                         session_activity: BTreeMap::new(),
                     },
                 );
@@ -4169,72 +4133,126 @@ mod tests {
     }
 
     #[test]
-    fn first_observation_dates_the_find_and_seeds_every_other_source() {
+    fn first_observation_seeds_sources_without_emitting_an_event() {
         let temp = TempStore::new();
         let store = temp.store();
         let repo = "/repo/.git";
+        let inputs = || LifecycleInputs {
+            dirty: Some(true),
+            worktree: Some(true),
+            worktree_state: Some("healthy".to_owned()),
+            working_tree: Some(WorkingTreeSnapshot {
+                fingerprint: "ab".to_owned(),
+                reasons: vec!["modified a.rs".to_owned()],
+            }),
+            ..LifecycleInputs::default()
+        };
         store
             .sync_repo(
                 repo,
-                &[obs_with_inputs(
-                    Some("aaaaaaabbbbbbbb"),
-                    LifecycleInputs {
-                        dirty: Some(true),
-                        worktree: Some(true),
-                        worktree_state: Some("healthy".to_owned()),
-                        working_tree: Some(WorkingTreeSnapshot {
-                            fingerprint: "ab".to_owned(),
-                            reasons: vec!["modified a.rs".to_owned()],
-                        }),
-                        ..LifecycleInputs::default()
-                    },
-                )],
+                &[obs_with_inputs(Some("aaaaaaabbbbbbbb"), inputs())],
                 1_000,
             )
             .unwrap();
         let work = store.load().work;
         let record = work.branch(repo, "feat").expect("active");
-        assert_eq!(
-            record.updates,
-            vec![UpdateEvent {
-                source: UpdateSource::Lifecycle,
-                at_ms: 1_000,
-                reasons: vec!["worktree found".to_owned()],
-            }],
-            "first detection of the worktree dates the event"
+        assert!(
+            record.updates.is_empty(),
+            "first proven values seed the baseline without an event: {:?}",
+            record.updates
         );
-        assert_eq!(record.activity_at, None, "the find is no work activity");
+        assert_eq!(record.activity_at, None, "seeding is no work activity");
         let stamp = fs::metadata(temp.path(WORK)).unwrap().modified().unwrap();
         store
             .sync_repo(
                 repo,
-                &[obs_with_inputs(
-                    Some("aaaaaaabbbbbbbb"),
-                    LifecycleInputs {
-                        dirty: Some(true),
-                        worktree: Some(true),
-                        worktree_state: Some("healthy".to_owned()),
-                        working_tree: Some(WorkingTreeSnapshot {
-                            fingerprint: "ab".to_owned(),
-                            reasons: vec!["modified a.rs".to_owned()],
-                        }),
-                        ..LifecycleInputs::default()
-                    },
-                )],
+                &[obs_with_inputs(Some("aaaaaaabbbbbbbb"), inputs())],
                 2_000,
             )
             .unwrap();
         let work = store.load().work;
         let record = work.branch(repo, "feat").expect("active");
-        assert_eq!(
-            record.updates.len(),
-            1,
-            "an unchanged poll appends nothing past the find event"
+        assert!(
+            record.updates.is_empty(),
+            "an unchanged poll appends nothing"
         );
         assert_eq!(
             fs::metadata(temp.path(WORK)).unwrap().modified().unwrap(),
             stamp,
             "an unchanged poll writes nothing"
+        );
+    }
+
+    #[test]
+    fn presence_seeds_silently_and_only_proven_transitions_emit() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        let inputs = |worktree: Option<bool>, git_dir: Option<bool>| LifecycleInputs {
+            worktree,
+            git_dir,
+            ..LifecycleInputs::default()
+        };
+        let sync = |inputs: LifecycleInputs, at: u64| {
+            let mut o = obs("feat", false);
+            o.inputs = inputs;
+            store.sync_repo(repo, &[o], at).unwrap();
+            store.load().work.branch(repo, "feat").unwrap().clone()
+        };
+        // Unproven, then proven: the first known values seed the
+        // baseline without an event on either pass.
+        let record = sync(inputs(None, None), 500);
+        assert!(record.updates.is_empty(), "{:?}", record.updates);
+        let record = sync(inputs(Some(true), Some(true)), 1_000);
+        assert!(
+            record.updates.is_empty(),
+            "first proven values emit nothing: {:?}",
+            record.updates
+        );
+        assert_eq!(record.activity_at, None);
+        // Both sides proven on both passes: gone and missing date the
+        // pass, and found and restored are the reverse transition.
+        sync(inputs(Some(false), Some(false)), 2_000);
+        let record = sync(inputs(Some(true), Some(true)), 3_000);
+        assert_eq!(
+            record.updates,
+            vec![
+                UpdateEvent {
+                    source: UpdateSource::Lifecycle,
+                    at_ms: 2_000,
+                    reasons: vec!["worktree gone".to_owned(), ".git missing".to_owned()],
+                },
+                UpdateEvent {
+                    source: UpdateSource::Lifecycle,
+                    at_ms: 3_000,
+                    reasons: vec!["worktree found".to_owned(), ".git restored".to_owned()],
+                },
+            ]
+        );
+        // A path record behaves the same.
+        let path = "/wt";
+        let sync_path = |inputs: LifecycleInputs, at: u64| {
+            store.sync_path(path, "/r/.git", &inputs, at).unwrap();
+            store.load().work.path(path).unwrap().clone()
+        };
+        let record = sync_path(inputs(Some(true), Some(true)), 1_000);
+        assert!(record.updates.is_empty(), "{:?}", record.updates);
+        sync_path(inputs(Some(false), Some(false)), 2_000);
+        let record = sync_path(inputs(Some(true), Some(true)), 3_000);
+        assert_eq!(
+            record.updates,
+            vec![
+                UpdateEvent {
+                    source: UpdateSource::Lifecycle,
+                    at_ms: 2_000,
+                    reasons: vec!["worktree gone".to_owned(), ".git missing".to_owned()],
+                },
+                UpdateEvent {
+                    source: UpdateSource::Lifecycle,
+                    at_ms: 3_000,
+                    reasons: vec!["worktree found".to_owned(), ".git restored".to_owned()],
+                },
+            ]
         );
     }
 
@@ -4279,11 +4297,6 @@ mod tests {
             record.updates,
             vec![
                 UpdateEvent {
-                    source: UpdateSource::Lifecycle,
-                    at_ms: 1_000,
-                    reasons: vec!["worktree found".to_owned()],
-                },
-                UpdateEvent {
                     source: UpdateSource::WorkingTree,
                     at_ms: 2_000,
                     reasons: vec!["modified bb.rs".to_owned()],
@@ -4314,7 +4327,7 @@ mod tests {
         let work = store.load().work;
         assert_eq!(
             work.branch(repo, "feat").expect("active").updates.len(),
-            4,
+            3,
             "unchanged polls append no duplicate"
         );
     }
@@ -4349,11 +4362,6 @@ mod tests {
         assert_eq!(
             record.updates,
             vec![
-                UpdateEvent {
-                    source: UpdateSource::Lifecycle,
-                    at_ms: 1_000,
-                    reasons: vec!["worktree found".to_owned()],
-                },
                 UpdateEvent {
                     source: UpdateSource::Commit,
                     at_ms: 2_000,
@@ -4497,31 +4505,24 @@ mod tests {
         let record = work.branch(repo, "feat").expect("the record");
         assert_eq!(
             record.updates,
-            vec![
-                UpdateEvent {
-                    source: UpdateSource::Lifecycle,
-                    at_ms: 1_000,
-                    reasons: vec!["worktree found".to_owned()],
-                },
-                UpdateEvent {
-                    source: UpdateSource::Lifecycle,
-                    at_ms: 2_000,
-                    reasons: vec![
-                        "worktree gone".to_owned(),
-                        "path: /a -> /b".to_owned(),
-                        "admin id: a1 -> a2".to_owned(),
-                        "dirty: clean -> dirty".to_owned(),
-                        "ahead: 1 -> 3".to_owned(),
-                        "behind: 0 -> 1".to_owned(),
-                        "unpushed: 2 -> 0".to_owned(),
-                        "upstream: tracked origin/feat -> gone".to_owned(),
-                        "landed: no -> merged".to_owned(),
-                        "forge: open -> merged".to_owned(),
-                        "pipeline: success -> failed".to_owned(),
-                        "worktree state: healthy -> broken: missing".to_owned(),
-                    ],
-                },
-            ]
+            vec![UpdateEvent {
+                source: UpdateSource::Lifecycle,
+                at_ms: 2_000,
+                reasons: vec![
+                    "worktree gone".to_owned(),
+                    "path: /a -> /b".to_owned(),
+                    "admin id: a1 -> a2".to_owned(),
+                    "dirty: clean -> dirty".to_owned(),
+                    "ahead: 1 -> 3".to_owned(),
+                    "behind: 0 -> 1".to_owned(),
+                    "unpushed: 2 -> 0".to_owned(),
+                    "upstream: tracked origin/feat -> gone".to_owned(),
+                    "landed: no -> merged".to_owned(),
+                    "forge: open -> merged".to_owned(),
+                    "pipeline: success -> failed".to_owned(),
+                    "worktree state: healthy -> broken: missing".to_owned(),
+                ],
+            }]
         );
         assert_eq!(record.activity_at, Some(2_000));
     }

@@ -1330,36 +1330,29 @@ fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
     assert_eq!(conv.repo.as_deref(), Some(repo_id(&world.repo).as_str()));
     assert_eq!(conv.worktree.as_deref(), Some(wt.as_path()));
     assert!(agent_sessions::snapshot::binds(row, conv));
-    // First detection dated the find; the `.git` loss adds a second
-    // lifecycle event without touching `worktree`.
-    assert_eq!(row.updates.len(), 2, "{:?}", row.updates);
+    // The first scan seeded the baseline silently; the `.git` loss is
+    // the first lifecycle event, and it does not touch `worktree`.
+    assert_eq!(row.updates.len(), 1, "{:?}", row.updates);
+    assert_eq!(row.updates[0].source, UpdateSource::Lifecycle);
     assert_eq!(
         row.updates[0].reasons,
-        ["worktree found", ".git present"],
-        "{:?}",
-        row.updates[0]
-    );
-    assert_eq!(row.updates[1].source, UpdateSource::Lifecycle);
-    assert_eq!(
-        row.updates[1].reasons,
         [
             ".git missing".to_owned(),
             "worktree state: healthy -> broken: gitdir file points to non-existent location"
                 .to_owned()
         ],
         "{:?}",
-        row.updates[1].reasons
+        row.updates[0].reasons
     );
-    assert_eq!(
+    assert!(
         first
             .work
             .iter()
             .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
             .expect("the first row")
             .updates
-            .len(),
-        1,
-        "first observation dates the find, nothing else"
+            .is_empty(),
+        "first observation seeds the baseline without an event"
     );
 
     let third = collect(&world);
@@ -1392,7 +1385,7 @@ fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
         .collect();
     assert_eq!(sessions.len(), 1, "{:?}", row.updates);
     assert_eq!(sessions[0].reasons, ["8f423bbb more"]);
-    assert_eq!(row.updates.len(), 3, "{:?}", row.updates);
+    assert_eq!(row.updates.len(), 2, "{:?}", row.updates);
     assistant_turn_at(
         &world.home,
         OTHER,
@@ -1405,7 +1398,7 @@ fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
         .iter()
         .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
         .expect("the worktree row");
-    assert_eq!(row.updates.len(), 4, "{:?}", row.updates);
+    assert_eq!(row.updates.len(), 3, "{:?}", row.updates);
     assert!(
         row.updates
             .iter()
@@ -1445,13 +1438,9 @@ fn a_row_records_commit_working_tree_and_session_updates() {
     transcript(&world.home, CONV, &wt);
     let first = collect(&world);
     let row = work(&first, "feat-login");
-    assert_eq!(
-        row.updates
-            .iter()
-            .map(|e| e.reasons.as_slice())
-            .collect::<Vec<_>>(),
-        [&["worktree found".to_owned(), ".git present".to_owned()][..]],
-        "first observation dates only the find: {:?}",
+    assert!(
+        row.updates.is_empty(),
+        "first observation seeds the baseline without an event: {:?}",
         row.updates
     );
 
@@ -1496,9 +1485,8 @@ fn a_row_records_commit_working_tree_and_session_updates() {
         .iter()
         .filter(|e| e.source == UpdateSource::Lifecycle)
         .collect();
-    assert_eq!(lifecycle.len(), 2, "{:?}", row.updates);
-    assert_eq!(lifecycle[0].reasons, ["worktree found", ".git present"]);
-    assert_eq!(lifecycle[1].reasons, ["ahead: 1 -> 2", "unpushed: 1 -> 2"]);
+    assert_eq!(lifecycle.len(), 1, "{:?}", row.updates);
+    assert_eq!(lifecycle[0].reasons, ["ahead: 1 -> 2", "unpushed: 1 -> 2"]);
 
     let third = collect(&world);
     let row = work(&third, "feat-login");
@@ -1624,13 +1612,9 @@ fn a_worktree_without_git_stays_present_while_its_repo_is_out_of_scope() {
         .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
         .expect("the worktree row");
     assert_eq!(row.kind, WorkKind::Detached);
-    assert_eq!(
-        row.updates
-            .iter()
-            .map(|e| e.reasons.as_slice())
-            .collect::<Vec<_>>(),
-        [&["worktree found".to_owned(), ".git missing".to_owned()][..]],
-        "{:?}",
+    assert!(
+        row.updates.is_empty(),
+        "the initial scan seeds the baseline without an event: {:?}",
         row.updates
     );
 
@@ -1645,12 +1629,8 @@ fn a_worktree_without_git_stays_present_while_its_repo_is_out_of_scope() {
         .iter()
         .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
         .expect("the space row");
-    assert_eq!(
-        row.updates
-            .iter()
-            .map(|e| e.reasons.as_slice())
-            .collect::<Vec<_>>(),
-        [&["worktree found".to_owned(), ".git missing".to_owned()][..]],
+    assert!(
+        row.updates.is_empty(),
         "an unproven pass revokes nothing: {:?}",
         row.updates
     );
@@ -1671,12 +1651,8 @@ fn a_worktree_without_git_stays_present_while_its_repo_is_out_of_scope() {
         .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
         .expect("the worktree row");
     assert_eq!(row.kind, WorkKind::Detached);
-    assert_eq!(
-        row.updates
-            .iter()
-            .map(|e| e.reasons.as_slice())
-            .collect::<Vec<_>>(),
-        [&["worktree found".to_owned(), ".git missing".to_owned()][..]],
+    assert!(
+        row.updates.is_empty(),
         "the repo returning to scope is no transition: {:?}",
         row.updates
     );
