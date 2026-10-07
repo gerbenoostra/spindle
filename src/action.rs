@@ -84,9 +84,24 @@ pub struct ResumePlan {
 
 /// The selection key a Work row carries - what `EnterWork` and
 /// `OpenForge` name. The cursor's tracking key and the fresh
-/// re-resolution must mean the same row, so both live here.
+/// re-resolution must mean the same row, so both live here. Name alone
+/// does not pin one row - two detached checkouts can sit on the same
+/// commit and a recreated branch shares its name with the gone record a
+/// reference still names - so the workspace path goes in too; a
+/// branch-only row's empty path stays distinct from a gone row's
+/// recorded workspace.
 pub fn work_key(w: &WorkRow) -> String {
-    format!("{}\u{0}{}\u{0}{}", w.repo, w.kind.as_str(), w.name)
+    let workspace = w
+        .worktree
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    format!(
+        "{}\u{0}{}\u{0}{}\u{0}{workspace}",
+        w.repo,
+        w.kind.as_str(),
+        w.name
+    )
 }
 
 /// Resolve `request` against `snapshot`, collected fresh and complete,

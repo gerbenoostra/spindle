@@ -19,10 +19,11 @@ use agent_sessions::attention::Attention;
 use agent_sessions::forge::{Pipeline, WorkItem};
 use agent_sessions::runtime::{Provider, Runtime};
 use agent_sessions::snapshot::{
-    Collector, ConversationRow, ConversationState, Snapshot, Upstream, WorkKind, WorkRow,
+    Collector, ConversationRow, ConversationState, PaneRow, Snapshot, Upstream, WorkKind, WorkRow,
     WorkSection,
 };
 use agent_sessions::store::{self, Seen, Store};
+use agent_sessions::tmux::{PaneId, PaneTarget, WindowId};
 use agent_sessions::tui;
 use support::fixture::FixtureRepo;
 use support::tempdir::TempDir;
@@ -573,6 +574,61 @@ fn enter_selects_the_work_window_deterministically() {
         None,
     );
     assert!(matches!(outcome, ActionOutcome::Failed(_)), "{outcome:?}");
+}
+
+#[test]
+fn same_name_work_rows_select_their_own_window() {
+    let _locked = locked();
+    if !tmux_or_skip() {
+        return;
+    }
+    // Two detached checkouts of one commit read identically by name -
+    // `detached @<sha>` twice - so the workspace distinguishes them; a
+    // recreated branch likewise shares its name with the gone record a
+    // reference still names. Each row's bound pane lives on a dead
+    // socket of its own: the select fails either way, but the error
+    // names whose target it tried.
+    let detached = |workspace: &str, socket: &str| WorkRow {
+        worktree: Some(PathBuf::from(workspace)),
+        kind: WorkKind::Detached,
+        panes: vec![PaneRow {
+            handle: "agents:@1.%1".to_owned(),
+            command: "claude".to_owned(),
+            target: Some(PaneTarget {
+                socket: PathBuf::from(socket),
+                window: WindowId::parse("@1").unwrap(),
+                pane: PaneId::parse("%1").unwrap(),
+            }),
+        }],
+        ..work_row("detached @abc1234", WorkItem::Unknown, None)
+    };
+    let snap = snapshot_of(
+        vec![detached("/ws/a", "/sock/a"), detached("/ws/b", "/sock/b")],
+        Vec::new(),
+    );
+    assert_ne!(
+        work_key(&snap.work[0]),
+        work_key(&snap.work[1]),
+        "the selection key pins one row"
+    );
+
+    let outcome = run(
+        &ActionRequest::EnterWork {
+            key: work_key(&snap.work[1]),
+        },
+        &snap,
+        None,
+        None,
+    );
+    match &outcome {
+        ActionOutcome::Failed(message) => {
+            assert!(
+                message.contains("/sock/b"),
+                "the second row's target: {message}"
+            )
+        }
+        other => panic!("a dead socket reports its own target: {other:?}"),
+    }
 }
 
 #[test]
