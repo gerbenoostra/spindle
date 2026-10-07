@@ -68,8 +68,8 @@ impl fmt::Display for PaneRef {
     }
 }
 
-/// A pane's socket-qualified location for an action: the server, window,
-/// pane and session that `select-window`/`select-pane` need. Built only
+/// A pane's socket-qualified location for an action: the server, window
+/// and pane that `select-window`/`select-pane` need. Built only
 /// from an inventory record - never parsed back out of a display label
 /// or a provider handle, which cannot carry the socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +78,6 @@ pub struct PaneTarget {
     pub socket: PathBuf,
     pub window: WindowId,
     pub pane: PaneId,
-    pub session: SessionId,
 }
 
 /// One pane of the merged inventory, as `list-panes -a` reported it.
@@ -123,7 +122,6 @@ impl Pane {
             socket: self.socket.clone(),
             window: self.window.clone(),
             pane: self.id.clone(),
-            session: self.session.clone(),
         }
     }
 
