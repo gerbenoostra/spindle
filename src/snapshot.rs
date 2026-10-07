@@ -487,6 +487,11 @@ pub struct PaneRow {
     pub handle: String,
     /// `pane_current_command`.
     pub command: String,
+    /// The pane's socket-qualified identity for Enter's window select.
+    /// Action-only: a handle label cannot carry the socket, and the JSON
+    /// contract does not grow it, so this stays out of the document.
+    #[serde(skip)]
+    pub target: Option<tmux::PaneTarget>,
 }
 
 /// `ReferenceRow.kind`: which shape of live entity still names the gone
@@ -600,6 +605,11 @@ pub struct AttachmentRow {
     pub liveness_detail: Option<String>,
     /// The bound pane as `session:window.pane`, when bound.
     pub pane: Option<String>,
+    /// The bound pane's socket-qualified identity, for Enter's jump:
+    /// what `select-window`/`select-pane` need, kept off the document -
+    /// a display label cannot carry the socket.
+    #[serde(skip)]
+    pub target: Option<tmux::PaneTarget>,
     /// How the pane was bound; `None` when unbound.
     pub pane_source: Option<PaneSource>,
     /// Why the pane is unbound, when it is (`dead`, `superseded`, or the
@@ -2513,6 +2523,7 @@ fn anchor_panes(anchor: &Anchor, panes: &tmux::PaneInventory) -> Vec<PaneRow> {
         .map(|p| PaneRow {
             handle: format!("{}:{}.{}", p.session_name, p.window, p.id),
             command: p.command.clone(),
+            target: Some(p.target()),
         })
         .collect()
 }
@@ -3309,6 +3320,11 @@ fn attachment_row(
         liveness,
         liveness_detail,
         pane: r.attachment.pane.as_ref().map(|p| display_pane(p, panes)),
+        target: r
+            .attachment
+            .pane
+            .as_ref()
+            .and_then(|pref| panes.get(pref).map(|p| p.target())),
         pane_source,
         placement_detail,
         source: r.attachment.source,
@@ -4949,6 +4965,7 @@ mod tests {
             liveness: AttachmentLiveness::Instance,
             liveness_detail: None,
             pane: None,
+            target: None,
             pane_source: Some(PaneSource::Published),
             placement_detail: None,
             source: EvidenceSource::Published,

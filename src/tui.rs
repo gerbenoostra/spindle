@@ -3,8 +3,9 @@
 //!
 //! [1] Repos and [2] Work scope whatever sits below them; [3] Conversations
 //! is the attention inbox across the selected scope. The shell owns the
-//! numbered panes, `Tab`, `j`/`k`, `/` text-and-age filters, `?` help and `q`
-//! - keys other tasks have not shipped stay absent and inert.
+//! numbered panes, `Tab`, `j`/`k`, `/` text-and-age filters, `?` help and `q`,
+//! and the Enter/`o` navigation actions - keys other tasks have not shipped
+//! stay absent and inert.
 //!
 //! The render path reads only the snapshot: collectors do all subprocess and
 //! file work behind it, so a bursty filesystem or a slow remote can never
@@ -23,6 +24,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::action::{self, ActionOutcome, ActionRequest, ResumePlan, work_key};
 use crate::attention::{Attention, ClaimOutcome};
 use crate::config;
 use crate::forge::{Pipeline, WorkItem};
@@ -175,6 +177,9 @@ pub struct App {
     /// until the next key - a keypress that wrote nothing must not look
     /// like it worked.
     notice: Option<String>,
+    /// The Enter/`o` request a keypress left for the run loop to
+    /// re-resolve and act on.
+    action: Option<ActionRequest>,
     /// The spinner's frame index while a snapshot is still incomplete.
     /// `Cell` because a draw is `&self`: the animation ticks by rendering.
     spin: std::cell::Cell<u64>,
@@ -224,6 +229,7 @@ impl App {
             store: None,
             forgotten_after: config::DEFAULT_FORGOTTEN_AFTER,
             notice: None,
+            action: None,
             spin: std::cell::Cell::new(0),
         }
     }
@@ -469,7 +475,10 @@ impl App {
     /// The handled set is exactly the shipped one: `1`-`4` focus, `Tab`
     /// cycles, `j`/`k` move the cursor, `/` filters the focused list,
     /// `space` acknowledges attention or marks a Busy row not-busy, `p`
-    /// parks a Work row (suppressing only its `Forgotten` placement), `?`
+    /// parks a Work row (suppressing only its `Forgotten` placement),
+    /// `enter` selects a conversation pane or a bound work window - or
+    /// resumes a stopped conversation - and `o` opens a work row's
+    /// forge item; both leave a request the run loop resolves. `?`
     /// toggles help, `q` quits, `Esc` closes help or a filter. Everything
     /// else is inert: an unbound key does nothing, and nothing here pretends
     /// to a behaviour a later task owns.
@@ -528,8 +537,71 @@ impl App {
             Key::Char(' ') => self.space(),
             Key::Char('p') => self.park(),
             Key::Char('h') => self.toggle_history(),
+            Key::Enter => self.enter(),
+            Key::Char('o') => self.open_forge(),
             _ => {}
         }
+    }
+
+    /// `enter`: the focused row's navigation request, left for the run
+    /// loop. Only concrete rows carry one - a conversation selects its
+    /// pane or resumes, an active work row selects its bound window.
+    /// `all`, repo, excluded history and gone rows, and the detail
+    /// pane, are inert.
+    fn enter(&mut self) {
+        let Some(list) = self.focused_list() else {
+            return;
+        };
+        let cursor = self.cursor[list_index(list)];
+        if cursor == 0 {
+            return;
+        }
+        let view = self.view();
+        let Some(row) = view.rows(list).get(cursor - 1) else {
+            return; // coverage: off - the get-miss arm is unreachable: cursors clamp before a view
+        };
+        self.action = match row {
+            Row::Conversation(c) => Some(ActionRequest::EnterConversation {
+                provider: c.provider,
+                session_id: c.session_id.clone(),
+            }),
+            Row::Work(w) if w.gone.is_none() => Some(ActionRequest::EnterWork { key: work_key(w) }),
+            // `all`, repos, excluded history and gone rows carry no action.
+            _ => None,
+        };
+    }
+
+    /// `o`: the open-forge request - only an active concrete work row
+    /// carries one; everything else is inert.
+    fn open_forge(&mut self) {
+        if self.focused_list() != Some(List::Work) {
+            return;
+        }
+        let cursor = self.cursor[list_index(List::Work)];
+        if cursor == 0 {
+            return;
+        }
+        let view = self.view();
+        let Some(Row::Work(w)) = view.work.get(cursor - 1) else {
+            return;
+        };
+        if w.gone.is_some() {
+            return;
+        }
+        self.action = Some(ActionRequest::OpenForge { key: work_key(w) });
+    }
+
+    /// The pending Enter/`o` request, taken once: the loop re-resolves
+    /// it against a fresh snapshot rather than trusting the frame the
+    /// user saw.
+    pub fn take_action(&mut self) -> Option<ActionRequest> {
+        self.action.take()
+    }
+
+    /// What the last action left to say - a failure's reason or a
+    /// success's word - shown in the footer until the next key.
+    pub fn set_notice(&mut self, notice: Option<String>) {
+        self.notice = notice;
     }
 
     /// `space` on the focused row - the write goes to the journal's
@@ -1762,7 +1834,10 @@ impl App {
             } else if area.width < 60 {
                 match self.focused_list() {
                     Some(List::Work) => {
-                        "1-4 | tab | j/k | e | p park | h | / filter | ? | q quit".to_owned()
+                        "1-4 | tab | j/k | ⏎ | o | e | p | h | / | ? | q quit".to_owned()
+                    }
+                    Some(List::Conversations) => {
+                        "1-4 | tab | j/k | ⏎ | e | / filter | ? | q quit".to_owned()
                     }
                     Some(_) => "1-4 | tab | j/k | e | / filter | ? | q quit".to_owned(),
                     None => "1-4 | tab | j/k scroll | e | ? | q quit".to_owned(),
@@ -1771,10 +1846,10 @@ impl App {
                 let hints = match self.focused_list() {
                     Some(List::Repos) => "1-4 focus | tab next | j/k move | e evidence | / filter",
                     Some(List::Work) => {
-                        "1-4 focus | tab next | j/k move | e evidence | / filter | space ack | p park | h history"
+                        "1-4 focus | tab next | j/k move | enter jump | o open | e evidence | / filter | space ack | p park | h history"
                     }
                     Some(_) => {
-                        "1-4 focus | tab next | j/k move | e evidence | / filter | space ack"
+                        "1-4 focus | tab next | j/k move | enter jump | e evidence | / filter | space ack"
                     }
                     None => "1-4 focus | tab next | j/k scroll | e evidence | esc close",
                 };
@@ -1818,9 +1893,12 @@ impl App {
                 Line::from(""),
                 Line::from(match list {
                     List::Work => {
-                        "j/k move   / filter   e evidence   space ack/mark   p park   h history   enter/jump (later)"
+                        "j/k move   / filter   e evidence   space ack/mark   p park   h history   enter jump   o open"
                     }
-                    _ => "j/k move   / filter   e evidence   space ack/mark   enter/jump (later)",
+                    List::Conversations => {
+                        "j/k move   / filter   e evidence   space ack/mark   enter jump"
+                    }
+                    _ => "j/k move   / filter   e evidence   space ack/mark",
                 }),
             ],
             None => vec![
@@ -1932,11 +2010,6 @@ fn selection_key(row: &Row<'_>) -> String {
         Row::History(_, h) => h.id.clone(),
         Row::Conversation(c) => format!("{}\u{0}{}", c.provider.as_str(), c.session_id),
     }
-}
-
-/// The selection key a Work row carries.
-fn work_key(w: &WorkRow) -> String {
-    format!("{}\u{0}{}\u{0}{}", w.repo, w.kind.as_str(), w.name)
 }
 
 /// The scope a work row selects in [3].
@@ -2550,11 +2623,76 @@ pub fn run(
         Err(std::sync::mpsc::TryRecvError::Empty) => Feed::Idle, // coverage: off - the unexecuted instantiation's arm edge
         Err(std::sync::mpsc::TryRecvError::Disconnected) => Feed::Dead, // coverage: off - needs the worker to die while the loop runs
     }; // coverage: off - the unexecuted instantiation's region edge
-    let result = run_loop(&mut terminal, &mut app, feed, poll_event);
+    let result = run_loop(
+        &mut terminal,
+        &mut app,
+        feed,
+        poll_event,
+        act_on,
+        suspend_for,
+    ); // coverage: off - `?` needs a broken terminal
     disable_raw_mode()?; // coverage: off - `?` needs a broken terminal
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?; // coverage: off - same
     result // coverage: off - same
 } // coverage: off - the unexecuted instantiation's exit edge
+// coverage: off - the instantiation edge lands on this line
+/// The loop's Enter/`o` resolution: the request a keypress named is // coverage: off - `run` itself needs a real terminal
+/// re-resolved against a snapshot collected fresh after it - a fresh // coverage: off - same
+/// configured collector, a fresh runtime, the dashboard's own pane - so // coverage: off - same
+/// a row that moved or vanished since the frame was drawn never drives // coverage: off - same
+/// an action. // coverage: off - same
+// The `coverage: off` markers below must sit on the exact line a zero
+// region lands on, so rustfmt - which relocates trailing comments after
+// `{` - is asked to leave these four functions alone.
+#[rustfmt::skip]
+fn act_on(request: &ActionRequest) -> ActionOutcome { // coverage: off - `run` itself needs a real terminal
+    match collector() { // coverage: off - same
+        Ok(mut collector) => { // coverage: off - same
+            let runtime = crate::runtime::Runtime::observe(); // coverage: off - same
+            let snapshot = collector.collect(&runtime, own_pane().as_ref()); // coverage: off - same
+            let store = app_store(); // coverage: off - same
+            let path = std::env::var_os("PATH"); // coverage: off - same
+            action::act(request, &snapshot, store.as_ref(), path.as_deref()) // coverage: off - same
+        } // coverage: off - same
+        Err(e) => ActionOutcome::Failed(e), // coverage: off - same
+    } // coverage: off - same
+} // coverage: off - the unexecuted instantiation's exit edge
+// coverage: off - the instantiation edge lands on this line
+/// The loop's resume executor: the dashboard's terminal is suspended // coverage: off - a resume needs a real terminal
+/// before exec so the agent inherits an ordinary pane, and a failed // coverage: off - same
+/// exec puts the screen back so the loop can report the failure // coverage: off - same
+/// instead of leaving a broken terminal. // coverage: off - same
+#[rustfmt::skip]
+fn suspend_for(plan: &ResumePlan) -> Result<(), String> { // coverage: off - a resume needs a real terminal
+    if let Err(e) = suspend_terminal() { // coverage: off - same
+        return Err(format!("terminal suspend: {e}")); // coverage: off - same
+    } // coverage: off - same
+    match action::exec_resume(plan, app_store().as_ref()) { // coverage: off - same
+        Err(e) => { // coverage: off - same
+            let _ = restore_terminal(); // coverage: off - same
+            Err(e) // coverage: off - same
+        } // coverage: off - same
+        Ok(never) => match never {}, // coverage: off - exec does not return on success
+    } // coverage: off - same
+} // coverage: off - same
+// coverage: off - the instantiation edge lands on this line
+/// Raw mode off and the alternate screen left: the dashboard yields the // coverage: off - the unexecuted instantiation's region edge
+/// terminal to the process a resume execs. // coverage: off - same
+#[rustfmt::skip]
+fn suspend_terminal() -> io::Result<()> { // coverage: off - a resume needs a real terminal
+    use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode}; // coverage: off - same
+    disable_raw_mode()?; // coverage: off - `?` needs a broken terminal
+    crossterm::execute!(io::stdout(), LeaveAlternateScreen) // coverage: off - same
+} // coverage: off - same
+// coverage: off - the instantiation edge lands on this line
+/// The dashboard's screen back after an exec that failed to replace the // coverage: off - same
+/// process. // coverage: off - same
+#[rustfmt::skip]
+fn restore_terminal() -> io::Result<()> { // coverage: off - a resume needs a real terminal
+    use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode}; // coverage: off - same
+    enable_raw_mode()?; // coverage: off - `?` needs a broken terminal
+    crossterm::execute!(io::stdout(), EnterAlternateScreen) // coverage: off - same
+} // coverage: off - same
 /// The collector's own loop, on its own thread: one staged pass streams
 /// its snapshots through `publish`, each handed over once the previous one
 /// was taken (the bounded channel paces the worker), then `interval` of
@@ -2598,15 +2736,21 @@ fn poll_event() -> io::Result<Option<Event>> {
 }
 
 /// Draw, consume one event, swap in whatever the collector already
-/// produced - until `q` quits. Both sources are injected so the loop needs
-/// no terminal and no worker: tests hand it a key script and a scripted
-/// snapshot source. Anything the user presses is mapped to a `Key` and
-/// applied; release events and unmapped codes are ignored.
+/// produced - until `q` quits. The sources are injected so the loop
+/// needs no terminal and no worker: tests hand it a key script, a
+/// scripted snapshot source, and scripted actions. Anything the user
+/// presses is mapped to a `Key` and applied; release events and
+/// unmapped codes are ignored. An Enter/`o` request the key left is
+/// resolved through `act` against a fresh snapshot - a resume outcome
+/// goes to `suspend`, which replaces the process in production and
+/// just records in tests.
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     mut next_snapshot: impl FnMut() -> Feed,
     mut poll: impl FnMut() -> io::Result<Option<Event>>,
+    mut act: impl FnMut(&ActionRequest) -> ActionOutcome,
+    mut suspend: impl FnMut(&ResumePlan) -> Result<(), String>,
 ) -> io::Result<()>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -2632,6 +2776,19 @@ where
         }
         let event = poll()?; // coverage: off - `?` needs a broken stdin
         dispatch_event(app, event);
+        if let Some(request) = app.take_action() {
+            match act(&request) {
+                ActionOutcome::Done(message) => app.set_notice(message),
+                ActionOutcome::Failed(message) => app.set_notice(Some(message)),
+                // A plan replaces this process; `Ok` means the dashboard
+                // is gone - unreachable in production, where exec
+                // diverges or fails.
+                ActionOutcome::Resume(plan) => match suspend(&plan) {
+                    Ok(()) => break,
+                    Err(message) => app.set_notice(Some(message)),
+                },
+            }
+        }
     } // coverage: off - the unexecuted instantiation's region edge
     Ok(()) // coverage: off - same
 }
@@ -2963,6 +3120,7 @@ mod tests {
                         liveness: AttachmentLiveness::Instance,
                         liveness_detail: None,
                         pane: Some("workmux:@149.%162".to_owned()),
+                        target: None,
                         pane_source: Some(PaneSource::Published),
                         placement_detail: None,
                         source: EvidenceSource::Published,
@@ -3687,18 +3845,230 @@ mod tests {
             &mut app,
             &[
                 Key::Char('p'),
-                Key::Char('o'),
                 Key::Char('x'),
                 Key::Char('d'),
                 Key::Char('D'),
                 Key::Char('c'),
                 Key::Char('i'),
                 Key::Char(' '),
-                Key::Enter,
             ],
         );
         assert_eq!(render_to(&app, 55, 24), before);
         assert!(!app.quit());
+    }
+
+    /// Which rows `enter` and `o` answer: concrete rows leave a request,
+    /// `all`, repo, history and gone rows - and the detail pane - stay
+    /// inert.
+    #[test]
+    fn enter_and_o_request_the_row_under_the_cursor() {
+        let mut app = App::new(fixture());
+
+        // [3] on a conversation: Enter requests provider plus full id.
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Enter]);
+        assert_eq!(
+            app.take_action(),
+            Some(ActionRequest::EnterConversation {
+                provider: Provider::Claude,
+                session_id: "8f423bbb-1111-2222-3333-444444444444".to_owned(),
+            })
+        );
+        assert!(app.take_action().is_none(), "a request is taken once");
+
+        // [2] on the active `feat/login` work row: Enter and `o` request
+        // the same stable work key the cursor tracks.
+        let key = work_key(&fixture().work[0]);
+        press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+        app.key(Key::Enter);
+        assert_eq!(
+            app.take_action(),
+            Some(ActionRequest::EnterWork { key: key.clone() })
+        );
+        app.key(Key::Char('o'));
+        assert_eq!(app.take_action(), Some(ActionRequest::OpenForge { key }));
+
+        // `o` away from the work list, `o` and `enter` on `all`, a repo
+        // row and the detail pane are all inert.
+        press(&mut app, &[Key::Char('3'), Key::Char('o')]);
+        assert!(app.take_action().is_none(), "o is a work-row key");
+        press(&mut app, &[Key::Char('2'), Key::Char('k')]);
+        app.key(Key::Enter);
+        app.key(Key::Char('o'));
+        assert!(app.take_action().is_none(), "the all row carries nothing");
+        press(&mut app, &[Key::Char('1'), Key::Char('j'), Key::Enter]);
+        assert!(app.take_action().is_none(), "a repo row carries nothing");
+        press(&mut app, &[Key::Char('4'), Key::Enter]);
+        assert!(app.take_action().is_none(), "the detail pane is inert");
+
+        // A gone work row is read-only for both keys.
+        let mut app = App::new(fixture());
+        app.snapshot.work[0].gone = Some("branch deleted".to_owned());
+        press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+        app.key(Key::Enter);
+        app.key(Key::Char('o'));
+        assert!(app.take_action().is_none(), "gone work carries no action");
+
+        // And an excluded history row is read-only too.
+        let mut app = App::new(fixture());
+        app.snapshot.work[0].same_name_history.push(incarnation(
+            "i000",
+            "/repos/a/.git",
+            "feat/login",
+            0,
+        ));
+        app.history = true;
+        press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char('j')]);
+        app.key(Key::Enter);
+        app.key(Key::Char('o'));
+        assert!(app.take_action().is_none(), "excluded history is inert");
+    }
+
+    /// Enter leaves a request; the loop resolves it through the injected
+    /// seams - `act` answers Done/Failed into the footer, a resume plan
+    /// goes to `suspend`.
+    #[test]
+    fn the_loop_routes_actions_to_the_injected_executor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new(fixture());
+        press(&mut app, &[Key::Char('3'), Key::Char('j')]);
+        // The poll script dies after Enter: a notice survives to assert
+        // only while no later key has cleared it.
+        let mut events = std::collections::VecDeque::from([
+            Ok(Some(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))),
+            Err(io::Error::other("stdin died")),
+        ]);
+        let mut poll = move || events.pop_front().unwrap_or(Ok(None));
+        let mut asked = Vec::new();
+        let mut act = |request: &ActionRequest| -> ActionOutcome {
+            asked.push(format!("{request:?}"));
+            ActionOutcome::Done(Some("did it".to_owned()))
+        };
+        let mut suspend =
+            |_: &ResumePlan| -> Result<(), String> { unreachable!("no resume in this script") }; // coverage: off - the script never reaches it
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let result = run_loop(
+            &mut terminal,
+            &mut app,
+            &mut || Feed::Idle,
+            &mut poll,
+            &mut act,
+            &mut suspend,
+        );
+        assert!(result.is_err(), "a dead stdin ends the loop");
+        assert_eq!(asked.len(), 1);
+        assert!(
+            asked[0].contains("8f423bbb-1111-2222-3333-444444444444"),
+            "{asked:?}"
+        );
+        assert_eq!(app.notice.as_deref(), Some("did it"));
+
+        // A failure lands on the footer too, and the loop runs on to `q`.
+        let mut app = App::new(fixture());
+        press(&mut app, &[Key::Char('3'), Key::Char('j')]);
+        let mut events = std::collections::VecDeque::from([
+            Ok(Some(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))),
+            Err(io::Error::other("stdin died")),
+        ]);
+        let mut poll = move || events.pop_front().unwrap_or(Ok(None));
+        let mut act =
+            |_: &ActionRequest| -> ActionOutcome { ActionOutcome::Failed("nope".to_owned()) };
+        let mut suspend =
+            |_: &ResumePlan| -> Result<(), String> { unreachable!("no resume in this script") }; // coverage: off - the script never reaches it
+        let result = run_loop(
+            &mut terminal,
+            &mut app,
+            &mut || Feed::Idle,
+            &mut poll,
+            &mut act,
+            &mut suspend,
+        );
+        assert!(result.is_err());
+        assert_eq!(app.notice.as_deref(), Some("nope"));
+
+        // A resume plan goes to `suspend`: a recorded replacement ends
+        // the loop outright and its executor writes the plan's
+        // acknowledgement, a failed one preserves seen-state, leaves a
+        // footer notice and runs on.
+        let key = store::conversation_key("claude", "8f423bbb-1111-2222-3333-444444444444");
+        for replaced in [true, false] {
+            let dir =
+                std::env::temp_dir().join(format!("as-resume-{}-{replaced}", std::process::id()));
+            let mut app = App::new(fixture());
+            press(&mut app, &[Key::Char('3'), Key::Char('j')]);
+            // A replaced process breaks the loop outright; a failed one
+            // is followed by a dead stdin, so its notice survives to
+            // assert.
+            let mut events = std::collections::VecDeque::from([
+                Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )))),
+                Err(io::Error::other("stdin died")),
+            ]);
+            let mut poll = move || events.pop_front().unwrap_or(Ok(None));
+            let plan = ResumePlan {
+                executable: std::ffi::OsString::from("claude"),
+                argv: vec![
+                    std::ffi::OsString::from("--resume"),
+                    std::ffi::OsString::from("id"),
+                ],
+                cwd: PathBuf::from("/tmp"),
+                acknowledgement: Some((key.clone(), 3, Some(7))),
+            };
+            let store = crate::store::Store::open(dir.clone());
+            let mut suspended = Vec::new();
+            let mut act =
+                move |_: &ActionRequest| -> ActionOutcome { ActionOutcome::Resume(plan.clone()) };
+            let mut suspend = |plan: &ResumePlan| -> Result<(), String> {
+                suspended.push(plan.executable.clone());
+                if replaced {
+                    // The injected executor stands where exec would be:
+                    // a successful replacement records the acknowledgement.
+                    let (key, seq, wait_ms) = plan.acknowledgement.clone().expect("a pending ack");
+                    store.acknowledge(&key, seq, wait_ms).expect("ack lands");
+                    Ok(())
+                } else {
+                    Err("could not exec".to_owned())
+                }
+            };
+            let result = run_loop(
+                &mut terminal,
+                &mut app,
+                &mut || Feed::Idle,
+                &mut poll,
+                &mut act,
+                &mut suspend,
+            );
+            if replaced {
+                result.unwrap();
+            } else {
+                assert!(result.is_err(), "the dead stdin ends the loop");
+            }
+            assert_eq!(suspended, [std::ffi::OsString::from("claude")]);
+            let seen = crate::store::Store::open(dir.clone()).load().seen;
+            if replaced {
+                assert!(!app.quit(), "the process is gone, not quit");
+                assert_eq!(
+                    seen.get(&key).copied(),
+                    Some(store::Seen {
+                        seq: 3,
+                        wait_ms: Some(7)
+                    })
+                );
+            } else {
+                assert_eq!(app.notice.as_deref(), Some("could not exec"));
+                assert!(seen.is_empty(), "a failed resume acknowledges nothing");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -4060,7 +4430,21 @@ mod tests {
                 .unwrap_or(Feed::Idle)
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        run_loop(&mut terminal, &mut app, &mut next_snapshot, &mut poll).unwrap();
+        #[rustfmt::skip]
+        let mut act = |_: &ActionRequest| -> ActionOutcome { // coverage: off - the script presses no Enter or o
+            unreachable!("the script presses no Enter or o") // coverage: off - the script never reaches it
+        }; // coverage: off - same
+        let mut suspend =
+            |_: &ResumePlan| -> Result<(), String> { unreachable!("no resume outcome") }; // coverage: off - the script never reaches it
+        run_loop(
+            &mut terminal,
+            &mut app,
+            &mut next_snapshot,
+            &mut poll,
+            &mut act,
+            &mut suspend,
+        )
+        .unwrap();
         assert!(app.quit());
         // `j` moved the focused (Repos) cursor one row; release and
         // unmapped keys did not. The worker's finished snapshots swapped in
@@ -4079,7 +4463,15 @@ mod tests {
         ]);
         let mut poll = move || Ok(events.pop_front().unwrap_or(None));
         let mut next_snapshot = || Feed::Idle;
-        run_loop(&mut terminal, &mut app, &mut next_snapshot, &mut poll).unwrap();
+        run_loop(
+            &mut terminal,
+            &mut app,
+            &mut next_snapshot,
+            &mut poll,
+            &mut act,
+            &mut suspend,
+        )
+        .unwrap();
         assert!(app.quit());
         assert_eq!(app.snapshot.observed_at, 1_800_000_000);
     }
@@ -4101,7 +4493,21 @@ mod tests {
         let mut feeds = std::collections::VecDeque::from([Feed::Dead]);
         let mut next_snapshot = move || feeds.pop_front().unwrap_or(Feed::Idle);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        run_loop(&mut terminal, &mut app, &mut next_snapshot, &mut poll).unwrap();
+        #[rustfmt::skip]
+        let mut act = |_: &ActionRequest| -> ActionOutcome { // coverage: off - the script presses no Enter or o
+            unreachable!("the script presses no Enter or o") // coverage: off - the script never reaches it
+        }; // coverage: off - same
+        let mut suspend =
+            |_: &ResumePlan| -> Result<(), String> { unreachable!("no resume outcome") }; // coverage: off - the script never reaches it
+        run_loop(
+            &mut terminal,
+            &mut app,
+            &mut next_snapshot,
+            &mut poll,
+            &mut act,
+            &mut suspend,
+        )
+        .unwrap();
         assert!(app.quit());
         // A dead collector does not leave stale rows looking live: the
         // footer names it.
@@ -4322,6 +4728,7 @@ mod tests {
             liveness: l,
             liveness_detail: None,
             pane: None,
+            target: None,
             pane_source: None,
             placement_detail: None,
             source: EvidenceSource::Derived,

@@ -68,6 +68,19 @@ impl fmt::Display for PaneRef {
     }
 }
 
+/// A pane's socket-qualified location for an action: the server, window,
+/// pane and session that `select-window`/`select-pane` need. Built only
+/// from an inventory record - never parsed back out of a display label
+/// or a provider handle, which cannot carry the socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneTarget {
+    /// The socket path of the server the pane lives on.
+    pub socket: PathBuf,
+    pub window: WindowId,
+    pub pane: PaneId,
+    pub session: SessionId,
+}
+
 /// One pane of the merged inventory, as `list-panes -a` reported it.
 #[derive(Debug, Clone)]
 pub struct Pane {
@@ -104,6 +117,16 @@ pub struct Pane {
 }
 
 impl Pane {
+    /// The pane's socket-qualified action target.
+    pub fn target(&self) -> PaneTarget {
+        PaneTarget {
+            socket: self.socket.clone(),
+            window: self.window.clone(),
+            pane: self.id.clone(),
+            session: self.session.clone(),
+        }
+    }
+
     /// Whether this pane's evidence binds it to `worktree`: the stored
     /// admin-id edge when the window publishes one, else the derived edge -
     /// a pane cwd at or below the worktree root. Both spellings are
@@ -249,6 +272,14 @@ impl PaneInventory {
     /// so more than one server can answer.
     pub fn by_pane_id(&self, id: &PaneId) -> Vec<&Pane> {
         self.panes.iter().filter(|pane| &pane.id == id).collect()
+    }
+
+    /// The record a socket-qualified pane reference names, when the
+    /// inventory still holds it.
+    pub fn get(&self, pref: &PaneRef) -> Option<&Pane> {
+        self.panes
+            .iter()
+            .find(|pane| pane.id == pref.pane && pane.socket == pref.socket)
     }
 
     /// The pane whose root process is `pid` (`pane_pid`), anywhere.

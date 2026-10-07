@@ -86,7 +86,7 @@ fn production_sources_never_name_a_tmux_write() {
 /// The only modules allowed to spawn a subprocess: each external program's
 /// argv lives behind one audited boundary, and adding a spawn surface means
 /// editing this list where a reviewer will see it.
-const SPAWN_MODULES: [&str; 4] = ["git.rs", "forge.rs", "process.rs", "tmux.rs"];
+const SPAWN_MODULES: [&str; 5] = ["action.rs", "git.rs", "forge.rs", "process.rs", "tmux.rs"];
 
 #[test]
 fn external_programs_are_spawned_in_their_own_module() {
@@ -184,6 +184,42 @@ fn only_the_store_module_writes_files() {
                 path.display()
             );
         }
+    }
+}
+
+/// argv words the action module must never build, as quoted string
+/// literals: a shell - the resume is exec'd argv, never a `-c` line -
+/// tmux topology creation, renames and option writes, and any URL
+/// literal, since forge URLs arrive from the snapshot only. Selection
+/// argv (`select-window`, `select-pane`, `-t`) stays allowed.
+const FORBIDDEN_ACTION_ARGV: [&str; 15] = [
+    "\"sh\"",
+    "\"bash\"",
+    "\"zsh\"",
+    "\"fish\"",
+    "\"-c\"",
+    "\"new-session\"",
+    "\"new-window\"",
+    "\"split-window\"",
+    "\"rename-window\"",
+    "\"rename-session\"",
+    "\"set-option\"",
+    "\"set-window-option\"",
+    "\"setw\"",
+    "\"http://",
+    "\"https://",
+];
+
+#[test]
+fn action_code_spawns_no_shell_topology_or_urls() {
+    let action = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/action.rs");
+    let text = fs::read_to_string(&action).expect("src/action.rs exists");
+    let production = production_part(&text, &action);
+    for argv in FORBIDDEN_ACTION_ARGV {
+        assert!(
+            !production.contains(argv),
+            "src/action.rs: names {argv} - resumes are exec'd argv, jumps only select, URLs come from the snapshot"
+        );
     }
 }
 
