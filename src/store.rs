@@ -1171,6 +1171,56 @@ fn working_tree_update(
     .then_some(observed_ms)
 }
 
+/// Everything a live record owes one observation: commit, working-tree
+/// and lifecycle events dated at the pass, then the merged inputs. The
+/// continuing-record arm and the proven-rename arm run the same
+/// sequence, so a move cannot defer a transition to the pass after it.
+fn absorb_updates(record: &mut BranchRecord, obs: &ObservedRef, observed_ms: u64) -> bool {
+    let mut changed = false;
+    let mut newest = commit_update(
+        &mut record.updates,
+        &record.head,
+        &obs.head,
+        &obs.commit,
+        observed_ms,
+    );
+    if obs.head.is_some() && record.head != obs.head {
+        record.head = obs.head.clone();
+        changed = true;
+    }
+    newest = newest.max(working_tree_update(
+        &mut record.updates,
+        &record.inputs.working_tree,
+        &obs.inputs.working_tree,
+        observed_ms,
+    ));
+    // A changed proven fingerprint is a transition; first observation
+    // never lands here. A newly proven field is stored without dating
+    // anything.
+    let reasons = obs.inputs.transitions_from(&record.inputs);
+    if !reasons.is_empty() {
+        append_update(
+            &mut record.updates,
+            UpdateEvent {
+                source: UpdateSource::Lifecycle,
+                at_ms: observed_ms,
+                reasons,
+            },
+        );
+        newest = newest.max(Some(observed_ms));
+    }
+    if let Some(at) = newest {
+        bump_activity(&mut record.activity_at, at);
+        changed = true;
+    }
+    let inputs = obs.inputs.over(&record.inputs);
+    if record.inputs != inputs {
+        record.inputs = inputs;
+        changed = true;
+    }
+    changed
+}
+
 fn session_update(
     updates: &mut Vec<UpdateEvent>,
     cursors: &mut BTreeMap<String, u64>,
@@ -1693,18 +1743,7 @@ impl Store {
             work.active_branches.remove(&old_key);
             record.ref_name = obs.name.clone();
             record.last_observed_at = observed_ms;
-            if let Some(at) = commit_update(
-                &mut record.updates,
-                &record.head,
-                &obs.head,
-                &obs.commit,
-                observed_ms,
-            ) {
-                bump_activity(&mut record.activity_at, at);
-            }
-            if obs.head.is_some() {
-                record.head = obs.head.clone();
-            }
+            absorb_updates(record, obs, observed_ms);
             record.continuity_evidence = ContinuityEvidence::ProvenRename;
             if record.creation_evidence.is_none() {
                 record.creation_evidence = obs.creation.clone();
@@ -1794,47 +1833,7 @@ impl Store {
                         record.continuity_evidence = continuity;
                         changed = true;
                     }
-                    let mut newest = commit_update(
-                        &mut record.updates,
-                        &record.head,
-                        &obs.head,
-                        &obs.commit,
-                        observed_ms,
-                    );
-                    if obs.head.is_some() && record.head != obs.head {
-                        record.head = obs.head.clone();
-                        changed = true;
-                    }
-                    newest = newest.max(working_tree_update(
-                        &mut record.updates,
-                        &record.inputs.working_tree,
-                        &obs.inputs.working_tree,
-                        observed_ms,
-                    ));
-                    // A changed proven fingerprint is a transition; first
-                    // observation never lands here. A newly proven field
-                    // is stored without dating anything.
-                    let reasons = obs.inputs.transitions_from(&record.inputs);
-                    if !reasons.is_empty() {
-                        append_update(
-                            &mut record.updates,
-                            UpdateEvent {
-                                source: UpdateSource::Lifecycle,
-                                at_ms: observed_ms,
-                                reasons,
-                            },
-                        );
-                        newest = newest.max(Some(observed_ms));
-                    }
-                    if let Some(at) = newest {
-                        bump_activity(&mut record.activity_at, at);
-                        changed = true;
-                    }
-                    let inputs = obs.inputs.over(&record.inputs);
-                    if record.inputs != inputs {
-                        record.inputs = inputs;
-                        changed = true;
-                    }
+                    changed |= absorb_updates(record, obs, observed_ms);
                 }
                 None => {
                     open_incarnation(
@@ -4551,6 +4550,32 @@ mod tests {
             "a head move without commit metadata dates at the pass"
         );
         assert_eq!(record.activity_at, Some(2_000));
+    }
+
+    #[test]
+    fn a_proven_rename_lands_the_passes_own_transitions() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        store.sync_repo(repo, &[obs("feat", false)], 1_000).unwrap();
+        // The rename pass is an observation like any other: a proven
+        // lifecycle change dates this pass, not the next one to find
+        // the moved record.
+        let mut renamed = obs("feat2", true);
+        renamed.renamed_from = Some("feat".to_owned());
+        store.sync_repo(repo, &[renamed], 2_000).unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat2").expect("the record");
+        assert_eq!(
+            record.updates,
+            vec![UpdateEvent {
+                source: UpdateSource::Lifecycle,
+                at_ms: 2_000,
+                reasons: vec!["dirty: clean -> dirty".to_owned()],
+            }]
+        );
+        assert_eq!(record.activity_at, Some(2_000));
+        assert_eq!(record.inputs.dirty, Some(true));
     }
 
     #[test]
