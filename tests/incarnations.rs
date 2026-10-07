@@ -1334,13 +1334,12 @@ fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
     // the first lifecycle event, and it does not touch `worktree`.
     assert_eq!(row.updates.len(), 1, "{:?}", row.updates);
     assert_eq!(row.updates[0].source, UpdateSource::Lifecycle);
-    assert_eq!(
-        row.updates[0].reasons,
-        [
-            ".git missing".to_owned(),
-            "worktree state: healthy -> broken: gitdir file points to non-existent location"
-                .to_owned()
-        ],
+    // Git's `prunable` wording is passed through verbatim; pin the
+    // stable prefix, not the sentence.
+    assert_eq!(row.updates[0].reasons.len(), 2, "{:?}", row.updates[0]);
+    assert_eq!(row.updates[0].reasons[0], ".git missing");
+    assert!(
+        row.updates[0].reasons[1].starts_with("worktree state: healthy -> broken: gitdir"),
         "{:?}",
         row.updates[0].reasons
     );
