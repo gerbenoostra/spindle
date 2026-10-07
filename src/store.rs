@@ -1038,7 +1038,6 @@ fn open_incarnation(
     continuity: ContinuityEvidence,
 ) {
     let id = incarnation_id(repo, &obs.name, observed_ms);
-    let updates = Vec::new();
     work.branches.insert(
         id.clone(),
         BranchRecord {
@@ -1054,7 +1053,7 @@ fn open_incarnation(
             parked: false,
             activity_at: None,
             inputs: obs.inputs.clone(),
-            updates,
+            updates: Vec::new(),
             session_activity: BTreeMap::new(),
         },
     );
