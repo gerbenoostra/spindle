@@ -2185,7 +2185,9 @@ fn lifecycle_inputs(state: &vector::WorkState) -> store::LifecycleInputs {
         dirty: v.dirty.known().copied(),
         worktree: Some(v.worktree.is_some()),
         git_dir: match &state.anchor {
-            Anchor::Worktree { path, .. } => Some(path.join(".git").exists()),
+            // A stat failure is unproven, not missing: the record keeps
+            // its last value instead of dating a false ".git missing".
+            Anchor::Worktree { path, .. } => path.join(".git").try_exists().ok(),
             Anchor::Branch { .. } => None,
         },
         worktree_path: v.worktree.as_ref().map(|p| p.display().to_string()),
