@@ -2915,10 +2915,15 @@ mod legacy {
     }
 
     /// The v2 `updates` split: Lifecycle and WorkingTree events are
-    /// observations at their old time, Session events are Conversation
-    /// activities, and a Commit event is activity only when the stored
-    /// commit metadata proves its timestamp - unprovable ones stay as
-    /// Commit observations.
+    /// observations at their old time, and Session events are
+    /// Conversation observations - v2's writer used
+    /// `Conversation::last_activity()`, which preferred live
+    /// updatedAt/statusUpdatedAt, so it could not distinguish source
+    /// activity from publication evidence and stored no provenance
+    /// proving occurrence time; current collection rebuilds
+    /// source-backed conversation activity. A Commit event is activity
+    /// only when the stored commit metadata proves its timestamp -
+    /// unprovable ones stay as Commit observations.
     fn events(
         inputs: &LifecycleInputs,
         updates: Vec<UpdateEvent>,
@@ -2943,11 +2948,11 @@ mod legacy {
                         reasons: event.reasons,
                     },
                 ),
-                UpdateSource::Session => append_activity(
-                    &mut activities,
-                    ActivityEvent {
-                        source: ActivitySource::Conversation,
-                        occurred_at_ms: event.at_ms,
+                UpdateSource::Session => append_observation(
+                    &mut observations,
+                    ObservationEvent {
+                        source: ObservationSource::Conversation,
+                        observed_at_ms: event.at_ms,
                         reasons: event.reasons,
                     },
                 ),
@@ -5661,23 +5666,19 @@ mod tests {
         let (work, errors) = temp.store().work();
         assert!(errors.is_empty(), "{errors:?}");
         let record = work.branches.get("i1").expect("the record");
-        // Proven commit events are activity at their proven time; the
-        // unproven one stays a detection. Session events are Conversation
-        // activity; lifecycle and working-tree events are observations.
+        // Only the proven commit event is activity. The unproven one
+        // stays a detection, and the Session event is a Conversation
+        // observation: v2 stored no provenance proving its occurrence
+        // time, so it cannot become source-backed activity on
+        // migration. Lifecycle and working-tree events are
+        // observations too.
         assert_eq!(
             record.activities,
-            vec![
-                ActivityEvent {
-                    source: ActivitySource::Conversation,
-                    occurred_at_ms: 6_000,
-                    reasons: vec!["8f423bbb turn".to_owned()],
-                },
-                ActivityEvent {
-                    source: ActivitySource::Commit,
-                    occurred_at_ms: 7_777,
-                    reasons: vec!["aaaaaaa landed".to_owned()],
-                },
-            ]
+            vec![ActivityEvent {
+                source: ActivitySource::Commit,
+                occurred_at_ms: 7_777,
+                reasons: vec!["aaaaaaa landed".to_owned()],
+            }]
         );
         assert_eq!(
             record.observations,
@@ -5697,6 +5698,11 @@ mod tests {
                     observed_at_ms: 4_000,
                     reasons: vec!["modified a.rs".to_owned()],
                 },
+                ObservationEvent {
+                    source: ObservationSource::Conversation,
+                    observed_at_ms: 6_000,
+                    reasons: vec!["8f423bbb turn".to_owned()],
+                },
             ]
         );
         // The stored aggregate is ignored wholesale: 999_999 is not the
@@ -5707,9 +5713,11 @@ mod tests {
         assert_eq!(work.active_branches.get("/r/.git\u{0}feat").unwrap(), "i1");
         assert_eq!(work.touches.len(), 1);
         let path = work.path("/p").expect("the path record");
+        // Nothing here is activity: 888_888 is ignored, the Commit
+        // event is unproven, and the Session event is an observation.
         assert_eq!(
             newest_activity(&path.activities),
-            Some(5_000),
+            None,
             "888_888 never enters either"
         );
         // A path record holds no commit metadata, so its Commit event is
@@ -5726,6 +5734,11 @@ mod tests {
                     source: ObservationSource::Commit,
                     observed_at_ms: 1_600,
                     reasons: vec!["dddddddd unknown".to_owned()],
+                },
+                ObservationEvent {
+                    source: ObservationSource::Conversation,
+                    observed_at_ms: 5_000,
+                    reasons: vec!["c turn".to_owned()],
                 },
             ]
         );
