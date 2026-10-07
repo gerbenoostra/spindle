@@ -240,12 +240,12 @@ impl Conversation {
             .or_else(|| self.transcript.as_ref().and_then(|t| t.last_at))
     }
 
-    /// The most recent evidence of the conversation at all.
+    /// The conversation's latest source-backed activity: the newest
+    /// transcript message time. A live file's `updatedAt` and
+    /// `statusUpdatedAt` are publication times - state evidence, never
+    /// work - and a first detection has no occurrence to date.
     pub fn last_activity(&self) -> Option<SystemTime> {
-        self.live
-            .as_ref()
-            .and_then(|l| l.updated_at.or(l.status_updated_at))
-            .or_else(|| self.transcript.as_ref().and_then(|t| t.last_at))
+        self.transcript.as_ref().and_then(|t| t.last_at)
     }
 
     /// The process claim a live session makes, for runtime resolution.

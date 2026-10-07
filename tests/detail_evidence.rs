@@ -15,8 +15,8 @@ use agent_sessions::snapshot::{
     RepoCounts, RepoRow, SCHEMA_VERSION, Snapshot, Upstream, WorkKind, WorkRow, WorkSection,
 };
 use agent_sessions::store::{
-    Confidence, ContinuityEvidence, Exec, Mark, NormEvent, RejectedRecord, TouchProvenance,
-    UpdateEvent, UpdateSource,
+    ActivityEvent, ActivitySource, Confidence, ContinuityEvidence, Exec, Mark, NormEvent,
+    ObservationEvent, ObservationSource, RejectedRecord, TouchProvenance,
 };
 use agent_sessions::tui::{App, Key};
 use agent_sessions::verdict::{ActionVerdict, Verdict};
@@ -101,7 +101,8 @@ fn work() -> WorkRow {
         branch: Some("feat/login".to_owned()),
         dirty: Some(true),
         broken: None,
-        updates: Vec::new(),
+        activities: Vec::new(),
+        observations: Vec::new(),
         commits_ahead: Some(3),
         unpushed: Some(3),
         upstream: Upstream::Tracked,
@@ -130,8 +131,6 @@ fn work() -> WorkRow {
         }],
         gone: None,
         references: Vec::new(),
-        transition_at: Some(NOW - 3600),
-        git_activity_at: Some(NOW - 300),
         worktree_removal: Some(ActionVerdict {
             verdict: Verdict::Blocked,
             reasons: vec!["uncommitted changes".to_owned()],
@@ -284,44 +283,49 @@ fn work_detail_shows_incarnation_delivery_upstream_forge_and_cleanup() {
 }
 
 #[test]
-fn update_history_groups_sources_by_newest_and_caps_at_seven() {
+fn activity_and_observation_histories_render_separately_and_cap_at_seven() {
     let mut snapshot = fixture();
-    let mut updates = Vec::new();
+    let mut activities = Vec::new();
     for i in 0..8u64 {
-        updates.push(UpdateEvent {
-            source: UpdateSource::Commit,
-            at_ms: (NOW - 600 - i * 60) * 1000,
+        activities.push(ActivityEvent {
+            source: ActivitySource::Commit,
+            occurred_at_ms: (NOW - 600 - i * 60) * 1000,
             reasons: vec![format!("commit{i:02} subject {i}")],
         });
     }
-    updates.push(UpdateEvent {
-        source: UpdateSource::WorkingTree,
-        at_ms: (NOW - 60) * 1000,
+    activities.push(ActivityEvent {
+        source: ActivitySource::WorkingTree,
+        occurred_at_ms: (NOW - 60) * 1000,
         reasons: vec!["deleted README.md".to_owned()],
     });
-    updates.push(UpdateEvent {
-        source: UpdateSource::Session,
-        at_ms: (NOW - 30) * 1000,
+    activities.push(ActivityEvent {
+        source: ActivitySource::Conversation,
+        occurred_at_ms: (NOW - 30) * 1000,
         reasons: vec!["8f423bbb update pane labels".to_owned()],
     });
-    updates.push(UpdateEvent {
-        source: UpdateSource::Lifecycle,
-        at_ms: (NOW - 90) * 1000,
+    snapshot.work[0].activities = activities;
+    snapshot.work[0].observations = vec![ObservationEvent {
+        source: ObservationSource::Lifecycle,
+        observed_at_ms: (NOW - 90) * 1000,
         reasons: vec!["upstream: a -> b".to_owned(), "ahead: 1 -> 2".to_owned()],
-    });
-    snapshot.work[0].updates = updates;
+    }];
     let mut app = App::new(snapshot);
     press(&mut app, &[Key::Char('2'), Key::Char('j')]);
     for width in [55, 200] {
         let text = render(&app, width, 50);
-        assert!(text.contains("updates:"), "{text}");
-        let session = text.find("  session:").expect("session group");
+        assert!(text.contains("activity:"), "{text}");
+        assert!(text.contains("observations:"), "{text}");
+        assert!(
+            text.find("activity:").unwrap() < text.find("observations:").unwrap(),
+            "activity lists first: {text}"
+        );
+        // Activity sources group by their newest occurrence.
+        let conversation = text.find("  conversation:").expect("conversation group");
         let working = text.find("  working tree:").expect("working tree group");
-        let lifecycle = text.find("  lifecycle:").expect("lifecycle group");
         let commit = text.find("  commit:").expect("commit group");
         assert!(
-            session < working && working < lifecycle && lifecycle < commit,
-            "sources order by their newest event: {text}"
+            conversation < working && working < commit,
+            "activity sources order by their newest event: {text}"
         );
         assert!(
             text.find("commit00").unwrap() < text.find("commit01").unwrap(),
@@ -332,8 +336,11 @@ fn update_history_groups_sources_by_newest_and_caps_at_seven() {
             "the eighth commit event is past the display cap: {text}"
         );
         assert!(text.contains("deleted README.md"), "{text}");
+        // The lifecycle transition is detection evidence, rendered under
+        // `observations:` at its own time - never under `activity:`.
         assert!(text.contains("upstream: a -> b"), "{text}");
         assert!(text.contains("ahead: 1 -> 2"), "{text}");
+        assert!(!text.contains("last change"), "{text}");
     }
     let text = render(&app, 200, 50);
     assert!(text.contains("8f423bbb update pane labels"), "{text}");
@@ -342,8 +349,8 @@ fn update_history_groups_sources_by_newest_and_caps_at_seven() {
     press(&mut quiet, &[Key::Char('2'), Key::Char('j')]);
     let text = render(&quiet, 200, 40);
     assert!(
-        !text.contains("updates:"),
-        "a row with no events renders no section: {text}"
+        !text.contains("observations:"),
+        "a row with no observations renders no section: {text}"
     );
 }
 
@@ -359,8 +366,8 @@ fn work_detail_renders_question_marks_for_unproven_fields() {
     row.forge_label = None;
     row.worktree_removal = None;
     row.branch_deletion = None;
-    row.transition_at = None;
-    row.git_activity_at = None;
+    row.activities = Vec::new();
+    row.observations = Vec::new();
     let mut snapshot = fixture();
     snapshot.work = vec![row];
     let mut app = App::new(snapshot);
@@ -372,7 +379,7 @@ fn work_detail_renders_question_marks_for_unproven_fields() {
         "{text}"
     );
     assert!(text.contains("forge: ?"), "{text}");
-    assert!(text.contains("last change ? · last commit ?"), "{text}");
+    assert!(text.contains("activity: ?"), "{text}");
     assert!(text.contains("worktree remove: ?"), "{text}");
     assert!(text.contains("branch delete: ?"), "{text}");
     // An unproven base lists no commits: the honest cell.

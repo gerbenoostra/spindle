@@ -1312,51 +1312,49 @@ impl App {
                 push_text(out, format!("  {} {}", p.handle, p.command), width);
             }
         }
+        // Activity versus detection: `activity:` names the newest
+        // source-backed occurrence (`?` when none is proven) and lists
+        // each event at the time its source dated it; `observations:`
+        // lists what passes learned, at the time they learned it - a
+        // detection can never pass for work.
         push_text(
             out,
             format!(
-                "activity: last change {} · last commit {}",
-                age(now, w.transition_at),
-                age(now, w.git_activity_at)
+                "activity: {}",
+                store::newest_activity(&w.activities)
+                    .map_or_else(|| "?".to_owned(), |ms| age_ms(now.saturating_mul(1000), ms))
             ),
             width,
         );
-        if !w.updates.is_empty() {
-            let mut groups: std::collections::BTreeMap<
-                store::UpdateSource,
-                Vec<&store::UpdateEvent>,
-            > = std::collections::BTreeMap::new();
-            for event in &w.updates {
-                groups.entry(event.source).or_default().push(event);
-            }
-            let mut groups: Vec<_> = groups.into_iter().collect();
-            groups.sort_by(|(a_source, a), (b_source, b)| {
-                let newest =
-                    |events: &Vec<&store::UpdateEvent>| events.iter().map(|e| e.at_ms).max();
-                newest(b).cmp(&newest(a)).then(a_source.cmp(b_source))
-            });
-            push_head(out, "updates:".to_owned(), width);
-            for (source, mut events) in groups {
-                let label = serde_json::to_value(source)
+        for line in event_lines(
+            &w.activities,
+            |e| {
+                serde_json::to_value(e.source)
                     .ok()
                     .and_then(|v| v.as_str().map(str::to_owned))
                     .unwrap_or_default()
-                    .replace('_', " ");
-                push_text(out, format!("  {label}:"), width);
-                events.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then(b.reasons.cmp(&a.reasons)));
-                for event in events.iter().take(UPDATE_DISPLAY_PER_SOURCE) {
-                    for reason in &event.reasons {
-                        push_text(
-                            out,
-                            format!(
-                                "    {} {}",
-                                age_ms(now.saturating_mul(1000), event.at_ms),
-                                escape_text(reason)
-                            ),
-                            width,
-                        );
-                    }
-                }
+            },
+            |e| e.occurred_at_ms,
+            |e| &e.reasons,
+            now.saturating_mul(1000),
+        ) {
+            push_text(out, line, width);
+        }
+        if !w.observations.is_empty() {
+            push_head(out, "observations:".to_owned(), width);
+            for line in event_lines(
+                &w.observations,
+                |e| {
+                    serde_json::to_value(e.source)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_default()
+                },
+                |e| e.observed_at_ms,
+                |e| &e.reasons,
+                now.saturating_mul(1000),
+            ) {
+                push_text(out, line, width);
             }
         }
         if !w.same_name_history.is_empty() {
@@ -2387,7 +2385,48 @@ fn ref_kind(kind: ReferenceKind) -> &'static str {
     }
 }
 
-const UPDATE_DISPLAY_PER_SOURCE: usize = 7;
+const EVENT_DISPLAY_PER_SOURCE: usize = 7;
+
+/// A row's events rendered grouped by source, groups ordered by their
+/// newest event and each event listed at its own `at` - the shape the
+/// `activity:` and `observations:` sections share, where `at` is the
+/// occurrence or the detection time respectively.
+fn event_lines<E>(
+    events: &[E],
+    source: impl Fn(&E) -> String,
+    at: impl Fn(&E) -> u64,
+    reasons: impl Fn(&E) -> &[String],
+    now_ms: u64,
+) -> Vec<String> {
+    let mut by_source: std::collections::BTreeMap<String, Vec<&E>> =
+        std::collections::BTreeMap::new();
+    for event in events {
+        by_source.entry(source(event)).or_default().push(event);
+    }
+    let mut groups: Vec<(u64, String, Vec<&E>)> = by_source
+        .into_iter()
+        .map(|(source, events)| {
+            (
+                events.iter().map(|e| at(e)).max().unwrap_or(0),
+                source,
+                events,
+            )
+        })
+        .collect();
+    groups.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut lines = Vec::new();
+    for (_, source, mut events) in groups {
+        lines.push(format!("  {}:", source.replace('_', " ")));
+        events.sort_by_key(|e| std::cmp::Reverse(at(e)));
+        for event in events.iter().take(EVENT_DISPLAY_PER_SOURCE) {
+            let when = age_ms(now_ms, at(event));
+            for reason in reasons(event) {
+                lines.push(format!("    {when} {}", escape_text(reason)));
+            }
+        }
+    }
+    lines
+}
 
 /// An epoch-ms evidence timestamp as an age against `now_ms`.
 fn age_ms(now_ms: u64, then_ms: u64) -> String {
@@ -2773,7 +2812,8 @@ mod tests {
                     branch: Some("feat/login".to_owned()),
                     dirty: Some(true),
                     broken: None,
-                    updates: Vec::new(),
+                    activities: Vec::new(),
+                    observations: Vec::new(),
                     commits_ahead: Some(3),
                     unpushed: Some(3),
                     upstream: Upstream::Tracked,
@@ -2799,8 +2839,6 @@ mod tests {
                     panes: Vec::new(),
                     gone: None,
                     references: Vec::new(),
-                    transition_at: Some(1_800_000_000 - 3600),
-                    git_activity_at: Some(1_800_000_000 - 300),
                     worktree_removal: Some(crate::verdict::ActionVerdict {
                         verdict: crate::verdict::Verdict::Blocked,
                         reasons: vec!["uncommitted changes".to_owned()],
@@ -2821,7 +2859,8 @@ mod tests {
                     branch: Some("feat/old".to_owned()),
                     dirty: Some(false),
                     broken: None,
-                    updates: Vec::new(),
+                    activities: Vec::new(),
+                    observations: Vec::new(),
                     commits_ahead: Some(7),
                     unpushed: Some(7),
                     upstream: Upstream::NeverPushed,
@@ -2847,8 +2886,6 @@ mod tests {
                     panes: Vec::new(),
                     gone: None,
                     references: Vec::new(),
-                    transition_at: None,
-                    git_activity_at: None,
                     worktree_removal: Some(crate::verdict::ActionVerdict {
                         verdict: crate::verdict::Verdict::NotApplicable,
                         reasons: vec![],
@@ -2869,7 +2906,8 @@ mod tests {
                     branch: None,
                     dirty: None,
                     broken: None,
-                    updates: Vec::new(),
+                    activities: Vec::new(),
+                    observations: Vec::new(),
                     commits_ahead: None,
                     unpushed: None,
                     upstream: Upstream::NotApplicable,
@@ -2895,8 +2933,6 @@ mod tests {
                     panes: Vec::new(),
                     gone: None,
                     references: Vec::new(),
-                    transition_at: None,
-                    git_activity_at: None,
                     worktree_removal: None,
                     branch_deletion: None,
                     section: crate::snapshot::WorkSection::FollowUp,

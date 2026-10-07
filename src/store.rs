@@ -44,7 +44,11 @@ use crate::provider::SourceError;
 /// `behind`), and `worktree` turned into a proven-or-`None` tri-state - a
 /// v1 build rewrites the file without all of that, so its writes must
 /// refuse rather than clobber what it cannot read.
-pub const SCHEMA: u32 = 2;
+/// v2 -> v3: the mixed `updates`/`activity_at` contract split into
+/// source-backed `activities` and scan-time `observations`. A v2
+/// `work.json` reads and migrates on the first successful
+/// read-modify-write; a future or malformed one is still refused.
+pub const SCHEMA: u32 = 3;
 
 /// Compact once the journal's un-checkpointed tail passes this many
 /// records: enough that a busy day never rewrites, small enough that a
@@ -276,6 +280,11 @@ pub struct Fold {
     /// The producer-sequence high-water mark; older rejects as reordered.
     #[serde(default)]
     pub pseq_high: Option<u64>,
+    /// The newest producer-supplied timestamp (`pts`) any folded record
+    /// carried, epoch milliseconds - conversation activity as the hook
+    /// producer dated it, never the journal's commit time.
+    #[serde(default)]
+    pub last_pts: Option<u64>,
 }
 
 /// How one record landed in a fold.
@@ -310,6 +319,9 @@ impl Fold {
             }
         }
         self.last_seq = self.last_seq.max(record.seq);
+        if let Some(pts) = record.pts {
+            self.last_pts = Some(self.last_pts.map_or(pts, |p| p.max(pts)));
+        }
         let observed = record.pts.unwrap_or(record.at);
         let Some(kind) = record.event else {
             self.ping = Some((record.seq, observed));
@@ -358,6 +370,9 @@ impl Fold {
     /// A duplicate heartbeat refreshes the observation time of whatever it
     /// duplicates - the lease's expiry moves, the `since` does not.
     fn refresh_observed(&mut self, record: &Record) {
+        if let Some(pts) = record.pts {
+            self.last_pts = Some(self.last_pts.map_or(pts, |p| p.max(pts)));
+        }
         let observed = record.pts.unwrap_or(record.at);
         if let Some(event) = &mut self.last_event
             && (event.seq == record.seq
@@ -402,13 +417,14 @@ pub struct Mark {
     pub at_ms: u64,
 }
 
-/// The observable lifecycle facts whose *change* is meaningful work
-/// activity: dirty flag and tree shape, delivery evidence, forge state.
-/// Persisted as the record's last reading so a restart does not redate an
-/// unchanged state, and a changed input dates at its observation time.
-/// An optional field is `None` when unproven: it keeps the last proven
-/// value and dates nothing, so an offline pass, a forge outage or a timed
-/// out probe is never mistaken for work.
+/// The observable lifecycle facts whose *change* is a proven transition:
+/// dirty flag and tree shape, delivery evidence, forge state. Persisted
+/// as the record's last reading so a restart does not re-report an
+/// unchanged state, and a changed input lands an observation at its
+/// detection time - diagnostics, never activity. An optional field is
+/// `None` when unproven: it keeps the last proven value and observes
+/// nothing, so an offline pass, a forge outage or a timed out probe is
+/// never mistaken for a transition.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleInputs {
     /// The worktree's dirty flag; `None` when unproven or not applicable.
@@ -466,21 +482,68 @@ pub struct LifecycleInputs {
     pub working_tree: Option<WorkingTreeSnapshot>,
 }
 
-pub const UPDATE_RETAIN_PER_SOURCE: usize = 100;
+/// How many events one history keeps per source: enough that a busy
+/// week's diagnostics survive, bounded so a churning worktree cannot
+/// grow the file without limit.
+pub const HISTORY_RETAIN_PER_SOURCE: usize = 100;
 
+/// Where an [`ActivityEvent`]'s occurrence time came from: the source
+/// that dated the work itself, never the scan that noticed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UpdateSource {
+pub enum ActivitySource {
+    /// A commit's committer time - a HEAD move whose stored metadata
+    /// proves the tip's date, or the tip's `%(committerdate)`.
     Commit,
+    /// A dated commit, merge, reset, rebase or amend reflog entry - real
+    /// repository interaction, never bookkeeping lines.
+    Reflog,
+    /// The newest mtime among the working tree's current changed paths.
     WorkingTree,
-    Session,
+    /// A forge work item's merge or close date.
+    Forge,
+    /// A conversation's transcript message or hook producer time.
+    Conversation,
+}
+
+/// A source-backed work event: when the work *happened*, as the source
+/// itself dated it. Occurrence times backfill freely - a first
+/// collection may record work from long before it ran - but no missing
+/// source timestamp ever falls back to scan time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityEvent {
+    pub source: ActivitySource,
+    /// When the work occurred, epoch milliseconds.
+    pub occurred_at_ms: u64,
+    pub reasons: Vec<String>,
+}
+
+/// Where an [`ObservationEvent`]'s detection time came from: the pass
+/// that learned a fact or proved a transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationSource {
+    /// A HEAD move whose stored commit metadata could not date it.
+    Commit,
+    /// A changed working-tree fingerprint.
+    WorkingTree,
+    /// A forge state or pipeline transition.
+    Forge,
+    /// A conversation's discovery or placement.
+    Conversation,
+    /// A proven lifecycle-input transition: presence flips, moves, and
+    /// every changed delivery or work-item reading.
     Lifecycle,
 }
 
+/// A scan-time diagnostic event: when the collector *learned* something,
+/// not when it happened. Observations never count as activity - a recent
+/// detection cannot make old work look new.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpdateEvent {
-    pub source: UpdateSource,
-    pub at_ms: u64,
+pub struct ObservationEvent {
+    pub source: ObservationSource,
+    /// When the pass observed the fact, epoch milliseconds.
+    pub observed_at_ms: u64,
     pub reasons: Vec<String>,
 }
 
@@ -495,6 +558,13 @@ pub struct ObservedCommit {
 pub struct WorkingTreeSnapshot {
     pub fingerprint: String,
     pub reasons: Vec<String>,
+    /// The newest mtime among the changed paths' successfully read
+    /// metadata, epoch milliseconds - the occurrence time a changed
+    /// fingerprint may carry into an activity event. `None` when no
+    /// changed path's metadata read (a deleted or clean tree), which is
+    /// never proxied through scan time.
+    #[serde(default)]
+    pub newest_mtime_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -826,6 +896,11 @@ pub struct ObservedRef {
     /// from - the exact evidence that preserves identity across names.
     pub renamed_from: Option<String>,
     pub commit: Option<ObservedCommit>,
+    /// The source-backed activity the pass can prove for this ref,
+    /// deduplicated into the record's history - first collection may
+    /// therefore backfill old occurrence times, but never promotes its
+    /// own scan time into one.
+    pub activities: Vec<ActivityEvent>,
     pub inputs: LifecycleInputs,
 }
 
@@ -868,16 +943,18 @@ pub struct BranchRecord {
     /// The authored parked flag; suppresses only the `Forgotten` section.
     #[serde(default)]
     pub parked: bool,
-    /// When the last lifecycle transition was observed, epoch ms. Source
-    /// timestamps (commit, reflog) are re-derived each pass and never
-    /// stored; first observation fingerprints without dating anything.
+    /// Source-backed work events, newest kept at
+    /// [`HISTORY_RETAIN_PER_SOURCE`] per source. Their newest occurrence
+    /// is the record's activity - derived, never persisted separately.
     #[serde(default)]
-    pub activity_at: Option<u64>,
-    /// The inputs `activity_at` was judged against.
+    pub activities: Vec<ActivityEvent>,
+    /// Scan-time diagnostics: what the collector learned and when, kept
+    /// independently of activity so a detection can never pass for work.
+    #[serde(default)]
+    pub observations: Vec<ObservationEvent>,
+    /// The inputs transitions are judged against.
     #[serde(default)]
     pub inputs: LifecycleInputs,
-    #[serde(default)]
-    pub updates: Vec<UpdateEvent>,
     #[serde(default)]
     pub session_activity: BTreeMap<String, u64>,
 }
@@ -895,11 +972,11 @@ pub struct PathRecord {
     #[serde(default)]
     pub parked: bool,
     #[serde(default)]
-    pub activity_at: Option<u64>,
+    pub activities: Vec<ActivityEvent>,
+    #[serde(default)]
+    pub observations: Vec<ObservationEvent>,
     #[serde(default)]
     pub inputs: LifecycleInputs,
-    #[serde(default)]
-    pub updates: Vec<UpdateEvent>,
     #[serde(default)]
     pub session_activity: BTreeMap<String, u64>,
 }
@@ -1029,14 +1106,17 @@ fn continuity_of(record: &BranchRecord, obs: &ObservedRef) -> Option<ContinuityE
 }
 
 /// Open a new incarnation for `obs` at `observed_ms`: new id, `parked:
-/// false`, the observation's evidence and fingerprint stored.
+/// false`, the observation's evidence, fingerprint and provable
+/// activities stored - first collection backfills source occurrence
+/// times without ever dating the baseline itself. Returns the new
+/// record's id.
 fn open_incarnation(
     work: &mut Work,
     repo: &str,
     obs: &ObservedRef,
     observed_ms: u64,
     continuity: ContinuityEvidence,
-) {
+) -> String {
     let id = incarnation_id(repo, &obs.name, observed_ms);
     work.branches.insert(
         id.clone(),
@@ -1051,13 +1131,19 @@ fn open_incarnation(
             continuity_evidence: continuity,
             ended_at: None,
             parked: false,
-            activity_at: None,
+            activities: Vec::new(),
+            observations: Vec::new(),
             inputs: obs.inputs.clone(),
-            updates: Vec::new(),
             session_activity: BTreeMap::new(),
         },
     );
-    work.active_branches.insert(branch_key(repo, &obs.name), id);
+    let record = work.branches.get_mut(&id).expect("just inserted");
+    for event in &obs.activities {
+        append_activity(&mut record.activities, event.clone());
+    }
+    work.active_branches
+        .insert(branch_key(repo, &obs.name), id.clone());
+    id
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -1069,29 +1155,99 @@ fn short_sha(sha: &str) -> &str {
     &sha[..end]
 }
 
-fn append_update(updates: &mut Vec<UpdateEvent>, event: UpdateEvent) -> bool {
-    if updates.contains(&event) {
+/// The record's newest source-backed occurrence, epoch milliseconds -
+/// derived from the history every read, so no stored aggregate can
+/// drift from it. `None` reads as `?` everywhere it surfaces.
+pub fn newest_activity(activities: &[ActivityEvent]) -> Option<u64> {
+    activities.iter().map(|e| e.occurred_at_ms).max()
+}
+
+const ACTIVITY_SOURCES: [ActivitySource; 5] = [
+    ActivitySource::Commit,
+    ActivitySource::Reflog,
+    ActivitySource::WorkingTree,
+    ActivitySource::Forge,
+    ActivitySource::Conversation,
+];
+
+const OBSERVATION_SOURCES: [ObservationSource; 5] = [
+    ObservationSource::Commit,
+    ObservationSource::WorkingTree,
+    ObservationSource::Forge,
+    ObservationSource::Conversation,
+    ObservationSource::Lifecycle,
+];
+
+/// Append one activity, deduplicated on `(source, occurred_at_ms)`:
+/// a second event at the same occurrence merges its reasons rather
+/// than listing twice - the transition path and the pass's own
+/// evidence can date the same work independently. Returns whether the
+/// history changed.
+pub fn append_activity(activities: &mut Vec<ActivityEvent>, event: ActivityEvent) -> bool {
+    match activities
+        .iter_mut()
+        .find(|e| e.source == event.source && e.occurred_at_ms == event.occurred_at_ms)
+    {
+        Some(existing) => {
+            let mut reasons = event.reasons;
+            reasons.retain(|r| !existing.reasons.contains(r));
+            if reasons.is_empty() {
+                return false;
+            }
+            existing.reasons.extend(reasons);
+            existing.reasons.sort_unstable();
+            existing.reasons.dedup();
+            true
+        }
+        None => {
+            activities.push(event);
+            activities.sort_by(|a, b| {
+                a.occurred_at_ms
+                    .cmp(&b.occurred_at_ms)
+                    .then(a.source.cmp(&b.source))
+                    .then(a.reasons.cmp(&b.reasons))
+            });
+            for source in ACTIVITY_SOURCES {
+                let mut drop = activities
+                    .iter()
+                    .filter(|e| e.source == source)
+                    .count()
+                    .saturating_sub(HISTORY_RETAIN_PER_SOURCE);
+                activities.retain(|e| {
+                    if e.source == source && drop > 0 {
+                        drop -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            true
+        }
+    }
+}
+
+/// Append one observation; an identical event (same source, time and
+/// reasons) is a repeated detection, not a new one. Returns whether the
+/// history changed.
+fn append_observation(observations: &mut Vec<ObservationEvent>, event: ObservationEvent) -> bool {
+    if observations.contains(&event) {
         return false;
     }
-    updates.push(event);
-    updates.sort_by(|a, b| {
-        a.at_ms
-            .cmp(&b.at_ms)
+    observations.push(event);
+    observations.sort_by(|a, b| {
+        a.observed_at_ms
+            .cmp(&b.observed_at_ms)
             .then(a.source.cmp(&b.source))
             .then(a.reasons.cmp(&b.reasons))
     });
-    for source in [
-        UpdateSource::Commit,
-        UpdateSource::WorkingTree,
-        UpdateSource::Session,
-        UpdateSource::Lifecycle,
-    ] {
-        let mut drop = updates
+    for source in OBSERVATION_SOURCES {
+        let mut drop = observations
             .iter()
             .filter(|e| e.source == source)
             .count()
-            .saturating_sub(UPDATE_RETAIN_PER_SOURCE);
-        updates.retain(|e| {
+            .saturating_sub(HISTORY_RETAIN_PER_SOURCE);
+        observations.retain(|e| {
             if e.source == source && drop > 0 {
                 drop -= 1;
                 false
@@ -1103,81 +1259,101 @@ fn append_update(updates: &mut Vec<UpdateEvent>, event: UpdateEvent) -> bool {
     true
 }
 
-fn bump_activity(activity_at: &mut Option<u64>, at_ms: u64) -> bool {
-    let next = activity_at.map_or(at_ms, |a| a.max(at_ms));
-    if *activity_at != Some(next) {
-        *activity_at = Some(next);
-        true
-    } else {
-        false
-    }
-}
-
-fn commit_update(
-    updates: &mut Vec<UpdateEvent>,
+/// A proven HEAD move: a Commit activity when the stored commit metadata
+/// dates the new tip, a Commit observation when it cannot - a HEAD move
+/// whose occurrence no source proves is detection, not work.
+fn commit_transition(
+    activities: &mut Vec<ActivityEvent>,
+    observations: &mut Vec<ObservationEvent>,
     prior: &Option<String>,
     head: &Option<String>,
     commit: &Option<ObservedCommit>,
     observed_ms: u64,
-) -> Option<u64> {
+) -> bool {
     let (Some(new), Some(old)) = (head, prior) else {
-        return None;
+        return false;
     };
     if new == old {
-        return None;
-    }
-    let (reason, at_ms) = match commit {
-        Some(c) if &c.sha == new => (
-            match &c.subject {
-                Some(subject) => format!("{} {}", short_sha(new), subject),
-                None => short_sha(new).to_owned(),
-            },
-            c.at_ms.unwrap_or(observed_ms),
-        ),
-        _ => (short_sha(new).to_owned(), observed_ms),
+        return false;
     };
-    append_update(
-        updates,
-        UpdateEvent {
-            source: UpdateSource::Commit,
-            at_ms,
-            reasons: vec![reason],
+    let reason = match commit {
+        Some(c) if &c.sha == new => match &c.subject {
+            Some(subject) => format!("{} {}", short_sha(new), subject),
+            None => short_sha(new).to_owned(),
         },
-    )
-    .then_some(at_ms)
+        _ => short_sha(new).to_owned(),
+    };
+    match commit {
+        Some(c) if &c.sha == new && c.at_ms.is_some() => append_activity(
+            activities,
+            ActivityEvent {
+                source: ActivitySource::Commit,
+                occurred_at_ms: c.at_ms.expect("the guard proves it"),
+                reasons: vec![reason],
+            },
+        ),
+        _ => append_observation(
+            observations,
+            ObservationEvent {
+                source: ObservationSource::Commit,
+                observed_at_ms: observed_ms,
+                reasons: vec![reason],
+            },
+        ),
+    }
 }
 
-fn working_tree_update(
-    updates: &mut Vec<UpdateEvent>,
+/// A proven working-tree fingerprint change: always a WorkingTree
+/// observation at detection time, plus a WorkingTree activity at the
+/// snapshot's newest changed-path mtime when one exists. A deleted-file
+/// or clean transition carries no remaining path's mtime, so it is
+/// observation only.
+fn working_tree_transition(
+    activities: &mut Vec<ActivityEvent>,
+    observations: &mut Vec<ObservationEvent>,
     prior: &Option<WorkingTreeSnapshot>,
     current: &Option<WorkingTreeSnapshot>,
     observed_ms: u64,
-) -> Option<u64> {
+) -> bool {
     let (Some(new), Some(old)) = (current, prior) else {
-        return None;
+        return false;
     };
     if new.fingerprint == old.fingerprint {
-        return None;
+        return false;
     }
-    append_update(
-        updates,
-        UpdateEvent {
-            source: UpdateSource::WorkingTree,
-            at_ms: observed_ms,
+    let mut changed = append_observation(
+        observations,
+        ObservationEvent {
+            source: ObservationSource::WorkingTree,
+            observed_at_ms: observed_ms,
             reasons: new.reasons.clone(),
         },
-    )
-    .then_some(observed_ms)
+    );
+    if let Some(at_ms) = new.newest_mtime_ms {
+        changed |= append_activity(
+            activities,
+            ActivityEvent {
+                source: ActivitySource::WorkingTree,
+                occurred_at_ms: at_ms,
+                reasons: new.reasons.clone(),
+            },
+        );
+    }
+    changed
 }
 
-/// Everything a live record owes one observation: commit, working-tree
-/// and lifecycle events dated at the pass, then the merged inputs. The
+/// Everything a live record owes one pass: the pass's provable
+/// activities, the transition evidence, then the merged inputs. The
 /// continuing-record arm and the proven-rename arm run the same
 /// sequence, so a move cannot defer a transition to the pass after it.
-fn absorb_updates(record: &mut BranchRecord, obs: &ObservedRef, observed_ms: u64) -> bool {
+fn absorb_evidence(record: &mut BranchRecord, obs: &ObservedRef, observed_ms: u64) -> bool {
     let mut changed = false;
-    let mut newest = commit_update(
-        &mut record.updates,
+    for event in &obs.activities {
+        changed |= append_activity(&mut record.activities, event.clone());
+    }
+    changed |= commit_transition(
+        &mut record.activities,
+        &mut record.observations,
         &record.head,
         &obs.head,
         &obs.commit,
@@ -1187,30 +1363,26 @@ fn absorb_updates(record: &mut BranchRecord, obs: &ObservedRef, observed_ms: u64
         record.head = obs.head.clone();
         changed = true;
     }
-    newest = newest.max(working_tree_update(
-        &mut record.updates,
+    changed |= working_tree_transition(
+        &mut record.activities,
+        &mut record.observations,
         &record.inputs.working_tree,
         &obs.inputs.working_tree,
         observed_ms,
-    ));
+    );
     // A changed proven fingerprint is a transition; first observation
-    // never lands here. A newly proven field is stored without dating
+    // never lands here. A newly proven field is stored without observing
     // anything.
     let reasons = obs.inputs.transitions_from(&record.inputs);
     if !reasons.is_empty() {
-        append_update(
-            &mut record.updates,
-            UpdateEvent {
-                source: UpdateSource::Lifecycle,
-                at_ms: observed_ms,
+        changed |= append_observation(
+            &mut record.observations,
+            ObservationEvent {
+                source: ObservationSource::Lifecycle,
+                observed_at_ms: observed_ms,
                 reasons,
             },
         );
-        newest = newest.max(Some(observed_ms));
-    }
-    if let Some(at) = newest {
-        bump_activity(&mut record.activity_at, at);
-        changed = true;
     }
     let inputs = obs.inputs.over(&record.inputs);
     if record.inputs != inputs {
@@ -1220,10 +1392,56 @@ fn absorb_updates(record: &mut BranchRecord, obs: &ObservedRef, observed_ms: u64
     changed
 }
 
+/// The same evidence a path record owes one pass: the provable
+/// activities, HEAD and working-tree transitions, lifecycle
+/// observations, then the merged inputs.
+fn absorb_path_evidence(
+    record: &mut PathRecord,
+    inputs: &LifecycleInputs,
+    activities: &[ActivityEvent],
+    observed_ms: u64,
+) -> bool {
+    let mut changed = false;
+    for event in activities {
+        changed |= append_activity(&mut record.activities, event.clone());
+    }
+    changed |= commit_transition(
+        &mut record.activities,
+        &mut record.observations,
+        &record.inputs.head,
+        &inputs.head,
+        &inputs.commit,
+        observed_ms,
+    );
+    changed |= working_tree_transition(
+        &mut record.activities,
+        &mut record.observations,
+        &record.inputs.working_tree,
+        &inputs.working_tree,
+        observed_ms,
+    );
+    let reasons = inputs.transitions_from(&record.inputs);
+    if !reasons.is_empty() {
+        changed |= append_observation(
+            &mut record.observations,
+            ObservationEvent {
+                source: ObservationSource::Lifecycle,
+                observed_at_ms: observed_ms,
+                reasons,
+            },
+        );
+    }
+    let inputs = inputs.over(&record.inputs);
+    if record.inputs != inputs {
+        record.inputs = inputs;
+        changed = true;
+    }
+    changed
+}
+
 fn session_update(
-    updates: &mut Vec<UpdateEvent>,
+    activities: &mut Vec<ActivityEvent>,
     cursors: &mut BTreeMap<String, u64>,
-    activity_at: &mut Option<u64>,
     update: &SessionUpdate,
 ) -> bool {
     match cursors.get_mut(&update.conversation) {
@@ -1234,28 +1452,14 @@ fn session_update(
         Some(cursor) if update.at_ms <= *cursor => false,
         Some(cursor) => {
             *cursor = update.at_ms;
-            match updates
-                .iter_mut()
-                .find(|e| e.source == UpdateSource::Session && e.at_ms == update.at_ms)
-            {
-                Some(event) if !event.reasons.contains(&update.reason) => {
-                    event.reasons.push(update.reason.clone());
-                    event.reasons.sort_unstable();
-                    event.reasons.dedup();
-                }
-                Some(_) => {}
-                None => {
-                    append_update(
-                        updates,
-                        UpdateEvent {
-                            source: UpdateSource::Session,
-                            at_ms: update.at_ms,
-                            reasons: vec![update.reason.clone()],
-                        },
-                    );
-                }
-            }
-            bump_activity(activity_at, update.at_ms);
+            append_activity(
+                activities,
+                ActivityEvent {
+                    source: ActivitySource::Conversation,
+                    occurred_at_ms: update.at_ms,
+                    reasons: vec![update.reason.clone()],
+                },
+            );
             true
         }
     }
@@ -1663,8 +1867,10 @@ impl Store {
     /// updates it, a ref absent from the observation closes its active
     /// record (`ended_at`), and a ref with no active record opens a new
     /// incarnation - new id, `parked: false`, the current inputs
-    /// fingerprinted without dating activity. A changed fingerprint on a
-    /// live record is a lifecycle transition dated `observed_ms`.
+    /// fingerprinted silently. A changed fingerprint on a live record is
+    /// a lifecycle transition observed at `observed_ms` - a detection,
+    /// never activity. The activities each ref carries land on its
+    /// record at their own proven occurrence times, first pass included.
     ///
     /// Continuity: a proven `Branch: renamed` line moves the record with
     /// its id; reflog creation evidence that no longer matches proves a
@@ -1742,7 +1948,7 @@ impl Store {
             work.active_branches.remove(&old_key);
             record.ref_name = obs.name.clone();
             record.last_observed_at = observed_ms;
-            absorb_updates(record, obs, observed_ms);
+            absorb_evidence(record, obs, observed_ms);
             record.continuity_evidence = ContinuityEvidence::ProvenRename;
             if record.creation_evidence.is_none() {
                 record.creation_evidence = obs.creation.clone();
@@ -1774,6 +1980,16 @@ impl Store {
                 continue; // coverage: off - the same lookup just answered it
             };
             record.ended_at = Some(observed_ms);
+            // An established branch going absent is a proven presence
+            // transition: observed, never activity.
+            append_observation(
+                &mut record.observations,
+                ObservationEvent {
+                    source: ObservationSource::Lifecycle,
+                    observed_at_ms: observed_ms,
+                    reasons: vec!["branch gone".to_owned()],
+                },
+            );
             last_seen(record);
             work.active_branches.remove(&key);
             close_touches(&mut work, &id, observed_ms);
@@ -1805,6 +2021,16 @@ impl Store {
                             continue; // coverage: off - the same lookup just answered it
                         };
                         record.ended_at = Some(observed_ms);
+                        // The ref never went absent: this is a detected
+                        // incarnation boundary, not a presence flip.
+                        append_observation(
+                            &mut record.observations,
+                            ObservationEvent {
+                                source: ObservationSource::Lifecycle,
+                                observed_at_ms: observed_ms,
+                                reasons: vec!["branch incarnation changed".to_owned()],
+                            },
+                        );
                         last_seen(record);
                         work.active_branches.remove(&key);
                         close_touches(&mut work, &id, observed_ms);
@@ -1832,16 +2058,34 @@ impl Store {
                         record.continuity_evidence = continuity;
                         changed = true;
                     }
-                    changed |= absorb_updates(record, obs, observed_ms);
+                    changed |= absorb_evidence(record, obs, observed_ms);
                 }
                 None => {
-                    open_incarnation(
+                    // No active record for this ref: a first-ever sighting
+                    // is a silent baseline; a ref that a closed record
+                    // proves was already observed-and-gone is found again.
+                    let returned = work
+                        .branches
+                        .values()
+                        .any(|r| r.repo == repo && r.ref_name == obs.name && r.ended_at.is_some());
+                    let id = open_incarnation(
                         &mut work,
                         repo,
                         obs,
                         observed_ms,
                         ContinuityEvidence::FirstObservation,
                     );
+                    if returned {
+                        let record = work.branches.get_mut(&id).expect("just opened");
+                        append_observation(
+                            &mut record.observations,
+                            ObservationEvent {
+                                source: ObservationSource::Lifecycle,
+                                observed_at_ms: observed_ms,
+                                reasons: vec!["branch found".to_owned()],
+                            },
+                        );
+                    }
                     changed = true;
                 }
             }
@@ -1973,13 +2217,15 @@ impl Store {
 
     /// Synchronize the record for `path` - a detached worktree or a
     /// project space, owned by `repo` - with the fingerprint a pass observed at
-    /// `observed_ms`. Creates it absent, dates a changed fingerprint as a
-    /// transition, and writes nothing when nothing changed.
+    /// `observed_ms` and the source-backed `activities` it can prove.
+    /// Creates it absent, lands changed fingerprints and field transitions
+    /// as observations, and writes nothing when nothing changed.
     pub fn sync_path(
         &self,
         path: &str,
         repo: &str,
         inputs: &LifecycleInputs,
+        activities: &[ActivityEvent],
         observed_ms: u64,
     ) -> io::Result<()> {
         fs::create_dir_all(&self.dir)?; // coverage: off - a directory-creation failure needs a filesystem fault
@@ -1996,53 +2242,21 @@ impl Store {
                     record.repo = Some(repo.to_owned());
                     changed = true;
                 }
-                let mut newest = commit_update(
-                    &mut record.updates,
-                    &record.inputs.head,
-                    &inputs.head,
-                    &inputs.commit,
-                    observed_ms,
-                );
-                newest = newest.max(working_tree_update(
-                    &mut record.updates,
-                    &record.inputs.working_tree,
-                    &inputs.working_tree,
-                    observed_ms,
-                ));
-                let reasons = inputs.transitions_from(&record.inputs);
-                if !reasons.is_empty() {
-                    append_update(
-                        &mut record.updates,
-                        UpdateEvent {
-                            source: UpdateSource::Lifecycle,
-                            at_ms: observed_ms,
-                            reasons,
-                        },
-                    );
-                    newest = newest.max(Some(observed_ms));
-                }
-                if let Some(at) = newest {
-                    bump_activity(&mut record.activity_at, at);
-                    changed = true;
-                }
-                let inputs = inputs.over(&record.inputs);
-                if record.inputs != inputs {
-                    record.inputs = inputs;
-                    changed = true;
-                }
+                changed |= absorb_path_evidence(record, inputs, activities, observed_ms);
             }
             None => {
-                work.paths.insert(
-                    path.to_owned(),
-                    PathRecord {
-                        repo: Some(repo.to_owned()),
-                        parked: false,
-                        activity_at: None,
-                        inputs: inputs.clone(),
-                        updates: Vec::new(),
-                        session_activity: BTreeMap::new(),
-                    },
-                );
+                let mut record = PathRecord {
+                    repo: Some(repo.to_owned()),
+                    parked: false,
+                    activities: Vec::new(),
+                    observations: Vec::new(),
+                    inputs: inputs.clone(),
+                    session_activity: BTreeMap::new(),
+                };
+                for event in activities {
+                    append_activity(&mut record.activities, event.clone());
+                }
+                work.paths.insert(path.to_owned(), record);
                 changed = true;
             }
         }
@@ -2062,20 +2276,10 @@ impl Store {
         for update in updates {
             let applied = match &update.identity {
                 UpdateIdentity::Branch(id) => work.branches.get_mut(id).map(|record| {
-                    session_update(
-                        &mut record.updates,
-                        &mut record.session_activity,
-                        &mut record.activity_at,
-                        update,
-                    )
+                    session_update(&mut record.activities, &mut record.session_activity, update)
                 }),
                 UpdateIdentity::Path(path) => work.paths.get_mut(path).map(|record| {
-                    session_update(
-                        &mut record.updates,
-                        &mut record.session_activity,
-                        &mut record.activity_at,
-                        update,
-                    )
+                    session_update(&mut record.activities, &mut record.session_activity, update)
                 }),
             };
             changed |= applied.unwrap_or(false);
@@ -2380,12 +2584,47 @@ impl Store {
         self.write_authored(MARKS, marks)
     }
 
-    /// The work-state file: incarnation and path records. Malformed or
-    /// future content reports and reads as absent - never guessed.
+    /// The work-state file: incarnation and path records. The envelope's
+    /// `v` picks the shape - v2 and older read the legacy records and
+    /// migrate them in place, v3 reads current, and a future or
+    /// malformed file reports and reads as absent, never guessed.
     fn read_work(&self, errors: &mut Vec<SourceError>) -> Work {
-        self.read_authored(WORK, errors)
-            .map(|authored: Authored<Work>| authored.data)
-            .unwrap_or_default()
+        let path = self.dir.join(WORK);
+        let Some(bytes) = read_file(&path, WORK, errors) else {
+            return Work::default();
+        };
+        let mut malformed = |e: serde_json::Error| {
+            errors.push(SourceError {
+                source: WORK.to_owned(),
+                detail: format!("{}: {e}", path.display()),
+            });
+            Work::default()
+        };
+        let envelope = match serde_json::from_slice::<Authored<serde_json::Value>>(&bytes) {
+            Ok(envelope) => envelope,
+            Err(e) => return malformed(e),
+        };
+        if envelope.v > SCHEMA {
+            errors.push(SourceError {
+                source: WORK.to_owned(),
+                detail: format!(
+                    "{}: schema v{} is newer than v{SCHEMA}",
+                    path.display(),
+                    envelope.v
+                ),
+            });
+            return Work::default();
+        }
+        if envelope.v <= 2 {
+            return match serde_json::from_slice::<Authored<legacy::Work>>(&bytes) {
+                Ok(a) => legacy::migrate(a.data),
+                Err(e) => malformed(e),
+            };
+        }
+        match serde_json::from_slice::<Authored<Work>>(&bytes) {
+            Ok(a) => a.data,
+            Err(e) => malformed(e),
+        }
     }
 
     /// The work state under the same update precondition as seen-state: a
@@ -2565,6 +2804,227 @@ pub fn epoch_ms(t: SystemTime) -> u64 {
 /// The writer identity a record carries.
 fn writer() -> String {
     format!("agent-sessions/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The v2 `work.json` shapes a read still accepts: the mixed
+/// `updates`/`activity_at` contract before the activity/observation
+/// split. A v2 file migrates into the v3 contract on read, and its
+/// first successful read-modify-write rewrites it as v3 - current
+/// writes never carry the legacy keys.
+mod legacy {
+    use std::collections::BTreeMap;
+
+    use serde::Deserialize;
+
+    use super::{
+        ActivityEvent, ActivitySource, BranchRecord, BranchTouch, ContinuityEvidence,
+        LifecycleInputs, ObservationEvent, ObservationSource, ObservedCommit, PathRecord,
+        RefCreationEvidence, append_activity, append_observation, short_sha,
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum UpdateSource {
+        Commit,
+        WorkingTree,
+        Session,
+        Lifecycle,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct UpdateEvent {
+        pub source: UpdateSource,
+        pub at_ms: u64,
+        #[serde(default)]
+        pub reasons: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct BranchRecordV2 {
+        pub id: String,
+        pub repo: String,
+        pub ref_name: String,
+        pub first_observed_at: u64,
+        #[serde(default)]
+        pub last_observed_at: u64,
+        #[serde(default)]
+        pub head: Option<String>,
+        #[serde(default)]
+        pub creation_evidence: Option<RefCreationEvidence>,
+        #[serde(default)]
+        pub continuity_evidence: ContinuityEvidence,
+        #[serde(default)]
+        pub ended_at: Option<u64>,
+        #[serde(default)]
+        pub parked: bool,
+        /// The stored aggregate: never trusted - source evidence decides
+        /// what becomes activity, and later collection rebuilds the rest.
+        #[serde(default)]
+        #[allow(dead_code)]
+        pub activity_at: Option<u64>,
+        #[serde(default)]
+        pub inputs: LifecycleInputs,
+        #[serde(default)]
+        pub updates: Vec<UpdateEvent>,
+        #[serde(default)]
+        pub session_activity: BTreeMap<String, u64>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct PathRecordV2 {
+        #[serde(default)]
+        pub repo: Option<String>,
+        #[serde(default)]
+        pub parked: bool,
+        #[serde(default)]
+        #[allow(dead_code)]
+        pub activity_at: Option<u64>,
+        #[serde(default)]
+        pub inputs: LifecycleInputs,
+        #[serde(default)]
+        pub updates: Vec<UpdateEvent>,
+        #[serde(default)]
+        pub session_activity: BTreeMap<String, u64>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct Work {
+        #[serde(default)]
+        pub branches: BTreeMap<String, BranchRecordV2>,
+        #[serde(default)]
+        pub active_branches: BTreeMap<String, String>,
+        #[serde(default)]
+        pub paths: BTreeMap<String, PathRecordV2>,
+        #[serde(default)]
+        pub touches: Vec<BranchTouch>,
+    }
+
+    /// Whether the stored commit metadata proves a v2 Commit event's
+    /// timestamp: the record's current tip is the sha the event names
+    /// and carries the event's own time. Anything less is an
+    /// unproven-time Commit observation.
+    fn proven_commit(commit: &Option<ObservedCommit>, event: &UpdateEvent) -> bool {
+        let Some(c) = commit else {
+            return false;
+        };
+        c.at_ms == Some(event.at_ms)
+            && event
+                .reasons
+                .first()
+                .is_some_and(|r| r.starts_with(short_sha(&c.sha)))
+    }
+
+    /// The v2 `updates` split: Lifecycle and WorkingTree events are
+    /// observations at their old time, Session events are Conversation
+    /// activities, and a Commit event is activity only when the stored
+    /// commit metadata proves its timestamp - unprovable ones stay as
+    /// Commit observations.
+    fn events(
+        inputs: &LifecycleInputs,
+        updates: Vec<UpdateEvent>,
+    ) -> (Vec<ActivityEvent>, Vec<ObservationEvent>) {
+        let mut activities = Vec::new();
+        let mut observations = Vec::new();
+        for event in updates {
+            match event.source {
+                UpdateSource::Lifecycle => append_observation(
+                    &mut observations,
+                    ObservationEvent {
+                        source: ObservationSource::Lifecycle,
+                        observed_at_ms: event.at_ms,
+                        reasons: event.reasons,
+                    },
+                ),
+                UpdateSource::WorkingTree => append_observation(
+                    &mut observations,
+                    ObservationEvent {
+                        source: ObservationSource::WorkingTree,
+                        observed_at_ms: event.at_ms,
+                        reasons: event.reasons,
+                    },
+                ),
+                UpdateSource::Session => append_activity(
+                    &mut activities,
+                    ActivityEvent {
+                        source: ActivitySource::Conversation,
+                        occurred_at_ms: event.at_ms,
+                        reasons: event.reasons,
+                    },
+                ),
+                UpdateSource::Commit if proven_commit(&inputs.commit, &event) => append_activity(
+                    &mut activities,
+                    ActivityEvent {
+                        source: ActivitySource::Commit,
+                        occurred_at_ms: event.at_ms,
+                        reasons: event.reasons,
+                    },
+                ),
+                UpdateSource::Commit => append_observation(
+                    &mut observations,
+                    ObservationEvent {
+                        source: ObservationSource::Commit,
+                        observed_at_ms: event.at_ms,
+                        reasons: event.reasons,
+                    },
+                ),
+            };
+        }
+        (activities, observations)
+    }
+
+    /// The whole v2 file migrated: every record, identity mapping, touch
+    /// interval, parked flag and session cursor preserved; only the
+    /// event contract and the ignored `activity_at` change meaning.
+    pub fn migrate(work: Work) -> super::Work {
+        super::Work {
+            branches: work
+                .branches
+                .into_iter()
+                .map(|(id, r)| {
+                    let (activities, observations) = events(&r.inputs, r.updates);
+                    (
+                        id.clone(),
+                        BranchRecord {
+                            id: r.id,
+                            repo: r.repo,
+                            ref_name: r.ref_name,
+                            first_observed_at: r.first_observed_at,
+                            last_observed_at: r.last_observed_at,
+                            head: r.head,
+                            creation_evidence: r.creation_evidence,
+                            continuity_evidence: r.continuity_evidence,
+                            ended_at: r.ended_at,
+                            parked: r.parked,
+                            activities,
+                            observations,
+                            inputs: r.inputs,
+                            session_activity: r.session_activity,
+                        },
+                    )
+                })
+                .collect(),
+            active_branches: work.active_branches,
+            paths: work
+                .paths
+                .into_iter()
+                .map(|(path, r)| {
+                    let (activities, observations) = events(&r.inputs, r.updates);
+                    (
+                        path,
+                        PathRecord {
+                            repo: r.repo,
+                            parked: r.parked,
+                            activities,
+                            observations,
+                            inputs: r.inputs,
+                            session_activity: r.session_activity,
+                        },
+                    )
+                })
+                .collect(),
+            touches: work.touches,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3164,14 +3624,33 @@ mod tests {
         let mut ping = Record::new("claude", "s1", "OddEvent");
         ping.seq = 1;
         ping.at = 1_000;
+        ping.pts = Some(900);
         ping.pseq = Some(9);
         assert_eq!(fold.apply(&ping), Apply::Accepted);
+        assert_eq!(fold.last_pts, Some(900));
         // The same producer sequence again is a heartbeat: the observation
-        // refreshes and the ping's clock moves, but nothing latches.
+        // refreshes and the ping's clock moves, but nothing latches. An
+        // older `pts` cannot drag the producer watermark back.
         ping.seq = 2;
         ping.at = 1_500;
+        ping.pts = Some(800);
         assert_eq!(fold.apply(&ping), Apply::Duplicate);
-        assert_eq!(fold.ping, Some((1, 1_500)));
+        assert_eq!(fold.ping, Some((1, 900)));
+        assert_eq!(fold.last_pts, Some(900));
+        // A newer producer sequence folds in; an older `pts` still loses
+        // to the watermark.
+        ping.seq = 3;
+        ping.at = 2_000;
+        ping.pts = Some(850);
+        ping.pseq = Some(10);
+        assert_eq!(fold.apply(&ping), Apply::Accepted);
+        assert_eq!(fold.last_pts, Some(900));
+        // And a newer `pts` moves it.
+        ping.seq = 4;
+        ping.pts = Some(1_100);
+        ping.pseq = Some(11);
+        assert_eq!(fold.apply(&ping), Apply::Accepted);
+        assert_eq!(fold.last_pts, Some(1_100));
     }
 
     #[test]
@@ -3512,6 +3991,7 @@ mod tests {
             renamed_from: None,
             rewritten: false,
             commit: None,
+            activities: Vec::new(),
             inputs: LifecycleInputs {
                 dirty: Some(dirty),
                 ..LifecycleInputs::default()
@@ -3533,7 +4013,15 @@ mod tests {
         let feat = work.branch(repo, "feat").expect("feat is active");
         assert_ne!(main.id, feat.id);
         assert_eq!(main.first_observed_at, 1_000);
-        assert_eq!(main.activity_at, None, "first observation dates nothing");
+        assert_eq!(
+            newest_activity(&main.activities),
+            None,
+            "first observation dates nothing"
+        );
+        assert!(
+            main.observations.is_empty() && feat.observations.is_empty(),
+            "the first-ever baseline is silent - no presence events"
+        );
         assert!(!main.parked);
         // The same observation on a later pass is a no-op: the file does
         // not move, so a dashboard left open rewrites nothing per refresh.
@@ -3542,16 +4030,26 @@ mod tests {
             .sync_repo(repo, &[obs("main", false), obs("feat", false)], 1_500)
             .unwrap();
         assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes);
-        // A fingerprint change dates the transition at its observation.
+        // A fingerprint change lands the transition as an observation at
+        // detection time - it never passes for work activity.
         store
             .sync_repo(repo, &[obs("main", false), obs("feat", true)], 2_000)
             .unwrap();
         let work = store.load().work;
         let feat = work.branch(repo, "feat").unwrap();
-        assert_eq!(feat.activity_at, Some(2_000));
+        assert_eq!(
+            feat.observations,
+            vec![ObservationEvent {
+                source: ObservationSource::Lifecycle,
+                observed_at_ms: 2_000,
+                reasons: vec!["dirty: clean -> dirty".to_owned()],
+            }]
+        );
+        assert_eq!(newest_activity(&feat.activities), None);
         assert_eq!(feat.inputs.dirty, Some(true));
         // `feat` gone from the observation: the record closes and stays -
-        // it leaves the active lookup but remains in the history.
+        // it leaves the active lookup but remains in the history, and the
+        // established presence flip lands a `branch gone` observation.
         let old_id = feat.id.clone();
         store.sync_repo(repo, &[obs("main", false)], 3_000).unwrap();
         let work = store.load().work;
@@ -3560,8 +4058,26 @@ mod tests {
         let closed = &work.branches[&old_id];
         assert_eq!(closed.ended_at, Some(3_000));
         assert_eq!(closed.first_observed_at, 1_000);
+        assert_eq!(
+            closed.observations,
+            vec![
+                ObservationEvent {
+                    source: ObservationSource::Lifecycle,
+                    observed_at_ms: 2_000,
+                    reasons: vec!["dirty: clean -> dirty".to_owned()],
+                },
+                ObservationEvent {
+                    source: ObservationSource::Lifecycle,
+                    observed_at_ms: 3_000,
+                    reasons: vec!["branch gone".to_owned()],
+                },
+            ]
+        );
+        assert_eq!(newest_activity(&closed.activities), None);
         // Reappearance opens a new incarnation: new id, unparked, and the
-        // closed record survives beside it.
+        // closed record survives beside it. The prior absent interval
+        // makes this sighting a `branch found` - an observation, so the
+        // new record still carries no activity.
         store
             .sync_repo(repo, &[obs("main", false), obs("feat", false)], 4_000)
             .unwrap();
@@ -3570,6 +4086,15 @@ mod tests {
         assert_ne!(feat.id, old_id);
         assert_eq!(feat.first_observed_at, 4_000);
         assert_eq!(feat.ended_at, None);
+        assert_eq!(
+            feat.observations,
+            vec![ObservationEvent {
+                source: ObservationSource::Lifecycle,
+                observed_at_ms: 4_000,
+                reasons: vec!["branch found".to_owned()],
+            }]
+        );
+        assert!(feat.activities.is_empty());
         assert_eq!(work.branches.len(), 3, "{:?}", work.branches);
         assert_eq!(work.branches[&old_id].ended_at, Some(3_000));
         // Another repo's records are not touched by this repo's sync.
@@ -3579,6 +4104,46 @@ mod tests {
         let work = store.load().work;
         assert_eq!(work.branches.len(), 3, "{:?}", work.branches);
         assert!(other.branch(repo, "main").is_some());
+    }
+
+    #[test]
+    fn a_creation_boundary_close_records_incarnation_changed_not_gone() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        let creation = |head: &str, at_ms: u64| {
+            Some(RefCreationEvidence {
+                head: head.to_owned(),
+                at_ms,
+            })
+        };
+        let mut o = obs("feat", false);
+        o.creation = creation("aaaa", 500);
+        store.sync_repo(repo, &[o], 1_000).unwrap();
+        // A different creation proven under a never-absent name is an
+        // incarnation boundary: the old record closes with `incarnation
+        // changed` - it was never gone - and the same-pass open is no
+        // `found`, since no absent interval preceded it.
+        let mut o = obs("feat", false);
+        o.creation = creation("bbbb", 800);
+        store.sync_repo(repo, &[o], 2_000).unwrap();
+        let work = store.load().work;
+        assert_eq!(work.branches.len(), 2);
+        let closed = work
+            .branches
+            .values()
+            .find(|r| r.ended_at == Some(2_000))
+            .expect("the closed incarnation");
+        assert_eq!(
+            closed.observations.last().expect("the boundary").reasons,
+            ["branch incarnation changed".to_owned()]
+        );
+        let open = work.branch(repo, "feat").expect("the new incarnation");
+        assert!(
+            open.observations.is_empty(),
+            "no absent interval, so no `branch found`: {:?}",
+            open.observations
+        );
     }
 
     #[test]
@@ -3603,6 +4168,7 @@ mod tests {
                         renamed_from: None,
                         rewritten: false,
                         commit: None,
+                        activities: Vec::new(),
                         inputs: inputs.clone(),
                     }],
                     at,
@@ -3619,30 +4185,41 @@ mod tests {
             ..proven.clone()
         };
         let record = observe(&offline, 2_000);
-        assert_eq!(record.activity_at, None);
+        assert!(record.observations.is_empty());
         assert_eq!(record.inputs, proven);
-        // Back online with the same answers: still nothing to date.
-        assert_eq!(observe(&proven, 3_000).activity_at, None);
-        // A proven change dates, even when other fields are unproven.
+        // Back online with the same answers: still nothing to observe.
+        assert!(observe(&proven, 3_000).observations.is_empty());
+        // A proven change observes, even when other fields are unproven -
+        // and the observation never passes for work.
         let merged = LifecycleInputs {
             forge: Some("closed".to_owned()),
             upstream: None,
             ..proven.clone()
         };
         let record = observe(&merged, 4_000);
-        assert_eq!(record.activity_at, Some(4_000));
+        assert_eq!(
+            record.observations,
+            vec![ObservationEvent {
+                source: ObservationSource::Lifecycle,
+                observed_at_ms: 4_000,
+                reasons: vec!["forge: open -> closed".to_owned()],
+            }]
+        );
+        assert_eq!(newest_activity(&record.activities), None);
         assert_eq!(record.inputs.forge.as_deref(), Some("closed"));
         assert_eq!(
             record.inputs.upstream.as_deref(),
             Some("tracked origin/feat")
         );
         // The same holds for a path record.
-        store.sync_path("/space", "/space", &proven, 1_000).unwrap();
         store
-            .sync_path("/space", "/space", &offline, 2_000)
+            .sync_path("/space", "/space", &proven, &[], 1_000)
+            .unwrap();
+        store
+            .sync_path("/space", "/space", &offline, &[], 2_000)
             .unwrap();
         let work = store.load().work;
-        assert_eq!(work.path("/space").unwrap().activity_at, None);
+        assert!(work.path("/space").unwrap().observations.is_empty());
 
         // A record made while a field was unproven - a first run offline -
         // adopts the field's first proven value without dating it, then
@@ -3659,6 +4236,7 @@ mod tests {
                         renamed_from: None,
                         rewritten: false,
                         commit: None,
+                        activities: Vec::new(),
                         inputs: inputs.clone(),
                     }],
                     at,
@@ -3668,18 +4246,26 @@ mod tests {
         };
         first(&offline, 1_000);
         let record = first(&proven, 2_000);
-        assert_eq!(record.activity_at, None);
+        assert!(record.observations.is_empty());
         assert_eq!(record.inputs, proven);
-        assert_eq!(first(&merged, 3_000).activity_at, Some(3_000));
+        let record = first(&merged, 3_000);
+        assert_eq!(
+            record.observations,
+            vec![ObservationEvent {
+                source: ObservationSource::Lifecycle,
+                observed_at_ms: 3_000,
+                reasons: vec!["forge: open -> closed".to_owned()],
+            }]
+        );
         store
-            .sync_path("/fresh-space", "/fresh-space", &offline, 1_000)
+            .sync_path("/fresh-space", "/fresh-space", &offline, &[], 1_000)
             .unwrap();
         store
-            .sync_path("/fresh-space", "/fresh-space", &proven, 2_000)
+            .sync_path("/fresh-space", "/fresh-space", &proven, &[], 2_000)
             .unwrap();
         let work = store.load().work;
         let space = work.path("/fresh-space").unwrap();
-        assert_eq!(space.activity_at, None);
+        assert!(space.observations.is_empty());
         assert_eq!(space.inputs, proven);
     }
 
@@ -3688,7 +4274,7 @@ mod tests {
         let temp = TempStore::new();
         let store = temp.store();
         store
-            .sync_path("/wt", "/r/.git", &LifecycleInputs::default(), 1_000)
+            .sync_path("/wt", "/r/.git", &LifecycleInputs::default(), &[], 1_000)
             .unwrap();
         assert_eq!(
             store.load().work.paths["/wt"].repo.as_deref(),
@@ -3701,11 +4287,11 @@ mod tests {
         store.write_work(&work).unwrap();
         assert_eq!(store.load().work.paths["/wt"].repo, None);
         store
-            .sync_path("/wt", "/r/.git", &LifecycleInputs::default(), 2_000)
+            .sync_path("/wt", "/r/.git", &LifecycleInputs::default(), &[], 2_000)
             .unwrap();
         let record = &store.load().work.paths["/wt"];
         assert_eq!(record.repo.as_deref(), Some("/r/.git"));
-        assert_eq!(record.activity_at, None);
+        assert!(record.observations.is_empty());
         // A project-space sync names only itself: a repo-less record
         // adopts it, but where a repo already claimed the record the
         // space displaces nothing.
@@ -3713,14 +4299,14 @@ mod tests {
         work.paths.get_mut("/wt").unwrap().repo = None;
         store.write_work(&work).unwrap();
         store
-            .sync_path("/wt", "/wt", &LifecycleInputs::default(), 3_000)
+            .sync_path("/wt", "/wt", &LifecycleInputs::default(), &[], 3_000)
             .unwrap();
         assert_eq!(store.load().work.paths["/wt"].repo.as_deref(), Some("/wt"));
         store
-            .sync_path("/wt", "/r/.git", &LifecycleInputs::default(), 4_000)
+            .sync_path("/wt", "/r/.git", &LifecycleInputs::default(), &[], 4_000)
             .unwrap();
         store
-            .sync_path("/wt", "/wt", &LifecycleInputs::default(), 5_000)
+            .sync_path("/wt", "/wt", &LifecycleInputs::default(), &[], 5_000)
             .unwrap();
         assert_eq!(
             store.load().work.paths["/wt"].repo.as_deref(),
@@ -3735,12 +4321,12 @@ mod tests {
         let store = temp.store();
         assert_eq!(store.work_stamp(), None, "no file, no stamp");
         store
-            .sync_path("/p", "/p", &LifecycleInputs::default(), 1_000)
+            .sync_path("/p", "/p", &LifecycleInputs::default(), &[], 1_000)
             .unwrap();
         let first = store.work_stamp().expect("the file exists");
         // A no-op sync leaves the file, and so the stamp, alone.
         store
-            .sync_path("/p", "/p", &LifecycleInputs::default(), 2_000)
+            .sync_path("/p", "/p", &LifecycleInputs::default(), &[], 2_000)
             .unwrap();
         assert_eq!(store.work_stamp(), Some(first));
         // A same-length rewrite still moves it: the rename is a new inode.
@@ -3765,27 +4351,40 @@ mod tests {
         assert!(!temp.0.exists());
         // Identical fingerprints likewise: the file stays byte-identical.
         store
-            .sync_path("/space", "/space", &LifecycleInputs::default(), 1_000)
+            .sync_path("/space", "/space", &LifecycleInputs::default(), &[], 1_000)
             .unwrap();
         let bytes = fs::read(temp.path(WORK)).unwrap();
         store
-            .sync_path("/space", "/space", &LifecycleInputs::default(), 2_000)
+            .sync_path("/space", "/space", &LifecycleInputs::default(), &[], 2_000)
             .unwrap();
         assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes);
-        // A changed proven fingerprint is a transition: it lands
-        // `activity_at` and rewrites once.
+        // A changed proven fingerprint is a transition: it lands a
+        // Lifecycle observation - never activity - and rewrites once.
         let clean = LifecycleInputs {
             dirty: Some(false),
             ..LifecycleInputs::default()
         };
-        store.sync_path("/space", "/space", &clean, 2_500).unwrap();
+        store
+            .sync_path("/space", "/space", &clean, &[], 2_500)
+            .unwrap();
         let inputs = LifecycleInputs {
             dirty: Some(true),
             ..LifecycleInputs::default()
         };
-        store.sync_path("/space", "/space", &inputs, 3_000).unwrap();
+        store
+            .sync_path("/space", "/space", &inputs, &[], 3_000)
+            .unwrap();
         let work = store.load().work;
-        assert_eq!(work.path("/space").unwrap().activity_at, Some(3_000));
+        let record = work.path("/space").unwrap();
+        assert_eq!(
+            record.observations,
+            vec![ObservationEvent {
+                source: ObservationSource::Lifecycle,
+                observed_at_ms: 3_000,
+                reasons: vec!["dirty: clean -> dirty".to_owned()],
+            }]
+        );
+        assert_eq!(newest_activity(&record.activities), None);
         // Toggling an identity no file can name is NotFound before a
         // single byte is written.
         let empty = TempStore::new();
@@ -3804,7 +4403,7 @@ mod tests {
             .sync_repo(repo, &[obs("main", false), obs("feat", true)], 1_000)
             .unwrap();
         store
-            .sync_path("/space", "/space", &LifecycleInputs::default(), 1_000)
+            .sync_path("/space", "/space", &LifecycleInputs::default(), &[], 1_000)
             .unwrap();
         let work = store.load().work;
         let id = work.branch(repo, "feat").unwrap().id.clone();
@@ -3873,7 +4472,7 @@ mod tests {
         // A record exists so the toggle reaches the lock rather than
         // answering NotFound off the missing file.
         store
-            .sync_path("/p", "/p", &LifecycleInputs::default(), 1_000)
+            .sync_path("/p", "/p", &LifecycleInputs::default(), &[], 1_000)
             .unwrap();
         // A held lock fails every work mutation rather than clobbering.
         let held = Lock::acquire(&temp.path(LOCK)).unwrap();
@@ -3886,7 +4485,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .sync_path("/p", "/p", &LifecycleInputs::default(), 1)
+                .sync_path("/p", "/p", &LifecycleInputs::default(), &[], 1)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
@@ -3916,11 +4515,13 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         drop(held);
-        // Malformed and future-schema files refuse the read-modify-write
-        // and keep their bytes.
+        // Malformed, malformed-at-every-schema and future-schema files
+        // refuse the read-modify-write and keep their bytes.
         for bytes in [
             "{oops".to_owned(),
             serde_json::json!({"v": 99, "data": {}}).to_string(),
+            serde_json::json!({"v": SCHEMA, "data": "bogus"}).to_string(),
+            serde_json::json!({"v": 2, "data": "bogus"}).to_string(),
         ] {
             fs::write(temp.path(WORK), &bytes).unwrap();
             let err = store
@@ -3928,7 +4529,7 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             let err = store
-                .sync_path("/p", "/p", &LifecycleInputs::default(), 1_000)
+                .sync_path("/p", "/p", &LifecycleInputs::default(), &[], 1_000)
                 .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             let err = store
@@ -4126,6 +4727,7 @@ mod tests {
                 subject: Some("landed subject".to_owned()),
                 at_ms: Some(7_777),
             }),
+            activities: Vec::new(),
             inputs,
         }
     }
@@ -4142,6 +4744,7 @@ mod tests {
             working_tree: Some(WorkingTreeSnapshot {
                 fingerprint: "ab".to_owned(),
                 reasons: vec!["modified a.rs".to_owned()],
+                newest_mtime_ms: None,
             }),
             ..LifecycleInputs::default()
         };
@@ -4155,11 +4758,11 @@ mod tests {
         let work = store.load().work;
         let record = work.branch(repo, "feat").expect("active");
         assert!(
-            record.updates.is_empty(),
+            record.observations.is_empty(),
             "first proven values seed the baseline without an event: {:?}",
-            record.updates
+            record.observations
         );
-        assert_eq!(record.activity_at, None, "seeding is no work activity");
+        assert!(record.activities.is_empty(), "seeding is no work activity");
         let stamp = fs::metadata(temp.path(WORK)).unwrap().modified().unwrap();
         store
             .sync_repo(
@@ -4171,7 +4774,7 @@ mod tests {
         let work = store.load().work;
         let record = work.branch(repo, "feat").expect("active");
         assert!(
-            record.updates.is_empty(),
+            record.observations.is_empty(),
             "an unchanged poll appends nothing"
         );
         assert_eq!(
@@ -4200,54 +4803,56 @@ mod tests {
         // Unproven, then proven: the first known values seed the
         // baseline without an event on either pass.
         let record = sync(inputs(None, None), 500);
-        assert!(record.updates.is_empty(), "{:?}", record.updates);
+        assert!(record.observations.is_empty(), "{:?}", record.observations);
         let record = sync(inputs(Some(true), Some(true)), 1_000);
         assert!(
-            record.updates.is_empty(),
+            record.observations.is_empty(),
             "first proven values emit nothing: {:?}",
-            record.updates
+            record.observations
         );
-        assert_eq!(record.activity_at, None);
-        // Both sides proven on both passes: gone and missing date the
-        // pass, and found and restored are the reverse transition.
+        assert!(record.activities.is_empty());
+        // Both sides proven on both passes: gone and missing land an
+        // observation at the pass, found and restored the reverse - and
+        // a presence transition can never pass for activity.
         sync(inputs(Some(false), Some(false)), 2_000);
         let record = sync(inputs(Some(true), Some(true)), 3_000);
         assert_eq!(
-            record.updates,
+            record.observations,
             vec![
-                UpdateEvent {
-                    source: UpdateSource::Lifecycle,
-                    at_ms: 2_000,
+                ObservationEvent {
+                    source: ObservationSource::Lifecycle,
+                    observed_at_ms: 2_000,
                     reasons: vec!["worktree gone".to_owned(), ".git missing".to_owned()],
                 },
-                UpdateEvent {
-                    source: UpdateSource::Lifecycle,
-                    at_ms: 3_000,
+                ObservationEvent {
+                    source: ObservationSource::Lifecycle,
+                    observed_at_ms: 3_000,
                     reasons: vec!["worktree found".to_owned(), ".git restored".to_owned()],
                 },
             ]
         );
+        assert_eq!(newest_activity(&record.activities), None);
         // A path record behaves the same.
         let path = "/wt";
         let sync_path = |inputs: LifecycleInputs, at: u64| {
-            store.sync_path(path, "/r/.git", &inputs, at).unwrap();
+            store.sync_path(path, "/r/.git", &inputs, &[], at).unwrap();
             store.load().work.path(path).unwrap().clone()
         };
         let record = sync_path(inputs(Some(true), Some(true)), 1_000);
-        assert!(record.updates.is_empty(), "{:?}", record.updates);
+        assert!(record.observations.is_empty(), "{:?}", record.observations);
         sync_path(inputs(Some(false), Some(false)), 2_000);
         let record = sync_path(inputs(Some(true), Some(true)), 3_000);
         assert_eq!(
-            record.updates,
+            record.observations,
             vec![
-                UpdateEvent {
-                    source: UpdateSource::Lifecycle,
-                    at_ms: 2_000,
+                ObservationEvent {
+                    source: ObservationSource::Lifecycle,
+                    observed_at_ms: 2_000,
                     reasons: vec!["worktree gone".to_owned(), ".git missing".to_owned()],
                 },
-                UpdateEvent {
-                    source: UpdateSource::Lifecycle,
-                    at_ms: 3_000,
+                ObservationEvent {
+                    source: ObservationSource::Lifecycle,
+                    observed_at_ms: 3_000,
                     reasons: vec!["worktree found".to_owned(), ".git restored".to_owned()],
                 },
             ]
@@ -4266,6 +4871,7 @@ mod tests {
             working_tree: Some(WorkingTreeSnapshot {
                 fingerprint: fingerprint.to_owned(),
                 reasons: vec![format!("modified {fingerprint}.rs")],
+                newest_mtime_ms: None,
             }),
             ..LifecycleInputs::default()
         };
@@ -4292,26 +4898,31 @@ mod tests {
         let work = store.load().work;
         let record = work.branch(repo, "feat").expect("active");
         assert_eq!(
-            record.updates,
+            record.observations,
             vec![
-                UpdateEvent {
-                    source: UpdateSource::WorkingTree,
-                    at_ms: 2_000,
+                ObservationEvent {
+                    source: ObservationSource::WorkingTree,
+                    observed_at_ms: 2_000,
                     reasons: vec!["modified bb.rs".to_owned()],
                 },
-                UpdateEvent {
-                    source: UpdateSource::Lifecycle,
-                    at_ms: 2_000,
+                ObservationEvent {
+                    source: ObservationSource::Lifecycle,
+                    observed_at_ms: 2_000,
                     reasons: vec!["worktree state: healthy -> broken: .git missing".to_owned()],
-                },
-                UpdateEvent {
-                    source: UpdateSource::Commit,
-                    at_ms: 7_777,
-                    reasons: vec!["bbbbbbb landed subject".to_owned()],
                 },
             ]
         );
-        assert_eq!(record.activity_at, Some(7_777));
+        // The commit metadata proves its own occurrence: 7_777 is when
+        // the commit happened, not when the pass saw it.
+        assert_eq!(
+            record.activities,
+            vec![ActivityEvent {
+                source: ActivitySource::Commit,
+                occurred_at_ms: 7_777,
+                reasons: vec!["bbbbbbb landed subject".to_owned()],
+            }]
+        );
+        assert_eq!(newest_activity(&record.activities), Some(7_777));
         store
             .sync_repo(
                 repo,
@@ -4323,8 +4934,9 @@ mod tests {
             )
             .unwrap();
         let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("active");
         assert_eq!(
-            work.branch(repo, "feat").expect("active").updates.len(),
+            record.activities.len() + record.observations.len(),
             3,
             "unchanged polls append no duplicate"
         );
@@ -4346,83 +4958,176 @@ mod tests {
             working_tree: Some(WorkingTreeSnapshot {
                 fingerprint: fingerprint.to_owned(),
                 reasons: vec![format!("modified {fingerprint}.rs")],
+                newest_mtime_ms: None,
             }),
             ..LifecycleInputs::default()
         };
         store
-            .sync_path(path, path, &inputs("aaaaaaa1", "aa"), 1_000)
+            .sync_path(path, path, &inputs("aaaaaaa1", "aa"), &[], 1_000)
             .unwrap();
         store
-            .sync_path(path, path, &inputs("bbbbbbb2", "bb"), 2_000)
+            .sync_path(path, path, &inputs("bbbbbbb2", "bb"), &[], 2_000)
             .unwrap();
         let work = store.load().work;
         let record = work.path(path).expect("the record");
         assert_eq!(
-            record.updates,
+            record.observations,
             vec![
-                UpdateEvent {
-                    source: UpdateSource::Commit,
-                    at_ms: 2_000,
+                ObservationEvent {
+                    source: ObservationSource::Commit,
+                    observed_at_ms: 2_000,
                     reasons: vec!["bbbbbbb".to_owned()],
                 },
-                UpdateEvent {
-                    source: UpdateSource::WorkingTree,
-                    at_ms: 2_000,
+                ObservationEvent {
+                    source: ObservationSource::WorkingTree,
+                    observed_at_ms: 2_000,
                     reasons: vec!["modified bb.rs".to_owned()],
                 },
             ]
         );
+        // A HEAD move whose commit metadata carries no time fails
+        // closed: it is a detection, never work.
+        assert_eq!(newest_activity(&record.activities), None);
     }
 
     #[test]
-    fn append_update_dedupes_orders_and_retains_per_source() {
-        let mut updates = Vec::new();
-        let event = |source: UpdateSource, at_ms: u64, reason: &str| UpdateEvent {
+    fn histories_dedupe_order_and_retain_per_source_independently() {
+        // Activities deduplicate on (source, occurrence): a repeated
+        // sighting of the same work merges reasons, never lists twice.
+        let mut activities = Vec::new();
+        let activity = |source: ActivitySource, at_ms: u64, reason: &str| ActivityEvent {
             source,
-            at_ms,
+            occurred_at_ms: at_ms,
             reasons: vec![reason.to_owned()],
         };
-        let commit = event(UpdateSource::Commit, 5_000, "c");
-        assert!(append_update(&mut updates, commit.clone()));
-        assert!(!append_update(&mut updates, commit));
-        assert_eq!(updates.len(), 1);
-        assert!(append_update(
-            &mut updates,
-            event(UpdateSource::Session, 1_000, "s")
+        let commit = activity(ActivitySource::Commit, 5_000, "c");
+        assert!(append_activity(&mut activities, commit.clone()));
+        assert!(!append_activity(&mut activities, commit));
+        assert_eq!(activities.len(), 1);
+        assert!(append_activity(
+            &mut activities,
+            activity(ActivitySource::Commit, 5_000, "c2")
         ));
-        assert_eq!(updates[0].source, UpdateSource::Session);
+        assert_eq!(activities.len(), 1);
+        assert_eq!(
+            activities[0].reasons,
+            vec!["c".to_owned(), "c2".to_owned()],
+            "same work, merged reasons"
+        );
+        assert!(append_activity(
+            &mut activities,
+            activity(ActivitySource::Conversation, 1_000, "s")
+        ));
+        assert_eq!(activities[0].source, ActivitySource::Conversation);
         for i in 0..101u64 {
-            append_update(
-                &mut updates,
-                event(UpdateSource::Commit, 10_000 + i, &format!("c{i}")),
+            append_activity(
+                &mut activities,
+                activity(ActivitySource::Commit, 10_000 + i, &format!("c{i}")),
             );
-            append_update(
-                &mut updates,
-                event(UpdateSource::WorkingTree, 10_000 + i, &format!("w{i}")),
+            append_activity(
+                &mut activities,
+                activity(ActivitySource::WorkingTree, 10_000 + i, &format!("w{i}")),
             );
         }
-        let commits = updates
+        let commits = activities
             .iter()
-            .filter(|e| e.source == UpdateSource::Commit)
+            .filter(|e| e.source == ActivitySource::Commit)
             .count();
-        let trees = updates
+        let trees = activities
             .iter()
-            .filter(|e| e.source == UpdateSource::WorkingTree)
+            .filter(|e| e.source == ActivitySource::WorkingTree)
             .count();
-        assert_eq!(commits, UPDATE_RETAIN_PER_SOURCE);
-        assert_eq!(trees, UPDATE_RETAIN_PER_SOURCE);
+        assert_eq!(commits, HISTORY_RETAIN_PER_SOURCE);
+        assert_eq!(trees, HISTORY_RETAIN_PER_SOURCE);
         assert!(
-            updates
+            activities
                 .iter()
-                .any(|e| e.source == UpdateSource::Commit && e.at_ms == 10_100),
+                .any(|e| e.source == ActivitySource::Commit && e.occurred_at_ms == 10_100),
             "the newest commit survives"
         );
         assert!(
-            !updates
+            !activities
                 .iter()
-                .any(|e| e.source == UpdateSource::Commit && e.at_ms == 5_000),
+                .any(|e| e.source == ActivitySource::Commit && e.occurred_at_ms == 5_000),
             "the oldest commit ages out"
         );
+
+        // Observations deduplicate on identity: the same detection again
+        // is a no-op, a different detection at the same time is kept.
+        let mut observations = Vec::new();
+        let observation = |source: ObservationSource, at_ms: u64, reason: &str| ObservationEvent {
+            source,
+            observed_at_ms: at_ms,
+            reasons: vec![reason.to_owned()],
+        };
+        let gone = observation(ObservationSource::Lifecycle, 5_000, "worktree gone");
+        assert!(append_observation(&mut observations, gone.clone()));
+        assert!(!append_observation(&mut observations, gone));
+        assert_eq!(observations.len(), 1);
+        assert!(append_observation(
+            &mut observations,
+            observation(ObservationSource::WorkingTree, 1_000, "modified a")
+        ));
+        assert_eq!(observations[0].source, ObservationSource::WorkingTree);
+        for i in 0..101u64 {
+            append_observation(
+                &mut observations,
+                observation(ObservationSource::Lifecycle, 10_000 + i, &format!("l{i}")),
+            );
+        }
+        let lifecycle = observations
+            .iter()
+            .filter(|e| e.source == ObservationSource::Lifecycle)
+            .count();
+        assert_eq!(lifecycle, HISTORY_RETAIN_PER_SOURCE);
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|e| e.source == ObservationSource::WorkingTree)
+                .count(),
+            1,
+            "the other source's bound is untouched"
+        );
+        // Newest activity is derived, never stored: a fresh observation
+        // cannot change it.
+        let newest = newest_activity(&activities);
+        assert!(append_observation(
+            &mut observations,
+            observation(ObservationSource::Lifecycle, u64::MAX - 1, "just now")
+        ));
+        assert_eq!(newest_activity(&activities), newest);
+    }
+
+    #[test]
+    fn event_sources_round_trip_their_wire_names() {
+        for (source, name) in [
+            (ActivitySource::Commit, "commit"),
+            (ActivitySource::Reflog, "reflog"),
+            (ActivitySource::WorkingTree, "working_tree"),
+            (ActivitySource::Forge, "forge"),
+            (ActivitySource::Conversation, "conversation"),
+        ] {
+            let json = serde_json::to_string(&source).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<ActivitySource>(&json).unwrap(),
+                source
+            );
+        }
+        for (source, name) in [
+            (ObservationSource::Commit, "commit"),
+            (ObservationSource::WorkingTree, "working_tree"),
+            (ObservationSource::Forge, "forge"),
+            (ObservationSource::Conversation, "conversation"),
+            (ObservationSource::Lifecycle, "lifecycle"),
+        ] {
+            let json = serde_json::to_string(&source).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<ObservationSource>(&json).unwrap(),
+                source
+            );
+        }
     }
 
     #[test]
@@ -4502,10 +5207,10 @@ mod tests {
         let work = store.load().work;
         let record = work.branch(repo, "feat").expect("the record");
         assert_eq!(
-            record.updates,
-            vec![UpdateEvent {
-                source: UpdateSource::Lifecycle,
-                at_ms: 2_000,
+            record.observations,
+            vec![ObservationEvent {
+                source: ObservationSource::Lifecycle,
+                observed_at_ms: 2_000,
                 reasons: vec![
                     "worktree gone".to_owned(),
                     "path: /a -> /b".to_owned(),
@@ -4522,11 +5227,13 @@ mod tests {
                 ],
             }]
         );
-        assert_eq!(record.activity_at, Some(2_000));
+        // A transition is detection, not work: the derived activity
+        // stays empty.
+        assert_eq!(newest_activity(&record.activities), None);
     }
 
     #[test]
-    fn a_proven_rename_with_a_moved_tip_writes_the_commit_event() {
+    fn a_proven_rename_with_a_moved_tip_writes_a_commit_observation() {
         let temp = TempStore::new();
         let store = temp.store();
         let repo = "/repo/.git";
@@ -4540,15 +5247,19 @@ mod tests {
         let work = store.load().work;
         let record = work.branch(repo, "feat2").expect("the record");
         assert_eq!(
-            record.updates,
-            vec![UpdateEvent {
-                source: UpdateSource::Commit,
-                at_ms: 2_000,
+            record.observations,
+            vec![ObservationEvent {
+                source: ObservationSource::Commit,
+                observed_at_ms: 2_000,
                 reasons: vec!["bbbbbbb".to_owned()],
             }],
-            "a head move without commit metadata dates at the pass"
+            "a head move without commit metadata lands a detection"
         );
-        assert_eq!(record.activity_at, Some(2_000));
+        assert_eq!(
+            newest_activity(&record.activities),
+            None,
+            "an undated tip move fails closed - never activity"
+        );
     }
 
     #[test]
@@ -4566,14 +5277,13 @@ mod tests {
         let work = store.load().work;
         let record = work.branch(repo, "feat2").expect("the record");
         assert_eq!(
-            record.updates,
-            vec![UpdateEvent {
-                source: UpdateSource::Lifecycle,
-                at_ms: 2_000,
+            record.observations,
+            vec![ObservationEvent {
+                source: ObservationSource::Lifecycle,
+                observed_at_ms: 2_000,
                 reasons: vec!["dirty: clean -> dirty".to_owned()],
             }]
         );
-        assert_eq!(record.activity_at, Some(2_000));
         assert_eq!(record.inputs.dirty, Some(true));
     }
 
@@ -4584,7 +5294,13 @@ mod tests {
         let repo = "/repo/.git";
         store.sync_repo(repo, &[obs("feat", false)], 1_000).unwrap();
         store
-            .sync_path("/spaces/a", "/spaces/a", &LifecycleInputs::default(), 1_000)
+            .sync_path(
+                "/spaces/a",
+                "/spaces/a",
+                &LifecycleInputs::default(),
+                &[],
+                1_000,
+            )
             .unwrap();
         let id = store
             .load()
@@ -4618,21 +5334,21 @@ mod tests {
         let work = store.load().work;
         let record = work.branches.get(&id).expect("the record");
         assert_eq!(record.session_activity.get(&conv), Some(&5_000));
-        assert!(record.updates.is_empty(), "backfill emits no event");
+        assert!(record.activities.is_empty(), "backfill emits no event");
         store
             .sync_session_updates(&[update(6_000, "8f423bbb new", &branch)])
             .unwrap();
         let work = store.load().work;
         let record = work.branches.get(&id).expect("the record");
         assert_eq!(
-            record.updates,
-            vec![UpdateEvent {
-                source: UpdateSource::Session,
-                at_ms: 6_000,
+            record.activities,
+            vec![ActivityEvent {
+                source: ActivitySource::Conversation,
+                occurred_at_ms: 6_000,
                 reasons: vec!["8f423bbb new".to_owned()],
             }]
         );
-        assert_eq!(record.activity_at, Some(6_000));
+        assert_eq!(newest_activity(&record.activities), Some(6_000));
         store
             .sync_session_updates(&[
                 update(6_000, "8f423bbb new", &branch),
@@ -4641,7 +5357,7 @@ mod tests {
             .unwrap();
         let work = store.load().work;
         assert_eq!(
-            work.branches.get(&id).expect("the record").updates.len(),
+            work.branches.get(&id).expect("the record").activities.len(),
             1,
             "equal or older turns append nothing"
         );
@@ -4672,7 +5388,7 @@ mod tests {
                 .work
                 .path("/spaces/a")
                 .expect("the record")
-                .updates
+                .activities
                 .is_empty(),
             "first observations adopt the cursor only"
         );
@@ -4686,10 +5402,10 @@ mod tests {
         let work = store.load().work;
         let record = work.path("/spaces/a").expect("the record");
         assert_eq!(
-            record.updates,
-            vec![UpdateEvent {
-                source: UpdateSource::Session,
-                at_ms: 7_000,
+            record.activities,
+            vec![ActivityEvent {
+                source: ActivitySource::Conversation,
+                occurred_at_ms: 7_000,
                 reasons: vec!["aaaa".to_owned(), "bbbb".to_owned()],
             }],
             "one event per identity and timestamp, reasons sorted and deduped"
@@ -4705,7 +5421,7 @@ mod tests {
     }
 
     #[test]
-    fn records_written_before_updates_deserialize() {
+    fn records_written_before_the_event_histories_deserialize() {
         let temp = TempStore::new();
         fs::create_dir_all(&temp.0).unwrap();
         fs::write(
@@ -4732,8 +5448,300 @@ mod tests {
         let (work, errors) = temp.store().work();
         assert!(errors.is_empty(), "{errors:?}");
         let record = work.branches.get("i1").expect("the record");
-        assert!(record.updates.is_empty());
+        assert!(record.activities.is_empty() && record.observations.is_empty());
         assert!(record.session_activity.is_empty());
-        assert!(work.path("/p").expect("the path").updates.is_empty());
+        let path = work.path("/p").expect("the path");
+        assert!(path.activities.is_empty() && path.observations.is_empty());
+    }
+
+    #[test]
+    fn pass_supplied_activities_backfill_and_dedupe() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        // The first pass proves old work outright: the events it supplies
+        // land on the new record at their own occurrence times.
+        let mut o = obs("feat", false);
+        o.activities = vec![
+            ActivityEvent {
+                source: ActivitySource::Commit,
+                occurred_at_ms: 500,
+                reasons: vec!["aaaaaaa old".to_owned()],
+            },
+            ActivityEvent {
+                source: ActivitySource::Reflog,
+                occurred_at_ms: 600,
+                reasons: vec!["reflog work".to_owned()],
+            },
+        ];
+        store.sync_repo(repo, &[o.clone()], 1_000).unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("active");
+        assert_eq!(record.activities, o.activities);
+        assert_eq!(newest_activity(&record.activities), Some(600));
+        // The same pass seen again is a dedupe, not a second event.
+        store.sync_repo(repo, &[o], 2_000).unwrap();
+        let record = store.load().work.branch(repo, "feat").unwrap().clone();
+        assert_eq!(record.activities.len(), 2);
+        // The same occurrence from a different angle merges reasons.
+        let mut o = obs("feat", false);
+        o.activities = vec![ActivityEvent {
+            source: ActivitySource::Commit,
+            occurred_at_ms: 500,
+            reasons: vec!["other view".to_owned()],
+        }];
+        store.sync_repo(repo, &[o], 3_000).unwrap();
+        let record = store.load().work.branch(repo, "feat").unwrap().clone();
+        assert_eq!(record.activities.len(), 2);
+        assert_eq!(
+            record.activities[0].reasons,
+            vec!["aaaaaaa old".to_owned(), "other view".to_owned()]
+        );
+        // Path records seed the same way on creation.
+        store
+            .sync_path(
+                "/p",
+                "/p",
+                &LifecycleInputs::default(),
+                &[ActivityEvent {
+                    source: ActivitySource::Reflog,
+                    occurred_at_ms: 700,
+                    reasons: vec!["reflog work".to_owned()],
+                }],
+                4_000,
+            )
+            .unwrap();
+        let work = store.load().work;
+        let record = work.path("/p").expect("the record");
+        assert_eq!(newest_activity(&record.activities), Some(700));
+    }
+
+    #[test]
+    fn a_changed_tree_activity_dates_at_the_mtime_not_the_pass() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        let inputs = |fingerprint: &str, mtime: Option<u64>| LifecycleInputs {
+            working_tree: Some(WorkingTreeSnapshot {
+                fingerprint: fingerprint.to_owned(),
+                reasons: vec!["modified a.rs".to_owned()],
+                newest_mtime_ms: mtime,
+            }),
+            ..LifecycleInputs::default()
+        };
+        let mut o = obs("feat", false);
+        o.inputs = inputs("aa", Some(100));
+        store.sync_repo(repo, &[o], 1_000).unwrap();
+        // A dirty tree's first reading seeds the baseline; the pinned
+        // mtime still lands as provable work at its own time.
+        let mut o = obs("feat", false);
+        o.inputs = inputs("bb", Some(300));
+        store.sync_repo(repo, &[o], 2_000).unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("active");
+        assert_eq!(
+            record.activities,
+            vec![ActivityEvent {
+                source: ActivitySource::WorkingTree,
+                occurred_at_ms: 300,
+                reasons: vec!["modified a.rs".to_owned()],
+            }]
+        );
+        assert_eq!(
+            record.observations,
+            vec![ObservationEvent {
+                source: ObservationSource::WorkingTree,
+                observed_at_ms: 2_000,
+                reasons: vec!["modified a.rs".to_owned()],
+            }]
+        );
+        // A transition with no remaining changed-path mtime - a deletion
+        // or a return to clean - observes at the pass and adds no work.
+        let mut o = obs("feat", false);
+        o.inputs = inputs("cc", None);
+        store.sync_repo(repo, &[o], 3_000).unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("active");
+        assert_eq!(
+            record
+                .observations
+                .iter()
+                .filter(|e| e.source == ObservationSource::WorkingTree)
+                .count(),
+            2
+        );
+        assert_eq!(newest_activity(&record.activities), Some(300));
+        // The same holds for a path record.
+        let inputs = |f: &str, m: Option<u64>| {
+            let mut i = inputs(f, m);
+            i.dirty = Some(true);
+            i
+        };
+        store
+            .sync_path("/wt", "/r/.git", &inputs("aa", None), &[], 1_000)
+            .unwrap();
+        store
+            .sync_path("/wt", "/r/.git", &inputs("bb", None), &[], 2_000)
+            .unwrap();
+        let work = store.load().work;
+        let record = work.path("/wt").expect("the record");
+        assert!(record.activities.is_empty());
+        assert_eq!(
+            record
+                .observations
+                .iter()
+                .filter(|e| e.source == ObservationSource::WorkingTree)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_v2_work_file_migrates_and_ignores_the_stored_aggregate() {
+        let temp = TempStore::new();
+        fs::create_dir_all(&temp.0).unwrap();
+        fs::write(
+            temp.path(WORK),
+            serde_json::json!({
+                "v": 2,
+                "data": {
+                    "branches": {
+                        "i1": {
+                            "id": "i1",
+                            "repo": "/r/.git",
+                            "ref_name": "feat",
+                            "first_observed_at": 1,
+                            "last_observed_at": 1,
+                            "head": "aaaaaaaaaaaaaaaa",
+                            "activity_at": 999_999,
+                            "parked": true,
+                            "inputs": {
+                                "commit": {
+                                    "sha": "aaaaaaaaaaaaaaaa",
+                                    "subject": "landed",
+                                    "at_ms": 7_777
+                                }
+                            },
+                            "updates": [
+                                {"source": "commit", "at_ms": 7_777, "reasons": ["aaaaaaa landed"]},
+                                {"source": "commit", "at_ms": 2_000, "reasons": ["bbbbbbb moved"]},
+                                {"source": "session", "at_ms": 6_000, "reasons": ["8f423bbb turn"]},
+                                {"source": "lifecycle", "at_ms": 3_000, "reasons": ["dirty: clean -> dirty"]},
+                                {"source": "working_tree", "at_ms": 4_000, "reasons": ["modified a.rs"]}
+                            ],
+                            "session_activity": {"claude:s1": 6_000}
+                        }
+                    },
+                    "active_branches": {"/r/.git\u{0}feat": "i1"},
+                    "paths": {
+                        "/p": {
+                            "repo": "/r/.git",
+                            "activity_at": 888_888,
+                            "updates": [
+                                {"source": "commit", "at_ms": 1_600, "reasons": ["dddddddd unknown"]},
+                                {"source": "session", "at_ms": 5_000, "reasons": ["c turn"]},
+                                {"source": "lifecycle", "at_ms": 1_500, "reasons": ["worktree gone"]}
+                            ]
+                        }
+                    },
+                    "touches": [{
+                        "conversation": "claude:s1",
+                        "branch": "i1",
+                        "head": "aaaaaaaaaaaaaaaa",
+                        "provenance": "cwd",
+                        "confidence": "exact",
+                        "valid_from": 5_000,
+                        "valid_until": null
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (work, errors) = temp.store().work();
+        assert!(errors.is_empty(), "{errors:?}");
+        let record = work.branches.get("i1").expect("the record");
+        // Proven commit events are activity at their proven time; the
+        // unproven one stays a detection. Session events are Conversation
+        // activity; lifecycle and working-tree events are observations.
+        assert_eq!(
+            record.activities,
+            vec![
+                ActivityEvent {
+                    source: ActivitySource::Conversation,
+                    occurred_at_ms: 6_000,
+                    reasons: vec!["8f423bbb turn".to_owned()],
+                },
+                ActivityEvent {
+                    source: ActivitySource::Commit,
+                    occurred_at_ms: 7_777,
+                    reasons: vec!["aaaaaaa landed".to_owned()],
+                },
+            ]
+        );
+        assert_eq!(
+            record.observations,
+            vec![
+                ObservationEvent {
+                    source: ObservationSource::Commit,
+                    observed_at_ms: 2_000,
+                    reasons: vec!["bbbbbbb moved".to_owned()],
+                },
+                ObservationEvent {
+                    source: ObservationSource::Lifecycle,
+                    observed_at_ms: 3_000,
+                    reasons: vec!["dirty: clean -> dirty".to_owned()],
+                },
+                ObservationEvent {
+                    source: ObservationSource::WorkingTree,
+                    observed_at_ms: 4_000,
+                    reasons: vec!["modified a.rs".to_owned()],
+                },
+            ]
+        );
+        // The stored aggregate is ignored wholesale: 999_999 is not the
+        // record's recency, the events' own times are.
+        assert_eq!(newest_activity(&record.activities), Some(7_777));
+        assert!(record.parked);
+        assert_eq!(record.session_activity.get("claude:s1"), Some(&6_000));
+        assert_eq!(work.active_branches.get("/r/.git\u{0}feat").unwrap(), "i1");
+        assert_eq!(work.touches.len(), 1);
+        let path = work.path("/p").expect("the path record");
+        assert_eq!(
+            newest_activity(&path.activities),
+            Some(5_000),
+            "888_888 never enters either"
+        );
+        // A path record holds no commit metadata, so its Commit event is
+        // unproven by definition and stays an observation.
+        assert_eq!(
+            path.observations,
+            vec![
+                ObservationEvent {
+                    source: ObservationSource::Lifecycle,
+                    observed_at_ms: 1_500,
+                    reasons: vec!["worktree gone".to_owned()],
+                },
+                ObservationEvent {
+                    source: ObservationSource::Commit,
+                    observed_at_ms: 1_600,
+                    reasons: vec!["dddddddd unknown".to_owned()],
+                },
+            ]
+        );
+        // The first read-modify-write rewrites the file as the current
+        // contract: no legacy key survives the round trip.
+        temp.store()
+            .toggle_parked(&WorkIdentity::Branch("i1".to_owned()))
+            .unwrap();
+        let bytes = fs::read(temp.path(WORK)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["v"], SCHEMA);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("activity_at"), "{text}");
+        assert!(!text.contains("\"updates\""), "{text}");
+        let (work, errors) = temp.store().work();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!work.branches["i1"].parked);
     }
 }

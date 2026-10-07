@@ -34,8 +34,11 @@ use crate::vector::{
 use crate::verdict::{self, Verdict};
 
 /// The JSON contract version. Additive changes keep it; a field's removal,
-/// rename or change of meaning bumps it.
-pub const SCHEMA_VERSION: u32 = 1;
+/// rename or change of meaning bumps it. v1 -> v2: `transition_at`,
+/// `git_activity_at` and `updates` gave way to `activities` and
+/// `observations`, and `last_activity` carries source-backed occurrence
+/// times only - detection times can no longer order rows.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One refresh's complete, unfiltered view.
 #[derive(Debug, Serialize)]
@@ -398,10 +401,10 @@ pub struct WorkRow {
     pub live_sessions: usize,
     /// Conversations ever recorded against the row's path.
     pub past_sessions: usize,
-    /// Latest meaningful activity: the newest real work in the row's
-    /// reflogs (never creation or checkout bookkeeping), the authored
-    /// record's last proven transition and bound conversations' turns;
-    /// `None` is `?`.
+    /// Latest meaningful activity: the newest source-backed occurrence
+    /// across the row's stored and pass-proved activities and bound
+    /// conversations' source times; `None` is `?`. Detection times -
+    /// lifecycle transitions, first sightings, `ended_at` - never count.
     pub last_activity: Option<u64>,
     /// The rolled-up attention of the conversations bound to the row.
     pub attention: Attention,
@@ -443,13 +446,14 @@ pub struct WorkRow {
     /// session, process and agent session that still names it. Empty on
     /// live rows.
     pub references: Vec<ReferenceRow>,
-    /// The authored record's last proven lifecycle transition, epoch
-    /// seconds; `None` is `?`.
-    pub transition_at: Option<u64>,
-    /// The newest real work the row's reflogs recorded, epoch seconds;
-    /// `None` is `?`.
-    pub git_activity_at: Option<u64>,
-    pub updates: Vec<store::UpdateEvent>,
+    /// The row's source-backed work events, at their own occurrence
+    /// times (`occurred_at_ms`, epoch milliseconds): commit, reflog,
+    /// working-tree, forge and conversation work.
+    pub activities: Vec<store::ActivityEvent>,
+    /// The row's scan-time diagnostics, at their detection times
+    /// (`observed_at_ms`, epoch milliseconds). Kept beside activity, but
+    /// never counted as it.
+    pub observations: Vec<store::ObservationEvent>,
     /// `git worktree remove` verdict and reasons; `None` for project
     /// spaces, which carry no cleanup verdicts at all.
     pub worktree_removal: Option<verdict::ActionVerdict>,
@@ -647,7 +651,11 @@ pub struct ConversationRow {
     /// The newest event sequence the conversation has; a not-busy mark
     /// written at it is superseded by anything newer.
     pub journal_seq: Option<u64>,
-    /// Most recent evidence of the conversation at all.
+    /// The newest source-backed activity of the conversation: a
+    /// transcript message's own timestamp or a hook record's producer
+    /// timestamp. Live publication times (`updatedAt`,
+    /// `statusUpdatedAt`) and the pass that first detected the
+    /// conversation never count, so `None` means no proven work.
     pub last_activity: Option<u64>,
     /// Whether a live session record exists.
     pub live: bool,
@@ -1335,6 +1343,7 @@ impl Collector {
                                 }),
                                 renamed_from: w.renamed_from().map(str::to_owned),
                                 commit: observed_commit(&w.state, w.ref_head()),
+                                activities: pass_activities(&w.state, w.ref_head()),
                                 inputs: lifecycle_inputs(&w.state),
                             })
                         })
@@ -1354,6 +1363,7 @@ impl Collector {
                                 &path.display().to_string(),
                                 repo_id,
                                 &lifecycle_inputs(&w.state),
+                                &pass_activities(&w.state, w.ref_head()),
                                 observed_ms,
                             )
                         {
@@ -1368,6 +1378,7 @@ impl Collector {
                             &row.repo,
                             &row.repo,
                             &store::LifecycleInputs::default(),
+                            &[],
                             observed_ms,
                         )
                     {
@@ -1537,7 +1548,8 @@ impl Collector {
             match &model.data {
                 RepoData::Git(local) => {
                     for anchor in &local.anchors {
-                        let mut row = work_row(id, &model.name, &anchor.state, authored);
+                        let mut row =
+                            work_row(id, &model.name, &anchor.state, anchor.ref_head(), authored);
                         row.panes = anchor_panes(&anchor.state.anchor, &runtime.panes);
                         work.push(row);
                     }
@@ -2007,6 +2019,7 @@ fn work_row(
     repo_id: &str,
     repo_name: &str,
     state: &vector::WorkState,
+    head: Option<&str>,
     authored: &store::Work,
 ) -> WorkRow {
     let anchor = &state.anchor;
@@ -2034,24 +2047,31 @@ fn work_row(
     // Work identity: an active incarnation's id for a branch row, the
     // canonical path for a detached one. A branch whose record the sync
     // has not written yet carries no identity rather than a guess.
-    let (identity, parked, authored_ms, authored_updates) = match &branch {
+    let (identity, parked, authored_activities, observations) = match &branch {
         Some(name) => match authored.branch(repo_id, name) {
             Some(r) => (
                 Some(r.id.clone()),
                 r.parked,
-                r.activity_at,
-                r.updates.clone(),
+                r.activities.clone(),
+                r.observations.clone(),
             ),
-            None => (None, false, None, Vec::new()),
+            None => (None, false, Vec::new(), Vec::new()),
         },
         None => {
             let path = v.worktree.as_ref().map(|p| p.display().to_string());
             match path.as_deref().and_then(|p| authored.path(p)) {
-                Some(r) => (path, r.parked, r.activity_at, r.updates.clone()),
-                None => (path, false, None, Vec::new()),
+                Some(r) => (path, r.parked, r.activities.clone(), r.observations.clone()),
+                None => (path, false, Vec::new(), Vec::new()),
             }
         }
     };
+    // The pass's own provable activities fold into the record's: a row
+    // whose sync has not landed yet - or a store-less collect - still
+    // reads its source times, never the scan's.
+    let mut activities = authored_activities;
+    for event in pass_activities(state, head) {
+        store::append_activity(&mut activities, event);
+    }
     // The incarnation rows: every retained record of this `(repo,
     // ref_name)`, numbered oldest first - the active one on the row, the
     // closed ones as excluded same-name history.
@@ -2098,15 +2118,10 @@ fn work_row(
         live_pids: v.live_pids,
         live_sessions: v.live_agent_sessions,
         past_sessions: v.past_agent_sessions,
-        // Meaningful activity: the Git time the pass observed, folded with
-        // the persisted transition time. Bound conversations' activity
-        // joins in `classify_work`.
-        last_activity: v
-            .last_git_activity
-            .map(epoch)
-            .into_iter()
-            .chain(authored_ms.map(|ms| ms / 1000))
-            .max(),
+        // Meaningful activity: the newest source-backed occurrence,
+        // derived from the events rather than a stored aggregate. Bound
+        // conversations' source times join in `classify_work`.
+        last_activity: store::newest_activity(&activities).map(|ms| ms / 1000),
         attention: Attention::None,
         identity,
         incarnation,
@@ -2132,9 +2147,8 @@ fn work_row(
         panes: Vec::new(),
         gone: None,
         references: Vec::new(),
-        transition_at: authored_ms.map(|ms| ms / 1000),
-        git_activity_at: v.last_git_activity.map(epoch),
-        updates: authored_updates,
+        activities,
+        observations,
         worktree_removal: Some(removal),
         branch_deletion: Some(deletion),
         section: WorkSection::FollowUp,
@@ -2216,18 +2230,77 @@ fn lifecycle_inputs(state: &vector::WorkState) -> store::LifecycleInputs {
         },
         commit: observed_commit(state, head.as_deref()),
         head,
-        working_tree: v
-            .worktree
-            .as_deref()
-            .zip(v.working_tree.known())
-            .map(|(root, bytes)| {
-                let status = git::status(bytes, root);
-                store::WorkingTreeSnapshot {
-                    fingerprint: status.fingerprint,
-                    reasons: status.reasons,
-                }
-            }),
+        working_tree: worktree_status(state).map(|status| store::WorkingTreeSnapshot {
+            fingerprint: status.fingerprint,
+            reasons: status.reasons,
+            newest_mtime_ms: status.newest_changed_mtime.map(store::epoch_ms),
+        }),
     }
+}
+
+/// The worktree's parsed porcelain status, when the pass can read one:
+/// the fingerprint, reasons and newest changed-path mtime every
+/// consumer of working-tree evidence shares.
+fn worktree_status(state: &vector::WorkState) -> Option<git::Status> {
+    let v = &state.vector;
+    v.worktree
+        .as_deref()
+        .zip(v.working_tree.known())
+        .map(|(root, bytes)| git::status(bytes, root))
+}
+
+/// The source-backed work one anchor's state proves this pass, as
+/// activity events: the tip's committerdate when it provably dates the
+/// incarnation, the reflog's newest real-work entry, the newest
+/// changed-path mtime, and the forge item's own merge/close date.
+/// Checkout, ref-creation, pipeline and first-detection evidence are not
+/// here - they are not work.
+fn pass_activities(state: &vector::WorkState, head: Option<&str>) -> Vec<store::ActivityEvent> {
+    let v = &state.vector;
+    let mut events = Vec::new();
+    if let Some(at) = v.commit_activity {
+        let reason = observed_commit(state, head).map_or_else(
+            || "tip commit".to_owned(),
+            |c| match c.subject {
+                Some(subject) => format!("{} {}", short_sha(&c.sha), subject),
+                None => short_sha(&c.sha).to_owned(),
+            },
+        );
+        events.push(store::ActivityEvent {
+            source: store::ActivitySource::Commit,
+            occurred_at_ms: store::epoch_ms(at),
+            reasons: vec![reason],
+        });
+    }
+    if let Some(at) = v.reflog_activity {
+        events.push(store::ActivityEvent {
+            source: store::ActivitySource::Reflog,
+            occurred_at_ms: store::epoch_ms(at),
+            reasons: vec!["reflog work".to_owned()],
+        });
+    }
+    if let Some(status) = worktree_status(state)
+        && let Some(at) = status.newest_changed_mtime
+    {
+        events.push(store::ActivityEvent {
+            source: store::ActivitySource::WorkingTree,
+            occurred_at_ms: store::epoch_ms(at),
+            reasons: status.reasons.clone(),
+        });
+    }
+    if let Some(at_ms) = state.forge.occurred_at_ms {
+        let label = state
+            .forge
+            .label
+            .clone()
+            .unwrap_or_else(|| "work item".to_owned());
+        events.push(store::ActivityEvent {
+            source: store::ActivitySource::Forge,
+            occurred_at_ms: at_ms,
+            reasons: vec![format!("{} {}", label, state.forge.item.as_str())],
+        });
+    }
+    events
 }
 
 fn observed_commit(state: &vector::WorkState, head: Option<&str>) -> Option<store::ObservedCommit> {
@@ -2252,6 +2325,7 @@ fn unknown_forge(reason: &str) -> ForgeStatus {
         label: None,
         url: None,
         reason: Some(reason.to_owned()),
+        occurred_at_ms: None,
     }
 }
 
@@ -2408,18 +2482,20 @@ fn touch_row(
 }
 
 /// Refresh a path-keyed row's authored fields - a project space's row is
-/// stored in the model, so parked and transition dates apply per publish.
+/// stored in the model, so parked, events and derived activity apply per
+/// publish.
 fn apply_path_record(row: &mut WorkRow, authored: &store::Work) {
     let Some(identity) = &row.identity else {
         return; // coverage: off - a space row's identity is its path, always present
     };
     if let Some(record) = authored.path(identity) {
         row.parked = record.parked;
-        row.updates = record.updates.clone();
+        row.activities = record.activities.clone();
+        row.observations = record.observations.clone();
         row.last_activity = row
             .last_activity
             .into_iter()
-            .chain(record.activity_at.map(|ms| ms / 1000))
+            .chain(store::newest_activity(&record.activities).map(|ms| ms / 1000))
             .max();
     }
 }
@@ -2640,14 +2716,15 @@ fn gone_rows(
             branch: Some(record.ref_name.clone()),
             identity: Some(record.id.clone()),
             incarnation: Some(incarnation_row(record, number)),
-            last_activity: record
-                .ended_at
-                .map(|ms| ms / 1000)
-                .or_else(|| record.activity_at.map(|ms| ms / 1000)), // coverage: off - the loop's `ended_at.is_some()` filter proves the map
+            // A gone row's recency is its retained source activity only:
+            // `ended_at` and `last_observed_at` are detection times, so
+            // a just-deleted old branch still reads old.
+            last_activity: store::newest_activity(&record.activities).map(|ms| ms / 1000),
             gone: Some(gone.clone()),
             summary: format!("{gone} · {}", reference_summary(&refs)),
             references: refs,
-            updates: record.updates.clone(),
+            activities: record.activities.clone(),
+            observations: record.observations.clone(),
             section: WorkSection::CleanupReview,
             ..space_row(&record.repo, &path)
         });
@@ -2678,8 +2755,9 @@ fn gone_rows(
             gone: Some(gone.to_owned()),
             summary: format!("{gone} · {}", reference_summary(&refs)),
             references: refs,
-            updates: record.updates.clone(),
-            last_activity: record.activity_at.map(|ms| ms / 1000),
+            activities: record.activities.clone(),
+            observations: record.observations.clone(),
+            last_activity: store::newest_activity(&record.activities).map(|ms| ms / 1000),
             section: WorkSection::CleanupReview,
             ..space_row(path_str, &path)
         });
@@ -3141,9 +3219,8 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         panes: Vec::new(),
         gone: None,
         references: Vec::new(),
-        transition_at: None,
-        git_activity_at: None,
-        updates: Vec::new(),
+        activities: Vec::new(),
+        observations: Vec::new(),
         worktree_removal: None,
         branch_deletion: None,
         section: WorkSection::FollowUp,
@@ -3386,6 +3463,16 @@ fn conversation_row(
     let marked = derived.marked;
     let jseq = (derived.journal_seq > 0).then_some(derived.journal_seq);
     let process_start = attachment.as_ref().and_then(|a| a.pid_start);
+    // Conversation activity is source-backed only: transcript message
+    // times and the fold's hook producer times. Live publication times
+    // (`updatedAt`, `statusUpdatedAt`) and first detection never count.
+    let last_activity_ms = [
+        conv.last_activity().map(store::epoch_ms),
+        evidence.fold.and_then(|f| f.last_pts),
+    ]
+    .into_iter()
+    .flatten()
+    .max();
     ConversationRow {
         provider: Provider::Claude,
         session_id: conv.session_id.clone(),
@@ -3406,7 +3493,7 @@ fn conversation_row(
         attention_seq: (derived.ack_through > 0).then_some(derived.ack_through),
         attention_wait_ms: derived.wait_ms,
         journal_seq: jseq,
-        last_activity: conv.last_activity().map(epoch),
+        last_activity: last_activity_ms.map(|ms| ms / 1000),
         live: conv.live.is_some(),
         attachment,
         cwd: conv.cwd().map(Path::to_owned),
@@ -3616,9 +3703,9 @@ mod tests {
             continuity_evidence: store::ContinuityEvidence::FirstObservation,
             ended_at: ended_ms,
             parked: false,
-            activity_at: None,
+            activities: Vec::new(),
             inputs: store::LifecycleInputs::default(),
-            updates: Vec::new(),
+            observations: Vec::new(),
             session_activity: Default::default(),
         }
     }
@@ -3737,6 +3824,7 @@ mod tests {
                 label: None,
                 url: None,
                 reason: None,
+                occurred_at_ms: None,
             },
             broken: None,
             vector: vector::StateVector {
@@ -3753,10 +3841,12 @@ mod tests {
                 upstream_state: UpstreamState::NotApplicable,
                 unpushed_commits: Evidence::Unknown("none asked".to_owned()),
                 landed: Evidence::Unknown("none asked".to_owned()),
+                reflog_activity: None,
+                commit_activity: None,
                 last_git_activity: None,
             },
         };
-        let row = work_row("/r/.git", "r", &state, &work);
+        let row = work_row("/r/.git", "r", &state, None, &work);
         let inc = row.incarnation.expect("the active incarnation");
         assert_eq!(inc.id, "i-3");
         assert_eq!(inc.number, 3);
@@ -3795,6 +3885,7 @@ mod tests {
                 label: None,
                 url: None,
                 reason: None,
+                occurred_at_ms: None,
             },
             broken: Some(broken.to_owned()),
             vector: vector::StateVector {
@@ -3811,6 +3902,8 @@ mod tests {
                 upstream_state: UpstreamState::NotApplicable,
                 unpushed_commits: Evidence::Unknown("none asked".to_owned()),
                 landed: Evidence::Unknown("none asked".to_owned()),
+                reflog_activity: None,
+                commit_activity: None,
                 last_git_activity: None,
             },
         };
@@ -3819,6 +3912,7 @@ mod tests {
             "/r/.git",
             "r",
             &state("gitdir file points to non-existent location"),
+            None,
             &authored,
         );
         assert_eq!(
@@ -3826,7 +3920,7 @@ mod tests {
             Some(".git missing; metadata retained by r")
         );
         fs::write(dir.join(".git"), "gitdir: /elsewhere\n").unwrap();
-        let row = work_row("/r/.git", "r", &state("checkout moved"), &authored);
+        let row = work_row("/r/.git", "r", &state("checkout moved"), None, &authored);
         assert_eq!(row.broken.as_deref(), Some("checkout moved"));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -4961,6 +5055,11 @@ mod tests {
         let mut record = branch_record("i1", 1_000, Some(3_000));
         record.inputs.worktree_path = Some(missing.clone());
         record.inputs.admin_id = Some("adm1".to_owned());
+        record.activities = vec![store::ActivityEvent {
+            source: store::ActivitySource::Commit,
+            occurred_at_ms: 2_000,
+            reasons: vec!["aaaaaaa tip".to_owned()],
+        }];
         work.branches.insert("i1".to_owned(), record);
         let mut kept = branch_record("i2", 1_000, Some(3_000));
         kept.ref_name = "kept".to_owned();
@@ -4971,6 +5070,22 @@ mod tests {
         let mut bare = branch_record("i0", 1_000, Some(3_000));
         bare.ref_name = "bare".to_owned();
         work.branches.insert("i0".to_owned(), bare);
+        // A closed path record whose folder is gone but still named: it
+        // reads its own retained source activity too.
+        let space = format!("{}/gone-space", root.display());
+        let space_record = store::PathRecord {
+            repo: Some("/r/.git".to_owned()),
+            parked: false,
+            inputs: store::LifecycleInputs::default(),
+            activities: vec![store::ActivityEvent {
+                source: store::ActivitySource::Conversation,
+                occurred_at_ms: 1_500,
+                reasons: vec!["turn".to_owned()],
+            }],
+            observations: Vec::new(),
+            session_activity: std::collections::BTreeMap::new(),
+        };
+        work.paths.insert(space.clone(), space_record);
         // Two live panes bound by their stored worktree edges - the
         // summary says `2 panes` - plus one that binds nowhere.
         let mut pane = tmux_pane("/sock/a", "%9", 50);
@@ -4996,19 +5111,32 @@ mod tests {
         no_attach.cwd = Some(PathBuf::from(&missing));
         let mut outside = live_row("dddddddd-1", 88);
         outside.cwd = Some(PathBuf::from("/elsewhere"));
+        // A live agent session sitting in the gone space keeps the path
+        // record's row.
+        let mut in_space = live_row("eeeeeeee-1", 90);
+        in_space.cwd = Some(PathBuf::from(&space));
         let model = Model {
-            conversations: vec![c, no_attach, outside],
+            conversations: vec![c, no_attach, outside, in_space],
             ..Default::default()
         };
         let live_rt = runtime(
-            vec![prow(99, 50), prow(88, 1)],
+            vec![prow(99, 50), prow(88, 1), prow(90, 60)],
             vec![pane, pane2, pane3, stray],
         );
         let live_paths = HashSet::new();
         let rows = gone_rows(&model, &work, &live_rt, &live_paths);
-        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let space_row = rows
+            .iter()
+            .find(|r| r.kind == WorkKind::ProjectSpace)
+            .expect("the space row");
+        assert_eq!(space_row.last_activity, Some(1), "{space_row:?}");
         let row = &rows[0];
         assert_eq!(row.gone.as_deref(), Some("branch and worktree gone"));
+        // Its age is the retained source activity (2s), never the
+        // incarnation's end (3s) or last sighting - detection times do
+        // not make gone work look new.
+        assert_eq!(row.last_activity, Some(2));
         let kinds: Vec<ReferenceKind> = row.references.iter().map(|r| r.kind).collect();
         for kind in [
             ReferenceKind::Pane,
@@ -5044,9 +5172,9 @@ mod tests {
             store::PathRecord {
                 repo: None,
                 parked: false,
-                activity_at: Some(2_000),
+                activities: Vec::new(),
                 inputs: store::LifecycleInputs::default(),
-                updates: Vec::new(),
+                observations: Vec::new(),
                 session_activity: Default::default(),
             },
         );
@@ -5056,12 +5184,12 @@ mod tests {
             store::PathRecord {
                 repo: Some("/r/.git".to_owned()),
                 parked: false,
-                activity_at: Some(2_000),
+                activities: Vec::new(),
                 inputs: store::LifecycleInputs {
                     worktree: Some(true),
                     ..Default::default()
                 },
-                updates: Vec::new(),
+                observations: Vec::new(),
                 session_activity: Default::default(),
             },
         );
@@ -5114,12 +5242,12 @@ mod tests {
             store::PathRecord {
                 repo: None,
                 parked: false,
-                activity_at: Some(2_000),
+                activities: Vec::new(),
                 inputs: store::LifecycleInputs {
                     worktree: Some(true),
                     ..Default::default()
                 },
-                updates: Vec::new(),
+                observations: Vec::new(),
                 session_activity: Default::default(),
             },
         );
@@ -5225,5 +5353,99 @@ mod tests {
         let gone = root.join("gone");
         assert!(inside_path(&gone.join("x"), &gone));
         assert!(!inside_path(&gone, &gone.join("x")));
+    }
+
+    #[test]
+    fn pass_activities_date_each_source_at_its_own_evidence() {
+        let dir = std::env::temp_dir().join(format!("asd-pass-act-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let edit = dir.join("edit.txt");
+        fs::write(&edit, "x").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&edit)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(30))
+            .unwrap();
+        let mut state = vector::WorkState {
+            repo: git::Repo {
+                common_dir: PathBuf::from("/r/.git"),
+            },
+            anchor: Anchor::Branch {
+                name: "feat".to_owned(),
+            },
+            remote_url: None,
+            base: Evidence::Unknown("no base asked".to_owned()),
+            forge: ForgeStatus {
+                item: WorkItem::Closed,
+                pipeline: Pipeline::Unknown,
+                label: Some("PR #5".to_owned()),
+                url: None,
+                reason: None,
+                occurred_at_ms: Some(40_000),
+            },
+            broken: None,
+            vector: vector::StateVector {
+                worktree: Some(dir.clone()),
+                windows: WindowCount::default(),
+                live_pids: 0,
+                live_agent_sessions: 0,
+                past_agent_sessions: 0,
+                dirty: Evidence::Known(true),
+                working_tree: Evidence::Known(b" M edit.txt\0".to_vec()),
+                commits_ahead_of_base: Evidence::Known(1),
+                commits_behind_of_base: Evidence::Known(0),
+                commits_not_on_base: Evidence::Known(vec![git::LogCommit {
+                    sha: "aaaaaaaaaaaaaaaa".to_owned(),
+                    at: 20,
+                    subject: "landed".to_owned(),
+                }]),
+                upstream_state: UpstreamState::NotApplicable,
+                unpushed_commits: Evidence::Known(0),
+                landed: Evidence::Unknown("none asked".to_owned()),
+                reflog_activity: Some(UNIX_EPOCH + Duration::from_secs(10)),
+                commit_activity: Some(UNIX_EPOCH + Duration::from_secs(20)),
+                last_git_activity: Some(UNIX_EPOCH + Duration::from_secs(20)),
+            },
+        };
+        let events = pass_activities(&state, Some("aaaaaaaaaaaaaaaa"));
+        assert_eq!(
+            events,
+            vec![
+                store::ActivityEvent {
+                    source: store::ActivitySource::Commit,
+                    occurred_at_ms: 20_000,
+                    reasons: vec!["aaaaaaa landed".to_owned()],
+                },
+                store::ActivityEvent {
+                    source: store::ActivitySource::Reflog,
+                    occurred_at_ms: 10_000,
+                    reasons: vec!["reflog work".to_owned()],
+                },
+                store::ActivityEvent {
+                    source: store::ActivitySource::WorkingTree,
+                    occurred_at_ms: 30_000,
+                    reasons: vec!["modified edit.txt".to_owned()],
+                },
+                store::ActivityEvent {
+                    source: store::ActivitySource::Forge,
+                    occurred_at_ms: 40_000,
+                    reasons: vec!["PR #5 closed".to_owned()],
+                },
+            ]
+        );
+        // No head names the tip generically, and nothing else moves.
+        state.vector.commits_not_on_base = Evidence::Unknown("none asked".to_owned());
+        let events = pass_activities(&state, None);
+        assert_eq!(events[0].reasons, vec!["tip commit".to_owned()]);
+        // An unlabelled forge item reasons generically.
+        state.forge.label = None;
+        let events = pass_activities(&state, None);
+        assert_eq!(
+            events[3].reasons,
+            vec!["work item closed".to_owned()],
+            "{events:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

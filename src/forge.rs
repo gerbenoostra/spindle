@@ -73,6 +73,10 @@ pub struct ForgeStatus {
     pub url: Option<String>,
     /// Why `item` is `Unknown`, when it is.
     pub reason: Option<String>,
+    /// The item's own occurrence time - the merge or close date, epoch
+    /// milliseconds. `None` on open items, undated answers and
+    /// malformed dates: no forge date is ever guessed or borrowed.
+    pub occurred_at_ms: Option<u64>,
 }
 
 impl ForgeStatus {
@@ -83,6 +87,7 @@ impl ForgeStatus {
             label: None,
             url: None,
             reason: Some(reason.into()),
+            occurred_at_ms: None,
         }
     }
 
@@ -93,6 +98,7 @@ impl ForgeStatus {
             label: None,
             url: None,
             reason: None,
+            occurred_at_ms: None,
         }
     }
 }
@@ -208,7 +214,7 @@ impl Forge {
                 "--state".to_owned(),
                 state.to_owned(),
                 "--json".to_owned(),
-                "number,state,url,statusCheckRollup".to_owned(),
+                "number,state,url,statusCheckRollup,mergedAt,closedAt".to_owned(),
                 "--limit".to_owned(),
                 "20".to_owned(),
             ]
@@ -242,6 +248,16 @@ impl Forge {
             url: item["url"].as_str().map(str::to_owned),
             reason: (state != "OPEN" && state != "CLOSED" && state != "MERGED")
                 .then(|| format!("gh reports PR state {state:?}")),
+            // The state's own date alone: a merged PR dates at
+            // `mergedAt`, a closed one at `closedAt`. Nothing else - not
+            // an open item's update, not a pipeline run - is an
+            // occurrence, and a malformed merge date does not borrow
+            // the close date.
+            occurred_at_ms: match state {
+                "MERGED" => occurred_ms(item, "mergedAt"),
+                "CLOSED" => occurred_ms(item, "closedAt"),
+                _ => None,
+            },
         };
         if status.item == WorkItem::Open {
             status.pipeline = gh_pipeline(&item["statusCheckRollup"]);
@@ -301,6 +317,14 @@ impl Forge {
             url: item["web_url"].as_str().map(str::to_owned),
             reason: (!matches!(state, "opened" | "closed" | "merged" | "locked"))
                 .then(|| format!("glab reports MR state {state:?}")),
+            // The state's own date alone: `merged` dates at
+            // `merged_at`, `closed` at `closed_at`; `locked` and every
+            // other state prove no occurrence.
+            occurred_at_ms: match state {
+                "merged" => occurred_ms(item, "merged_at"),
+                "closed" => occurred_ms(item, "closed_at"),
+                _ => None,
+            },
         };
         if status.item == WorkItem::Open {
             status.pipeline = glab_pipeline(&item["head_pipeline"]);
@@ -324,6 +348,16 @@ impl Forge {
             .cloned()
             .ok_or_else(|| ForgeStatus::unknown(format!("{program} output is not a list")))
     }
+}
+
+/// The item's occurrence time: `key`'s value as a parseable RFC3339
+/// date, epoch milliseconds. A missing or malformed date fails closed
+/// to `None` without invalidating the item it rode in on.
+fn occurred_ms(item: &serde_json::Value, key: &str) -> Option<u64> {
+    let text = item[key].as_str()?;
+    let at =
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()?;
+    u64::try_from(at.unix_timestamp_nanos() / 1_000_000).ok()
 }
 
 /// A host containing "github" is served by `gh`, one containing "gitlab" by

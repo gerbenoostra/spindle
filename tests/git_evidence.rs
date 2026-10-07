@@ -23,6 +23,7 @@ fn no_item() -> ForgeStatus {
         label: None,
         url: None,
         reason: None,
+        occurred_at_ms: None,
     }
 }
 
@@ -33,6 +34,7 @@ fn open_item() -> ForgeStatus {
         label: Some("PR #191".to_owned()),
         url: Some("https://github.com/o/r/pull/191".to_owned()),
         reason: None,
+        occurred_at_ms: None,
     }
 }
 
@@ -748,6 +750,7 @@ fn an_open_work_item_blocks_and_unknown_does_not() {
         label: None,
         url: None,
         reason: Some("gh is not on PATH".to_owned()),
+        occurred_at_ms: None,
     };
     let (removal, _) = verdict::cleanup(state, &unknown);
     assert_eq!(removal.verdict, Verdict::Safe);

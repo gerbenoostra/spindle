@@ -187,8 +187,16 @@ pub struct StateVector {
     /// all - the ones removal actually loses.
     pub unpushed_commits: Evidence<u64>,
     pub landed: Evidence<Landed>,
-    /// Newest of the worktree HEAD (or branch) reflog's last entry and its
-    /// mtime.
+    /// Newest real work the anchor's reflogs record: the worktree HEAD
+    /// log's and the branch log's last work entries, each folded with the
+    /// file's mtime when its last write was work.
+    pub reflog_activity: Option<SystemTime>,
+    /// The tip's committerdate, when it provably dates work on this
+    /// incarnation (it postdates the ref's creation, or no creation is
+    /// proven).
+    pub commit_activity: Option<SystemTime>,
+    /// Newest of `reflog_activity` and `commit_activity` - the aggregate
+    /// readers that do not need the source distinction keep using.
     pub last_git_activity: Option<SystemTime>,
 }
 
@@ -297,7 +305,8 @@ struct AnchorLocal {
     unreachable: Option<Evidence<u64>>,
     working_tree: Evidence<Vec<u8>>,
     dirty: Evidence<bool>,
-    last_git_activity: Option<SystemTime>,
+    reflog_activity: Option<SystemTime>,
+    commit_activity: Option<SystemTime>,
     /// The branch tip's OID, from the batch or the old-git fallback.
     head_oid: Option<String>,
     /// The newest null-old creation the branch's own reflog proves.
@@ -538,6 +547,7 @@ fn anchor_work(
         Anchor::Worktree { path, .. } => repo.status(path),
         Anchor::Branch { .. } => Evidence::Unknown("no worktree".to_owned()),
     };
+    let (reflog_activity, commit_activity) = git_activity(repo, &anchor, fact);
     let local = AnchorLocal {
         remote_url: remote_url(repo, &config),
         config,
@@ -560,7 +570,8 @@ fn anchor_work(
             Anchor::Branch { .. } => Evidence::Known(false),
         },
         working_tree,
-        last_git_activity: last_git_activity(repo, &anchor, fact),
+        reflog_activity,
+        commit_activity,
         head_oid,
         creation: lifecycle.as_ref().and_then(|l| l.creation.clone()),
         renamed_from: lifecycle.and_then(|l| l.renamed_from),
@@ -576,6 +587,7 @@ fn anchor_work(
             label: None,
             url: None,
             reason: Some(PENDING.to_owned()),
+            occurred_at_ms: None,
         },
         broken: match &anchor {
             Anchor::Worktree { prunable, .. } => prunable.clone(),
@@ -601,24 +613,28 @@ fn anchor_work(
                 .clone()
                 .unwrap_or_else(|| Evidence::Unknown(PENDING.to_owned())),
             landed: Evidence::Unknown(PENDING.to_owned()),
-            last_git_activity: local.last_git_activity,
+            reflog_activity: local.reflog_activity,
+            commit_activity: local.commit_activity,
+            last_git_activity: [local.reflog_activity, local.commit_activity]
+                .into_iter()
+                .flatten()
+                .max(),
         },
     };
     AnchorWork { state, local } // coverage: off - the unexecuted instantiation's region edge
 }
 
-/// Newest real work the anchor's reflogs record: a checkout's HEAD log,
-/// plus - for anything on a branch - the branch's own log and, when the
-/// batch supplied it and the commit strictly postdates the ref's creation,
-/// the tip's committerdate. The branch log matters for a worktree added
-/// over commits made elsewhere, whose HEAD log holds only the add; the
-/// committerdate matters when a branch moved without a reflog write; a
-/// probe path keeps reflog only.
-fn last_git_activity(
+/// The anchor's source-distinguished Git activity, `(reflog, commit)`:
+/// real work the worktree HEAD and branch reflogs record, and the tip's
+/// committerdate when it provably dates this incarnation. The branch log
+/// matters for a worktree added over commits made elsewhere, whose HEAD
+/// log holds only the add; the committerdate matters when a branch moved
+/// without a reflog write; a probe path keeps reflog only.
+fn git_activity(
     repo: &Repo,
     anchor: &Anchor,
     fact: Option<&git::BranchFact>,
-) -> Option<SystemTime> {
+) -> (Option<SystemTime>, Option<SystemTime>) {
     // The HEAD reflog's real work only: the add's creation line and a
     // `checkout:` line are lifecycle events, not activity.
     let head = match anchor {
@@ -626,19 +642,20 @@ fn last_git_activity(
             .and_then(|log| repo.reflog_times(&log).worked_at),
         Anchor::Branch { .. } => None,
     };
-    let branch = anchor.branch().and_then(|name| {
+    let (mut branch, mut committed) = (None, None);
+    if let Some(name) = anchor.branch() {
         let times = repo.reflog_times(&PathBuf::from(format!("logs/refs/heads/{name}")));
-        let committed = fact
+        branch = times.worked_at;
+        committed = fact
             .and_then(|f| f.committer_date)
             .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
         // A tip commit counts only when it strictly postdates the ref's
         // creation: `git branch feat old-sha` borrows an old commit's
         // date without doing work. When the log proves no creation, the
         // committer date is the fallback it always was.
-        let committed = committed.filter(|t| times.created_at.is_none_or(|c| *t > c));
-        [times.worked_at, committed].into_iter().flatten().max()
-    });
-    [head, branch].into_iter().flatten().max()
+        committed = committed.filter(|t| times.created_at.is_none_or(|c| *t > c));
+    }
+    ([head, branch].into_iter().flatten().max(), committed)
 } // coverage: off - the unexecuted instantiation's exit edge
 
 /// `branch.<name>.remote`/`.merge`: the batch's `upstream:remotename` and
@@ -1218,6 +1235,7 @@ mod tests {
             label: None,
             url: None,
             reason: None,
+            occurred_at_ms: None,
         };
         let (removal, _) = crate::verdict::cleanup(&state, &forge);
         assert!(matches!(removal.verdict, crate::verdict::Verdict::Blocked)); // coverage: off - miss edge is the assert failing

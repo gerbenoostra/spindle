@@ -508,9 +508,9 @@ fn parked_suppresses_forgotten_and_nothing_else() {
     store(&world.home)
         .toggle_parked(&WorkIdentity::Branch(identity.clone()))
         .expect("parks");
-    // A changed lifecycle input on a still-live record is a transition:
-    // dirty `feat-resume`'s worktree so the next pass lands an authored
-    // `activity_at` the row's `last_activity` folds in.
+    // A changed working tree on a still-live record is work: dirty
+    // `feat-resume`'s worktree so the next pass lands a WorkingTree
+    // activity at the file's own mtime, which `last_activity` folds in.
     fs::write(world.a.dir.join("wt-resume/dirty.txt"), "x").unwrap();
     let snapshot = collect(&world);
     let old = work(&snapshot, "feat-old");
@@ -542,8 +542,8 @@ fn parked_suppresses_forgotten_and_nothing_else() {
     assert!(!old.summary.contains("parked"), "{}", old.summary);
 
     // A path record transitions the same way: reseed `notes` with a
-    // proven fingerprint, then a different one, and the store dates the
-    // change at the sync.
+    // proven fingerprint, then a different one, and the store lands the
+    // change as an observation - detection, never activity.
     let notes_path = world.home.join("notes").canonicalize().unwrap();
     for dirty in [false, true] {
         let inputs = LifecycleInputs {
@@ -555,13 +555,14 @@ fn parked_suppresses_forgotten_and_nothing_else() {
                 &notes_path.display().to_string(),
                 &notes_path.display().to_string(),
                 &inputs,
+                &[],
                 now() * 1000,
             )
             .expect("seeds");
     }
     let snapshot = collect(&world);
     let notes = work(&snapshot, "notes");
-    assert!(notes.last_activity.is_some(), "{}", notes.summary);
+    assert!(!notes.observations.is_empty(), "{}", notes.summary);
     store(&world.home)
         .toggle_parked(&WorkIdentity::Path(notes_path.display().to_string()))
         .expect("parks the space");
@@ -1071,4 +1072,116 @@ fn a_park_during_a_pass_holds_in_every_later_stage() {
     });
     assert!(published > 2, "{published}");
     assert!(stale.is_empty(), "stages that dropped the park: {stale:?}");
+}
+
+/// The snapshot's conversation row named `id`.
+fn conv<'a>(snapshot: &'a Snapshot, id: &str) -> &'a agent_sessions::snapshot::ConversationRow {
+    snapshot
+        .conversations
+        .iter()
+        .find(|c| c.session_id == id)
+        .unwrap_or_else(|| panic!("no conversation {id}"))
+}
+
+#[test]
+fn conversation_activity_is_transcript_and_hook_producer_time_only() {
+    let world = world();
+    // Pin the live conversation's transcript to an old message time: the
+    // session file's `updatedAt`/`statusUpdatedAt` - publication time -
+    // can no longer date it, and neither can the pass that first saw it.
+    let active_wt = world.a.dir.join("wt-active");
+    fs::write(
+        world
+            .home
+            .join(format!(".claude/projects/t/{ACTIVE_ID}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{ACTIVE_ID}\",\"cwd\":\"{}\",\"timestamp\":\"2020-01-01T00:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":\"old\"}}}}\n",
+            active_wt.display()
+        ),
+    )
+    .expect("the transcript writes");
+    let snapshot = collect(&world);
+    let active = conv(&snapshot, ACTIVE_ID);
+    assert_eq!(
+        active.last_activity,
+        Some(1_577_836_800),
+        "the transcript's own time, not the file's publication: {active:?}"
+    );
+    // A hook record's producer timestamp counts at its own time; the
+    // journal's commit time - much newer than the pinned `pts` - never
+    // does.
+    let mut r = Record::new("claude", ACTIVE_ID, "PostToolUse");
+    r.event = Some(NormEvent::Activity);
+    r.pts = Some(1_600_000_000_000);
+    store(&world.home).append(r).expect("append");
+    let snapshot = collect(&world);
+    let active = conv(&snapshot, ACTIVE_ID);
+    assert_eq!(active.last_activity, Some(1_600_000_000));
+    // First detection alone proves no time at all: the undated
+    // transcript's conversation keeps `?`.
+    let space = conv(&snapshot, SPACE_ID);
+    assert_eq!(space.last_activity, None);
+}
+
+#[test]
+fn a_recent_observation_never_passes_for_work_activity() {
+    let world = world();
+    let before = collect(&world);
+    let old = work(&before, "feat-old");
+    let activity = old.last_activity.expect("source-backed activity");
+    // Flip a proven lifecycle input on the record directly: the store
+    // lands the transition as an observation at this pass, not work.
+    let repo_id = world.b.main.join(".git").display().to_string();
+    let b_rollup = before
+        .repos
+        .iter()
+        .find(|r| r.id == repo_id)
+        .expect("repo b")
+        .last_activity;
+    let refs: Vec<agent_sessions::store::ObservedRef> =
+        ["main", "feat-old", "feat-stale", "feat-mystery"]
+            .iter()
+            .map(|name| agent_sessions::store::ObservedRef {
+                name: (*name).to_owned(),
+                head: None,
+                creation: None,
+                renamed_from: None,
+                rewritten: false,
+                commit: None,
+                activities: Vec::new(),
+                inputs: LifecycleInputs {
+                    dirty: Some(*name == "feat-old"),
+                    ..LifecycleInputs::default()
+                },
+            })
+            .collect();
+    store(&world.home)
+        .sync_repo(&repo_id, &refs, now() * 1000)
+        .expect("the observation lands");
+    let after = collect(&world);
+    let old = work(&after, "feat-old");
+    assert!(
+        !old.observations.is_empty(),
+        "the transition recorded its detection: {old:?}"
+    );
+    // Recency, section and repo order all read activity alone: the
+    // observation changes none of them.
+    assert_eq!(old.last_activity, Some(activity), "{old:?}");
+    assert_eq!(old.section, WorkSection::Forgotten, "{old:?}");
+    assert_eq!(
+        after
+            .repos
+            .iter()
+            .find(|r| r.id == repo_id)
+            .expect("repo b")
+            .last_activity,
+        b_rollup,
+        "the observation cannot reach the repo rollup either"
+    );
+    // The JSON exposes both histories at their own timestamp fields.
+    let json = to_json(&after).expect("serializes");
+    assert!(json.contains("\"activities\":"), "{json}");
+    assert!(json.contains("\"occurred_at_ms\":"), "{json}");
+    assert!(json.contains("\"observations\":"), "{json}");
+    assert!(json.contains("\"observed_at_ms\":"), "{json}");
 }

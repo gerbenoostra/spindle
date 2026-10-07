@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use agent_sessions::runtime::Runtime;
 use agent_sessions::snapshot::{Collector, Snapshot, WorkKind, WorkRow, to_json};
 use agent_sessions::store::{
-    BranchRecord, Confidence, ContinuityEvidence, DatedTouch, LifecycleInputs, ObservedRef,
-    RefCreationEvidence, Store, TouchPlacement, TouchProvenance, UpdateSource,
+    ActivitySource, BranchRecord, Confidence, ContinuityEvidence, DatedTouch, LifecycleInputs,
+    ObservationSource, ObservedRef, RefCreationEvidence, Store, TouchPlacement, TouchProvenance,
 };
 use agent_sessions::tui::{App, Key};
 use ratatui::Terminal;
@@ -270,6 +270,7 @@ fn obs(name: &str, head: Option<&str>, creation: Option<RefCreationEvidence>) ->
         renamed_from: None,
         rewritten: false,
         commit: None,
+        activities: Vec::new(),
         inputs: LifecycleInputs::default(),
     }
 }
@@ -1331,17 +1332,22 @@ fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
     assert_eq!(conv.worktree.as_deref(), Some(wt.as_path()));
     assert!(agent_sessions::snapshot::binds(row, conv));
     // The first scan seeded the baseline silently; the `.git` loss is
-    // the first lifecycle event, and it does not touch `worktree`.
-    assert_eq!(row.updates.len(), 1, "{:?}", row.updates);
-    assert_eq!(row.updates[0].source, UpdateSource::Lifecycle);
+    // the first lifecycle observation, and it does not touch `worktree`.
+    assert_eq!(row.observations.len(), 1, "{:?}", row.observations);
+    assert_eq!(row.observations[0].source, ObservationSource::Lifecycle);
     // Git's `prunable` wording is passed through verbatim; pin the
     // stable prefix, not the sentence.
-    assert_eq!(row.updates[0].reasons.len(), 2, "{:?}", row.updates[0]);
-    assert_eq!(row.updates[0].reasons[0], ".git missing");
-    assert!(
-        row.updates[0].reasons[1].starts_with("worktree state: healthy -> broken: gitdir"),
+    assert_eq!(
+        row.observations[0].reasons.len(),
+        2,
         "{:?}",
-        row.updates[0].reasons
+        row.observations[0]
+    );
+    assert_eq!(row.observations[0].reasons[0], ".git missing");
+    assert!(
+        row.observations[0].reasons[1].starts_with("worktree state: healthy -> broken: gitdir"),
+        "{:?}",
+        row.observations[0].reasons
     );
     assert!(
         first
@@ -1349,7 +1355,7 @@ fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
             .iter()
             .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
             .expect("the first row")
-            .updates
+            .observations
             .is_empty(),
         "first observation seeds the baseline without an event"
     );
@@ -1360,9 +1366,8 @@ fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
         .iter()
         .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
         .expect("the worktree row");
-    assert_eq!(again.transition_at, row.transition_at);
     assert_eq!(
-        again.updates, row.updates,
+        again.observations, row.observations,
         "a repeated broken scan appends nothing"
     );
     turn_at(
@@ -1378,13 +1383,13 @@ fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
         .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
         .expect("the worktree row");
     let sessions: Vec<_> = row
-        .updates
+        .activities
         .iter()
-        .filter(|e| e.source == UpdateSource::Session)
+        .filter(|e| e.source == ActivitySource::Conversation)
         .collect();
-    assert_eq!(sessions.len(), 1, "{:?}", row.updates);
+    assert_eq!(sessions.len(), 1, "{:?}", row.activities);
     assert_eq!(sessions[0].reasons, ["8f423bbb more"]);
-    assert_eq!(row.updates.len(), 2, "{:?}", row.updates);
+    assert_eq!(row.observations.len(), 1, "{:?}", row.observations);
     assistant_turn_at(
         &world.home,
         OTHER,
@@ -1397,14 +1402,13 @@ fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
         .iter()
         .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
         .expect("the worktree row");
-    assert_eq!(row.updates.len(), 3, "{:?}", row.updates);
     assert!(
-        row.updates
+        row.activities
             .iter()
-            .filter(|e| e.source == UpdateSource::Session)
+            .filter(|e| e.source == ActivitySource::Conversation)
             .any(|e| e.reasons == ["02aa0bbb"]),
         "an untitled conversation's reason is its short id alone: {:?}",
-        row.updates
+        row.activities
     );
     let sixth = collect(&world);
     let again = sixth
@@ -1413,9 +1417,10 @@ fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
         .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
         .expect("the worktree row");
     assert_eq!(
-        again.updates, row.updates,
+        again.activities, row.activities,
         "the same transcript turn never replays"
     );
+    assert_eq!(again.observations, row.observations);
     let work = store(&world.home).load().work;
     let record = work
         .path(&wt.display().to_string())
@@ -1438,9 +1443,13 @@ fn a_row_records_commit_working_tree_and_session_updates() {
     let first = collect(&world);
     let row = work(&first, "feat-login");
     assert!(
-        row.updates.is_empty(),
+        row.observations.is_empty(),
         "first observation seeds the baseline without an event: {:?}",
-        row.updates
+        row.observations
+    );
+    assert!(
+        !row.activities.is_empty(),
+        "the first pass already proves source-backed work"
     );
 
     world.repo.commit(&wt, "a.txt", "x", "retry handling");
@@ -1454,43 +1463,48 @@ fn a_row_records_commit_working_tree_and_session_updates() {
     let second = collect(&world);
     let row = work(&second, "feat-login");
     let commits: Vec<_> = row
-        .updates
+        .activities
         .iter()
-        .filter(|e| e.source == UpdateSource::Commit)
+        .filter(|e| e.source == ActivitySource::Commit)
         .collect();
-    assert_eq!(commits.len(), 1, "{:?}", row.updates);
-    assert!(
-        commits[0].reasons[0].ends_with(" retry handling"),
-        "{:?}",
-        commits[0].reasons
-    );
-    assert_eq!(commits[0].reasons[0].split(' ').next().unwrap().len(), 7);
+    // The new commit's own time lands exactly once, whatever earlier
+    // commit activity the first pass backfilled.
+    let landed: Vec<_> = commits
+        .iter()
+        .filter(|c| c.reasons[0].ends_with(" retry handling"))
+        .collect();
+    assert_eq!(landed.len(), 1, "{:?}", row.activities);
+    assert_eq!(landed[0].reasons[0].split(' ').next().unwrap().len(), 7);
     let trees: Vec<_> = row
-        .updates
+        .observations
         .iter()
-        .filter(|e| e.source == UpdateSource::WorkingTree)
+        .filter(|e| e.source == ObservationSource::WorkingTree)
         .collect();
-    assert_eq!(trees.len(), 1, "{:?}", row.updates);
+    assert_eq!(trees.len(), 1, "{:?}", row.observations);
     assert_eq!(trees[0].reasons, ["untracked loose change.txt"]);
     let sessions: Vec<_> = row
-        .updates
+        .activities
         .iter()
-        .filter(|e| e.source == UpdateSource::Session)
+        .filter(|e| e.source == ActivitySource::Conversation)
         .collect();
-    assert_eq!(sessions.len(), 1, "{:?}", row.updates);
+    assert_eq!(sessions.len(), 1, "{:?}", row.activities);
     assert_eq!(sessions[0].reasons, ["8f423bbb more"]);
     let lifecycle: Vec<_> = row
-        .updates
+        .observations
         .iter()
-        .filter(|e| e.source == UpdateSource::Lifecycle)
+        .filter(|e| e.source == ObservationSource::Lifecycle)
         .collect();
-    assert_eq!(lifecycle.len(), 1, "{:?}", row.updates);
+    assert_eq!(lifecycle.len(), 1, "{:?}", row.observations);
     assert_eq!(lifecycle[0].reasons, ["ahead: 1 -> 2", "unpushed: 1 -> 2"]);
 
     let third = collect(&world);
     let row = work(&third, "feat-login");
     let again = work(&second, "feat-login");
-    assert_eq!(row.updates, again.updates, "unchanged polls append nothing");
+    assert_eq!(
+        row.activities, again.activities,
+        "unchanged polls append nothing"
+    );
+    assert_eq!(row.observations, again.observations);
 }
 
 #[test]
@@ -1507,15 +1521,23 @@ fn a_second_dirty_edit_emits_again_when_porcelain_is_identical() {
     let second = collect(&world);
     let row = work(&second, "feat-login");
     let trees: Vec<_> = row
-        .updates
+        .observations
         .iter()
-        .filter(|e| e.source == UpdateSource::WorkingTree)
+        .filter(|e| e.source == ObservationSource::WorkingTree)
         .collect();
-    assert_eq!(trees.len(), 1, "{:?}", row.updates);
+    assert_eq!(trees.len(), 1, "{:?}", row.observations);
     assert_eq!(
         trees[0].reasons,
         ["modified feat-login-0.txt", "untracked loose.txt"]
     );
+    // The same transition lands a WorkingTree activity at the changed
+    // files' own newest mtime - not the scan's time.
+    let tree_activities: Vec<_> = row
+        .activities
+        .iter()
+        .filter(|e| e.source == ActivitySource::WorkingTree)
+        .collect();
+    assert_eq!(tree_activities.len(), 1, "{:?}", row.activities);
 
     let stamp = |path: &Path| {
         fs::File::options()
@@ -1532,15 +1554,15 @@ fn a_second_dirty_edit_emits_again_when_porcelain_is_identical() {
     let third = collect(&world);
     let row = work(&third, "feat-login");
     let trees: Vec<_> = row
-        .updates
+        .observations
         .iter()
-        .filter(|e| e.source == UpdateSource::WorkingTree)
+        .filter(|e| e.source == ObservationSource::WorkingTree)
         .collect();
     assert_eq!(
         trees.len(),
         2,
         "byte-identical porcelain over re-edited files still emits: {:?}",
-        row.updates
+        row.observations
     );
     assert_eq!(trees[1].reasons, trees[0].reasons);
 }
@@ -1612,9 +1634,9 @@ fn a_worktree_without_git_stays_present_while_its_repo_is_out_of_scope() {
         .expect("the worktree row");
     assert_eq!(row.kind, WorkKind::Detached);
     assert!(
-        row.updates.is_empty(),
+        row.observations.is_empty(),
         "the initial scan seeds the baseline without an event: {:?}",
-        row.updates
+        row.observations
     );
 
     // The repo leaves scope - its only anchoring conversation's project
@@ -1629,9 +1651,9 @@ fn a_worktree_without_git_stays_present_while_its_repo_is_out_of_scope() {
         .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
         .expect("the space row");
     assert!(
-        row.updates.is_empty(),
+        row.observations.is_empty(),
         "an unproven pass revokes nothing: {:?}",
-        row.updates
+        row.observations
     );
     let work = store(&world.home).load().work;
     let record = work
@@ -1651,9 +1673,9 @@ fn a_worktree_without_git_stays_present_while_its_repo_is_out_of_scope() {
         .expect("the worktree row");
     assert_eq!(row.kind, WorkKind::Detached);
     assert!(
-        row.updates.is_empty(),
+        row.observations.is_empty(),
         "the repo returning to scope is no transition: {:?}",
-        row.updates
+        row.observations
     );
 
     // And `.git` returning is its own transition - the file names the
@@ -1672,10 +1694,84 @@ fn a_worktree_without_git_stays_present_while_its_repo_is_out_of_scope() {
         .expect("the worktree row");
     assert_eq!(row.broken, None, "{:?}", row.broken);
     assert!(
-        row.updates
+        row.observations
             .iter()
             .any(|e| e.reasons.contains(&".git restored".to_owned())),
         "{:?}",
-        row.updates
+        row.observations
+    );
+}
+
+#[test]
+fn a_dirty_tree_activity_reads_the_files_own_mtime_and_a_deletion_nothing() {
+    let world = world();
+    world.repo.branch_with_commits("feat-login", 1, false);
+    let wt = world.repo.add_worktree("feat", Some("feat-login"));
+    collect(&world);
+
+    // Pin the changed file's mtime to a fixed old instant: the
+    // WorkingTree activity lands at the file's own time, while the
+    // WorkingTree observation lands at the pass that saw it.
+    let dirty = wt.join("edit.txt");
+    fs::write(&dirty, "x").expect("write");
+    fs::File::options()
+        .write(true)
+        .open(&dirty)
+        .expect("open")
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+        .expect("mtime pins");
+    let second = collect(&world);
+    let row = work(&second, "feat-login");
+    let activity = row
+        .activities
+        .iter()
+        .find(|e| e.source == ActivitySource::WorkingTree)
+        .expect("the dirty tree's activity");
+    assert_eq!(
+        activity.occurred_at_ms, 1_000_000_000,
+        "activity is the file's own time, not the scan's"
+    );
+    let observed = row
+        .observations
+        .iter()
+        .find(|e| e.source == ObservationSource::WorkingTree)
+        .expect("the dirty tree's observation");
+    assert!(
+        observed.observed_at_ms > 1_000_000_000,
+        "the observation dates at the pass that saw it"
+    );
+
+    // Deleting the file transitions the fingerprint again: a detection,
+    // but no remaining path's mtime to date - no second activity.
+    fs::remove_file(&dirty).expect("delete");
+    let third = collect(&world);
+    let row = work(&third, "feat-login");
+    assert_eq!(
+        row.activities
+            .iter()
+            .filter(|e| e.source == ActivitySource::WorkingTree)
+            .count(),
+        1,
+        "a deleted path proves no remaining mtime"
+    );
+    assert_eq!(
+        row.observations
+            .iter()
+            .filter(|e| e.source == ObservationSource::WorkingTree)
+            .count(),
+        2,
+        "both transitions observed"
+    );
+    // And the observation can never pass for activity: the row's newest
+    // WorkingTree occurrence is still the pinned file time.
+    assert_eq!(
+        agent_sessions::store::newest_activity(
+            &row.activities
+                .iter()
+                .filter(|e| e.source == ActivitySource::WorkingTree)
+                .cloned()
+                .collect::<Vec<_>>()
+        ),
+        Some(1_000_000_000)
     );
 }

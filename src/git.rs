@@ -1148,11 +1148,18 @@ fn admin_id_retained(path: &Path, common_dir: &Path) -> Option<String> {
 pub struct Status {
     pub fingerprint: String,
     pub reasons: Vec<String>,
+    /// The newest mtime among the changed paths' successfully read
+    /// metadata: when work on the tree last touched a file it still
+    /// carries. `None` when nothing changed, or when every changed path's
+    /// metadata failed to read - a deleted file proves no occurrence
+    /// time, and a clean tree has no paths to date.
+    pub newest_changed_mtime: Option<SystemTime>,
 }
 
 pub fn status(bytes: &[u8], root: &Path) -> Status {
     let mut reasons = Vec::new();
     let mut material = bytes.to_vec();
+    let mut newest = None;
     let mut records = bytes.split(|b| *b == 0);
     while let Some(record) = records.next() {
         if record.len() < 4 {
@@ -1164,7 +1171,8 @@ pub fn status(bytes: &[u8], root: &Path) -> Status {
         if x == b'!' {
             continue;
         }
-        fingerprint_path(&mut material, root, path);
+        let mtime = fingerprint_path(&mut material, root, path);
+        newest = newest.max(mtime);
         if x == b'?' {
             reasons.push(format!("untracked {}", text(path)));
         } else if x == b'R' || y == b'R' || x == b'C' || y == b'C' {
@@ -1175,7 +1183,8 @@ pub fn status(bytes: &[u8], root: &Path) -> Status {
             };
             let old = records.next().unwrap_or_default();
             if !old.is_empty() {
-                fingerprint_path(&mut material, root, old);
+                let mtime = fingerprint_path(&mut material, root, old);
+                newest = newest.max(mtime);
             }
             reasons.push(format!("{verb} {} -> {}", text(old), text(path)));
         } else if x == b'A' || y == b'A' {
@@ -1199,6 +1208,7 @@ pub fn status(bytes: &[u8], root: &Path) -> Status {
     Status {
         fingerprint: material.iter().map(|b| format!("{b:02x}")).collect(),
         reasons,
+        newest_changed_mtime: newest,
     }
 }
 
@@ -1210,7 +1220,10 @@ fn admin_globals(gitdir: &Path, checkout: &Path) -> [OsString; 2] {
     [gitdir_arg, worktree_arg]
 }
 
-fn fingerprint_path(out: &mut Vec<u8>, root: &Path, raw: &[u8]) {
+/// The path's contribution to the fingerprint material, and its mtime
+/// when metadata read: a missing or unreadable path proves no occurrence
+/// time either way.
+fn fingerprint_path(out: &mut Vec<u8>, root: &Path, raw: &[u8]) -> Option<SystemTime> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     out.push(0);
@@ -1222,8 +1235,12 @@ fn fingerprint_path(out: &mut Vec<u8>, root: &Path, raw: &[u8]) {
             out.extend_from_slice(&meta.size().to_be_bytes());
             out.extend_from_slice(&meta.mtime().to_be_bytes());
             out.extend_from_slice(&meta.mtime_nsec().to_be_bytes());
+            meta.modified().ok()
         }
-        Err(_) => out.push(0),
+        Err(_) => {
+            out.push(0);
+            None
+        }
     }
 }
 
