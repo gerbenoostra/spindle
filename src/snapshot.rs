@@ -869,6 +869,21 @@ impl Collector {
         own_pane: Option<&PaneRef>,
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) {
+        self.collect_stages(runtime, own_pane, false, publish)
+    }
+
+    /// The staged pass itself; `local_only` ends it where the remote asks
+    /// begin - stage 1's runtime and provider inventory plus stage 2's
+    /// cwd resolution and local Git, the evidence a navigation action's
+    /// re-resolve consumes. Remote and forge fields keep their defaults,
+    /// so the last snapshot it publishes is not `complete`.
+    fn collect_stages(
+        &mut self,
+        runtime: &Runtime,
+        own_pane: Option<&PaneRef>,
+        local_only: bool,
+        publish: &mut dyn FnMut(Snapshot) -> bool,
+    ) {
         // Stage 1 - runtime and provider inventory: conversations with
         // their published state, attachments and runtime evidence, before
         // any Git subprocess runs. The store loads here too - the journal
@@ -1147,6 +1162,12 @@ impl Collector {
             &running,
             &mut placements,
         );
+        if local_only {
+            // The action re-resolve ends where the network begins: no
+            // remote or forge ask belongs on a keypress's path.
+            let _ = self.emit(runtime, own_pane, publish);
+            return;
+        }
         // Stage 3 - remote evidence, one `ls-remote --symref` per repo and
         // remote per deadline, fanned out; then the local probes each
         // remote answer unlocks (bases, ahead/behind, landed, unpushed).
@@ -1508,6 +1529,20 @@ impl Collector {
     pub fn collect(&mut self, runtime: &Runtime, own_pane: Option<&PaneRef>) -> Snapshot {
         let mut last = None;
         self.collect_staged(runtime, own_pane, &mut |snapshot| {
+            last = Some(snapshot);
+            true
+        });
+        last.expect("a staged pass always publishes") // coverage: off - stage 1 always publishes
+    } // coverage: off - the unexecuted instantiation's exit edge
+
+    /// One pass through the local evidence only - stages 1 and 2: the
+    /// runtime, providers, cwd resolution and local Git - ending where a
+    /// remote or forge ask would begin. The Enter/`o` re-resolve runs on
+    /// it so a keypress never stalls on the network; rows carry no remote
+    /// or forge fields and the snapshot stays `complete: false`.
+    pub fn collect_local(&mut self, runtime: &Runtime, own_pane: Option<&PaneRef>) -> Snapshot {
+        let mut last = None;
+        self.collect_stages(runtime, own_pane, true, &mut |snapshot| {
             last = Some(snapshot);
             true
         });

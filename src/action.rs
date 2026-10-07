@@ -13,7 +13,8 @@
 //! platform opener for a forge URL, and Unix `exec` for a resume.
 //! Nothing here builds a shell string, creates or renames tmux
 //! topology, sets an option, or guesses a URL - session ids and URLs
-//! travel as single argv elements straight from the snapshot.
+//! travel as single argv elements, the id from the fresh snapshot and
+//! the URL exactly as the row recorded it.
 
 use std::convert::Infallible;
 use std::ffi::{OsStr, OsString};
@@ -46,8 +47,17 @@ pub enum ActionRequest {
     },
     /// Enter on a [2] work row: select a window bound to its worktree.
     EnterWork { key: String },
-    /// `o` on a [2] work row: open its forge item.
-    OpenForge { key: String },
+    /// `o` on a [2] work row: open the forge item it recorded. The
+    /// verdict and URL travel with the request: the re-resolve only
+    /// proves the row still exists - its scoped collect never runs the
+    /// forge ask that fills those fields.
+    OpenForge {
+        key: String,
+        /// The row's recorded forge verdict.
+        item: WorkItem,
+        /// The URL `gh`/`glab` recorded for an open item.
+        url: Option<String>,
+    },
 }
 
 /// What a resolved action came to.
@@ -104,9 +114,10 @@ pub fn work_key(w: &WorkRow) -> String {
     )
 }
 
-/// Resolve `request` against `snapshot`, collected fresh and complete,
-/// and perform it: a jump selects through tmux, an open invokes the
-/// platform opener, a resume returns the plan the terminal execs.
+/// Resolve `request` against `snapshot` - the local evidence collected
+/// fresh for the keypress - and perform it: a jump selects through
+/// tmux, an open invokes the platform opener, a resume returns the plan
+/// the terminal execs.
 /// `store` carries the seen-state a successful action acknowledges;
 /// `path` is the PATH executable lookup searches, `None` inheriting the
 /// process's own.
@@ -122,7 +133,9 @@ pub fn act(
             session_id,
         } => conversation(snapshot, *provider, session_id, store, path),
         ActionRequest::EnterWork { key } => work(snapshot, key),
-        ActionRequest::OpenForge { key } => forge(snapshot, key, path),
+        ActionRequest::OpenForge { key, item, url } => {
+            forge(snapshot, key, *item, url.as_deref(), path)
+        }
     }
 }
 
@@ -221,19 +234,28 @@ fn work(snapshot: &Snapshot, key: &str) -> ActionOutcome {
 }
 
 /// `o` on a work row: the recorded URL through the platform opener,
-/// exactly one argv element. Every other forge state is only a report -
-/// no opener runs, and nothing else changes.
-fn forge(snapshot: &Snapshot, key: &str, path: Option<&OsStr>) -> ActionOutcome {
-    let Some(row) = snapshot.work.iter().find(|w| work_key(w) == key) else {
+/// exactly one argv element. Re-resolution only proves the row still
+/// exists - the verdict and URL are the recorded evidence the request
+/// carries, since the action's local collect leaves forge fields unset.
+/// Every other forge state is only a report - no opener runs, and
+/// nothing else changes.
+fn forge(
+    snapshot: &Snapshot,
+    key: &str,
+    item: WorkItem,
+    url: Option<&str>,
+    path: Option<&OsStr>,
+) -> ActionOutcome {
+    if !snapshot.work.iter().any(|w| work_key(w) == key) {
         return failed("work row gone");
-    };
-    match row.forge {
+    }
+    match item {
         WorkItem::Open => {}
         WorkItem::NotExisting => return failed("not existing"),
         WorkItem::Closed => return failed("closed"),
         WorkItem::Unknown => return failed("?"),
     }
-    let Some(url) = row.forge_url.as_deref() else {
+    let Some(url) = url else {
         return failed("unavailable");
     };
     let Some(opener) = executable(OPENER, path) else {

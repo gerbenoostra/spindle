@@ -572,7 +572,8 @@ impl App {
     }
 
     /// `o`: the open-forge request - only an active concrete work row
-    /// carries one; everything else is inert.
+    /// carries one, along with its recorded verdict and URL; everything
+    /// else is inert.
     fn open_forge(&mut self) {
         if self.focused_list() != Some(List::Work) {
             return;
@@ -588,7 +589,11 @@ impl App {
         if w.gone.is_some() {
             return;
         }
-        self.action = Some(ActionRequest::OpenForge { key: work_key(w) });
+        self.action = Some(ActionRequest::OpenForge {
+            key: work_key(w),
+            item: w.forge,
+            url: w.forge_url.clone(),
+        });
     }
 
     /// The pending Enter/`o` request, taken once: the loop re-resolves
@@ -2637,10 +2642,10 @@ pub fn run(
 } // coverage: off - the unexecuted instantiation's exit edge
 // coverage: off - the instantiation edge lands on this line
 /// The loop's Enter/`o` resolution: the request a keypress named is // coverage: off - `run` itself needs a real terminal
-/// re-resolved against a snapshot collected fresh after it - a fresh // coverage: off - same
-/// configured collector, a fresh runtime, the dashboard's own pane - so // coverage: off - same
-/// a row that moved or vanished since the frame was drawn never drives // coverage: off - same
-/// an action. // coverage: off - same
+/// re-resolved against fresh local evidence - a fresh collector, a // coverage: off - same
+/// fresh runtime, the dashboard's own pane - so a row that moved or // coverage: off - same
+/// vanished since the frame was drawn never drives an action, and no // coverage: off - same
+/// remote or forge ask stalls the loop on a keypress. // coverage: off - same
 // The `coverage: off` markers below must sit on the exact line a zero
 // region lands on, so rustfmt - which relocates trailing comments after
 // `{` - is asked to leave these four functions alone.
@@ -2649,7 +2654,7 @@ fn act_on(request: &ActionRequest) -> ActionOutcome { // coverage: off - `run` i
     match collector() { // coverage: off - same
         Ok(mut collector) => { // coverage: off - same
             let runtime = crate::runtime::Runtime::observe(); // coverage: off - same
-            let snapshot = collector.collect(&runtime, own_pane().as_ref()); // coverage: off - same
+            let snapshot = collector.collect_local(&runtime, own_pane().as_ref()); // coverage: off - same
             let store = app_store(); // coverage: off - same
             let path = std::env::var_os("PATH"); // coverage: off - same
             action::act(request, &snapshot, store.as_ref(), path.as_deref()) // coverage: off - same
@@ -3876,8 +3881,10 @@ mod tests {
         assert!(app.take_action().is_none(), "a request is taken once");
 
         // [2] on the active `feat/login` work row: Enter and `o` request
-        // the same stable work key the cursor tracks.
-        let key = work_key(&fixture().work[0]);
+        // the same stable work key the cursor tracks; `o` also carries
+        // the row's recorded forge verdict and URL.
+        let fixture_work = fixture().work[0].clone();
+        let key = work_key(&fixture_work);
         press(&mut app, &[Key::Char('2'), Key::Char('j')]);
         app.key(Key::Enter);
         assert_eq!(
@@ -3885,7 +3892,14 @@ mod tests {
             Some(ActionRequest::EnterWork { key: key.clone() })
         );
         app.key(Key::Char('o'));
-        assert_eq!(app.take_action(), Some(ActionRequest::OpenForge { key }));
+        assert_eq!(
+            app.take_action(),
+            Some(ActionRequest::OpenForge {
+                key,
+                item: fixture_work.forge,
+                url: fixture_work.forge_url.clone(),
+            })
+        );
 
         // `o` away from the work list, `o` and `enter` on `all`, a repo
         // row and the detail pane are all inert.

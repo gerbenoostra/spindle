@@ -1095,8 +1095,15 @@ fn o_opens_the_recorded_url_and_reports_every_other_state() {
     let work = |forge: WorkItem, url: Option<&str>| {
         snapshot_of(vec![work_row("feat/x", forge, url)], Vec::new())
     };
-    let request = |snapshot: &Snapshot| ActionRequest::OpenForge {
-        key: work_key(&snapshot.work[0]),
+    // The request carries the row's recorded verdict and URL: the
+    // re-resolve proves only that the row still exists.
+    let request = |snapshot: &Snapshot| {
+        let w = &snapshot.work[0];
+        ActionRequest::OpenForge {
+            key: work_key(w),
+            item: w.forge,
+            url: w.forge_url.clone(),
+        }
     };
 
     // GitHub and GitLab URLs pass to the platform opener as exactly one
@@ -1159,6 +1166,31 @@ fn o_opens_the_recorded_url_and_reports_every_other_state() {
         "no opener ever ran for a report"
     );
 
+    // The re-resolved row carries no forge evidence - the action's
+    // collect stops before that stage - so the verdict and URL are the
+    // recorded ones the request carries: the row exists, the URL opens.
+    let snap = work(WorkItem::Unknown, None);
+    let outcome = run(
+        &ActionRequest::OpenForge {
+            key: work_key(&snap.work[0]),
+            item: WorkItem::Open,
+            url: Some("https://github.com/o/r/pull/191".to_owned()),
+        },
+        &snap,
+        None,
+        Some(opener_dir.path().as_os_str()),
+    );
+    match &outcome {
+        ActionOutcome::Done(Some(m)) => assert!(m.contains("pull/191"), "{m}"),
+        other => panic!("the recorded URL opens: {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(opener_dir.join("argv")).expect("argv recorded"),
+        "https://github.com/o/r/pull/191\n",
+        "the recorded URL, not the fresh row's empty field"
+    );
+    let _ = fs::remove_file(opener_dir.join("argv"));
+
     // A PATH without the opener, a nonzero opener, and an opener that
     // cannot exec each report failure rather than guessing.
     let empty = TempDir::new("nav-no-opener");
@@ -1199,12 +1231,45 @@ fn o_opens_the_recorded_url_and_reports_every_other_state() {
     let outcome = run(
         &ActionRequest::OpenForge {
             key: "no\0such\0row".to_owned(),
+            item: WorkItem::Open,
+            url: Some("https://github.com/o/r/pull/191".to_owned()),
         },
         &snap,
         None,
         Some(opener_dir.path().as_os_str()),
     );
     assert!(matches!(outcome, ActionOutcome::Failed(_)), "{outcome:?}");
+}
+
+#[test]
+fn the_action_collect_stops_before_remote_evidence() {
+    let _locked = locked();
+    let repo = FixtureRepo::new("origin");
+    repo.branch_with_commits("feat-login", 1, false);
+    let worktree = repo.add_worktree("login", Some("feat-login"));
+    let home = TempDir::new("nav-local");
+    transcript(&home, "-r-login", STOPPED_ID, &worktree);
+    let mut collector = Collector::new(home.join(".claude")).with_store(store_dir(&home));
+
+    let snap = collector.collect_local(&Runtime::observe_over(&[]), None);
+
+    // Stages 1 and 2 landed - the conversation and the work row its cwd
+    // resolves to - then the pass stopped: no remote or forge ask ran,
+    // so nothing carries forge evidence and the snapshot is incomplete.
+    assert!(
+        snap.conversations
+            .iter()
+            .any(|c| c.session_id == STOPPED_ID),
+        "stage 1's conversation rows"
+    );
+    let row = snap
+        .work
+        .iter()
+        .find(|w| w.name == "feat-login")
+        .expect("stage 2's work row");
+    assert_eq!(row.forge, WorkItem::Unknown);
+    assert!(row.forge_url.is_none());
+    assert!(!snap.complete);
 }
 
 #[test]
