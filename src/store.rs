@@ -5557,10 +5557,7 @@ mod tests {
                 "the old cursor does not suppress backfill"
             );
             assert!(
-                record
-                    .activities
-                    .iter()
-                    .all(|e| e.occurred_at_ms < 9_999_999_999_999),
+                record.activities.is_empty(),
                 "the bogus reflog date is gone"
             );
             // First-sighting backfill lands on the regenerated record.
