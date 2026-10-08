@@ -1,7 +1,9 @@
 # Attention architecture
 
 How hook events, provider state and acknowledgement become a row's glyph.
-User-visible behavior is in [attention](../attention.md).
+User-visible behavior is in [attention](../attention.md); work identity,
+history and navigation semantics are in
+[work-lifecycle](work-lifecycle.md).
 
 ## Data flow
 
@@ -13,16 +15,18 @@ User-visible behavior is in [attention](../attention.md).
    the not-busy mark, the provider's published state and process liveness
    into an execution state and an attention value. It is a pure function:
    `now` is an argument.
-4. The collector writes the focus acknowledgement. It is the only write a
-   refresh makes, and it re-derives the row from what was stored.
+4. The collector writes the focus acknowledgement and reconciles the
+   work records - identities, touches, session cursors and the
+   source-dated activities and scan-time observations. It preserves
+   authored parked flags.
 5. Work rows roll up their bound conversations' attention and pick their
    section on every publish. The TUI's `space` writes seen-state or a mark,
    and the next refresh reflects it.
 
 ## Invariants
 
-- The journal is the only shared mutable file, and `journal.lock` serializes
-  every mutation: append, compaction and the authored-file rewrites.
+- `journal.lock` serializes journal appends, compaction and every
+  authored-file rewrite in the store.
 - Reduction is a pure function of commit order. Replaying the journal,
   before or after compaction, yields the same folds.
 - A record with a future schema, an empty session id, or bytes that do not
@@ -90,15 +94,3 @@ User-visible behavior is in [attention](../attention.md).
   needs a schema version bump.
 - `seen.json` written by builds before the episode format is not read -
   because nothing has been released yet.
-- Reflog activity is dated by the work entries' own timestamps - because
-  maintenance rewrites the logs without adding work; not the file's mtime
-  (a last-write time cannot prove an event).
-- A conversation's first recorded turn backfills source-dated activity -
-  because the source's own timestamp is real work history however old;
-  not seating the cursor alone (recency and history then disagree).
-- `work.json` versions separately from the other stores and resets rather
-  than migrates while pre-release - because backwards compatibility is
-  not promised before release; not migration code (reinterpreting
-  ambiguously dated history is machinery for state nothing depends on).
-  Incarnation and parked history reset; journal, seen and marks are
-  unaffected.

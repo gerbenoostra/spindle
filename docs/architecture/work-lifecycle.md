@@ -1,0 +1,88 @@
+# Work lifecycle architecture
+
+How branches, worktrees, project folders and conversations become durable
+work history. User-visible behavior and its rationale are in
+[work](../work.md); this page holds the invariants and the decisions that
+live between modules.
+
+## Invariants
+
+- Work identity is scoped by the repository's canonical git common dir, not
+  its checkout path. Branch names are reusable, so a name alone is not an
+  identity: an incarnation is one observed lifetime of a name, numbered `#N`
+  per `(repo, ref)`.
+- Continuity is proven, not assumed: an exact rename or a force-push keeps
+  the incarnation's id, while a detected recreation or a boundary that
+  cannot be proven continuous starts a new one.
+- A detached checkout and a non-git project space are keyed by canonical
+  path. Runtime pane identity never defines a work row.
+- A conversation's placement is exact only: the live process's cwd, or a
+  Claude record's dated `gitBranch` resolving into the project repo - never
+  an arbitrary recorded cwd, an inferred intent, a same-name guess, or
+  process ancestry (a daemonized tmux process does not prove who spawned
+  it). A dead transcript keeps the project branch it was placed on - valid
+  history - while the live branch moving finished work to another row does
+  not rewrite it.
+- Closed same-name incarnations are excluded from the current row's
+  attention, counts and recency; their history still shows under `h`, and a
+  gone anchor keeps its row while current live references name it (then
+  under CleanupReview) - transcript or resumable history alone never
+  retains it.
+- Closed branch records are retained 90 days, or while a conversation touch
+  references them:
+  unreferenced history is bounded so the store cannot grow forever, while
+  history that is still in use is never aged out.
+
+## Activities versus observations
+
+The store keeps two bounded histories per record: `activities` are
+source-dated occurrences of real work; `observations` are detection times of
+what a pass learned. Only source timestamps date activity - a forge item's
+merge or close date counts, its `updatedAt` or pipeline bot churn does not; a
+conversation's transcript message or hook producer time counts, a live
+record's publication time does not; the newest mtime among changed paths
+counts, a clean or deleted tree gets no proxy. No missing source time ever
+falls back to scan time. First presence is a silent baseline; a first real
+source event backfills into the history at its own time. Keeping
+unproven-time history separate is what makes "worked 30 days ago" provable
+rather than "noticed 30 days ago".
+
+## Decisions
+
+- Reflog activity is dated by the work entries' own timestamps - because
+  maintenance rewrites the logs without adding work; not the file's mtime
+  (a last-write time cannot prove an event).
+- A conversation's first recorded turn backfills source-dated activity -
+  because the source's own timestamp is real work history however old; not
+  seating the cursor alone (recency and history then disagree).
+- `work.json` versions separately under `WORK_SCHEMA` and older files reset
+  rather than migrate while pre-release - because backwards compatibility is
+  not promised before release and the collector rebuilds the state; not
+  migration code (reinterpreting ambiguously dated history is machinery for
+  state nothing depends on). Incarnation and parked history reset; journal,
+  seen and marks are unaffected. A future-versioned or malformed file still
+  reports and refuses the read-modify-write, keeping its bytes.
+- A resume's acknowledgement is written in the instant between preflight
+  and `exec` - because an earlier write could acknowledge a conversation
+  whose resume never launched, and a later one can never run. The honest
+  limit: if `exec` fails after the write, the acknowledgement stays
+  persisted - there is no safe atomic rollback, since overwriting the record
+  could clobber a concurrent acknowledgement - and the launch failure is
+  reported rather than hidden. A live `enter` jump instead acknowledges
+  only after both selects succeed.
+- Work identity is the incarnation under the repo's canonical common dir -
+  because branch names are reused and checkout paths move; not name or path
+  identity (both silently merge distinct lifetimes).
+- Touches and placements come only from proven cwd and dated `gitBranch`
+  evidence - because a dead transcript's project branch is valid history
+  while a live branch moving finished work must not rewrite it; not
+  inferring the current branch (it misattributes history to wherever the
+  checkout happens to sit).
+- Relations between conversations are provider lineage, live ancestry and
+  same-incarnation touches only - because tmux's daemonized process
+  ancestry cannot prove which conversation created a pane; not name, intent
+  or creation-time inference.
+- Closed records are retained 90 days, or while a touch references them -
+  because unreferenced history must stay bounded while history that is
+  still in use must survive; not unbounded growth (the store becomes the
+  problem) nor aggressive expiry (audit value is the point of keeping it).

@@ -16,9 +16,12 @@ needs you takes a glance instead of a window tour.
 > and `list --json` prints the same complete snapshot. Attention works end
 > to end for Claude: `agent-sessions hook` records agent events, and rows
 > needing you sit under `Needs you` until you have seen them (see
-> [attention](docs/attention.md)). `enter` jumps to a conversation's live
-> pane - or resumes a stopped one in place - and `o` opens a work row's
-> pull or merge request; cleanup and hook registration still land
+> [attention](docs/attention.md)). Work rows are sectioned by what they
+> need and carry their branch's observed incarnation (`#N`, with `h` for
+> excluded same-name history); `enter` jumps to a conversation's live pane
+> - or resumes a stopped one in place, in a project folder when it has no
+> checkout - and `o` opens a work row's pull or merge request (see
+> [work](docs/work.md)). Cleanup and hook registration still land
 > piecemeal, and any subcommand that has not shipped is a usage error.
 
 `agent-sessions` is the binary and the state directory; `spindle` is this
@@ -131,6 +134,15 @@ is read from Git with `GIT_OPTIONAL_LOCKS=0`. Facts that cannot be proven are
 | `unpushed_commits` | `git rev-list --count @{u}..HEAD`; vs the proven base when never pushed; commits no `refs/*` reaches when detached | the real data-loss risk on removal |
 | `landed` | `no` / `ancestor-merged` / `content-merged` | ancestry first, then path-scoped tree comparison |
 | `last_git_activity` | the timestamps of real work entries in the worktree HEAD reflog, the branch reflog and the tip's committer date when it postdates the branch's creation | creation, checkout and clone bookkeeping never count as activity; the reflog file's mtime never counts either |
+
+`list --json` prints the whole snapshot under `schema_version` 2. Work rows
+carry two timestamped histories: `activities` (when the work itself happened,
+as `occurred_at_ms`) and `observations` (when a collection pass learned
+something, as `observed_at_ms`), both Unix epoch milliseconds, plus
+`last_activity`, the newest source-backed occurrence in epoch seconds or
+`null`. Incarnation identity, conversation placements and the
+activity/observation split are specified in
+[docs/architecture/work-lifecycle.md](docs/architecture/work-lifecycle.md).
 
 ## Development
 
