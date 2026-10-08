@@ -4,7 +4,7 @@
 #
 # x-release-please-start-version
 # Environment variables:
-#   AGENT_SESSIONS_VERSION       - pin a specific release (e.g. v0.0.2)
+#   AGENT_SESSIONS_VERSION       - pin a specific release (e.g. v0.1.0)
 #   AGENT_SESSIONS_INSTALL_DIR   - override install directory (default: $HOME/.local/bin)
 #   AGENT_SESSIONS_SKIP_CHECKSUM - set to 1 to skip checksum verification (not recommended)
 # x-release-please-end
@@ -43,7 +43,7 @@ agent-sessions installer
 Usage: curl -fsSL https://raw.githubusercontent.com/gerbenoostra/spindle/main/install.sh | sh
 
 Environment variables:
-  AGENT_SESSIONS_VERSION       pin a release (e.g. v0.0.2)
+  AGENT_SESSIONS_VERSION       pin a release (e.g. v0.1.0)
   AGENT_SESSIONS_INSTALL_DIR   install directory (default: $HOME/.local/bin)
   AGENT_SESSIONS_SKIP_CHECKSUM set to 1 to skip checksum verification
 EOF
