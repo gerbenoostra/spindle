@@ -130,7 +130,7 @@ is read from Git with `GIT_OPTIONAL_LOCKS=0`. Facts that cannot be proven are
 | `upstream_state` | `never_pushed` / `tracked` / `remote_gone` | proven by `ls-remote`; no fetch, no local mutation |
 | `unpushed_commits` | `git rev-list --count @{u}..HEAD`; vs the proven base when never pushed; commits no `refs/*` reaches when detached | the real data-loss risk on removal |
 | `landed` | `no` / `ancestor-merged` / `content-merged` | ancestry first, then path-scoped tree comparison |
-| `last_git_activity` | real work entries in the worktree HEAD reflog, the branch reflog and the tip's committer date when it postdates the branch's creation | creation, checkout and clone bookkeeping never count as activity |
+| `last_git_activity` | the timestamps of real work entries in the worktree HEAD reflog, the branch reflog and the tip's committer date when it postdates the branch's creation | creation, checkout and clone bookkeeping never count as activity; the reflog file's mtime never counts either |
 
 ## Development
 

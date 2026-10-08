@@ -5,8 +5,8 @@
 //! Everything is disposable: scratch git repositories, a temp `$HOME`, stub
 //! `gh` on a private search path - no live tmux, no real state, no network.
 //! A branch's old age is fabricated the way Git records it: the committer
-//! clock carries `GIT_COMMITTER_DATE`, and the branch reflog's mtime is set
-//! with it, because the collector reads both.
+//! clock carries `GIT_COMMITTER_DATE`, which dates both the commits and
+//! their reflog entries.
 
 mod support;
 
@@ -20,7 +20,9 @@ use agent_sessions::config::{Config, Loaded};
 use agent_sessions::forge::{Forge, Pipeline, WorkItem};
 use agent_sessions::runtime::Runtime;
 use agent_sessions::snapshot::{Collector, Snapshot, WorkKind, WorkSection, to_json};
-use agent_sessions::store::{LifecycleInputs, NormEvent, Record, Store, WorkIdentity};
+use agent_sessions::store::{
+    ActivitySource, LifecycleInputs, NormEvent, Record, Store, WorkIdentity,
+};
 use agent_sessions::tui::{App, Key};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -113,9 +115,8 @@ fn event(home: &TempDir, session: &str, native: &str, event: NormEvent, reason: 
 }
 
 /// A branch that reads `age` old: every commit carries the backdated
-/// committer clock (reflog entries take it too), and the branch reflog's
-/// mtime is set to match - `reflog_times` folds the mtime into the newest
-/// work entry when the last write was work.
+/// committer clock, and the reflog entries take it too - `reflog_times`
+/// reads the entries' own dates.
 fn old_pushed_branch(repo: &FixtureRepo, branch: &str, age: Duration) {
     let epoch = now() - age.as_secs();
     let date = format!("@{epoch} +0000");
@@ -148,13 +149,6 @@ fn old_pushed_branch(repo: &FixtureRepo, branch: &str, age: Duration) {
         &repo.main,
         &["worktree", "remove", "--force", scratch.to_str().unwrap()],
     );
-    let log = repo.main.join(format!(".git/logs/refs/heads/{branch}"));
-    fs::File::options()
-        .write(true)
-        .open(&log)
-        .expect("the branch reflog")
-        .set_modified(UNIX_EPOCH + Duration::from_secs(epoch))
-        .expect("mtime sets");
 }
 
 /// The repo `a` work row named `name`.
@@ -1184,4 +1178,151 @@ fn a_recent_observation_never_passes_for_work_activity() {
     assert!(json.contains("\"occurred_at_ms\":"), "{json}");
     assert!(json.contains("\"observations\":"), "{json}");
     assert!(json.contains("\"observed_at_ms\":"), "{json}");
+}
+
+/// `git reflog expire` rewrites the log even when nothing expires: the
+/// entry bytes stay identical but the file's mtime jumps to now.
+/// `reflog_times` reads only the entries' own dates, so maintenance
+/// cannot manufacture activity - the row's `last_activity` must not
+/// move. The mtime pinned old is the regression handle: under the
+/// removed mtime folding, before would read the pin and after would
+/// read now. (Regression: mtime folding let a no-op expire refresh a
+/// 30-day-old branch to "just now".)
+#[test]
+fn reflog_maintenance_is_not_activity() {
+    let repo = FixtureRepo::new("origin");
+    let home = TempDir::new("work-reflog-maint");
+    let branch = "feat-old";
+    let age = Duration::from_secs(30 * 24 * 3600);
+    old_pushed_branch(&repo, branch, age);
+    transcript(&home, RESUME_ID, &repo.main);
+    let mut collector = Collector::new(claude(&home)).with_store(state(&home));
+    let log = repo.main.join(format!(".git/logs/refs/heads/{branch}"));
+    // Pin the last write old, matching the entries: a reader that folds
+    // mtime into `worked_at` sees the same old instant a clean log shows.
+    fs::File::options()
+        .write(true)
+        .open(&log)
+        .expect("the reflog opens")
+        .set_modified(UNIX_EPOCH + Duration::from_secs(now() - age.as_secs()))
+        .expect("mtime pins");
+
+    let before = collector.collect(&Runtime::observe_over(&[]), None);
+    let bytes_before = fs::read(&log).expect("the reflog reads");
+    let activity_before = work(&before, branch).last_activity;
+    assert!(
+        activity_before.is_some_and(|a| now() - a >= 29 * 24 * 3600),
+        "the old branch reads old before maintenance: {activity_before:?}"
+    );
+
+    repo.git(
+        &repo.main,
+        &[
+            "reflog",
+            "expire",
+            "--expire=never",
+            "--expire-unreachable=never",
+            "--all",
+        ],
+    );
+
+    // Sanity: the rewrite really happened - the entries are byte-identical
+    // while the file's mtime moved. Both halves of the artifact.
+    let bytes_after = fs::read(&log).expect("the reflog reads");
+    assert_eq!(bytes_before, bytes_after, "expire rewrote the entries");
+    let mtime_after = fs::metadata(&log)
+        .and_then(|m| m.modified())
+        .expect("mtime reads");
+    assert!(
+        mtime_after > UNIX_EPOCH + Duration::from_secs(now() - 60),
+        "expire rewrote the file: {mtime_after:?}"
+    );
+
+    let after = collector.collect(&Runtime::observe_over(&[]), None);
+    assert_eq!(
+        work(&after, branch).last_activity,
+        activity_before,
+        "unchanged entries changed last_activity"
+    );
+}
+
+/// A dated transcript on a non-git project space backfills real
+/// source-backed work on first collection: the row's `last_activity`
+/// and a `Conversation` activity agree at the record's own time, the
+/// observations baseline stays empty, a fresh collector over the same
+/// store replays nothing, and the detail pane renders the event's
+/// source - never `activity: ?`.
+#[test]
+fn a_dated_project_space_turn_backfills_source_activity() {
+    let home = TempDir::new("work-space-dated");
+    let space = home.join("notes");
+    fs::create_dir_all(&space).expect("mkdir");
+    let projects = home.join(".claude/projects/t");
+    fs::create_dir_all(&projects).expect("mkdir");
+    fs::write(
+        projects.join(format!("{SPACE_ID}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{SPACE_ID}\",\"cwd\":\"{}\",\"timestamp\":\"2026-09-01T00:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":\"the task\"}}}}\n",
+            space.display()
+        ),
+    )
+    .expect("the dated transcript writes");
+    let world = World {
+        home,
+        a: FixtureRepo::new("origin"),
+        b: FixtureRepo::new("origin"),
+        agent: None,
+    };
+    // The first complete snapshot already carries the transcript's own
+    // time as source-backed activity: the pass backfills before the row
+    // renders.
+    let snapshot = collect(&world);
+    assert!(snapshot.complete, "{:?}", snapshot.errors);
+    let row = work(&snapshot, "notes");
+    assert_eq!(row.kind, WorkKind::ProjectSpace);
+    assert_eq!(row.last_activity, Some(1_788_220_800), "{row:?}");
+    assert!(
+        row.activities.iter().any(|e| {
+            e.source == ActivitySource::Conversation && e.occurred_at_ms == 1_788_220_800_000
+        }),
+        "the transcript's own time is source-backed activity: {:?}",
+        row.activities
+    );
+    assert!(
+        row.observations.is_empty(),
+        "first collection stays a silent baseline: {:?}",
+        row.observations
+    );
+    let activities = row.activities.clone();
+
+    // Every later collection - the same pass again or a brand-new
+    // collector over the same store - agrees and replays nothing.
+    let again = collect(&world);
+    assert_eq!(work(&again, "notes").activities, activities);
+    let mut fresh = Collector::new(claude(&world.home)).with_store(state(&world.home));
+    let third = fresh.collect(&Runtime::observe_over(&[]), None);
+    let third_row = work(&third, "notes");
+    assert_eq!(
+        third_row.activities, activities,
+        "a replayed update lands nothing twice"
+    );
+
+    // The detail pane names the event's source at its own time.
+    let mut app = App::new(third).with_store(store(&world.home));
+    app.key(Key::Char('2'));
+    // The list's first entry is `all`; the work rows follow it.
+    let index = 1 + app
+        .snapshot
+        .work
+        .iter()
+        .position(|w| w.name == "notes")
+        .expect("the notes row");
+    for _ in 0..index {
+        app.key(Key::Char('j'));
+    }
+    let text = render(&app, 200, 44);
+    assert!(text.contains("notes"), "{text}");
+    assert!(!text.contains("activity: ?"), "{text}");
+    assert!(text.contains("conversation:"), "{text}");
+    assert!(text.contains("the task"), "{text}");
 }

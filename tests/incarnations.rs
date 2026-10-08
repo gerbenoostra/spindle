@@ -1387,8 +1387,11 @@ fn a_broken_worktree_keeps_its_git_row_and_binds_its_conversation() {
         .iter()
         .filter(|e| e.source == ActivitySource::Conversation)
         .collect();
-    assert_eq!(sessions.len(), 1, "{:?}", row.activities);
-    assert_eq!(sessions[0].reasons, ["8f423bbb more"]);
+    // The first collect backfilled both conversations' opening turns at
+    // their shared source time; this collect adds only the newer turn.
+    assert_eq!(sessions.len(), 2, "{:?}", row.activities);
+    assert_eq!(sessions[0].reasons, ["02aa0bbb", "8f423bbb the task"]);
+    assert_eq!(sessions[1].reasons, ["8f423bbb more"]);
     assert_eq!(row.observations.len(), 1, "{:?}", row.observations);
     assistant_turn_at(
         &world.home,
@@ -1487,8 +1490,11 @@ fn a_row_records_commit_working_tree_and_session_updates() {
         .iter()
         .filter(|e| e.source == ActivitySource::Conversation)
         .collect();
-    assert_eq!(sessions.len(), 1, "{:?}", row.activities);
-    assert_eq!(sessions[0].reasons, ["8f423bbb more"]);
+    // The opening turn backfilled on the first collect; the newer turn
+    // is this collect's own event.
+    assert_eq!(sessions.len(), 2, "{:?}", row.activities);
+    assert_eq!(sessions[0].reasons, ["8f423bbb the task"]);
+    assert_eq!(sessions[1].reasons, ["8f423bbb more"]);
     let lifecycle: Vec<_> = row
         .observations
         .iter()

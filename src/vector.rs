@@ -188,8 +188,8 @@ pub struct StateVector {
     pub unpushed_commits: Evidence<u64>,
     pub landed: Evidence<Landed>,
     /// Newest real work the anchor's reflogs record: the worktree HEAD
-    /// log's and the branch log's last work entries, each folded with the
-    /// file's mtime when its last write was work.
+    /// log's and the branch log's last work entries, at their own
+    /// timestamps.
     pub reflog_activity: Option<SystemTime>,
     /// The tip's committerdate, when it provably dates work on this
     /// incarnation (it postdates the ref's creation, or no creation is

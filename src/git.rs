@@ -835,32 +835,26 @@ impl Repo {
     /// with; `worked_at` is the newest entry that moved the ref for real -
     /// a commit, merge, reset or rebase. Creation entries other than an
     /// initial commit, bookkeeping lines (`checkout:`, `Branch: renamed`)
-    /// and entries whose old and new tips agree are not work, and when
-    /// such a line was the last write even the file's mtime does not count.
+    /// and entries whose old and new tips agree are not work. The file's
+    /// mtime never counts: it timestamps the last write, and writes that
+    /// add nothing - a `reflog expire` rewriting identical bytes - would
+    /// otherwise manufacture activity out of maintenance.
     pub fn reflog_times(&self, log: &Path) -> ReflogTimes {
         let path = self.common_dir.join(log); // coverage: off - `join`'s empty-path arm is the missed region; a reflog name is never empty
         let mut times = ReflogTimes::default();
         let Ok(text) = fs::read_to_string(&path) else {
             return times;
         };
-        let mut last_is_work = false;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let Some(entry) = ReflogEntry::parse(line) else {
-                last_is_work = false;
                 continue;
             };
-            last_is_work = entry.work;
             if entry.creation && times.created_at.is_none() {
                 times.created_at = Some(entry.at);
             }
             if entry.work {
                 times.worked_at = Some(times.worked_at.map_or(entry.at, |w| w.max(entry.at)));
             }
-        }
-        // The file's mtime only timestamps its last write: it counts when
-        // that write was work.
-        if last_is_work && let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) {
-            times.worked_at = Some(times.worked_at.map_or(mtime, |w| w.max(mtime)));
         }
         times
     }
@@ -890,8 +884,7 @@ pub struct RefCreation {
 pub struct ReflogTimes {
     /// The ref's creation/checkout epoch - the null-old entry's time.
     pub created_at: Option<SystemTime>,
-    /// The newest real work entry's time, folded with the file's mtime
-    /// when the last write was work.
+    /// The newest real work entry's own timestamp.
     pub worked_at: Option<SystemTime>,
 }
 
@@ -1839,8 +1832,7 @@ mod tests {
         fs::write(log_dir.join("HEAD"), "old new\n").unwrap();
         assert_eq!(repo.reflog_times(log).worked_at, None);
 
-        // A creation-only log records the moment but proves no work - not
-        // even the file's own mtime counts against a bookkeeping line.
+        // A creation-only log records the moment but proves no work.
         fs::write(
             log_dir.join("HEAD"),
             "0000 1111 A Name <a@b> 1700000000 +0200\tbranch: Created from main\n",
@@ -1875,11 +1867,12 @@ mod tests {
             "0000 1111 A Name <a@b> 1700000002 +0200\tcommit (initial): one\n",
         )
         .unwrap();
-        let worked = repo
-            .reflog_times(log)
-            .worked_at
-            .expect("the initial commit is work");
-        assert!(worked >= UNIX_EPOCH + Duration::from_secs(1700000002));
+        let times = repo.reflog_times(log);
+        assert_eq!(
+            times.worked_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000002)),
+            "{times:?}"
+        );
 
         // A later commit is work.
         fs::write(
@@ -1889,10 +1882,12 @@ mod tests {
         )
         .unwrap();
         let times = repo.reflog_times(log);
-        let worked = times.worked_at.expect("the commit is work");
-        assert!(worked >= UNIX_EPOCH + Duration::from_secs(1700000500));
-        // And a checkout written after that commit is still not work -
-        // the mtime it moved does not refresh `worked_at`.
+        assert_eq!(
+            times.worked_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000500)),
+            "{times:?}"
+        );
+        // And a checkout written after that commit is still not work.
         fs::write(
             log_dir.join("HEAD"),
             "1111 2222 A Name <a@b> 1700000500 +0200\tcommit: real work\n\
@@ -1906,20 +1901,13 @@ mod tests {
             "{times:?}"
         );
         // A `branch: Reset to` entry is not creation bookkeeping: it moved
-        // the tip, so it is work like any other reset. The file's mtime is
-        // pinned older than the entry so `worked_at` proves the epoch.
+        // the tip, so it is work like any other reset.
         fs::write(
             log_dir.join("HEAD"),
             "0000 1111 A Name <a@b> 1700000000 +0200\tbranch: Created from main\n\
              1111 2222 A Name <a@b> 1700000900 +0200\tbranch: Reset to target\n",
         )
         .unwrap();
-        fs::File::options()
-            .write(true)
-            .open(log_dir.join("HEAD"))
-            .unwrap()
-            .set_modified(UNIX_EPOCH + Duration::from_secs(1700000800))
-            .unwrap();
         let times = repo.reflog_times(log);
         assert_eq!(
             times.created_at,

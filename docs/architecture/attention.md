@@ -90,3 +90,15 @@ User-visible behavior is in [attention](../attention.md).
   needs a schema version bump.
 - `seen.json` written by builds before the episode format is not read -
   because nothing has been released yet.
+- Reflog activity is dated by the work entries' own timestamps - because
+  maintenance rewrites the logs without adding work; not the file's mtime
+  (a last-write time cannot prove an event).
+- A conversation's first recorded turn backfills source-dated activity -
+  because the source's own timestamp is real work history however old;
+  not seating the cursor alone (recency and history then disagree).
+- `work.json` versions separately from the other stores and resets rather
+  than migrates while pre-release - because backwards compatibility is
+  not promised before release; not migration code (reinterpreting
+  ambiguously dated history is machinery for state nothing depends on).
+  Incarnation and parked history reset; journal, seen and marks are
+  unaffected.
