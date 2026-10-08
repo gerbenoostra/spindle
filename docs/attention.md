@@ -36,7 +36,10 @@ Attention is acknowledged, and so cleared, by exactly four things:
 - **`space`** on a row that carries attention. On a work row it
   acknowledges every bound conversation.
 - **A new prompt** (`start`) on the conversation.
-- **`enter`**, the deliberate jump, once it ships.
+- **`enter`** on a live conversation, the deliberate jump: a successful
+  pane selection acknowledges it. Resuming a stopped conversation
+  acknowledges just before the provider process launches - see
+  [the caveat](architecture/work-lifecycle.md#decisions).
 
 Moving the cursor, opening the detail pane and starting the dashboard never
 acknowledge anything.

@@ -107,6 +107,21 @@ pub struct Transcript {
     pub last_at: Option<SystemTime>,
     /// Lines that did not parse, retained for the evidence view.
     pub malformed_lines: usize,
+    /// The branch the conversation's project was on, as its records
+    /// report it: one mark per change of `gitBranch`, oldest first.
+    pub branch_trail: Vec<BranchMark>,
+}
+
+/// One change of the project's branch: from `at` on, the records carry
+/// this `gitBranch`. Claude stamps every record with the branch checked
+/// out in the session's project directory - the first record's `cwd` -
+/// whatever directory the record itself ran in, so a record from another
+/// repository still names the project's branch. `HEAD` (detached) is no
+/// branch, so `branch` is `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchMark {
+    pub at: SystemTime,
+    pub branch: Option<String>,
 }
 
 /// One scan's output: the merged conversations plus the failures and skips
@@ -194,6 +209,14 @@ impl Conversation {
             })
     }
 
+    /// The project's branch over time, from the provider's own records:
+    /// empty when it records no branch.
+    pub fn branch_trail(&self) -> &[BranchMark] {
+        self.transcript
+            .as_ref()
+            .map_or(&[], |t| t.branch_trail.as_slice())
+    }
+
     /// The normalized state observation for the core's arbitration: the
     /// published live state while live evidence exists, otherwise absent -
     /// a transcript is history, not a state claim.
@@ -217,12 +240,12 @@ impl Conversation {
             .or_else(|| self.transcript.as_ref().and_then(|t| t.last_at))
     }
 
-    /// The most recent evidence of the conversation at all.
+    /// The conversation's latest source-backed activity: the newest
+    /// transcript message time. A live file's `updatedAt` and
+    /// `statusUpdatedAt` are publication times - state evidence, never
+    /// work - and a first detection has no occurrence to date.
     pub fn last_activity(&self) -> Option<SystemTime> {
-        self.live
-            .as_ref()
-            .and_then(|l| l.updated_at.or(l.status_updated_at))
-            .or_else(|| self.transcript.as_ref().and_then(|t| t.last_at))
+        self.transcript.as_ref().and_then(|t| t.last_at)
     }
 
     /// The process claim a live session makes, for runtime resolution.
@@ -642,6 +665,7 @@ impl Transcript {
             first_at: None,
             last_at: None,
             malformed_lines: 0,
+            branch_trail: Vec::new(),
         }
     }
 }
@@ -704,13 +728,23 @@ fn absorb(text: &str, record: &mut Transcript, other_ids: &mut HashSet<String>) 
                 .and_then(|v| v.as_str())
                 .map(str::to_owned);
         }
-        if let Some(ts) = json
+        let at = json
             .get("timestamp")
             .and_then(|v| v.as_str())
-            .and_then(parse_iso8601)
-        {
+            .and_then(parse_iso8601);
+        if let Some(ts) = at {
             record.first_at = Some(record.first_at.map_or(ts, |f| f.min(ts)));
             record.last_at = Some(record.last_at.map_or(ts, |l| l.max(ts)));
+        }
+        if let (Some(at), Some(branch)) = (at, json.get("gitBranch").and_then(|v| v.as_str())) {
+            let branch = (!branch.is_empty() && branch != "HEAD").then(|| branch.to_owned());
+            if record
+                .branch_trail
+                .last()
+                .is_none_or(|m| m.branch != branch)
+            {
+                record.branch_trail.push(BranchMark { at, branch });
+            }
         }
         match json.get("type").and_then(|v| v.as_str()) {
             Some("user") => {

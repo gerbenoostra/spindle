@@ -18,21 +18,27 @@ use serde::Serialize;
 
 use crate::attention::{self, Attention};
 use crate::claude::{Claude, Conversation};
+use crate::config;
 use crate::evidence::Evidence;
 use crate::fanout;
+use crate::forge::{self, ForgeStatus, Pipeline, WorkItem};
 use crate::git::{self, Head, RemoteHead, RemoteListing, Resolved};
 use crate::process::{Liveness, ProcessInstance, ProcessStart};
 use crate::provider::{SourceError, StateEvidence};
-use crate::runtime::{PaneSource, Placement, Provider, Runtime};
+use crate::runtime::{EvidenceSource, PaneSource, Placement, Provider, Runtime};
 use crate::store::{self, Exec, Store};
-use crate::tmux::PaneRef;
+use crate::tmux::{self, PaneRef};
 use crate::vector::{
     self, Anchor, Landed as LandedVerdict, RemoteCache, RuntimeFacts, UpstreamState, WindowCount,
 };
+use crate::verdict::{self, Verdict};
 
 /// The JSON contract version. Additive changes keep it; a field's removal,
-/// rename or change of meaning bumps it.
-pub const SCHEMA_VERSION: u32 = 1;
+/// rename or change of meaning bumps it. v1 -> v2: `transition_at`,
+/// `git_activity_at` and `updates` gave way to `activities` and
+/// `observations`, and `last_activity` carries source-backed occurrence
+/// times only - detection times can no longer order rows.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One refresh's complete, unfiltered view.
 #[derive(Debug, Serialize)]
@@ -96,8 +102,60 @@ pub struct RepoRow {
     /// Work rows and live conversations in scope of this entry.
     pub work: usize,
     pub live: usize,
+    /// The work rows' rolled-up attention: the glyph [1] renders.
+    pub attention: Attention,
+    /// Rows asking for work - NeedsYou, Active, FollowUp, Forgotten.
+    pub open: usize,
+    /// Rows provably done - ReadyToClean and CleanupReview.
+    pub clean: usize,
     /// Latest meaningful activity across its work rows; `None` renders `?`.
     pub last_activity: Option<u64>,
+    /// The proven default branch: the remote's HEAD that every probed
+    /// base agreed on, `None` when nothing proves it (`?`).
+    pub default_branch: Option<String>,
+    /// The remote the repo's work anchors on, when proven or lone; `None`
+    /// is `?`.
+    pub remote: Option<String>,
+    /// The repo's work rows per section.
+    pub counts: RepoCounts,
+}
+
+/// `RepoRow.counts`: the section breakdown the detail view prints.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepoCounts {
+    pub needs_you: usize,
+    pub active: usize,
+    pub follow_up: usize,
+    pub forgotten: usize,
+    pub ready_to_clean: usize,
+    pub cleanup_review: usize,
+}
+
+impl RepoRow {
+    /// Recompute the rollup from the repo's rows in `work` - attention,
+    /// the `N open · M clean` counts, the section breakdown and the
+    /// latest activity. The emit path and a `p` reclassification share
+    /// it, so both read the same way.
+    pub fn roll_up(&mut self, work: &[WorkRow]) {
+        let rows: Vec<&WorkRow> = work.iter().filter(|w| w.repo == self.id).collect();
+        self.work = rows.len();
+        self.attention = attention::rollup(rows.iter().map(|w| &w.attention));
+        self.open = rows.iter().filter(|w| w.section.open()).count();
+        self.clean = rows.len() - self.open;
+        self.last_activity = rows.iter().filter_map(|w| w.last_activity).max();
+        let mut counts = RepoCounts::default();
+        for w in &rows {
+            match w.section {
+                WorkSection::NeedsYou => counts.needs_you += 1,
+                WorkSection::Active => counts.active += 1,
+                WorkSection::FollowUp => counts.follow_up += 1,
+                WorkSection::Forgotten => counts.forgotten += 1,
+                WorkSection::ReadyToClean => counts.ready_to_clean += 1,
+                WorkSection::CleanupReview => counts.cleanup_review += 1,
+            }
+        }
+        self.counts = counts;
+    }
 }
 
 /// `WorkRow.kind`: which anchor shape the row is.
@@ -143,6 +201,19 @@ pub enum Upstream {
     Unknown,
 }
 
+impl Upstream {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Upstream::Tracked => "tracked",
+            Upstream::NeverPushed => "never_pushed",
+            Upstream::RemoteGone => "remote_gone",
+            Upstream::NotApplicable => "not_applicable",
+            Upstream::Unknown => "unknown",
+        }
+    }
+}
+
 /// `WorkRow.landed`: whether HEAD's content already lives on the base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +225,17 @@ pub enum Landed {
     Content,
     /// Proven not landed (including the no-delta case).
     No,
+}
+
+impl Landed {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Landed::Ancestor => "ancestor",
+            Landed::Content => "content",
+            Landed::No => "no",
+        }
+    }
 }
 
 /// `AttachmentRow.liveness`: the claim's proven process state.
@@ -193,6 +275,16 @@ pub enum WorkSection {
     /// A live busy process with no higher attention and no authored
     /// not-busy mark.
     Active,
+    /// Resumable idle work, pending or failed delivery, dirty or unpushed
+    /// work, a blocked cleanup verdict - or simply open work.
+    FollowUp,
+    /// Unfinished work with no live process and no meaningful activity in
+    /// `forgotten_after`; `parked` suppresses only this placement.
+    Forgotten,
+    /// Every applicable cleanup action proved safe.
+    ReadyToClean,
+    /// An applicable action needs an explicit human review.
+    CleanupReview,
 }
 
 impl WorkSection {
@@ -201,7 +293,17 @@ impl WorkSection {
         match self {
             WorkSection::NeedsYou => "Needs you",
             WorkSection::Active => "Active",
+            WorkSection::FollowUp => "Follow up",
+            WorkSection::Forgotten => "Forgotten",
+            WorkSection::ReadyToClean => "Ready to clean",
+            WorkSection::CleanupReview => "Cleanup review",
         }
+    }
+
+    /// Whether the section counts as `open` in a repo rollup's
+    /// `N open · M clean` - the cleanup sections count as `clean`.
+    pub fn open(self) -> bool {
+        !matches!(self, WorkSection::ReadyToClean | WorkSection::CleanupReview)
     }
 }
 
@@ -217,9 +319,56 @@ impl ConversationState {
     }
 }
 
+/// One branch incarnation as the snapshot serializes it: a row of the
+/// persisted record, numbered oldest-first within its `(repo, ref_name)`.
+/// Times are epoch seconds - the store's milliseconds converted.
+#[derive(Debug, Clone, Serialize)]
+pub struct IncarnationRow {
+    /// The persisted `BranchRecord.id`.
+    pub id: String,
+    /// 1-based within `(repo, ref_name)`, oldest first.
+    pub number: usize,
+    pub repo: String,
+    pub ref_name: String,
+    pub first_observed_at: u64,
+    pub last_observed_at: u64,
+    /// The head the ref was created at, when the reflog proved it.
+    pub creation_head: Option<String>,
+    /// When the ref was created, when the reflog proved it.
+    pub creation_at: Option<u64>,
+    /// The tip the ref last proved, when it carried one.
+    pub head: Option<String>,
+    pub ended_at: Option<u64>,
+    /// The evidence that last established or separated this identity.
+    pub continuity: store::ContinuityEvidence,
+    /// `true` on retained earlier same-name history: it scopes and lists
+    /// but never contributes to the current row.
+    pub excluded: bool,
+}
+
+/// One persisted touch interval as the snapshot serializes it: the
+/// conversation's placement on an incarnation with HEAD, provenance and
+/// confidence. Times are epoch seconds.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TouchRow {
+    /// The touched `BranchRecord.id`.
+    pub incarnation_id: String,
+    pub repo: String,
+    pub ref_name: String,
+    /// The incarnation's 1-based number within `(repo, ref_name)`.
+    pub incarnation: usize,
+    /// The ref's tip the placement observed; `None` when the evidence
+    /// named the branch only.
+    pub head: Option<String>,
+    pub valid_from: u64,
+    /// `None` while the placement is current.
+    pub valid_until: Option<u64>,
+    pub provenance: store::TouchProvenance,
+    pub confidence: store::Confidence,
+}
+
 /// One Work row: a checkout on a branch, a detached checkout, a local branch
-/// without one, or a non-git project space. Incarnation identity and
-/// lifecycle sections are not modelled yet - rows are the on-disk anchors.
+/// without one, or a non-git project space.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkRow {
     /// The owning repo's (or project space's) identity.
@@ -234,6 +383,7 @@ pub struct WorkRow {
     /// The checked-out branch name, when any.
     pub branch: Option<String>,
     pub dirty: Option<bool>,
+    pub broken: Option<String>,
     /// Commits on the row's tip not on the proven base; `None` is `?`.
     pub commits_ahead: Option<u64>,
     pub unpushed: Option<u64>,
@@ -251,16 +401,197 @@ pub struct WorkRow {
     pub live_sessions: usize,
     /// Conversations ever recorded against the row's path.
     pub past_sessions: usize,
-    /// Newest of the HEAD reflog's last entry and its mtime; `None` is `?`.
+    /// Latest meaningful activity: the newest source-backed occurrence
+    /// across the row's stored and pass-proved activities and bound
+    /// conversations' source times; `None` is `?`. Detection times -
+    /// lifecycle transitions, first sightings, `ended_at` - never count.
     pub last_activity: Option<u64>,
     /// The rolled-up attention of the conversations bound to the row.
     pub attention: Attention,
-    /// The first-match section the row sits in; `None` is the flat
-    /// remainder until the lifecycle sections arrive.
-    pub section: Option<WorkSection>,
-    /// Why the row reads the way it does (`↑3 ~2`, `no remote`, `no wt`,
-    /// `error · working`).
+    /// The row's work identity: the active branch incarnation's id for
+    /// branch rows, the canonical path for a detached worktree or a
+    /// project space. `None` for a branch that has no record yet.
+    pub identity: Option<String>,
+    /// The active incarnation the identity names - its `#N` number and
+    /// continuity evidence. `None` where `identity` is not an incarnation.
+    pub incarnation: Option<IncarnationRow>,
+    /// Retained earlier incarnations of the same `(repo, ref_name)`,
+    /// numbered oldest first and excluded from everything this row
+    /// derives - `h` lists them below the row.
+    pub same_name_history: Vec<IncarnationRow>,
+    /// The authored parked flag from `work.json`; suppresses only the
+    /// `Forgotten` placement and reads back in the summary as `· parked`.
+    pub parked: bool,
+    /// The forge's work-item state for the branch.
+    pub forge: WorkItem,
+    /// Pipeline state of an open work item.
+    pub pipeline: Pipeline,
+    /// `PR #191`/`MR !7`-style label when the forge named one.
+    pub forge_label: Option<String>,
+    /// The work item's URL when known.
+    pub forge_url: Option<String>,
+    /// Commits on the proven base the row's tip lacks; `None` is `?`.
+    pub commits_behind: Option<u64>,
+    /// The newest commits on the tip the proven base lacks, newest first,
+    /// at most `vector::COMMIT_LIST_LIMIT` (`commits_ahead` counts them
+    /// all); `None` is `?` - the base is unproven or the read failed.
+    pub commits: Option<Vec<CommitRow>>,
+    /// The panes bound to the row's worktree; empty where there is no
+    /// worktree or none bound.
+    pub panes: Vec<PaneRow>,
+    /// What vanished, when the row is a gone-work row: its branch or
+    /// folder no longer exists but something live still references it.
+    pub gone: Option<String>,
+    /// The live references retaining a gone row - every pane, window,
+    /// session, process and agent session that still names it. Empty on
+    /// live rows.
+    pub references: Vec<ReferenceRow>,
+    /// The row's source-backed work events, at their own occurrence
+    /// times (`occurred_at_ms`, epoch milliseconds): commit, reflog,
+    /// working-tree, forge and conversation work.
+    pub activities: Vec<store::ActivityEvent>,
+    /// The row's scan-time diagnostics, at their detection times
+    /// (`observed_at_ms`, epoch milliseconds). Kept beside activity, but
+    /// never counted as it.
+    pub observations: Vec<store::ObservationEvent>,
+    /// `git worktree remove` verdict and reasons; `None` for project
+    /// spaces, which carry no cleanup verdicts at all.
+    pub worktree_removal: Option<verdict::ActionVerdict>,
+    /// `git branch -d/-D` verdict and reasons.
+    pub branch_deletion: Option<verdict::ActionVerdict>,
+    /// The first-match section the row sits in.
+    pub section: WorkSection,
+    /// The section reason followed by the compact evidence tail (`↑3`,
+    /// `~dirty`, `no remote`, `no wt`, `merged`, a PR/MR label).
     pub summary: String,
+}
+
+/// One commit on a row's tip that its proven base lacks.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitRow {
+    pub sha: String,
+    pub subject: String,
+    /// Committer time, epoch seconds.
+    pub at: u64,
+    /// The short id of the one conversation whose touch to this
+    /// incarnation was open at the commit time; `None` (`?`) when no
+    /// touch or more than one covers it.
+    pub conversation: Option<String>,
+}
+
+/// One tmux pane bound to a worktree, for the Work detail's `tmux` line.
+#[derive(Debug, Clone, Serialize)]
+pub struct PaneRow {
+    /// `session_name:@window.%pane` - the handle shape a provider
+    /// publishes.
+    pub handle: String,
+    /// `pane_current_command`.
+    pub command: String,
+    /// The pane's socket-qualified identity for Enter's window select.
+    /// Action-only: a handle label cannot carry the socket, and the JSON
+    /// contract does not grow it, so this stays out of the document.
+    #[serde(skip)]
+    pub target: Option<tmux::PaneTarget>,
+}
+
+/// `ReferenceRow.kind`: which shape of live entity still names the gone
+/// work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceKind {
+    Pane,
+    Window,
+    /// A tmux session.
+    TmuxSession,
+    /// A live process.
+    Process,
+    /// A live agent session.
+    AgentSession,
+}
+
+/// One live reference retaining a gone work row - what it is and how it
+/// identifies itself. Read-only; dismissal is not this surface.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReferenceRow {
+    pub kind: ReferenceKind,
+    /// `workmux:@149.%162`, `workmux:@149`, `workmux`, `pid 4200`,
+    /// `claude:8f423bbb`.
+    pub label: String,
+}
+
+/// `RelatedRow.strength`, in proven-strength order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationStrength {
+    /// The provider declared the relation itself.
+    ProviderLineage,
+    /// One live process sits in the other's ancestor chain.
+    ProcessAncestry,
+    /// Both conversations touched the same exact incarnation.
+    SameIncarnation,
+}
+
+/// One conversation related to this row, with the evidence that proved
+/// the relation. Only proven relations exist: a shared ref name, a pane
+/// shared at different times, or mere time proximity never produces one.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedRow {
+    /// The strength group the relation belongs to.
+    pub strength: RelationStrength,
+    /// What the relation claims about the other conversation:
+    /// `ancestor`, `descendant` or `same incarnation`.
+    pub label: String,
+    /// The evidence that proved it, for the view's provenance column.
+    pub provenance: String,
+    pub provider: Provider,
+    pub session_id: String,
+    /// First eight of the related session's id.
+    pub short_id: String,
+    pub title: Option<String>,
+    /// The related row's attention glyph.
+    pub attention: Attention,
+    /// Its effective-state age basis, epoch seconds.
+    pub state_since: Option<u64>,
+}
+
+/// One retained latch event with its acknowledgement state.
+#[derive(Debug, Clone, Serialize)]
+pub struct LatchRow {
+    /// The journal commit sequence.
+    pub seq: u64,
+    pub kind: store::NormEvent,
+    /// The observation's own time, epoch ms.
+    pub at_ms: u64,
+    /// The record's reason or native name.
+    pub reason: Option<String>,
+    /// Whether seen-state already acknowledges it.
+    pub acknowledged: bool,
+}
+
+/// The conversation's arbitration and store evidence, for the `e` view:
+/// what claimed the state, what lost and why, and what the journal and
+/// the authored files recorded.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EvidenceRow {
+    /// The execution claims considered, in evaluation order.
+    pub claims: Vec<attention::ClaimRow>,
+    /// Every retained latch event and its acknowledgement state.
+    pub latches: Vec<LatchRow>,
+    /// Committed records the fold rejected as stale or duplicate, with
+    /// the fold's reason.
+    pub rejected: Vec<store::RejectedRecord>,
+    /// What acknowledgement the user has recorded: retained events
+    /// through `seen_seq`, and the newest seen wait episode's `since`.
+    pub seen_seq: Option<u64>,
+    pub seen_wait_ms: Option<u64>,
+    /// The authored not-busy mark, when one applies.
+    pub mark: Option<store::Mark>,
+    /// Whether the mark suppressed a live `Busy` claim.
+    pub mark_suppressed: bool,
+    /// The newest journal commit sequence on the conversation.
+    pub journal_seq: Option<u64>,
+    /// The producer-sequence high-water records are ordered against.
+    pub producer_seq: Option<u64>,
 }
 
 /// What a conversation's process claim resolved to this refresh.
@@ -274,11 +605,21 @@ pub struct AttachmentRow {
     pub liveness_detail: Option<String>,
     /// The bound pane as `session:window.pane`, when bound.
     pub pane: Option<String>,
+    /// The bound pane's socket-qualified identity, for Enter's jump:
+    /// what `select-window`/`select-pane` need, kept off the document -
+    /// a display label cannot carry the socket.
+    #[serde(skip)]
+    pub target: Option<tmux::PaneTarget>,
     /// How the pane was bound; `None` when unbound.
     pub pane_source: Option<PaneSource>,
     /// Why the pane is unbound, when it is (`dead`, `superseded`, or the
     /// failed-closed reason).
     pub placement_detail: Option<String>,
+    /// Where the claim was observed - a published file, a lock, a hook or
+    /// derivation.
+    pub source: EvidenceSource,
+    /// When the claim's evidence was produced, epoch seconds.
+    pub observed_at: u64,
 }
 
 /// One conversation in the snapshot - live, restorable or transcript-only.
@@ -320,7 +661,11 @@ pub struct ConversationRow {
     /// The newest event sequence the conversation has; a not-busy mark
     /// written at it is superseded by anything newer.
     pub journal_seq: Option<u64>,
-    /// Most recent evidence of the conversation at all.
+    /// The newest source-backed activity of the conversation: a
+    /// transcript message's own timestamp or a hook record's producer
+    /// timestamp. Live publication times (`updatedAt`,
+    /// `statusUpdatedAt`) and the pass that first detected the
+    /// conversation never count, so `None` means no proven work.
     pub last_activity: Option<u64>,
     /// Whether a live session record exists.
     pub live: bool,
@@ -342,6 +687,31 @@ pub struct ConversationRow {
     pub repo: Option<String>,
     pub worktree: Option<PathBuf>,
     pub branch: Option<String>,
+    /// The conversation's persisted touch intervals, oldest first - the
+    /// exact placements live observation and the provider's records
+    /// proved.
+    pub touches: Vec<TouchRow>,
+    /// The incarnation the newest open interval names, if one is current.
+    pub current_incarnation: Option<String>,
+    /// When the conversation began as its own records date it: the
+    /// transcript's first record, else the live process's start; `None`
+    /// is `?`.
+    pub started_at: Option<u64>,
+    /// The conversations proven related to this one, strongest group
+    /// first - lineage, then shared incarnations.
+    pub related: Vec<RelatedRow>,
+    /// The arbitration and store evidence the `e` view renders.
+    pub evidence: EvidenceRow,
+}
+
+/// One provider branch mark, placed: from `at_ms` (epoch ms) on, the
+/// conversation's project in `repo` was on `branch`; `None` is a detached
+/// stretch with no placeable branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrailMark {
+    at_ms: u64,
+    repo: String,
+    branch: Option<String>,
 }
 
 impl ConversationRow {
@@ -364,6 +734,15 @@ impl ConversationRow {
 pub struct Collector {
     claude: Claude,
     remotes: RemoteCache,
+    /// The forge CLI handle and its five-minute answer cache; stage 4
+    /// serves every branch ask through them.
+    forge: forge::Forge,
+    forge_cache: forge::ForgeCache,
+    /// The configured `forgotten_after`: how old a quiet unfinished row
+    /// must be before it sinks into `Forgotten`.
+    forgotten_after: Duration,
+    /// Config-load warnings, retained in `errors` like any read failure.
+    warnings: Vec<SourceError>,
     /// The event journal and authored records; `None` where no state dir
     /// could be placed (no `$HOME`, no `$XDG_STATE_HOME`).
     store: Option<Store>,
@@ -389,6 +768,19 @@ pub struct Collector {
 struct Model {
     conversations: Vec<ConversationRow>,
     repos: BTreeMap<String, RepoModel>,
+    /// The authored Work state - incarnation ids, parked flags, lifecycle
+    /// fingerprints - loaded at stage 1 and re-read whenever `work.json`
+    /// changed: by the pass's own sync, or by a `p` landing mid-pass.
+    work: store::Work,
+    /// The `work.json` stamp `work` was read at.
+    work_stamp: Option<store::WorkStamp>,
+    /// Conversation key -> its provider branch trail, placed in the
+    /// repository its cwd resolved to; replaced by every stage 2.
+    trails: HashMap<String, Vec<TrailMark>>,
+    /// Repo id -> the epoch ms of this process's last ref sync over it:
+    /// an active incarnation's last observation, which a quiet pass does
+    /// not write to `work.json`.
+    ref_observed: HashMap<String, u64>,
     errors: Vec<SourceError>,
     skipped: Vec<String>,
     stale_sockets: usize,
@@ -408,7 +800,7 @@ enum RepoData {
     /// The anchors with their local facts and merged vector state.
     Git(vector::RepoLocal),
     /// The one row a non-git space carries.
-    Space(WorkRow),
+    Space(Box<WorkRow>),
 }
 
 impl Collector {
@@ -417,9 +809,12 @@ impl Collector {
     pub fn new(claude_root: PathBuf) -> Collector {
         let claude = Claude::new(claude_root);
         let remotes = RemoteCache::default();
+        let forge = forge::Forge::from_env();
+        let forge_cache = forge::ForgeCache::new(vector::REMOTE_DEADLINE); // coverage: off - the unexecuted instantiation's region edge
+        let forgotten_after = config::DEFAULT_FORGOTTEN_AFTER;
         let model = Model::default(); // coverage: off - the unexecuted instantiation's region edge
         let workers = fanout::WORKERS; // coverage: off - same
-        Collector { claude, remotes, store: None, idles: HashMap::new(), undated: HashMap::new(), model, workers }
+        Collector { claude, remotes, forge, forge_cache, forgotten_after, warnings: Vec::new(), store: None, idles: HashMap::new(), undated: HashMap::new(), model, workers }
     }
 
     /// Read (and acknowledge through) the store at `dir` - the journal of
@@ -427,6 +822,29 @@ impl Collector {
     /// published evidence only.
     pub fn with_store(mut self, dir: PathBuf) -> Collector {
         self.store = Some(Store::open(dir));
+        self
+    }
+
+    /// The resolved configuration's collector-relevant fields: today the
+    /// `forgotten_after` threshold; load warnings are retained in the
+    /// snapshot's `errors` like every other read failure.
+    pub fn with_config(mut self, loaded: config::Loaded) -> Collector {
+        self.forgotten_after = loaded.config.forgotten_after;
+        self.warnings = loaded
+            .warnings
+            .into_iter()
+            .map(|detail| SourceError {
+                source: "config".to_owned(),
+                detail,
+            })
+            .collect();
+        self
+    }
+
+    /// The forge handle the collector asks - `Forge::with_path` in tests
+    /// routes stage 4's lookups at a stub `gh`/`glab` directory.
+    pub fn with_forge(mut self, forge: forge::Forge) -> Collector {
+        self.forge = forge;
         self
     }
 
@@ -451,6 +869,21 @@ impl Collector {
         own_pane: Option<&PaneRef>,
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) {
+        self.collect_stages(runtime, own_pane, false, publish)
+    }
+
+    /// The staged pass itself; `local_only` ends it where the remote asks
+    /// begin - stage 1's runtime and provider inventory plus stage 2's
+    /// cwd resolution and local Git, the evidence a navigation action's
+    /// re-resolve consumes. Remote and forge fields keep their defaults,
+    /// so the last snapshot it publishes is not `complete`.
+    fn collect_stages(
+        &mut self,
+        runtime: &Runtime,
+        own_pane: Option<&PaneRef>,
+        local_only: bool,
+        publish: &mut dyn FnMut(Snapshot) -> bool,
+    ) {
         // Stage 1 - runtime and provider inventory: conversations with
         // their published state, attachments and runtime evidence, before
         // any Git subprocess runs. The store loads here too - the journal
@@ -458,8 +891,14 @@ impl Collector {
         let observed_at = runtime.observed_at;
         let inventory = self.claude.scan();
         self.model.errors = inventory.errors;
+        // Stamp before loading: a write racing the load then shows as a
+        // changed stamp at the next publish, never as a missed one.
+        let work_stamp = self.store.as_ref().and_then(Store::work_stamp);
         let mut loaded = self.store.as_ref().map(Store::load).unwrap_or_default();
         self.model.errors.append(&mut loaded.errors);
+        self.model.errors.extend(self.warnings.iter().cloned());
+        self.model.work = std::mem::take(&mut loaded.work);
+        self.model.work_stamp = work_stamp;
         self.model.skipped = inventory
             .skipped
             .iter()
@@ -529,7 +968,7 @@ impl Collector {
         let mut conversations: Vec<ConversationRow> = Vec::new();
         for (i, conv) in inventory.conversations.iter().enumerate() {
             let resolved_claim = attachment_of[i].map(|slot| &resolved[slot]);
-            let attachment = resolved_claim.map(attachment_row);
+            let attachment = resolved_claim.map(|r| attachment_row(r, &runtime.panes));
             let key = store::conversation_key("claude", &conv.session_id);
             // The published claim applies only while it is bound to a live
             // attachment; a dead `(pid, pid_start)` leaves it as history.
@@ -590,7 +1029,23 @@ impl Collector {
                 .map(|c| (c.repo.clone(), c.worktree.clone(), c.branch.clone()))
                 .unwrap_or_default();
             conversations.push(conversation_row(
-                conv, attachment, derived, repo, worktree, branch,
+                conv,
+                attachment,
+                derived,
+                repo,
+                worktree,
+                branch,
+                EvidenceIn {
+                    fold: loaded.folds.get(&key),
+                    seen: loaded.seen.get(&key).copied().unwrap_or_default(),
+                    mark: loaded.marks.get(&key).copied(),
+                    rejected: loaded
+                        .rejected
+                        .iter()
+                        .filter(|r| r.conversation == key)
+                        .cloned()
+                        .collect(),
+                },
             ));
         }
         self.model.conversations = conversations;
@@ -604,7 +1059,21 @@ impl Collector {
         // nothing still on disk. Distinct cwds are few while conversations
         // are many, so each resolves once per pass - a failure is one
         // error, not one per conversation.
-        let placements = resolve_cwds(&inventory.conversations, &mut self.model.errors);
+        let mut placements = resolve_cwds(&inventory.conversations, &mut self.model.errors);
+        // The provider trails stay in the model: the evidence dated
+        // touches derive from, not part of the published rows.
+        self.model.trails = self
+            .model
+            .conversations
+            .iter()
+            .zip(resolve_trails(&inventory.conversations, &placements))
+            .map(|(c, trail)| {
+                (
+                    store::conversation_key(c.provider.as_str(), &c.session_id),
+                    trail,
+                )
+            })
+            .collect();
         for (conv, place) in self.model.conversations.iter_mut().zip(placements.iter()) {
             let (repo, worktree, branch) = match place {
                 Some(CwdPlacement::Checkout {
@@ -638,7 +1107,7 @@ impl Collector {
                         repo: None,
                         name: display_name(path),
                         path: path.clone(),
-                        data: RepoData::Space(space_row(&id, path)),
+                        data: RepoData::Space(Box::new(space_row(&id, path))),
                     });
             }
         }
@@ -686,6 +1155,18 @@ impl Collector {
             if !alive {
                 return;
             }
+        }
+        self.reconcile_worktree_spaces(
+            runtime,
+            &inventory.conversations,
+            &running,
+            &mut placements,
+        );
+        if local_only {
+            // The action re-resolve ends where the network begins: no
+            // remote or forge ask belongs on a keypress's path.
+            let _ = self.emit(runtime, own_pane, publish);
+            return;
         }
         // Stage 3 - remote evidence, one `ls-remote --symref` per repo and
         // remote per deadline, fanned out; then the local probes each
@@ -754,11 +1235,292 @@ impl Collector {
             }
         }
 
-        // Stage 4 - forge enrichment. No producer ships yet (the work-item
-        // overlay arrives with the cleanup tasks); `gh`/`glab` collectors
-        // plug into the pipeline here rather than being retrofitted.
+        // Stage 4 - forge enrichment: one status lookup per branch whose
+        // remote parses as a forge remote, through the five-minute cache,
+        // fanned out like the remote evidence before it.
+        self.collect_forge();
+        // Authored work state syncs once the pass's evidence is final:
+        // incarnation records, parked flags and the lifecycle fingerprints
+        // transitions date from. Best-effort - a refused write reports and
+        // the rows keep their last-known authored values.
+        if let Some(store) = self.store.clone() {
+            self.sync_work(&store, now_ms);
+        }
         self.model.complete = true;
         self.emit(runtime, own_pane, publish);
+    }
+
+    /// The forge fan-out: enumerate every branch anchor's `(remote_url,
+    /// branch)` ask, skip what the cache still holds, fetch the rest in
+    /// parallel, then apply a cached status to every anchor that asked.
+    /// Anchors without a forge remote get their `Unknown` reason here.
+    fn collect_forge(&mut self) {
+        let now = std::time::Instant::now();
+        let mut asks: Vec<(String, String)> = Vec::new();
+        let mut settled: Vec<(String, usize, ForgeStatus)> = Vec::new();
+        for (repo_id, model) in &self.model.repos {
+            let RepoData::Git(local) = &model.data else {
+                continue;
+            };
+            for (i, work) in local.anchors.iter().enumerate() {
+                let Some(branch) = work.state.anchor.branch().map(str::to_owned) else {
+                    settled.push((repo_id.clone(), i, unknown_forge("no branch")));
+                    continue;
+                };
+                match &work.state.remote_url {
+                    Some(url) if forge::parse_remote(url).is_some() => {
+                        if !self.forge_cache.fresh(url, &branch, now) {
+                            asks.push((url.clone(), branch));
+                        }
+                    }
+                    Some(_) => {
+                        settled.push((repo_id.clone(), i, unknown_forge("not a forge remote")))
+                    }
+                    None => settled.push((repo_id.clone(), i, unknown_forge("no upstream remote"))),
+                }
+            }
+        }
+        asks.sort();
+        asks.dedup();
+        let mut answers: Vec<Option<ForgeStatus>> = vec![None; asks.len()];
+        fanout::fan_out(
+            &asks,
+            self.workers,
+            |(url, branch)| self.forge.status(url, branch),
+            |i, status| answers[i] = Some(status), // coverage: off - the closure edge of the unexecuted instantiation
+        );
+        for ((url, branch), status) in asks.iter().zip(answers) {
+            let Some(status) = status else {
+                continue; // coverage: off - fan_out delivers every index
+            };
+            self.forge_cache.seed(url, branch, status, now);
+        }
+        for (repo_id, i, status) in settled {
+            let Some(RepoModel {
+                data: RepoData::Git(local),
+                ..
+            }) = self.model.repos.get_mut(&repo_id)
+            else {
+                continue; // coverage: off - the model cannot change underneath one pass
+            };
+            if let Some(work) = local.anchors.get_mut(i) {
+                work.state.forge = status;
+            } // coverage: off - the get-miss edge is unreachable: `i` indexes this same vec
+        }
+        for model in self.model.repos.values_mut() {
+            let RepoData::Git(local) = &mut model.data else {
+                continue;
+            };
+            for work in &mut local.anchors {
+                let (Some(url), Some(branch)) =
+                    (&work.state.remote_url, work.state.anchor.branch())
+                else {
+                    continue;
+                };
+                if let Some(status) = self.forge_cache.peek(url, branch) {
+                    work.state.forge = status.clone();
+                }
+            }
+        }
+    }
+
+    /// Sync `work.json` with what the pass observed: one ref sync per Git
+    /// repo (which closes records for vanished refs and opens new
+    /// incarnations), one path sync per detached anchor and project
+    /// space, then one touch sync over every conversation's exact
+    /// placement. `model.work` re-reads after each write so the published
+    /// snapshot's identities, intervals and parked flags are this
+    /// pass's, not the stage-1 load's.
+    fn sync_work(&mut self, store: &Store, observed_ms: u64) {
+        // `(repo, branch)` -> the tip the pass proved: what a touch's
+        // `head` carries.
+        let mut heads: HashMap<(String, String), String> = HashMap::new();
+        let git_worktrees: HashSet<PathBuf> = self
+            .model
+            .repos
+            .values()
+            .flat_map(|model| match &model.data {
+                RepoData::Git(local) => local
+                    .anchors
+                    .iter()
+                    .filter_map(|w| match &w.state.anchor {
+                        Anchor::Worktree { path, .. } => Some(path.clone()),
+                        Anchor::Branch { .. } => None,
+                    })
+                    .collect::<Vec<_>>(),
+                RepoData::Space(_) => Vec::new(),
+            })
+            .collect();
+        let mut observed = Vec::new();
+        for (repo_id, model) in &self.model.repos {
+            match &model.data {
+                RepoData::Git(local) => {
+                    let mut seen = HashSet::new();
+                    let refs: Vec<store::ObservedRef> = local
+                        .anchors
+                        .iter()
+                        .filter_map(|w| {
+                            let name = w.state.anchor.branch()?;
+                            if let Some(head) = w.ref_head() {
+                                heads.insert((repo_id.clone(), name.to_owned()), head.to_owned());
+                            }
+                            seen.insert(name.to_owned()).then(|| store::ObservedRef {
+                                name: name.to_owned(),
+                                head: w.ref_head().map(str::to_owned),
+                                rewritten: rewritten(&self.model.work, repo_id, name, w),
+                                creation: w.ref_creation().map(|c| store::RefCreationEvidence {
+                                    head: c.head.clone(),
+                                    at_ms: store::epoch_ms(c.at),
+                                }),
+                                renamed_from: w.renamed_from().map(str::to_owned),
+                                commit: observed_commit(&w.state, w.ref_head()),
+                                activities: pass_activities(&w.state, w.ref_head()),
+                                inputs: lifecycle_inputs(&w.state),
+                            })
+                        })
+                        .collect();
+                    let previous = self.model.ref_observed.get(repo_id).copied();
+                    match store.sync_repo_after(repo_id, &refs, observed_ms, previous) {
+                        Ok(()) => observed.push(repo_id.clone()),
+                        Err(e) => self.model.errors.push(work_state_error(repo_id, e)),
+                    }
+                    for w in &local.anchors {
+                        if let Anchor::Worktree {
+                            path,
+                            head: Head::Detached(_),
+                            ..
+                        } = &w.state.anchor
+                            && let Err(e) = store.sync_path(
+                                &path.display().to_string(),
+                                repo_id,
+                                &lifecycle_inputs(&w.state),
+                                &pass_activities(&w.state, w.ref_head()),
+                                observed_ms,
+                            )
+                        {
+                            self.model.errors.push(work_state_error(repo_id, e));
+                        }
+                    }
+                }
+                RepoData::Space(row) => {
+                    let claimed = git_worktrees.iter().any(|wt| inside_path(&model.path, wt));
+                    if !claimed
+                        && let Err(e) = store.sync_path(
+                            &row.repo,
+                            &row.repo,
+                            &store::LifecycleInputs::default(),
+                            &[],
+                            observed_ms,
+                        )
+                    {
+                        self.model.errors.push(work_state_error(repo_id, e));
+                    }
+                }
+            }
+        }
+        for repo_id in observed {
+            self.model.ref_observed.insert(repo_id, observed_ms);
+        }
+        // Repo reconciliation first: placements name the active
+        // incarnation ids the sync just settled.
+        let mut errors = self.refresh_work();
+        self.model.errors.append(&mut errors);
+        let mut placements = Vec::new();
+        let mut dated = Vec::new();
+        for c in &self.model.conversations {
+            let key = store::conversation_key(c.provider.as_str(), &c.session_id);
+            let trail = self.model.trails.get(&key).map_or(&[][..], Vec::as_slice);
+            dated.extend(dated_touches(&key, trail, &self.model.work));
+            // A cwd places only a live conversation: where a dead one's
+            // directory points now says nothing about where it worked.
+            if !c.running() {
+                continue;
+            }
+            // No checkout on a branch, no record of it, or an unproven tip
+            // (a touch would name a head it cannot swear to): no exact
+            // placement.
+            let (Some(repo), Some(branch)) = (&c.repo, &c.branch) else {
+                continue;
+            };
+            let (Some(record), Some(head)) = (
+                self.model.work.branch(repo, branch),
+                heads.get(&(repo.clone(), branch.clone())),
+            ) else {
+                continue;
+            };
+            placements.push(store::TouchPlacement {
+                conversation: key,
+                branch: record.id.clone(),
+                head: head.clone(),
+                provenance: store::TouchProvenance::Cwd,
+                confidence: store::Confidence::Exact,
+            });
+        }
+        if let Err(e) = store.sync_touches(&placements, &dated, observed_ms) {
+            self.model.errors.push(SourceError {
+                source: "work.json".to_owned(),
+                detail: format!("touches: {e}"),
+            });
+        }
+        let mut errors = self.refresh_work();
+        self.model.errors.append(&mut errors);
+        let mut bound: HashMap<String, store::UpdateIdentity> = HashMap::new();
+        for touch in &self.model.work.touches {
+            if touch.valid_until.is_none() && touch.confidence == store::Confidence::Exact {
+                bound.insert(
+                    touch.conversation.clone(),
+                    store::UpdateIdentity::Branch(touch.branch.clone()),
+                );
+            }
+        }
+        let mut updates = Vec::new();
+        for conv in &self.model.conversations {
+            let key = store::conversation_key(conv.provider.as_str(), &conv.session_id);
+            let identity = bound.get(&key).cloned().or_else(|| {
+                if conv.branch.is_some() {
+                    return None;
+                }
+                conv.worktree
+                    .as_ref()
+                    .map(|path| store::UpdateIdentity::Path(path.display().to_string()))
+                    .or_else(|| conv.repo.clone().map(store::UpdateIdentity::Path))
+            });
+            let (Some(identity), Some(at)) = (identity, conv.last_activity) else {
+                continue;
+            };
+            updates.push(store::SessionUpdate {
+                identity,
+                conversation: key,
+                at_ms: at.saturating_mul(1000),
+                reason: conv.title.as_ref().map_or_else(
+                    || conv.short_id.clone(),
+                    |title| format!("{} {}", conv.short_id, title),
+                ),
+            });
+        }
+        match store.sync_session_updates(&updates) {
+            Ok(()) => {}
+            Err(e) => self.model.errors.push(work_state_error("sessions", e)), // coverage: off - a refused write needs a filesystem fault
+        }
+        let mut errors = self.refresh_work();
+        self.model.errors.append(&mut errors);
+    }
+
+    /// Re-read `work.json` into the model when its stamp moved since the
+    /// last read - the pass's own sync or a `p` from the TUI - and return
+    /// that read's errors. An unchanged file is not parsed again.
+    fn refresh_work(&mut self) -> Vec<SourceError> {
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        let stamp = store.work_stamp();
+        if stamp == self.model.work_stamp {
+            return Vec::new();
+        }
+        let (work, errors) = store.work();
+        self.model.work = work;
+        self.model.work_stamp = stamp;
+        errors
     }
 
     /// One pass run to completion: the staged collect's final snapshot,
@@ -773,58 +1535,159 @@ impl Collector {
         last.expect("a staged pass always publishes") // coverage: off - stage 1 always publishes
     } // coverage: off - the unexecuted instantiation's exit edge
 
+    /// One pass through the local evidence only - stages 1 and 2: the
+    /// runtime, providers, cwd resolution and local Git - ending where a
+    /// remote or forge ask would begin. The Enter/`o` re-resolve runs on
+    /// it so a keypress never stalls on the network; rows carry no remote
+    /// or forge fields and the snapshot stays `complete: false`.
+    pub fn collect_local(&mut self, runtime: &Runtime, own_pane: Option<&PaneRef>) -> Snapshot {
+        let mut last = None;
+        self.collect_stages(runtime, own_pane, true, &mut |snapshot| {
+            last = Some(snapshot);
+            true
+        });
+        last.expect("a staged pass always publishes") // coverage: off - stage 1 always publishes
+    } // coverage: off - the unexecuted instantiation's exit edge
+
     /// Rebuild the publishable snapshot from the retained model: work rows
     /// projected from every anchor's state, repo rollups recomputed, and
     /// the completeness flag as it currently stands.
     fn emit(
-        &self,
+        &mut self,
         runtime: &Runtime,
         own_pane: Option<&PaneRef>,
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) -> bool {
+        let now = epoch(runtime.observed_at);
+        // Authored state as the store holds it now, not as stage 1 loaded
+        // it: a `p` that lands mid-pass must hold in every later stage.
+        // Stage 1 and the sync already report the file's read errors.
+        let _ = self.refresh_work();
+        let authored = &self.model.work;
+        // Touches re-derive per publish like the Work identities: stage 1
+        // may show last pass's persisted intervals, the publish after the
+        // sync shows the reconciled ones. The model carries them so
+        // `binds` sees the same rows classification does.
+        let numbers = incarnation_numbers(authored);
+        for c in &mut self.model.conversations {
+            let key = store::conversation_key(c.provider.as_str(), &c.session_id);
+            c.touches = authored
+                .touches
+                .iter()
+                .filter(|t| t.conversation == key)
+                .filter_map(|t| touch_row(t, authored, &numbers))
+                .collect();
+            // Provider intervals can land after the observed ones they
+            // predate: the row reads in time order, landing order within.
+            c.touches.sort_by_key(|t| t.valid_from);
+            c.current_incarnation = c
+                .touches
+                .iter()
+                .filter(|t| t.valid_until.is_none())
+                .max_by_key(|t| t.valid_from)
+                .map(|t| t.incarnation_id.clone());
+        }
+        relate(&mut self.model.conversations, runtime);
         let mut work = Vec::new();
-        let mut repos = Vec::new();
         for (id, model) in &self.model.repos {
-            let mut last_activity = None;
             match &model.data {
                 RepoData::Git(local) => {
                     for anchor in &local.anchors {
-                        let row = work_row(id, &model.name, &anchor.state);
-                        last_activity = last_activity.max(row.last_activity);
+                        let mut row =
+                            work_row(id, &model.name, &anchor.state, anchor.ref_head(), authored);
+                        row.panes = anchor_panes(&anchor.state.anchor, &runtime.panes);
                         work.push(row);
                     }
                 }
-                RepoData::Space(row) => work.push(row.clone()),
+                RepoData::Space(row) => {
+                    let mut row = (**row).clone();
+                    apply_path_record(&mut row, authored);
+                    work.push(row);
+                }
             }
-            let work_count = work.iter().filter(|w| w.repo == *id).count();
+        }
+        // The paths the live rows still anchor: a closed record whose
+        // last workspace is one of them leaves its references to the live
+        // row, and produces no gone row at all.
+        let live_paths: HashSet<String> = work
+            .iter()
+            .filter_map(|w| w.worktree.as_ref().map(|p| p.display().to_string()))
+            .collect();
+        work.extend(gone_rows(&self.model, authored, runtime, &live_paths));
+        // A branch row's session counts are its incarnation's, not its
+        // location's: runtime facts count every conversation under the
+        // worktree or repo, but the row claims only the exact touches to
+        // its incarnation - closed same-name intervals count toward the
+        // excluded history they name, never toward the current row.
+        for w in &mut work {
+            // An active incarnation was observed by this process's last
+            // ref sync over its repo, even when that quiet pass wrote
+            // nothing.
+            if let Some(inc) = &mut w.incarnation
+                && let Some(ms) = self.model.ref_observed.get(&w.repo)
+            {
+                inc.last_observed_at = inc.last_observed_at.max(ms / 1000);
+            }
+            let Some(id) = w.incarnation.as_ref().map(|i| i.id.as_str()) else {
+                continue;
+            };
+            w.past_sessions = self
+                .model
+                .conversations
+                .iter()
+                .filter(|c| c.touches.iter().any(|t| t.incarnation_id == id))
+                .count();
+            w.live_sessions = self
+                .model
+                .conversations
+                .iter()
+                .filter(|c| {
+                    c.running()
+                        && c.touches.iter().any(|t| {
+                            t.incarnation_id == id
+                                && t.valid_until.is_none()
+                                && t.confidence == store::Confidence::Exact
+                        })
+                })
+                .count();
+            w.live_pids = w.live_sessions;
+            attribute_commits(&mut w.commits, id, &self.model.conversations);
+        }
+        // Attention, section and summary are derived per publish from the
+        // conversations bound to the row; sections order first, newest
+        // activity inside a section, a stable identity last.
+        for w in &mut work {
+            classify_work(w, &self.model.conversations, self.forgotten_after, now);
+        }
+        sort_work(&mut work);
+        let mut repos = Vec::new();
+        for (id, model) in &self.model.repos {
             let live = self
                 .model
                 .conversations
                 .iter()
                 .filter(|c| c.running() && c.repo.as_deref() == Some(id.as_str()))
                 .count();
-            repos.push(RepoRow {
+            let (default_branch, remote) = repo_default(model);
+            let mut row = RepoRow {
                 id: id.clone(),
                 name: model.name.clone(),
                 path: model.path.clone(),
                 git: model.repo.is_some(),
-                work: work_count,
+                work: 0,
                 live,
-                last_activity,
-            });
+                attention: Attention::None,
+                open: 0,
+                clean: 0,
+                last_activity: None,
+                default_branch,
+                remote,
+                counts: RepoCounts::default(),
+            };
+            row.roll_up(&work);
+            repos.push(row);
         }
-        // Attention and the first-match section are derived per publish
-        // from the conversations bound to the row; sections order first,
-        // newest activity inside a section.
-        for w in &mut work {
-            classify_work(w, &self.model.conversations);
-        }
-        work.sort_by(|a, b| {
-            section_order(a)
-                .cmp(&section_order(b))
-                .then_with(|| b.last_activity.cmp(&a.last_activity))
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        sort_repos(&mut repos);
         let mut conversations = self.model.conversations.clone();
         sort_conversations(&mut conversations, runtime.observed_at);
         publish(Snapshot {
@@ -868,6 +1731,100 @@ impl Collector {
     /// A repo whose local read failed keeps its error and drops its row.
     #[rustfmt::skip]
     fn fail_repo(&mut self, repo_id: &str, error: SourceError) { self.model.errors.push(error); self.model.repos.remove(repo_id); } // coverage: off - the caller's arm needs a gitdir to vanish mid-pass
+
+    fn reconcile_worktree_spaces(
+        &mut self,
+        runtime: &Runtime,
+        conversations: &[Conversation],
+        running: &[bool],
+        placements: &mut [Option<CwdPlacement>],
+    ) {
+        let mut claimed: Vec<(PathBuf, String, Option<String>)> = Vec::new();
+        for (repo_id, model) in &self.model.repos {
+            let RepoData::Git(local) = &model.data else {
+                continue;
+            };
+            for w in &local.anchors {
+                let Anchor::Worktree { path, head, .. } = &w.state.anchor else {
+                    continue;
+                };
+                let branch = match head {
+                    Head::Branch(name) | Head::Unborn(name) => Some(name.clone()),
+                    Head::Detached(_) => None,
+                };
+                claimed.push((path.clone(), repo_id.clone(), branch));
+            }
+        }
+        if claimed.is_empty() {
+            return;
+        }
+        self.model.repos.retain(|_, model| match &model.data {
+            RepoData::Space(_) => !claimed
+                .iter()
+                .any(|(path, ..)| inside_path(&model.path, path)),
+            RepoData::Git(_) => true,
+        });
+        let mut touched: HashSet<String> = HashSet::new();
+        for (conv, place) in self
+            .model
+            .conversations
+            .iter_mut()
+            .zip(placements.iter_mut())
+        {
+            let Some(CwdPlacement::ProjectSpace { path }) = place else {
+                continue;
+            };
+            let Some((root, repo_id, branch)) = claimed
+                .iter()
+                .filter(|(root, ..)| inside_path(path, root))
+                .max_by_key(|(root, ..)| root.components().count())
+            else {
+                continue;
+            };
+            *place = Some(CwdPlacement::Checkout {
+                repo_id: repo_id.clone(),
+                root: root.clone(),
+                branch: branch.clone(),
+            });
+            conv.repo = Some(repo_id.clone());
+            conv.worktree = Some(root.clone());
+            conv.branch = branch.clone();
+            touched.insert(repo_id.clone());
+        }
+        if touched.is_empty() {
+            return;
+        }
+        let trails = resolve_trails(conversations, placements);
+        for (conv, trail) in self.model.conversations.iter().zip(trails) {
+            self.model.trails.insert(
+                store::conversation_key(conv.provider.as_str(), &conv.session_id),
+                trail,
+            );
+        }
+        for repo_id in &touched {
+            let Some(RepoModel {
+                data: RepoData::Git(local),
+                ..
+            }) = self.model.repos.get_mut(repo_id)
+            else {
+                continue; // coverage: off - touched only ever names a collected Git repo
+            };
+            for work in &mut local.anchors {
+                let facts = runtime_facts(
+                    runtime,
+                    conversations,
+                    running,
+                    placements,
+                    &work.state.anchor,
+                    repo_id,
+                );
+                work.state.vector.windows = facts.windows;
+                work.state.vector.live_pids = facts.live_pids;
+                work.state.vector.live_agent_sessions = facts.live_agent_sessions;
+                work.state.vector.past_agent_sessions = facts.past_agent_sessions;
+            }
+        }
+    }
 
     /// Merge one finished repository into the model. Remote-owned fields
     /// carry their last-pass values over into the fresh local state - they
@@ -934,6 +1891,33 @@ fn resolve_cwds(
                 .or_insert_with(|| resolve_cwd(cwd, errors))
                 .clone(),
             None => None,
+        })
+        .collect()
+}
+
+/// Every conversation's provider branch trail, placed in the repository
+/// its own cwd resolved to: the branch names the provider records are the
+/// project directory's, so they belong to that repository and no other.
+/// A conversation whose cwd is no checkout has no placeable trail.
+fn resolve_trails(
+    conversations: &[Conversation],
+    placements: &[Option<CwdPlacement>],
+) -> Vec<Vec<TrailMark>> {
+    conversations
+        .iter()
+        .zip(placements)
+        .map(|(conv, place)| {
+            let Some(CwdPlacement::Checkout { repo_id, .. }) = place else {
+                return Vec::new();
+            };
+            conv.branch_trail()
+                .iter()
+                .map(|mark| TrailMark {
+                    at_ms: store::epoch_ms(mark.at),
+                    repo: repo_id.clone(),
+                    branch: mark.branch.clone(),
+                })
+                .collect()
         })
         .collect()
 }
@@ -1073,8 +2057,16 @@ fn runtime_facts(
 
 /// The `vector::WorkState` collapsed into the row's display contract.
 /// Fields whose stage has not landed read `Unknown` and render `?`, like
-/// any other unknown.
-fn work_row(repo_id: &str, repo_name: &str, state: &vector::WorkState) -> WorkRow {
+/// any other unknown. `authored` carries the persisted record: a branch
+/// row's work identity is its active incarnation's id, a detached row's
+/// its canonical path.
+fn work_row(
+    repo_id: &str,
+    repo_name: &str,
+    state: &vector::WorkState,
+    head: Option<&str>,
+    authored: &store::Work,
+) -> WorkRow {
     let anchor = &state.anchor;
     let v = &state.vector;
     let (kind, name, branch) = match anchor {
@@ -1096,19 +2088,57 @@ fn work_row(repo_id: &str, repo_name: &str, state: &vector::WorkState) -> WorkRo
         }
         Anchor::Branch { name } => (WorkKind::Branch, name.clone(), Some(name.clone())),
     };
-    let upstream = match &v.upstream_state {
-        UpstreamState::NeverPushed => Upstream::NeverPushed,
-        UpstreamState::Tracked { .. } => Upstream::Tracked,
-        UpstreamState::RemoteGone { .. } => Upstream::RemoteGone,
-        UpstreamState::Unknown(_) => Upstream::Unknown,
-        UpstreamState::NotApplicable => Upstream::NotApplicable,
+    let (upstream, upstream_detail) = upstream_of(&v.upstream_state);
+    // Work identity: an active incarnation's id for a branch row, the
+    // canonical path for a detached one. A branch whose record the sync
+    // has not written yet carries no identity rather than a guess.
+    let (identity, parked, authored_activities, observations) = match &branch {
+        Some(name) => match authored.branch(repo_id, name) {
+            Some(r) => (
+                Some(r.id.clone()),
+                r.parked,
+                r.activities.clone(),
+                r.observations.clone(),
+            ),
+            None => (None, false, Vec::new(), Vec::new()),
+        },
+        None => {
+            let path = v.worktree.as_ref().map(|p| p.display().to_string());
+            match path.as_deref().and_then(|p| authored.path(p)) {
+                Some(r) => (path, r.parked, r.activities.clone(), r.observations.clone()),
+                None => (path, false, Vec::new(), Vec::new()),
+            }
+        }
     };
-    let upstream_detail = match &v.upstream_state {
-        UpstreamState::Tracked { remote, merge_ref }
-        | UpstreamState::RemoteGone { remote, merge_ref } => Some(format!("{remote}/{merge_ref}")),
-        UpstreamState::Unknown(reason) => Some(reason.clone()),
-        _ => None,
-    };
+    // The pass's own provable activities fold into the record's: a row
+    // whose sync has not landed yet - or a store-less collect - still
+    // reads its source times, never the scan's.
+    let mut activities = authored_activities;
+    for event in pass_activities(state, head) {
+        store::append_activity(&mut activities, event);
+    }
+    // The incarnation rows: every retained record of this `(repo,
+    // ref_name)`, numbered oldest first - the active one on the row, the
+    // closed ones as excluded same-name history.
+    let mut incarnation = None;
+    let mut same_name_history = Vec::new();
+    if let Some(name) = &branch {
+        let mut records: Vec<&store::BranchRecord> = authored
+            .branches
+            .values()
+            .filter(|r| r.repo == repo_id && &r.ref_name == name)
+            .collect();
+        sort_incarnations(&mut records);
+        for (number, record) in records.into_iter().enumerate() {
+            let row = incarnation_row(record, number + 1);
+            if record.ended_at.is_some() {
+                same_name_history.push(row);
+            } else {
+                incarnation = Some(row);
+            }
+        }
+    }
+    let (removal, deletion) = verdict::cleanup(state, &state.forge);
     WorkRow {
         repo: repo_id.to_owned(),
         repo_name: repo_name.to_owned(),
@@ -1117,65 +2147,955 @@ fn work_row(repo_id: &str, repo_name: &str, state: &vector::WorkState) -> WorkRo
         worktree: v.worktree.clone(),
         branch,
         dirty: v.dirty.known().copied(),
+        broken: state.broken.as_ref().map(|reason| match &v.worktree {
+            Some(path) if !path.join(".git").exists() => {
+                format!(".git missing; metadata retained by {repo_name}")
+            }
+            _ => reason.clone(),
+        }),
         commits_ahead: v.commits_ahead_of_base.known().copied(),
         unpushed: v.unpushed_commits.known().copied(),
         upstream,
         upstream_detail,
-        landed: v.landed.known().map(|l| match l {
-            LandedVerdict::AncestorMerged => Landed::Ancestor,
-            LandedVerdict::ContentMerged => Landed::Content,
-            LandedVerdict::No => Landed::No,
-        }),
+        landed: landed_of(v),
         base: state.base.known().map(|b| b.label()),
         windows: v.windows.total,
         live_pids: v.live_pids,
         live_sessions: v.live_agent_sessions,
         past_sessions: v.past_agent_sessions,
-        last_activity: v.last_git_activity.map(epoch),
+        // Meaningful activity: the newest source-backed occurrence,
+        // derived from the events rather than a stored aggregate. Bound
+        // conversations' source times join in `classify_work`.
+        last_activity: store::newest_activity(&activities).map(|ms| ms / 1000),
         attention: Attention::None,
-        section: None,
-        summary: work_summary(v),
+        identity,
+        incarnation,
+        same_name_history,
+        parked,
+        forge: state.forge.item,
+        pipeline: state.forge.pipeline,
+        forge_label: state.forge.label.clone(),
+        forge_url: state.forge.url.clone(),
+        commits_behind: v.commits_behind_of_base.known().copied(),
+        commits: v.commits_not_on_base.known().map(|list| {
+            list.iter()
+                .map(|c| CommitRow {
+                    sha: c.sha.clone(),
+                    subject: c.subject.clone(),
+                    at: c.at,
+                    // Attributed per publish, once touches are this pass's.
+                    conversation: None,
+                })
+                .collect()
+        }),
+        // Filled by the caller with the runtime's pane inventory.
+        panes: Vec::new(),
+        gone: None,
+        references: Vec::new(),
+        activities,
+        observations,
+        worktree_removal: Some(removal),
+        branch_deletion: Some(deletion),
+        section: WorkSection::FollowUp,
+        summary: String::new(),
     }
 }
 
-/// Whether the conversation is bound to the work row: its checkout path for
-/// a row with one, its branch for a branch-only row, its repo identity for
-/// a project space. A detached row binds only by path.
+/// The row's upstream reading and its detail: `remote/merge_ref` for a
+/// configured upstream, the reason for an unknown one.
+fn upstream_of(state: &UpstreamState) -> (Upstream, Option<String>) {
+    match state {
+        UpstreamState::NeverPushed => (Upstream::NeverPushed, None),
+        UpstreamState::Tracked { remote, merge_ref } => {
+            (Upstream::Tracked, Some(format!("{remote}/{merge_ref}")))
+        }
+        UpstreamState::RemoteGone { remote, merge_ref } => {
+            (Upstream::RemoteGone, Some(format!("{remote}/{merge_ref}")))
+        }
+        UpstreamState::Unknown(reason) => (Upstream::Unknown, Some(reason.clone())),
+        UpstreamState::NotApplicable => (Upstream::NotApplicable, None),
+    }
+}
+
+/// The row's proven landed verdict, `None` while unproven.
+fn landed_of(v: &vector::StateVector) -> Option<Landed> {
+    v.landed.known().map(|l| match l {
+        LandedVerdict::AncestorMerged => Landed::Ancestor,
+        LandedVerdict::ContentMerged => Landed::Content,
+        LandedVerdict::No => Landed::No,
+    })
+}
+
+/// The lifecycle fingerprint one anchor's state produces for the authored
+/// record: every field a `work.json` record compares next pass to date a
+/// transition at its observation. Unproven readings are `None`, so they
+/// keep the record's last proven value instead of dating a transition.
+fn lifecycle_inputs(state: &vector::WorkState) -> store::LifecycleInputs {
+    let v = &state.vector;
+    let (upstream, detail) = upstream_of(&v.upstream_state);
+    let head = match &state.anchor {
+        Anchor::Worktree {
+            head: Head::Detached(sha),
+            ..
+        } => Some(sha.clone()),
+        _ => None,
+    };
+    store::LifecycleInputs {
+        dirty: v.dirty.known().copied(),
+        worktree: Some(v.worktree.is_some()),
+        git_dir: match &state.anchor {
+            // A stat failure is unproven, not missing: the record keeps
+            // its last value instead of dating a false ".git missing".
+            Anchor::Worktree { path, .. } => path.join(".git").try_exists().ok(),
+            Anchor::Branch { .. } => None,
+        },
+        worktree_path: v.worktree.as_ref().map(|p| p.display().to_string()),
+        admin_id: match &state.anchor {
+            Anchor::Worktree { admin_id, .. } => admin_id.clone(),
+            Anchor::Branch { .. } => None,
+        },
+        ahead: v.commits_ahead_of_base.known().copied(),
+        behind: v.commits_behind_of_base.known().copied(),
+        unpushed: v.unpushed_commits.known().copied(),
+        upstream: (upstream != Upstream::Unknown).then(|| match detail {
+            Some(detail) => format!("{} {detail}", upstream.as_str()),
+            None => upstream.as_str().to_owned(),
+        }),
+        landed: landed_of(v).map(|l| l.as_str().to_owned()),
+        forge: (state.forge.item != WorkItem::Unknown)
+            .then(|| state.forge.item.as_str().to_owned()),
+        pipeline: (state.forge.pipeline != Pipeline::Unknown)
+            .then(|| state.forge.pipeline.as_str().to_owned()),
+        worktree_state: match &state.anchor {
+            Anchor::Worktree { prunable, .. } => Some(match prunable {
+                Some(reason) => format!("broken: {reason}"),
+                None => "healthy".to_owned(),
+            }),
+            Anchor::Branch { .. } => None,
+        },
+        commit: observed_commit(state, head.as_deref()),
+        head,
+        working_tree: worktree_status(state).map(|status| store::WorkingTreeSnapshot {
+            fingerprint: status.fingerprint,
+            reasons: status.reasons,
+            newest_mtime_ms: status.newest_changed_mtime.map(store::epoch_ms),
+        }),
+    }
+}
+
+/// The worktree's parsed porcelain status, when the pass can read one:
+/// the fingerprint, reasons and newest changed-path mtime every
+/// consumer of working-tree evidence shares.
+fn worktree_status(state: &vector::WorkState) -> Option<git::Status> {
+    let v = &state.vector;
+    v.worktree
+        .as_deref()
+        .zip(v.working_tree.known())
+        .map(|(root, bytes)| git::status(bytes, root))
+}
+
+/// The source-backed work one anchor's state proves this pass, as
+/// activity events: the tip's committerdate when it provably dates the
+/// incarnation, the reflog's newest real-work entry, the newest
+/// changed-path mtime, and the forge item's own merge/close date.
+/// Checkout, ref-creation, pipeline and first-detection evidence are not
+/// here - they are not work.
+fn pass_activities(state: &vector::WorkState, head: Option<&str>) -> Vec<store::ActivityEvent> {
+    let v = &state.vector;
+    let mut events = Vec::new();
+    if let Some(at) = v.commit_activity {
+        let reason = observed_commit(state, head).map_or_else(
+            || "tip commit".to_owned(),
+            |c| match c.subject {
+                Some(subject) => format!("{} {}", short_sha(&c.sha), subject),
+                None => short_sha(&c.sha).to_owned(),
+            },
+        );
+        events.push(store::ActivityEvent {
+            source: store::ActivitySource::Commit,
+            occurred_at_ms: store::epoch_ms(at),
+            reasons: vec![reason],
+        });
+    }
+    if let Some(at) = v.reflog_activity {
+        events.push(store::ActivityEvent {
+            source: store::ActivitySource::Reflog,
+            occurred_at_ms: store::epoch_ms(at),
+            reasons: vec!["reflog work".to_owned()],
+        });
+    }
+    if let Some(status) = worktree_status(state)
+        && let Some(at) = status.newest_changed_mtime
+    {
+        events.push(store::ActivityEvent {
+            source: store::ActivitySource::WorkingTree,
+            occurred_at_ms: store::epoch_ms(at),
+            reasons: status.reasons.clone(),
+        });
+    }
+    if let Some(at_ms) = state.forge.occurred_at_ms {
+        let label = state
+            .forge
+            .label
+            .clone()
+            .unwrap_or_else(|| "work item".to_owned());
+        events.push(store::ActivityEvent {
+            source: store::ActivitySource::Forge,
+            occurred_at_ms: at_ms,
+            reasons: vec![format!("{} {}", label, state.forge.item.as_str())],
+        });
+    }
+    events
+}
+
+fn observed_commit(state: &vector::WorkState, head: Option<&str>) -> Option<store::ObservedCommit> {
+    let sha = head?;
+    let listed = state
+        .vector
+        .commits_not_on_base
+        .known()
+        .and_then(|commits| commits.iter().find(|c| c.sha == sha));
+    Some(store::ObservedCommit {
+        sha: sha.to_owned(),
+        subject: listed.map(|c| c.subject.clone()),
+        at_ms: listed.map(|c| c.at.saturating_mul(1000)),
+    })
+}
+
+/// The `Unknown` forge status anchors without a forge remote settle to.
+fn unknown_forge(reason: &str) -> ForgeStatus {
+    ForgeStatus {
+        item: WorkItem::Unknown,
+        pipeline: Pipeline::Unknown,
+        label: None,
+        url: None,
+        reason: Some(reason.to_owned()),
+        occurred_at_ms: None,
+    }
+}
+
+/// The error a failed `work.json` write records: it lands in the
+/// snapshot's `errors`, never silently.
+fn work_state_error(repo_id: &str, e: std::io::Error) -> SourceError {
+    SourceError {
+        source: "work.json".to_owned(),
+        detail: format!("{repo_id}: {e}"),
+    }
+}
+
+/// The dated touches a provider's branch trail proves: each mark that
+/// names a branch in a resolved repo becomes an interval until the next
+/// mark, on the one incarnation of that name that provably existed at the
+/// mark. A mark no single incarnation covers places nothing.
+fn dated_touches(
+    conversation: &str,
+    trail: &[TrailMark],
+    authored: &store::Work,
+) -> Vec<store::DatedTouch> {
+    let mut touches = Vec::new();
+    for (i, mark) in trail.iter().enumerate() {
+        let Some(branch) = &mark.branch else {
+            continue;
+        };
+        let repo = &mark.repo;
+        let Some(id) = incarnation_at(authored, repo, branch, mark.at_ms) else {
+            continue;
+        };
+        touches.push(store::DatedTouch {
+            conversation: conversation.to_owned(),
+            branch: id,
+            valid_from: mark.at_ms,
+            valid_until: trail.get(i + 1).map(|next| next.at_ms),
+        });
+    }
+    touches
+}
+
+/// The incarnation of `(repo, ref_name)` that provably existed at `at_ms`:
+/// from its reflog creation (or, without one, its first observation)
+/// through its end. Zero or several candidates is no answer - a time
+/// before any proven start, or inside a boundary the records cannot
+/// order, fails closed.
+fn incarnation_at(
+    authored: &store::Work,
+    repo: &str,
+    ref_name: &str,
+    at_ms: u64,
+) -> Option<String> {
+    let mut covering = authored.branches.values().filter(|r| {
+        let start = r
+            .creation_evidence
+            .as_ref()
+            .map_or(r.first_observed_at, |c| c.at_ms.min(r.first_observed_at));
+        r.repo == repo
+            && r.ref_name == ref_name
+            && start <= at_ms
+            && r.ended_at.is_none_or(|e| at_ms <= e)
+    });
+    let found = covering.next()?;
+    covering.next().is_none().then(|| found.id.clone())
+}
+
+/// Whether the anchor's branch tip moved off the active record's last
+/// proven head without descending from it - one `merge-base
+/// --is-ancestor` only when the tip moved. A first sighting, an unproven
+/// tip or a comparison git could not answer (the old commit pruned) is
+/// not a proven rewrite.
+fn rewritten(authored: &store::Work, repo_id: &str, name: &str, w: &vector::AnchorWork) -> bool {
+    let (Some(old), Some(new)) = (
+        authored
+            .branch(repo_id, name)
+            .and_then(|r| r.head.as_deref()),
+        w.ref_head(),
+    ) else {
+        return false;
+    };
+    old != new && w.state.repo.is_ancestor(old, new) == Evidence::Known(false)
+}
+
+/// Incarnation order within a `(repo, ref_name)`: oldest first,
+/// `(first_observed_at, id)` - the id is a stable tiebreak for two
+/// records a single pass both dated.
+fn sort_incarnations(records: &mut [&store::BranchRecord]) {
+    records.sort_by(|a, b| {
+        a.first_observed_at
+            .cmp(&b.first_observed_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+/// The `#N` numbers: every retained incarnation's 1-based rank within its
+/// `(repo, ref_name)`, ordered `(first_observed_at, id)` - the numbering a
+/// `#1`/`#2` label and a touch path share.
+fn incarnation_numbers(authored: &store::Work) -> HashMap<String, usize> {
+    let mut by_name: HashMap<(&str, &str), Vec<&store::BranchRecord>> = HashMap::new();
+    for record in authored.branches.values() {
+        by_name
+            .entry((record.repo.as_str(), record.ref_name.as_str()))
+            .or_default()
+            .push(record);
+    }
+    let mut numbers = HashMap::new();
+    for records in by_name.values_mut() {
+        sort_incarnations(records);
+        for (i, record) in records.iter().enumerate() {
+            numbers.insert(record.id.clone(), i + 1);
+        }
+    }
+    numbers
+}
+
+/// One persisted record as its serialized row, numbered within its
+/// `(repo, ref_name)` and marked excluded when closed.
+fn incarnation_row(record: &store::BranchRecord, number: usize) -> IncarnationRow {
+    IncarnationRow {
+        id: record.id.clone(),
+        number,
+        repo: record.repo.clone(),
+        ref_name: record.ref_name.clone(),
+        first_observed_at: record.first_observed_at / 1000,
+        last_observed_at: record.last_observed_at / 1000,
+        creation_head: record.creation_evidence.as_ref().map(|c| c.head.clone()),
+        creation_at: record.creation_evidence.as_ref().map(|c| c.at_ms / 1000),
+        head: record.head.clone(),
+        ended_at: record.ended_at.map(|ms| ms / 1000),
+        continuity: record.continuity_evidence,
+        excluded: record.ended_at.is_some(),
+    }
+}
+
+/// One persisted touch interval as its serialized row: the incarnation's
+/// repo, name and number resolved from the authored records. `None` when
+/// the record itself is gone.
+fn touch_row(
+    touch: &store::BranchTouch,
+    authored: &store::Work,
+    numbers: &HashMap<String, usize>,
+) -> Option<TouchRow> {
+    let record = authored.branches.get(&touch.branch)?;
+    Some(TouchRow {
+        incarnation_id: touch.branch.clone(),
+        repo: record.repo.clone(),
+        ref_name: record.ref_name.clone(),
+        incarnation: numbers.get(&touch.branch).copied().unwrap_or(0), // coverage: off - numbering covers every stored record
+        head: touch.head.clone(),
+        valid_from: touch.valid_from / 1000,
+        valid_until: touch.valid_until.map(|ms| ms / 1000),
+        provenance: touch.provenance,
+        confidence: touch.confidence,
+    })
+}
+
+/// Refresh a path-keyed row's authored fields - a project space's row is
+/// stored in the model, so parked, events and derived activity apply per
+/// publish.
+fn apply_path_record(row: &mut WorkRow, authored: &store::Work) {
+    let Some(identity) = &row.identity else {
+        return; // coverage: off - a space row's identity is its path, always present
+    };
+    if let Some(record) = authored.path(identity) {
+        row.parked = record.parked;
+        row.activities = record.activities.clone();
+        row.observations = record.observations.clone();
+        row.last_activity = row
+            .last_activity
+            .into_iter()
+            .chain(store::newest_activity(&record.activities).map(|ms| ms / 1000))
+            .max();
+    }
+}
+
+/// The panes bound to an anchor's worktree - a branch-only anchor binds
+/// nothing by path.
+fn anchor_panes(anchor: &Anchor, panes: &tmux::PaneInventory) -> Vec<PaneRow> {
+    let Anchor::Worktree { path, admin_id, .. } = anchor else {
+        return Vec::new();
+    };
+    panes
+        .panes
+        .iter()
+        .filter(|p| p.binds_worktree(admin_id.as_deref(), path))
+        .map(|p| PaneRow {
+            handle: format!("{}:{}.{}", p.session_name, p.window, p.id),
+            command: p.command.clone(),
+            target: Some(p.target()),
+        })
+        .collect()
+}
+
+/// The repo's proven default branch and remote: the remote HEAD every
+/// anchor's proven base agreed on - disagreeing or unprobed anchors
+/// prove nothing and read `?`. A lone configured remote still names
+/// itself for the `remote` field.
+fn repo_default(model: &RepoModel) -> (Option<String>, Option<String>) {
+    let RepoData::Git(local) = &model.data else {
+        return (None, None);
+    };
+    let mut bases: HashSet<(String, String)> = HashSet::new();
+    for anchor in &local.anchors {
+        if let Some(base) = anchor.state.base.known() {
+            bases.insert((base.remote.clone(), base.branch.clone()));
+        }
+    }
+    let (branch, remote) = match bases.len() {
+        1 => {
+            let (remote, branch) = bases.into_iter().next().unwrap_or_default();
+            (Some(branch), Some(remote))
+        }
+        _ => (None, None),
+    };
+    let remote = remote.or_else(|| match local.remote_names() {
+        Some([one]) => Some(one.clone()),
+        _ => None,
+    });
+    (branch, remote)
+}
+
+/// Fill every conversation's `related` from this pass's own evidence:
+/// live process ancestry and shared exact incarnations. A shared ref
+/// name, a pane shared at different times or mere time proximity is no
+/// relation. Neither is pane-creation correlation: a tmux pane's root
+/// process is a child of the daemonized tmux server, never of the agent
+/// that asked for the pane, so the process table cannot prove it.
+fn relate(conversations: &mut [ConversationRow], runtime: &Runtime) {
+    let n = conversations.len();
+    let pid_of = |i: usize| -> Option<u32> {
+        let c = &conversations[i];
+        c.running()
+            .then(|| c.attachment.as_ref().map(|a| a.pid))
+            .flatten()
+    };
+    let row = |strength: RelationStrength,
+               label: &str,
+               provenance: String,
+               other: &ConversationRow| RelatedRow {
+        strength,
+        label: label.to_owned(),
+        provenance,
+        provider: other.provider,
+        session_id: other.session_id.clone(),
+        short_id: other.short_id.clone(),
+        title: other.title.clone(),
+        attention: other.attention,
+        state_since: other.state_since,
+    };
+    let mut related: Vec<Vec<RelatedRow>> = (0..n).map(|_| Vec::new()).collect();
+    for a in 0..n {
+        for b in 0..n {
+            if a == b {
+                continue;
+            }
+            // Observed live process ancestry: b's process provably
+            // spawned a's. Both sides list it - a names its ancestor, b
+            // its descendant.
+            if let (Some(pa), Some(pb)) = (pid_of(a), pid_of(b))
+                && let Some(table) = runtime.processes.as_ref()
+                && table.ancestors(pa).iter().skip(1).any(|&p| p == pb)
+            {
+                related[a].push(row(
+                    RelationStrength::ProcessAncestry,
+                    "ancestor",
+                    "live process ancestry".to_owned(),
+                    &conversations[b],
+                ));
+                related[b].push(row(
+                    RelationStrength::ProcessAncestry,
+                    "descendant",
+                    "live process ancestry".to_owned(),
+                    &conversations[a],
+                ));
+            }
+            // Every exact incarnation both conversations touched.
+            for t in &conversations[a].touches {
+                if conversations[b]
+                    .touches
+                    .iter()
+                    .any(|s| s.incarnation_id == t.incarnation_id)
+                {
+                    related[a].push(row(
+                        RelationStrength::SameIncarnation,
+                        "same incarnation",
+                        format!("touch {}#{}", t.ref_name, t.incarnation),
+                        &conversations[b],
+                    ));
+                }
+            }
+        }
+    }
+    // A descendant lands on its ancestor's list out of loop order: keep
+    // the documented strongest-group-first order.
+    for (c, mut rel) in conversations.iter_mut().zip(related) {
+        rel.sort_by_key(|r| r.strength);
+        c.related = rel;
+    }
+}
+
+/// Name the conversation behind each listed commit of incarnation `id`:
+/// the one conversation whose touch to it was open at the commit time.
+/// No covering touch, or several, leaves `?` - a guess between them is
+/// no attribution.
+fn attribute_commits(
+    commits: &mut Option<Vec<CommitRow>>,
+    id: &str,
+    conversations: &[ConversationRow],
+) {
+    let Some(commits) = commits else {
+        return;
+    };
+    for commit in commits {
+        let mut covering = conversations.iter().filter(|c| {
+            c.touches.iter().any(|t| {
+                t.incarnation_id == id
+                    && t.valid_from <= commit.at
+                    && t.valid_until.is_none_or(|until| commit.at < until)
+            })
+        });
+        commit.conversation = match (covering.next(), covering.next()) {
+            (Some(one), None) => Some(one.short_id.clone()),
+            _ => None,
+        };
+    }
+}
+
+/// Gone work still referenced by something live: a closed branch
+/// incarnation whose last proven workspace no longer anchors a live row,
+/// or a path record whose directory lost every claim. It stays under
+/// `Cleanup review` only while a pane, window, tmux session, live
+/// process or live agent session still names it - a restorable or
+/// transcript-only conversation is never a reference.
+fn gone_rows(
+    model: &Model,
+    authored: &store::Work,
+    runtime: &Runtime,
+    live_paths: &HashSet<String>,
+) -> Vec<WorkRow> {
+    let mut rows = Vec::new();
+    let numbers = incarnation_numbers(authored);
+    // One vanished workspace is one row, however many closed records
+    // name it - a same-name branch recreated there, a pooled directory
+    // other branches reused. The newest closed record speaks for it. A
+    // branch-only incarnation records nothing a reference could name; a
+    // still-anchored workspace's references belong to the live row.
+    let mut newest: std::collections::BTreeMap<&str, &store::BranchRecord> =
+        std::collections::BTreeMap::new();
+    for record in authored.branches.values().filter(|r| r.ended_at.is_some()) {
+        let Some(path) = record.inputs.worktree_path.as_deref() else {
+            continue;
+        };
+        if live_paths.contains(path) {
+            continue;
+        }
+        let key = |r: &store::BranchRecord| (r.ended_at, r.last_observed_at, r.id.clone());
+        newest
+            .entry(path)
+            .and_modify(|kept| {
+                if key(record) > key(kept) {
+                    *kept = record;
+                }
+            })
+            .or_insert(record);
+    }
+    let mut emitted: HashSet<&str> = HashSet::new();
+    for (path_str, record) in newest {
+        let path = PathBuf::from(path_str);
+        let refs = references(
+            &runtime.panes,
+            record.inputs.admin_id.as_deref(),
+            &path,
+            &model.conversations,
+        );
+        if refs.is_empty() {
+            continue;
+        }
+        let gone = if path.is_dir() {
+            "branch deleted".to_owned()
+        } else {
+            "branch and worktree gone".to_owned()
+        };
+        let number = numbers.get(&record.id).copied().unwrap_or(0); // coverage: off - numbering covers every stored record
+        rows.push(WorkRow {
+            repo: record.repo.clone(),
+            repo_name: display_name(Path::new(&record.repo)),
+            kind: WorkKind::Branch,
+            name: record.ref_name.clone(),
+            worktree: Some(path.clone()),
+            branch: Some(record.ref_name.clone()),
+            identity: Some(record.id.clone()),
+            incarnation: Some(incarnation_row(record, number)),
+            // A gone row's recency is its retained source activity only:
+            // `ended_at` and `last_observed_at` are detection times, so
+            // a just-deleted old branch still reads old.
+            last_activity: store::newest_activity(&record.activities).map(|ms| ms / 1000),
+            gone: Some(gone.clone()),
+            summary: format!("{gone} · {}", reference_summary(&refs)),
+            references: refs,
+            activities: record.activities.clone(),
+            observations: record.observations.clone(),
+            section: WorkSection::CleanupReview,
+            ..space_row(&record.repo, &path)
+        });
+        emitted.insert(path_str);
+    }
+    // A path record for a workspace a closed branch already speaks for
+    // adds no second row.
+    for (path_str, record) in &authored.paths {
+        if live_paths.contains(path_str) || emitted.contains(path_str.as_str()) {
+            continue;
+        }
+        let path = PathBuf::from(path_str);
+        let refs = references(&runtime.panes, None, &path, &model.conversations);
+        if refs.is_empty() {
+            continue;
+        }
+        let (kind, gone) = match record.inputs.worktree {
+            Some(true) => (WorkKind::Detached, "worktree gone"),
+            _ => (WorkKind::ProjectSpace, "project folder gone"),
+        };
+        // The repo the record carries, so a detached row lists under its
+        // repository; a record from before the field names itself.
+        let repo = record.repo.as_deref().unwrap_or(path_str);
+        rows.push(WorkRow {
+            kind,
+            repo: repo.to_owned(),
+            repo_name: display_name(Path::new(repo)),
+            gone: Some(gone.to_owned()),
+            summary: format!("{gone} · {}", reference_summary(&refs)),
+            references: refs,
+            activities: record.activities.clone(),
+            observations: record.observations.clone(),
+            last_activity: store::newest_activity(&record.activities).map(|ms| ms / 1000),
+            section: WorkSection::CleanupReview,
+            ..space_row(path_str, &path)
+        });
+    }
+    rows
+}
+
+/// The live references retaining a gone workspace `path`: every pane
+/// bound to it - by a stored `wt_adminid` edge or a cwd inside it - the
+/// windows and tmux sessions containing them, and the live agent
+/// sessions (and their processes) still anchored inside it.
+fn references(
+    panes: &tmux::PaneInventory,
+    admin_id: Option<&str>,
+    path: &Path,
+    conversations: &[ConversationRow],
+) -> Vec<ReferenceRow> {
+    let mut refs = Vec::new();
+    let mut windows = std::collections::BTreeSet::new();
+    let mut sessions = std::collections::BTreeSet::new();
+    for pane in &panes.panes {
+        if !pane.binds_worktree(admin_id, path) {
+            continue;
+        }
+        refs.push(ReferenceRow {
+            kind: ReferenceKind::Pane,
+            label: format!("{}:{}.{}", pane.session_name, pane.window, pane.id),
+        });
+        windows.insert((
+            pane.socket.clone(),
+            pane.session_name.clone(),
+            pane.window.to_string(),
+        ));
+        sessions.insert((pane.socket.clone(), pane.session_name.clone()));
+    }
+    refs.extend(
+        windows
+            .into_iter()
+            .map(|(_, session, window)| ReferenceRow {
+                kind: ReferenceKind::Window,
+                label: format!("{session}:{window}"),
+            }),
+    );
+    refs.extend(sessions.into_iter().map(|(_, session)| ReferenceRow {
+        kind: ReferenceKind::TmuxSession,
+        label: session,
+    }));
+    for c in conversations.iter().filter(|c| c.running()) {
+        let inside = c.cwd.as_deref().is_some_and(|cwd| inside_path(cwd, path))
+            || c.worktree.as_deref().is_some_and(|w| inside_path(w, path));
+        if !inside {
+            continue;
+        }
+        if let Some(a) = &c.attachment {
+            refs.push(ReferenceRow {
+                kind: ReferenceKind::Process,
+                label: format!("pid {}", a.pid),
+            });
+        } // coverage: off - the `None` edge: `running()` proves the attachment
+        refs.push(ReferenceRow {
+            kind: ReferenceKind::AgentSession,
+            label: format!("{}:{}", c.provider.as_str(), c.short_id),
+        });
+    }
+    refs
+}
+
+/// Whether `cwd` sits at or below `root`, canonicalizing each side when
+/// it can - a gone path falls back to its literal spelling, matching how
+/// pane bindings read.
+fn inside_path(cwd: &Path, root: &Path) -> bool {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    cwd.starts_with(&root)
+}
+
+/// The reference counts a gone row's summary names.
+fn reference_summary(refs: &[ReferenceRow]) -> String {
+    [
+        (ReferenceKind::Pane, "pane"),
+        (ReferenceKind::Window, "window"),
+        (ReferenceKind::TmuxSession, "session"),
+        (ReferenceKind::Process, "process"),
+        (ReferenceKind::AgentSession, "agent session"),
+    ]
+    .into_iter()
+    .filter_map(|(kind, word)| {
+        let n = refs.iter().filter(|r| r.kind == kind).count();
+        (n > 0).then(|| format!("{n} {word}{}", if n == 1 { "" } else { "s" }))
+    })
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
+/// Whether the conversation is bound to the work row: an open exact
+/// touch to the row's incarnation for a branch-bearing row - the name
+/// and the worktree path are only labels, the touch is the binding - a
+/// checkout path for a detached row, or its repo identity for a project
+/// space. A branch row with no recorded incarnation binds nothing
+/// rather than guessing.
 pub fn binds(row: &WorkRow, c: &ConversationRow) -> bool {
     match (row.kind, row.worktree.as_deref(), row.branch.as_deref()) {
         (WorkKind::ProjectSpace, _, _) => c.repo.as_deref() == Some(row.repo.as_str()),
-        (_, Some(root), _) => {
+        (WorkKind::Detached, Some(root), _) => {
             c.repo.as_deref() == Some(row.repo.as_str()) && c.worktree.as_deref() == Some(root)
         }
-        (_, None, Some(branch)) => {
-            c.repo.as_deref() == Some(row.repo.as_str()) && c.branch.as_deref() == Some(branch)
-        }
+        (_, _, Some(_)) => match &row.identity {
+            Some(id) => c.touches.iter().any(|t| {
+                t.incarnation_id == *id
+                    && t.valid_until.is_none()
+                    && t.confidence == store::Confidence::Exact
+            }),
+            None => false,
+        },
         // A row with neither worktree nor branch binds nothing; anchors
         // always carry one.
         _ => false, // coverage: off - a fabricated row shape: anchors always carry a worktree or a branch
     }
 }
 
-/// Fold the bound conversations' attention into the row's rollup, section
-/// and summary. First match wins: `Needs you` for waiting/failed-unseen/
-/// completed-unseen, `Active` for a live busy process with nothing higher.
-fn classify_work(row: &mut WorkRow, conversations: &[ConversationRow]) {
+/// Fold the bound conversations' attention into the row's rollup, merge
+/// their activity into the row's, then place the row in its first-match
+/// section and compose its summary. The same call the pass applies is
+/// what a `p` toggle re-runs on the in-memory snapshot, so a parked row
+/// moves without waiting for a refresh.
+pub fn classify_work(
+    row: &mut WorkRow,
+    conversations: &[ConversationRow],
+    forgotten_after: Duration,
+    now: u64,
+) {
     let bound: Vec<&ConversationRow> = conversations.iter().filter(|c| binds(row, c)).collect();
     row.attention = attention::rollup(bound.iter().map(|c| &c.attention));
-    row.section = match row.attention {
-        Attention::Waiting | Attention::Error | Attention::CompletedUnseen => {
-            Some(WorkSection::NeedsYou)
-        }
-        Attention::Working => Some(WorkSection::Active),
-        _ => None,
-    };
-    if row.section.is_none() {
+    for c in &bound {
+        row.last_activity = row.last_activity.max(c.last_activity);
+    }
+    // A gone row keeps its own placement: it sits in `Cleanup review`
+    // for as long as something live references it, and no lifecycle
+    // verdict moves it.
+    if row.gone.is_some() {
         return;
     }
-    // The summary states why the row sits in its section: the attention
-    // and its reason first (`waiting: permission prompt`, `error:
-    // StopFailure`, `done`), `working` beside a retained latch while the
-    // agent grinds on, then the Git shape when it has something to say.
+    let (section, reason) = section_reason(row, &bound, forgotten_after, now);
+    row.section = section;
+    row.summary = summarize(row, reason);
+}
+
+/// Order the work rows as [2] renders them: section first, newest
+/// meaningful activity inside it (unknown last), then a stable identity.
+pub fn sort_work(work: &mut [WorkRow]) {
+    work.sort_by(|a, b| {
+        section_order(a)
+            .cmp(&section_order(b))
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+            .then_with(|| a.identity.cmp(&b.identity))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+/// First match in section order: attention, working, the FollowUp
+/// triggers, `Forgotten`, then the cleanup verdicts.
+fn section_reason(
+    row: &WorkRow,
+    bound: &[&ConversationRow],
+    forgotten_after: Duration,
+    now: u64,
+) -> (WorkSection, String) {
+    match row.attention {
+        Attention::Waiting | Attention::Error | Attention::CompletedUnseen => {
+            return (WorkSection::NeedsYou, attention_reason(row, bound));
+        }
+        Attention::Working => return (WorkSection::Active, attention_reason(row, bound)),
+        Attention::Unknown | Attention::None => {}
+    }
+    let finished = matches!(row.landed, Some(Landed::Ancestor | Landed::Content));
+    let quiet_beyond = row
+        .last_activity
+        .is_some_and(|a| now.saturating_sub(a) > forgotten_after.as_secs());
+    // A resumable conversation asks for a pick-up only while its work is
+    // unfinished and recent: landed work goes on to cleanup and quiet work
+    // to `Forgotten`, with the conversation still listed in [3]. A project
+    // space can be neither, so its resumable conversation always counts.
+    let pick_up = row.kind == WorkKind::ProjectSpace || (!finished && !quiet_beyond);
+    if let Some(reason) = follow_up(row, bound, pick_up) {
+        return (WorkSection::FollowUp, reason);
+    }
+    // Forgotten: unfinished, nothing running, quiet strictly beyond the
+    // configured threshold - and parked suppresses only this.
+    if row.kind != WorkKind::ProjectSpace
+        && !row.parked
+        && !finished
+        && row.live_pids == 0
+        && quiet_beyond
+    {
+        let age = age_at(now, row.last_activity.unwrap_or(now));
+        return (WorkSection::Forgotten, format!("idle {age}"));
+    }
+    if let Some(pair) = cleanup_section(row) {
+        return pair;
+    }
+    match row.kind {
+        // A non-actionable space is never forgotten or cleaned: it either
+        // holds a resumable conversation or it is simply there.
+        WorkKind::ProjectSpace => (WorkSection::FollowUp, "idle project".to_owned()),
+        _ => (WorkSection::FollowUp, "open".to_owned()),
+    }
+}
+
+/// The FollowUp triggers in order: known failed or pending checks, a dirty
+/// tree, unpushed commits, a resumable idle conversation when `pick_up`
+/// says the work is still unfinished and recent, or a blocked cleanup
+/// verdict. Unknown forge state triggers nothing by itself.
+fn follow_up(row: &WorkRow, bound: &[&ConversationRow], pick_up: bool) -> Option<String> {
+    if row.forge == WorkItem::Open {
+        match row.pipeline {
+            Pipeline::Failed => return Some("checks failed".to_owned()),
+            Pipeline::Busy => return Some("checks pending".to_owned()),
+            Pipeline::Succeeded | Pipeline::Unknown => {}
+        }
+    }
+    let blocked = [row.worktree_removal.as_ref(), row.branch_deletion.as_ref()]
+        .into_iter()
+        .flatten()
+        .find(|a| a.verdict == Verdict::Blocked);
+    // Landed work whose cleanup is blocked names both facts - its
+    // remaining dirt is part of why it is blocked, not a separate ask.
+    if blocked.is_some() && matches!(row.landed, Some(Landed::Ancestor | Landed::Content)) {
+        return Some("merged · blocked".to_owned());
+    }
+    if row.dirty == Some(true) {
+        return Some("dirty".to_owned());
+    }
+    if let Some(n) = row.unpushed.filter(|n| *n > 0) {
+        return Some(format!("unpushed {n}"));
+    }
+    if pick_up
+        && bound
+            .iter()
+            .any(|c| !c.running() && !c.resume_argv.is_empty())
+    {
+        return Some("resumable idle".to_owned());
+    }
+    if let Some(blocked) = blocked {
+        // A blocked row that is not landed names its first concrete
+        // blocker and is never a cleanup candidate.
+        let first = blocked.reasons.first().map(String::as_str).unwrap_or("?");
+        return Some(format!("blocked: {first}"));
+    }
+    None
+}
+
+/// The cleanup sections: every applicable action provably safe is `Ready
+/// to clean` and names what goes; an applicable `Review` is `Cleanup
+/// review` and names its first reason. Blocked actions never land here -
+/// they are FollowUp.
+fn cleanup_section(row: &WorkRow) -> Option<(WorkSection, String)> {
+    let removal = row.worktree_removal.as_ref();
+    let deletion = row.branch_deletion.as_ref();
+    let applicable: Vec<&verdict::ActionVerdict> = [removal, deletion]
+        .into_iter()
+        .flatten()
+        .filter(|a| a.verdict != Verdict::NotApplicable)
+        .collect();
+    if applicable.is_empty() {
+        return None;
+    }
+    if applicable
+        .iter()
+        .all(|a| matches!(a.verdict, Verdict::Safe | Verdict::SafeAfterWorktreeRemoval))
+    {
+        let what = match (
+            removal.is_some_and(|a| a.verdict != Verdict::NotApplicable),
+            deletion.is_some_and(|a| a.verdict != Verdict::NotApplicable),
+        ) {
+            (true, true) => "wt + branch",
+            (true, false) => "worktree only",
+            (false, true) => "branch only",
+            (false, false) => "?", // coverage: off - `applicable` was proven non-empty above
+        };
+        return Some((WorkSection::ReadyToClean, what.to_owned()));
+    }
+    if let Some(review) = applicable.iter().find(|a| a.verdict == Verdict::Review) {
+        let first = review.reasons.first().map(String::as_str).unwrap_or("?");
+        return Some((WorkSection::CleanupReview, format!("review: {first}")));
+    } // coverage: off - the find-miss edge: `Blocked` verdicts exit at `FollowUp`, so a `Review` is always found
+    None // coverage: off - the same edge
+}
+
+/// The attention sections' reason: `waiting: permission prompt`,
+/// `error: StopFailure`, `done` - with `working` beside a retained latch
+/// while the agent grinds on.
+fn attention_reason(row: &WorkRow, bound: &[&ConversationRow]) -> String {
     let mut parts = Vec::new();
     let detail = bound
         .iter()
@@ -1185,56 +3105,129 @@ fn classify_work(row: &mut WorkRow, conversations: &[ConversationRow]) {
         Some(d) => format!("{}: {d}", row.attention.label()),
         None => row.attention.label().to_owned(),
     });
-    if row.section == Some(WorkSection::NeedsYou)
+    if row.attention != Attention::Working
         && bound.iter().any(|c| c.state == ConversationState::Busy)
     {
         parts.push("working".to_owned());
     }
-    if row.summary != "clean" {
-        parts.push(row.summary.clone());
-    }
-    row.summary = parts.join(" · ");
+    parts.join(" · ")
 }
 
-/// The section's sort slot: `Needs you`, then `Active`, then the flat
-/// remainder.
-fn section_order(row: &WorkRow) -> u8 {
-    match row.section {
-        Some(WorkSection::NeedsYou) => 0,
-        Some(WorkSection::Active) => 1,
-        None => 2,
+/// The row's final summary: the section reason, then the compact evidence
+/// tail with any phrase the reason already made dropped, then `parked`.
+fn summarize(row: &WorkRow, reason: String) -> String {
+    let mut parts = vec![reason.clone()];
+    let reason_norm = normalized(&reason);
+    let facts: Vec<String> = work_facts(row)
+        .into_iter()
+        .filter(|f| {
+            // Only a pure-word fact can duplicate the reason (`~dirty`
+            // beside `dirty`); `?`/`↑?` normalize to nothing and counts
+            // like `↑2` may disagree with the reason's own count - both
+            // always stay.
+            let f = normalized(f);
+            f.is_empty() || f.bytes().any(|b| b.is_ascii_digit()) || !reason_norm.contains(&f)
+        })
+        .collect();
+    if !facts.is_empty() {
+        parts.push(facts.join(" "));
     }
+    if row.parked {
+        parts.push("parked".to_owned());
+    }
+    parts.join(" · ")
 }
 
-/// The compact `↑3 ~2`-style field: what the row's Git evidence says about
-/// its shape, with `?` and `no remote`/`no wt` as first-class readings.
-fn work_summary(v: &vector::StateVector) -> String {
+/// `a` contains `b` as a phrase, compared on lowercase alphanumerics only,
+/// so `~dirty` dedupes against the `dirty` reason and `PR #191` against
+/// `open PR #191`.
+fn normalized(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ')
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// The compact evidence tail: `no wt`, `no remote`/`remote gone`/`?`,
+/// `↑n`, `~dirty`, `merged`, the PR/MR label and the pipeline read-out.
+/// A project space says `no git` and nothing else.
+fn work_facts(row: &WorkRow) -> Vec<String> {
+    if row.kind == WorkKind::ProjectSpace {
+        return vec!["no git".to_owned()];
+    }
     let mut parts = Vec::new();
-    if v.worktree.is_none() {
+    if row.worktree.is_none() {
         parts.push("no wt".to_owned());
     }
-    match &v.upstream_state {
-        UpstreamState::NeverPushed => parts.push("no remote".to_owned()),
-        UpstreamState::RemoteGone { .. } => parts.push("remote gone".to_owned()),
-        UpstreamState::Unknown(_) => parts.push("?".to_owned()),
+    match row.upstream {
+        Upstream::NeverPushed => parts.push("no remote".to_owned()),
+        Upstream::RemoteGone => parts.push("remote gone".to_owned()),
+        Upstream::Unknown => parts.push("?".to_owned()),
+        Upstream::Tracked | Upstream::NotApplicable => {}
+    }
+    match row.commits_ahead {
+        Some(n) if n > 0 => parts.push(format!("↑{n}")),
+        None => parts.push("↑?".to_owned()),
         _ => {}
     }
-    match &v.commits_ahead_of_base {
-        Evidence::Known(n) if *n > 0 => parts.push(format!("↑{n}")),
-        Evidence::Unknown(_) => parts.push("↑?".to_owned()),
-        _ => {}
-    }
-    if let Evidence::Known(true) = v.dirty {
+    if row.dirty == Some(true) {
         parts.push("~dirty".to_owned());
     }
-    if parts.is_empty() {
-        parts.push("clean".to_owned());
+    if matches!(row.landed, Some(Landed::Ancestor | Landed::Content)) {
+        parts.push("merged".to_owned());
     }
-    parts.join(" ")
+    if let Some(label) = &row.forge_label {
+        parts.push(label.clone());
+    }
+    if row.forge == WorkItem::Open {
+        match row.pipeline {
+            Pipeline::Failed => parts.push("checks failed".to_owned()),
+            Pipeline::Busy => parts.push("checks pending".to_owned()),
+            Pipeline::Succeeded => parts.push("checks ok".to_owned()),
+            Pipeline::Unknown => {}
+        }
+    }
+    parts
+}
+
+/// Repos order by latest meaningful activity, unknown last, then a
+/// stable name/id.
+fn sort_repos(repos: &mut [RepoRow]) {
+    repos.sort_by(|a, b| {
+        b.last_activity
+            .cmp(&a.last_activity)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+/// The section's sort slot, in the enum's declared order.
+fn section_order(row: &WorkRow) -> u8 {
+    match row.section {
+        WorkSection::NeedsYou => 0,
+        WorkSection::Active => 1,
+        WorkSection::FollowUp => 2,
+        WorkSection::Forgotten => 3,
+        WorkSection::ReadyToClean => 4,
+        WorkSection::CleanupReview => 5,
+    }
+}
+
+/// How long ago `then` was at `now`, in the TUI's age buckets.
+fn age_at(now: u64, then: u64) -> String {
+    let secs = now.saturating_sub(then);
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
 }
 
 /// A non-git space's single row: the space anchors conversations but has
-/// no Git evidence, so every Git cell is a plain unknown or n/a.
+/// no Git evidence, so every Git cell is a plain unknown or n/a. Its work
+/// identity is its canonical path; parked and transition dates apply per
+/// publish through `apply_path_record`.
 fn space_row(repo_id: &str, path: &Path) -> WorkRow {
     WorkRow {
         repo: repo_id.to_owned(),
@@ -1246,6 +3239,7 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         worktree: Some(path.to_owned()),
         branch: None,
         dirty: None,
+        broken: None,
         commits_ahead: None,
         unpushed: None,
         upstream: Upstream::NotApplicable,
@@ -1258,8 +3252,25 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         past_sessions: 0,
         last_activity: None,
         attention: Attention::None,
-        section: None,
-        summary: "no git".to_owned(),
+        identity: Some(path.display().to_string()),
+        incarnation: None,
+        same_name_history: Vec::new(),
+        parked: false,
+        forge: WorkItem::Unknown,
+        pipeline: Pipeline::Unknown,
+        forge_label: None,
+        forge_url: None,
+        commits_behind: None,
+        commits: None,
+        panes: Vec::new(),
+        gone: None,
+        references: Vec::new(),
+        activities: Vec::new(),
+        observations: Vec::new(),
+        worktree_removal: None,
+        branch_deletion: None,
+        section: WorkSection::FollowUp,
+        summary: String::new(),
     }
 }
 
@@ -1291,10 +3302,17 @@ fn carry_remote(new: &mut vector::WorkState, old: &vector::WorkState) {
     new.vector.upstream_state = old.vector.upstream_state.clone();
     new.base = old.base.clone();
     new.vector.commits_ahead_of_base = old.vector.commits_ahead_of_base.clone();
+    new.vector.commits_behind_of_base = old.vector.commits_behind_of_base.clone();
+    new.vector.commits_not_on_base = old.vector.commits_not_on_base.clone();
     new.vector.landed = old.vector.landed.clone();
     if pending(&new.vector.unpushed_commits) {
         new.vector.unpushed_commits = old.vector.unpushed_commits.clone();
     }
+    // The forge overlay is stage-4-owned: it keeps its last answer until
+    // stage 4 lands this pass's.
+    if new.forge.reason.as_deref() == Some(vector::PENDING) {
+        new.forge = old.forge.clone();
+    } // coverage: off - the else edge: a fresh stage-3 state is always `collection pending`
 }
 
 /// Whether an `Evidence` is the not-yet-landed placeholder.
@@ -1316,7 +3334,10 @@ fn process_start(start: ProcessStart) -> Option<u64> {
 }
 
 /// `resolved` -> the row's attachment view.
-fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
+fn attachment_row(
+    r: &crate::runtime::ResolvedAttachment,
+    panes: &tmux::PaneInventory,
+) -> AttachmentRow {
     let (liveness, liveness_detail) = match &r.liveness {
         Liveness::Instance => (AttachmentLiveness::Instance, None),
         Liveness::PidOnly(reason) => (AttachmentLiveness::PidOnly, Some(reason.clone())),
@@ -1333,16 +3354,29 @@ fn attachment_row(r: &crate::runtime::ResolvedAttachment) -> AttachmentRow {
         pid_start: process_start(r.attachment.process.pid_start),
         liveness,
         liveness_detail,
-        pane: r.attachment.pane.as_ref().map(display_pane),
+        pane: r.attachment.pane.as_ref().map(|p| display_pane(p, panes)),
+        target: r
+            .attachment
+            .pane
+            .as_ref()
+            .and_then(|pref| panes.get(pref).map(|p| p.target())),
         pane_source,
         placement_detail,
+        source: r.attachment.source,
+        observed_at: epoch(r.attachment.observed_at),
     }
 }
 
 /// A resolved attachment's pane as `session:window.pane` - the handle shape
-/// a provider would publish - when the pane record is findable.
-fn display_pane(pane: &PaneRef) -> String {
-    pane.to_string()
+/// a provider would publish - when the pane record is findable; the
+/// socket-qualified id otherwise.
+fn display_pane(pane: &PaneRef, panes: &tmux::PaneInventory) -> String {
+    panes
+        .panes
+        .iter()
+        .find(|p| p.id == pane.pane && p.socket == pane.socket)
+        .map(|p| format!("{}:{}.{}", p.session_name, p.window, p.id))
+        .unwrap_or_else(|| pane.to_string())
 }
 
 /// A focus acknowledgement the store refused, reported for the evidence
@@ -1390,10 +3424,10 @@ fn retain_live_undated(undated: &mut HashMap<String, Undated>, live_keys: &HashS
     undated.retain(|key, _| live_keys.contains(key));
 }
 
-/// Whether two readings of one pid's start are the same instance. An
-/// OS-derived start is recomputed from `etime` each poll and can move by a
-/// second across a boundary, so it compares with `ProcessStart`'s tolerance
-/// rather than exactly; two undated readings stay pid-only and equal.
+/// Whether two readings of one pid's start are the same instance. A start
+/// may come from the OS or from a provider's quantized record, so it
+/// compares with `ProcessStart`'s tolerance rather than exactly; two
+/// undated readings stay pid-only and equal.
 fn same_start(a: ProcessStart, b: ProcessStart) -> bool {
     a.matches(&b).unwrap_or(a == b)
 }
@@ -1443,6 +3477,20 @@ fn is_own_pane(own_pane: Option<&PaneRef>, pane: &PaneRef) -> bool {
         && (own.socket == pane.socket || canonical(&own.socket) == canonical(&pane.socket))
 }
 
+/// The store evidence a conversation row carries into its `e` view,
+/// bundled so `conversation_row`'s parameter list stays readable.
+#[derive(Default)]
+struct EvidenceIn<'a> {
+    /// The journal fold for the conversation.
+    fold: Option<&'a store::Fold>,
+    /// Its acknowledgement state.
+    seen: store::Seen,
+    /// The authored not-busy mark.
+    mark: Option<store::Mark>,
+    /// Records the fold rejected while loading this pass.
+    rejected: Vec<store::RejectedRecord>,
+}
+
 fn conversation_row(
     conv: &Conversation,
     attachment: Option<AttachmentRow>,
@@ -1450,6 +3498,7 @@ fn conversation_row(
     repo: Option<String>,
     worktree: Option<PathBuf>,
     branch: Option<String>,
+    evidence: EvidenceIn<'_>,
 ) -> ConversationRow {
     let state = match derived.exec {
         Exec::Busy => ConversationState::Busy,
@@ -1461,6 +3510,20 @@ fn conversation_row(
         StateEvidence::Published(p) => p.raw,
         StateEvidence::Absent => None,
     };
+    // Read before `derived.claims` and `attachment` move into the row.
+    let marked = derived.marked;
+    let jseq = (derived.journal_seq > 0).then_some(derived.journal_seq);
+    let process_start = attachment.as_ref().and_then(|a| a.pid_start);
+    // Conversation activity is source-backed only: transcript message
+    // times and the fold's hook producer times. Live publication times
+    // (`updatedAt`, `statusUpdatedAt`) and first detection never count.
+    let last_activity_ms = [
+        conv.last_activity().map(store::epoch_ms),
+        evidence.fold.and_then(|f| f.last_pts),
+    ]
+    .into_iter()
+    .flatten()
+    .max();
     ConversationRow {
         provider: Provider::Claude,
         session_id: conv.session_id.clone(),
@@ -1480,8 +3543,8 @@ fn conversation_row(
         attention_detail: derived.attention_detail,
         attention_seq: (derived.ack_through > 0).then_some(derived.ack_through),
         attention_wait_ms: derived.wait_ms,
-        journal_seq: (derived.journal_seq > 0).then_some(derived.journal_seq),
-        last_activity: conv.last_activity().map(epoch),
+        journal_seq: jseq,
+        last_activity: last_activity_ms.map(|ms| ms / 1000),
         live: conv.live.is_some(),
         attachment,
         cwd: conv.cwd().map(Path::to_owned),
@@ -1503,6 +3566,39 @@ fn conversation_row(
         repo,
         worktree,
         branch,
+        touches: Vec::new(),
+        current_incarnation: None,
+        started_at: conv
+            .transcript
+            .as_ref()
+            .and_then(|t| t.first_at)
+            .map(epoch)
+            .or(process_start),
+        // Filled per publish by `relate`, once every row's touches are
+        // this pass's.
+        related: Vec::new(),
+        evidence: EvidenceRow {
+            claims: derived.claims,
+            latches: evidence.fold.map_or(Vec::new(), |f| {
+                f.retained
+                    .iter()
+                    .map(|r| LatchRow {
+                        seq: r.seq,
+                        kind: r.kind,
+                        at_ms: r.at_ms,
+                        reason: r.reason.clone(),
+                        acknowledged: r.seq <= evidence.seen.seq,
+                    })
+                    .collect()
+            }),
+            rejected: evidence.rejected,
+            seen_seq: (evidence.seen.seq > 0).then_some(evidence.seen.seq),
+            seen_wait_ms: evidence.seen.wait_ms,
+            mark: evidence.mark,
+            mark_suppressed: marked,
+            journal_seq: jseq,
+            producer_seq: evidence.fold.and_then(|f| f.pseq_high),
+        },
     }
 }
 
@@ -1620,6 +3716,7 @@ mod tests {
             first_at: None,
             last_at: Some(last_at),
             malformed_lines: 0,
+            branch_trail: Vec::new(),
         }
     }
 
@@ -1644,6 +3741,42 @@ mod tests {
         }
     }
 
+    /// A branch record fabricated to order.
+    fn branch_record(id: &str, first_ms: u64, ended_ms: Option<u64>) -> store::BranchRecord {
+        store::BranchRecord {
+            id: id.to_owned(),
+            repo: "/r/.git".to_owned(),
+            ref_name: "feat".to_owned(),
+            first_observed_at: first_ms,
+            last_observed_at: first_ms,
+            head: None,
+            creation_evidence: None,
+            continuity_evidence: store::ContinuityEvidence::FirstObservation,
+            ended_at: ended_ms,
+            parked: false,
+            activities: Vec::new(),
+            inputs: store::LifecycleInputs::default(),
+            observations: Vec::new(),
+            session_activity: Default::default(),
+        }
+    }
+
+    /// An open exact touch to `id`, as a fabricated conversation carries
+    /// it.
+    fn open_touch(id: &str) -> TouchRow {
+        TouchRow {
+            incarnation_id: id.to_owned(),
+            repo: "/r/.git".to_owned(),
+            ref_name: "feat".to_owned(),
+            incarnation: 1,
+            head: Some("aaaaaa".to_owned()),
+            valid_from: 1_000,
+            valid_until: None,
+            provenance: store::TouchProvenance::Cwd,
+            confidence: store::Confidence::Exact,
+        }
+    }
+
     /// A derived verdict fabricated to order.
     fn derived(exec: Exec, attention: Attention) -> attention::Derived {
         attention::Derived {
@@ -1656,7 +3789,191 @@ mod tests {
             wait_ms: None,
             journal_seq: 0,
             marked: false,
+            claims: Vec::new(),
         }
+    }
+
+    #[test]
+    fn incarnation_numbering_is_oldest_first_with_a_stable_tiebreak() {
+        // Two records one pass both dated order by id - deterministic,
+        // never insertion order.
+        let mut work = store::Work::default();
+        work.branches
+            .insert("i-zz".to_owned(), branch_record("i-zz", 1_000, Some(2_000)));
+        work.branches
+            .insert("i-aa".to_owned(), branch_record("i-aa", 1_000, None));
+        work.branches
+            .insert("i-old".to_owned(), branch_record("i-old", 500, None));
+        let numbers = incarnation_numbers(&work);
+        assert_eq!(numbers["i-old"], 1);
+        assert_eq!(numbers["i-aa"], 2);
+        assert_eq!(numbers["i-zz"], 3);
+    }
+
+    #[test]
+    fn a_touch_whose_record_is_gone_serializes_to_nothing() {
+        // A dangling interval - a record pruned while the touch that
+        // referenced it was lost - is dropped from the view, not guessed.
+        let work = store::Work::default();
+        let numbers = incarnation_numbers(&work);
+        let touch = store::BranchTouch {
+            conversation: "claude:s1".to_owned(),
+            branch: "i-gone".to_owned(),
+            head: Some("a".to_owned()),
+            valid_from: 1_000,
+            valid_until: None,
+            provenance: store::TouchProvenance::Cwd,
+            confidence: store::Confidence::Exact,
+        };
+        assert!(touch_row(&touch, &work, &numbers).is_none());
+        // With the record present, the interval resolves its context.
+        let mut work = store::Work::default();
+        work.branches
+            .insert("i-1".to_owned(), branch_record("i-1", 1_000, Some(2_000)));
+        let numbers = incarnation_numbers(&work);
+        let touch = store::BranchTouch {
+            conversation: "claude:s1".to_owned(),
+            branch: "i-1".to_owned(),
+            head: Some("a".to_owned()),
+            valid_from: 1_500,
+            valid_until: Some(2_000),
+            provenance: store::TouchProvenance::Cwd,
+            confidence: store::Confidence::Exact,
+        };
+        let row = touch_row(&touch, &work, &numbers).expect("the row resolves");
+        assert_eq!(row.incarnation, 1);
+        assert_eq!(row.ref_name, "feat");
+        assert_eq!(row.valid_from, 1);
+        assert_eq!(row.valid_until, Some(2));
+    }
+
+    #[test]
+    fn work_row_splits_active_incarnation_from_excluded_history() {
+        // The same-name records split across the row: the active one is
+        // the numbered incarnation, the closed ones are excluded history.
+        let mut work = store::Work::default();
+        work.branches
+            .insert("i-1".to_owned(), branch_record("i-1", 1_000, Some(2_000)));
+        work.branches
+            .insert("i-2".to_owned(), branch_record("i-2", 3_000, Some(4_000)));
+        work.branches
+            .insert("i-3".to_owned(), branch_record("i-3", 5_000, None));
+        work.active_branches
+            .insert("/r/.git\0feat".to_owned(), "i-3".to_owned());
+        let state = vector::WorkState {
+            repo: git::Repo {
+                common_dir: PathBuf::from("/r/.git"),
+            },
+            anchor: Anchor::Branch {
+                name: "feat".to_owned(),
+            },
+            remote_url: None,
+            base: Evidence::Unknown("no base asked".to_owned()),
+            forge: ForgeStatus {
+                item: WorkItem::Unknown,
+                pipeline: Pipeline::Unknown,
+                label: None,
+                url: None,
+                reason: None,
+                occurred_at_ms: None,
+            },
+            broken: None,
+            vector: vector::StateVector {
+                worktree: None,
+                windows: WindowCount::default(),
+                live_pids: 0,
+                live_agent_sessions: 0,
+                past_agent_sessions: 0,
+                dirty: Evidence::Known(false),
+                working_tree: Evidence::Unknown("no worktree".to_owned()),
+                commits_ahead_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_behind_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_not_on_base: Evidence::Unknown("none asked".to_owned()),
+                upstream_state: UpstreamState::NotApplicable,
+                unpushed_commits: Evidence::Unknown("none asked".to_owned()),
+                landed: Evidence::Unknown("none asked".to_owned()),
+                reflog_activity: None,
+                commit_activity: None,
+                last_git_activity: None,
+            },
+        };
+        let row = work_row("/r/.git", "r", &state, None, &work);
+        let inc = row.incarnation.expect("the active incarnation");
+        assert_eq!(inc.id, "i-3");
+        assert_eq!(inc.number, 3);
+        assert!(!inc.excluded);
+        let ids: Vec<&str> = row
+            .same_name_history
+            .iter()
+            .map(|h| h.id.as_str())
+            .collect();
+        assert_eq!(ids, ["i-1", "i-2"]);
+        assert!(row.same_name_history.iter().all(|h| h.excluded));
+        assert_eq!(row.identity.as_deref(), Some("i-3"));
+    }
+
+    #[test]
+    fn a_broken_worktree_row_describes_its_break() {
+        let dir = std::env::temp_dir().join(format!("asd-broken-wt-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let state = |broken: &str| vector::WorkState {
+            repo: git::Repo {
+                common_dir: PathBuf::from("/r/.git"),
+            },
+            anchor: Anchor::Worktree {
+                path: dir.clone(),
+                admin_id: Some("wt".to_owned()),
+                head: Head::Detached("deadbeef".to_owned()),
+                locked: false,
+                main: false,
+                prunable: Some(broken.to_owned()),
+            },
+            remote_url: None,
+            base: Evidence::Unknown("no base asked".to_owned()),
+            forge: ForgeStatus {
+                item: WorkItem::Unknown,
+                pipeline: Pipeline::Unknown,
+                label: None,
+                url: None,
+                reason: None,
+                occurred_at_ms: None,
+            },
+            broken: Some(broken.to_owned()),
+            vector: vector::StateVector {
+                worktree: Some(dir.clone()),
+                windows: WindowCount::default(),
+                live_pids: 0,
+                live_agent_sessions: 0,
+                past_agent_sessions: 0,
+                dirty: Evidence::Known(false),
+                working_tree: Evidence::Unknown("no worktree".to_owned()),
+                commits_ahead_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_behind_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_not_on_base: Evidence::Unknown("none asked".to_owned()),
+                upstream_state: UpstreamState::NotApplicable,
+                unpushed_commits: Evidence::Unknown("none asked".to_owned()),
+                landed: Evidence::Unknown("none asked".to_owned()),
+                reflog_activity: None,
+                commit_activity: None,
+                last_git_activity: None,
+            },
+        };
+        let authored = store::Work::default();
+        let row = work_row(
+            "/r/.git",
+            "r",
+            &state("gitdir file points to non-existent location"),
+            None,
+            &authored,
+        );
+        assert_eq!(
+            row.broken.as_deref(),
+            Some(".git missing; metadata retained by r")
+        );
+        fs::write(dir.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let row = work_row("/r/.git", "r", &state("checkout moved"), None, &authored);
+        assert_eq!(row.broken.as_deref(), Some("checkout moved"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1676,6 +3993,7 @@ mod tests {
                 None,
                 None,
                 None,
+                EvidenceIn::default(),
             );
             assert_eq!(row.state, want, "{want:?}");
             assert!(row.live);
@@ -1687,6 +4005,7 @@ mod tests {
             None,
             None,
             None,
+            EvidenceIn::default(),
         );
         assert_eq!(row.state, ConversationState::Unknown);
         assert!(!row.live);
@@ -1708,6 +4027,7 @@ mod tests {
             None,
             None,
             None,
+            EvidenceIn::default(),
         );
         assert_eq!(row.state_since, Some(1_800_000_000));
         // A not-busy mark names only an arbitrated `since`.
@@ -1721,6 +4041,7 @@ mod tests {
             None,
             None,
             None,
+            EvidenceIn::default(),
         );
         assert_eq!(row.state_since, Some(1_800_000_060));
         // An arbitrated `since` wins over the provider's.
@@ -1733,6 +4054,7 @@ mod tests {
             None,
             None,
             None,
+            EvidenceIn::default(),
         );
         assert_eq!(row.state_since, Some(1_700_000_000));
     }
@@ -1777,66 +4099,54 @@ mod tests {
                 None,
             ),
         ] {
-            let row = attachment_row(&attachment(liveness, placement, true));
+            let row = attachment_row(
+                &attachment(liveness, placement, true),
+                &tmux::PaneInventory::default(),
+            );
             assert_eq!(row.liveness, want_state);
             assert_eq!(row.pane_source, want_source);
         }
         // A bound pane renders its handle; a dead one renders the reason.
-        let dead = attachment_row(&attachment(
-            Liveness::Dead("gone".to_owned()),
-            Placement::Dead("gone".to_owned()),
-            true,
-        ));
+        let dead = attachment_row(
+            &attachment(
+                Liveness::Dead("gone".to_owned()),
+                Placement::Dead("gone".to_owned()),
+                true,
+            ),
+            &tmux::PaneInventory::default(),
+        );
         assert_eq!(dead.placement_detail.as_deref(), Some("gone"));
         assert!(dead.pane.is_some(), "the pane ref stays for evidence");
-        let bare = attachment_row(&attachment(
-            Liveness::Instance,
-            Placement::Bound(PaneSource::Ancestry),
-            false,
-        ));
+        let bare = attachment_row(
+            &attachment(
+                Liveness::Instance,
+                Placement::Bound(PaneSource::Ancestry),
+                false,
+            ),
+            &tmux::PaneInventory::default(),
+        );
         assert!(bare.pane.is_none());
         assert_eq!(bare.pid_start, Some(1_800_000_000));
-        let undated = attachment_row(&attachment(
-            Liveness::Instance,
-            Placement::Bound(PaneSource::Ancestry),
-            false,
-        ));
+        let undated = attachment_row(
+            &attachment(
+                Liveness::Instance,
+                Placement::Bound(PaneSource::Ancestry),
+                false,
+            ),
+            &tmux::PaneInventory::default(),
+        );
         let _ = undated;
-    }
-
-    /// A `StateVector` that reports nothing - the base case every arm
-    /// overrides on.
-    fn empty_vector() -> vector::StateVector {
-        vector::StateVector {
-            worktree: None,
-            windows: WindowCount::default(),
-            live_pids: 0,
-            live_agent_sessions: 0,
-            past_agent_sessions: 0,
-            dirty: Evidence::Unknown("no checkout".to_owned()),
-            commits_ahead_of_base: Evidence::Unknown("no base".to_owned()),
-            upstream_state: UpstreamState::NotApplicable,
-            unpushed_commits: Evidence::Unknown("no base".to_owned()),
-            landed: Evidence::Unknown("no base".to_owned()),
-            last_git_activity: None,
-        }
     }
 
     #[test]
     fn classification_rolls_attention_up_to_first_match_sections() {
         // A work row's section is the bound conversations' best rank:
-        // waiting/error/done -> `Needs you`, working -> `Active`, anything
-        // else stays flat.
-        // A branch-only row, fabricated: no checkout, a Git summary to its
-        // name.
-        let mut row = WorkRow {
-            kind: WorkKind::Branch,
-            worktree: None,
-            branch: Some("feat".to_owned()),
-            summary: "no wt ↑?".to_owned(),
-            ..space_row("r", Path::new("/r"))
-        };
-        row.repo = "/r/.git".to_owned();
+        // waiting/error/done -> `Needs you`, working -> `Active`, and
+        // anything else goes on to the FollowUp and cleanup sections.
+        // A branch-only row, fabricated: no checkout, its Git evidence
+        // unread (`no wt ↑?` in the facts tail).
+        let threshold = Duration::from_secs(14 * 24 * 3600);
+        let now = 2_000_000_000;
         let conv = |attention, state| {
             let mut c = conversation_row(
                 &conversation(None, None),
@@ -1845,65 +4155,82 @@ mod tests {
                 Some("/r/.git".to_owned()),
                 None,
                 Some("feat".to_owned()),
+                EvidenceIn::default(),
             );
             c.state = state;
+            // The fabricated row's identity is its path; the touch to it
+            // is what binds the conversation to the row.
+            c.touches = vec![open_touch("/r")];
             c
         };
         // `classify_work` composes the summary once per publish; the test
         // rebuilds the row between classifications to keep it honest.
         let fresh = || WorkRow {
+            repo: "/r/.git".to_owned(),
             kind: WorkKind::Branch,
             worktree: None,
             branch: Some("feat".to_owned()),
-            summary: "no wt ↑?".to_owned(),
             ..space_row("r", Path::new("/r"))
         };
         let mut row = fresh();
-        row.repo = "/r/.git".to_owned();
         classify_work(
             &mut row,
             &[conv(Attention::Working, ConversationState::Busy)],
+            threshold,
+            now,
         );
-        assert_eq!(row.section, Some(WorkSection::Active));
+        assert_eq!(row.section, WorkSection::Active);
         assert_eq!(row.attention, Attention::Working);
         assert_eq!(row.summary, "working · no wt ↑?");
 
         // A retained error with the agent back at work: `error · working`.
         let mut row = fresh();
-        row.repo = "/r/.git".to_owned();
         let mut err = conv(Attention::Error, ConversationState::Busy);
         err.attention_detail = Some("StopFailure".to_owned());
-        classify_work(&mut row, &[err]);
-        assert_eq!(row.section, Some(WorkSection::NeedsYou));
+        classify_work(&mut row, &[err], threshold, now);
+        assert_eq!(row.section, WorkSection::NeedsYou);
         assert_eq!(row.summary, "error: StopFailure · working · no wt ↑?");
 
-        // A clean Git shape adds nothing beside the attention.
+        // A quiet, clean tree adds no facts beside the attention; the row
+        // has a checkout, so the conversation binds by its path.
         let mut row = fresh();
-        row.repo = "/r/.git".to_owned();
-        row.summary = "clean".to_owned();
-        classify_work(
-            &mut row,
-            &[conv(Attention::CompletedUnseen, ConversationState::Idle)],
-        );
+        row.worktree = Some(PathBuf::from("/r/wt"));
+        row.dirty = Some(false);
+        row.commits_ahead = Some(0);
+        let mut done = conv(Attention::CompletedUnseen, ConversationState::Idle);
+        done.worktree = Some(PathBuf::from("/r/wt"));
+        classify_work(&mut row, &[done], threshold, now);
         assert_eq!(row.summary, "done");
 
+        // No attention and nothing actionable: `Follow up`, resumable
+        // when a bound conversation can be resumed, plain `open` when not.
         let mut row = fresh();
-        row.repo = "/r/.git".to_owned();
-        classify_work(&mut row, &[conv(Attention::None, ConversationState::Idle)]);
-        assert_eq!(row.section, None);
-        // A conversation on another branch does not bind.
+        classify_work(
+            &mut row,
+            &[conv(Attention::None, ConversationState::Idle)],
+            threshold,
+            now,
+        );
+        assert_eq!(row.section, WorkSection::FollowUp);
+        assert_eq!(row.summary, "resumable idle · no wt ↑?");
+        let mut row = fresh();
+        classify_work(&mut row, &[], threshold, now);
+        assert_eq!(row.summary, "open · no wt ↑?");
+        // A conversation on another branch does not bind: its touch
+        // names a different incarnation.
         let mut other = conv(Attention::Waiting, ConversationState::Waiting);
         other.branch = Some("elsewhere".to_owned());
-        classify_work(&mut row, &[other]);
-        assert_eq!(row.section, None);
+        other.touches = vec![open_touch("i-elsewhere")];
+        classify_work(&mut row, &[other], threshold, now);
+        assert_eq!(row.section, WorkSection::FollowUp);
         assert_eq!(row.attention, Attention::None);
         // And the ordering puts Needs you first.
         assert!(
             section_order(&WorkRow {
-                section: Some(WorkSection::NeedsYou),
+                section: WorkSection::NeedsYou,
                 ..space_row("s", Path::new("/s"))
             }) < section_order(&WorkRow {
-                section: Some(WorkSection::Active),
+                section: WorkSection::Active,
                 ..space_row("s", Path::new("/s"))
             })
         );
@@ -1911,43 +4238,223 @@ mod tests {
 
     #[test]
     fn summaries_spell_git_shape_and_unknowns() {
-        let v = empty_vector();
-        assert_eq!(work_summary(&v), "no wt ↑?");
-
-        let mut v = empty_vector();
-        v.worktree = Some(PathBuf::from("/w"));
-        v.dirty = Evidence::Known(true);
-        v.commits_ahead_of_base = Evidence::Known(3);
-        v.upstream_state = UpstreamState::NeverPushed;
-        v.unpushed_commits = Evidence::Known(3);
-        assert_eq!(work_summary(&v), "no remote ↑3 ~dirty");
-
-        v.upstream_state = UpstreamState::Tracked {
-            remote: "origin".to_owned(),
-            merge_ref: "refs/heads/main".to_owned(),
+        // The evidence tail a WorkRow's fields produce, independent of the
+        // section reason that prefixes it.
+        let row = |f: &dyn Fn(&mut WorkRow)| {
+            let mut row = WorkRow {
+                kind: WorkKind::Branch,
+                worktree: Some(PathBuf::from("/w")),
+                branch: Some("b".to_owned()),
+                dirty: Some(false),
+                commits_ahead: Some(0),
+                unpushed: Some(0),
+                upstream: Upstream::Tracked,
+                landed: Some(Landed::No),
+                ..space_row("r", Path::new("/r"))
+            };
+            f(&mut row);
+            row
         };
-        assert_eq!(work_summary(&v), "↑3 ~dirty");
+        let facts = |row: &WorkRow| work_facts(row).join(" ");
 
-        v.upstream_state = UpstreamState::RemoteGone {
-            remote: "origin".to_owned(),
-            merge_ref: "refs/heads/main".to_owned(),
+        assert_eq!(facts(&row(&|_| {})), "");
+
+        let r = row(&|r| {
+            r.worktree = None;
+            r.commits_ahead = None;
+            r.upstream = Upstream::NotApplicable;
+        });
+        assert_eq!(facts(&r), "no wt ↑?");
+
+        let r = row(&|r| {
+            r.dirty = Some(true);
+            r.commits_ahead = Some(3);
+            r.upstream = Upstream::NeverPushed;
+        });
+        assert_eq!(facts(&r), "no remote ↑3 ~dirty");
+
+        let r = row(&|r| {
+            r.dirty = Some(true);
+            r.commits_ahead = Some(3);
+        });
+        assert_eq!(facts(&r), "↑3 ~dirty");
+
+        let r = row(&|r| {
+            r.dirty = Some(true);
+            r.commits_ahead = Some(3);
+            r.upstream = Upstream::RemoteGone;
+        });
+        assert_eq!(facts(&r), "remote gone ↑3 ~dirty");
+
+        let r = row(&|r| {
+            r.dirty = Some(true);
+            r.commits_ahead = Some(3);
+            r.upstream = Upstream::Unknown;
+        });
+        assert_eq!(facts(&r), "? ↑3 ~dirty");
+
+        // Delivery and forge facts join the tail.
+        let r = row(&|r| {
+            r.landed = Some(Landed::Ancestor);
+            r.forge = WorkItem::Open;
+            r.forge_label = Some("PR #191".to_owned());
+            r.pipeline = Pipeline::Busy;
+        });
+        assert_eq!(facts(&r), "merged PR #191 checks pending");
+
+        // A project space says `no git` and nothing else.
+        assert_eq!(
+            work_facts(&space_row("s", Path::new("/s"))).join(" "),
+            "no git"
+        );
+
+        // The summary keeps every fact the reason did not already say.
+        let mut r = row(&|r| {
+            r.dirty = Some(true);
+            r.commits_ahead = Some(3);
+        });
+        r.summary = summarize(&r, "dirty".to_owned());
+        assert_eq!(r.summary, "dirty · ↑3");
+        r.summary = summarize(&r, "merged · blocked".to_owned());
+        assert_eq!(r.summary, "merged · blocked · ↑3 ~dirty");
+        r.landed = Some(Landed::Ancestor);
+        r.summary = summarize(&r, "merged · blocked".to_owned());
+        assert_eq!(r.summary, "merged · blocked · ↑3 ~dirty");
+        r.parked = true;
+        r.summary = summarize(&r, "merged · blocked".to_owned());
+        assert_eq!(r.summary, "merged · blocked · ↑3 ~dirty · parked");
+    }
+
+    #[test]
+    fn forgotten_idle_project_and_cleanup_reasons_cover_their_arms() {
+        let now = 2_000_000_000u64;
+        // The age buckets a `Forgotten` reason reads - one per width.
+        for (threshold, age, want) in [
+            (Duration::from_secs(10), 30u64, "idle 30s"),
+            (Duration::from_secs(10), 300, "idle 5m"),
+            (Duration::from_secs(10), 7_200, "idle 2h"),
+            (Duration::from_secs(10), 100_000, "idle 1d"),
+        ] {
+            let mut row = WorkRow {
+                kind: WorkKind::Branch,
+                branch: Some("b".to_owned()),
+                dirty: Some(false),
+                commits_ahead: Some(1),
+                unpushed: Some(0),
+                upstream: Upstream::Tracked,
+                landed: Some(Landed::No),
+                last_activity: Some(now - age),
+                // Verdicts that would otherwise claim the row for review:
+                // not applicable here, so `Forgotten` proves it ran first.
+                worktree_removal: None,
+                branch_deletion: None,
+                ..space_row("r", Path::new("/r"))
+            };
+            classify_work(&mut row, &[], threshold, now);
+            assert_eq!(row.section, WorkSection::Forgotten, "{row:?}");
+            assert!(
+                row.summary.starts_with(want),
+                "{want:?} vs {:?}",
+                row.summary
+            );
+        }
+        // A parked row of the same age cannot be forgotten.
+        let mut row = WorkRow {
+            kind: WorkKind::Branch,
+            branch: Some("b".to_owned()),
+            dirty: Some(false),
+            commits_ahead: Some(1),
+            unpushed: Some(0),
+            upstream: Upstream::Tracked,
+            landed: Some(Landed::No),
+            last_activity: Some(now - 100_000),
+            parked: true,
+            ..space_row("r", Path::new("/r"))
         };
-        assert_eq!(work_summary(&v), "remote gone ↑3 ~dirty");
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.section, WorkSection::FollowUp, "{row:?}");
+        assert!(row.summary.ends_with("· parked"), "{}", row.summary);
 
-        v.upstream_state = UpstreamState::Unknown("unreachable".to_owned());
-        assert_eq!(work_summary(&v), "? ↑3 ~dirty");
+        // A project space with nothing resumable is `idle project`.
+        let mut row = space_row("s", Path::new("/s"));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.section, WorkSection::FollowUp);
+        assert_eq!(row.summary, "idle project · no git");
 
-        v.dirty = Evidence::Unknown("huh".to_owned());
-        v.commits_ahead_of_base = Evidence::Known(0);
-        assert_eq!(work_summary(&v), "?");
+        // The cleanup sections' reason names what the verdicts allow:
+        // only a worktree, only a branch, both, and a review's first
+        // reason.
+        let verdict = |v, rs: &[&str]| crate::verdict::ActionVerdict {
+            verdict: v,
+            reasons: rs.iter().map(|&s| s.to_owned()).collect(),
+        };
+        let mut row = WorkRow {
+            kind: WorkKind::Worktree,
+            worktree: Some(PathBuf::from("/r/wt")),
+            branch: Some("b".to_owned()),
+            dirty: Some(false),
+            commits_ahead: Some(0),
+            unpushed: Some(0),
+            upstream: Upstream::Tracked,
+            landed: Some(Landed::Ancestor),
+            worktree_removal: Some(verdict(Verdict::Safe, &["clean"])),
+            branch_deletion: Some(verdict(Verdict::NotApplicable, &[])),
+            ..space_row("r", Path::new("/r"))
+        };
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.section, WorkSection::ReadyToClean);
+        assert_eq!(row.summary, "worktree only · merged");
+        row.branch_deletion = Some(verdict(Verdict::SafeAfterWorktreeRemoval, &[]));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.summary, "wt + branch · merged");
+        row.worktree_removal = Some(verdict(Verdict::NotApplicable, &[]));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.summary, "branch only · merged");
+        row.branch_deletion = Some(verdict(Verdict::Review, &["needs -D"]));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.section, WorkSection::CleanupReview);
+        assert!(
+            row.summary.starts_with("review: needs -D"),
+            "{}",
+            row.summary
+        );
+        row.branch_deletion = Some(verdict(Verdict::Review, &[]));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert!(row.summary.starts_with("review: ?"), "{}", row.summary);
+        // Nothing applicable at all is neither section.
+        row.worktree_removal = Some(verdict(Verdict::NotApplicable, &[]));
+        row.branch_deletion = Some(verdict(Verdict::NotApplicable, &[]));
+        classify_work(&mut row, &[], Duration::from_secs(10), now);
+        assert_eq!(row.section, WorkSection::FollowUp, "{row:?}");
+        assert!(row.summary.starts_with("open"), "{}", row.summary);
+    }
 
-        // Nothing to say at all reads `clean`.
-        let mut v = empty_vector();
-        v.worktree = Some(PathBuf::from("/w"));
-        v.dirty = Evidence::Known(false);
-        v.commits_ahead_of_base = Evidence::Known(0);
-        v.unpushed_commits = Evidence::Known(0);
-        assert_eq!(work_summary(&v), "clean");
+    #[test]
+    fn repos_order_activity_then_name_then_id() {
+        let row = |name: &str, id: &str, last: Option<u64>| RepoRow {
+            name: name.to_owned(),
+            id: id.to_owned(),
+            path: PathBuf::from("/s"),
+            git: true,
+            work: 0,
+            live: 0,
+            attention: Attention::None,
+            open: 0,
+            clean: 0,
+            last_activity: last,
+            default_branch: None,
+            remote: None,
+            counts: RepoCounts::default(),
+        };
+        let mut repos = vec![
+            row("b", "/z", Some(2)),
+            row("a", "/b", Some(1)),
+            row("a", "/a", Some(1)),
+            row("a", "/c", None),
+        ];
+        sort_repos(&mut repos);
+        let ids: Vec<&str> = repos.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["/z", "/a", "/b", "/c"], "{repos:?}");
     }
 
     #[test]
@@ -1967,6 +4474,7 @@ mod tests {
             head: Head::Branch("main".to_owned()),
             locked: false,
             main: true,
+            prunable: None,
         }];
         assert_eq!(
             repo_display(anchors.iter(), &repo),
@@ -2026,6 +4534,11 @@ mod tests {
             repo: None,
             worktree: None,
             branch: None,
+            touches: Vec::new(),
+            current_incarnation: None,
+            started_at: None,
+            related: Vec::new(),
+            evidence: EvidenceRow::default(),
         };
         let now = SystemTime::now();
         // The inbox order is the attention rank, not the state.
@@ -2077,6 +4590,34 @@ mod tests {
             assert_eq!(wire(&state), serde_json::json!(want));
         }
         assert_eq!(Provider::Claude.as_str(), "claude");
+        for upstream in [
+            Upstream::Tracked,
+            Upstream::NeverPushed,
+            Upstream::RemoteGone,
+            Upstream::NotApplicable,
+            Upstream::Unknown,
+        ] {
+            assert_eq!(wire(&upstream), serde_json::json!(upstream.as_str()));
+        }
+        for landed in [Landed::Ancestor, Landed::Content, Landed::No] {
+            assert_eq!(wire(&landed), serde_json::json!(landed.as_str()));
+        }
+        for item in [
+            WorkItem::Unknown,
+            WorkItem::NotExisting,
+            WorkItem::Open,
+            WorkItem::Closed,
+        ] {
+            assert_eq!(wire(&item), serde_json::json!(item.as_str()));
+        }
+        for pipeline in [
+            Pipeline::Busy,
+            Pipeline::Succeeded,
+            Pipeline::Failed,
+            Pipeline::Unknown,
+        ] {
+            assert_eq!(wire(&pipeline), serde_json::json!(pipeline.as_str()));
+        }
         for (value, want) in [
             (wire(&Upstream::Tracked), "tracked"),
             (wire(&Upstream::NeverPushed), "never_pushed"),
@@ -2267,8 +4808,8 @@ mod tests {
 
     #[test]
     fn a_start_that_moves_a_second_between_polls_is_the_same_instance() {
-        // `etime` quantizes, so the OS-derived start of one process can read
-        // a second apart on consecutive polls without being a replacement.
+        // Start readings quantize to the second from different sources, so
+        // one process can read a second apart without being a replacement.
         let mut undated = HashMap::new();
         let mut live = live();
         live.status_raw = Some("waiting".to_owned());
@@ -2404,5 +4945,559 @@ mod tests {
         assert!(is_own_pane(Some(&own), &pref(link.join("default"))));
         assert!(!is_own_pane(Some(&own), &pref(link.join("other"))));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A minimal pane for fabricated inventories.
+    fn tmux_pane(socket: &str, id: &str, pid: u32) -> tmux::Pane {
+        tmux::Pane {
+            socket: PathBuf::from(socket),
+            id: PaneId::parse(id).unwrap(),
+            window: tmux::WindowId::parse("@1").unwrap(),
+            session: tmux::SessionId::parse("$1").unwrap(),
+            session_name: "s".to_owned(),
+            pid,
+            command: "claude".to_owned(),
+            cwd: None,
+            tty: None,
+            active: true,
+            last: false,
+            window_active: true,
+            window_activity: None,
+            session_attached: 1,
+            wt_adminid: None,
+            wt_handle: None,
+        }
+    }
+
+    /// A process table row: `pid` under `ppid`.
+    fn prow(pid: u32, ppid: u32) -> ProcessRow {
+        ProcessRow {
+            pid,
+            ppid,
+            start: ProcessStart::At(1_700_000_000),
+            exe: Some("claude".to_owned()),
+            tty: None,
+            state: 'S',
+        }
+    }
+
+    /// A fabricated conversation row: live, attached to `pid`.
+    fn live_row(session: &str, pid: u32) -> ConversationRow {
+        let mut row = conversation_row(
+            &conversation(Some(live()), None),
+            None,
+            derived(Exec::Busy, Attention::None),
+            None,
+            None,
+            None,
+            EvidenceIn::default(),
+        );
+        row.session_id = session.to_owned();
+        row.short_id = session.chars().take(8).collect();
+        row.attachment = Some(AttachmentRow {
+            pid,
+            pid_start: Some(1_700_000_000),
+            liveness: AttachmentLiveness::Instance,
+            liveness_detail: None,
+            pane: None,
+            target: None,
+            pane_source: Some(PaneSource::Published),
+            placement_detail: None,
+            source: EvidenceSource::Published,
+            observed_at: 1_800_000_000,
+        });
+        row
+    }
+
+    /// A runtime over fabricated processes and panes.
+    fn runtime(rows: Vec<ProcessRow>, panes: Vec<tmux::Pane>) -> Runtime {
+        Runtime {
+            processes: Some(ProcessTable::from_rows(rows)),
+            panes: tmux::PaneInventory {
+                panes,
+                servers: Vec::new(),
+                warnings: Vec::new(),
+                stale_sockets: 0,
+            },
+            observed_at: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn relations_follow_proven_strengths_and_never_guess() {
+        // b's pid is a's parent - observed ancestry. A pane a sits in
+        // whose root process descends from b relates nothing: real pane
+        // roots descend from the tmux server, so such a chain proves no
+        // creation. A shared ref name with different incarnation ids
+        // proves nothing either.
+        let mut a = live_row("aaaaaaaa-1", 101);
+        let mut b = live_row("bbbbbbbb-1", 100);
+        a.touches = vec![open_touch("i1")];
+        b.touches = vec![open_touch("i2")];
+        let runtime = runtime(
+            vec![prow(101, 100), prow(100, 1), prow(50, 100)],
+            vec![tmux_pane("/sock/a", "%7", 50)],
+        );
+        let mut convs = vec![a.clone(), b.clone()];
+        relate(&mut convs, &runtime);
+        let strengths: Vec<RelationStrength> =
+            convs[0].related.iter().map(|r| r.strength).collect();
+        assert_eq!(strengths, vec![RelationStrength::ProcessAncestry]);
+        assert_eq!(convs[0].related[0].session_id, "bbbbbbbb-1");
+        assert_eq!(convs[0].related[0].label, "ancestor");
+        // The parent lists its child: ancestry relates both ways. Sharing
+        // a ref name across distinct incarnations adds nothing more.
+        let parent: Vec<(&str, &str)> = convs[1]
+            .related
+            .iter()
+            .map(|r| (r.session_id.as_str(), r.label.as_str()))
+            .collect();
+        assert_eq!(parent, vec![("aaaaaaaa-1", "descendant")]);
+        // A shared exact incarnation is.
+        b.touches = vec![open_touch("i1")];
+        let mut convs = vec![a.clone(), b.clone()];
+        relate(&mut convs, &runtime);
+        let strengths: Vec<RelationStrength> =
+            convs[0].related.iter().map(|r| r.strength).collect();
+        assert!(
+            strengths.contains(&RelationStrength::SameIncarnation),
+            "{strengths:?}"
+        );
+        // With the parent first, its descendant arrives after its touch
+        // relation; the list still sorts strongest group first.
+        let mut convs = vec![b.clone(), a.clone()];
+        relate(&mut convs, &runtime);
+        let strengths: Vec<RelationStrength> =
+            convs[0].related.iter().map(|r| r.strength).collect();
+        assert_eq!(
+            strengths,
+            vec![
+                RelationStrength::ProcessAncestry,
+                RelationStrength::SameIncarnation
+            ]
+        );
+        // With no process table the first two strengths drop out; the
+        // touch relation still stands. A dead or attachment-less
+        // conversation relates through nothing live.
+        let runtime = Runtime {
+            processes: None,
+            panes: tmux::PaneInventory::default(),
+            observed_at: SystemTime::now(),
+        };
+        let mut convs = vec![a, b];
+        relate(&mut convs, &runtime);
+        let strengths: Vec<RelationStrength> =
+            convs[0].related.iter().map(|r| r.strength).collect();
+        assert_eq!(strengths, vec![RelationStrength::SameIncarnation]);
+    }
+
+    #[test]
+    fn gone_rows_name_every_live_reference_and_drop_the_unreferenced() {
+        // A closed incarnation whose proven workspace a pane's stored
+        // edge and a live agent session still name: every reference kind.
+        let root =
+            std::env::temp_dir().join(format!("agent-sessions-gone-{}-a", std::process::id()));
+        let missing = format!("{}/missing", root.display());
+        // A second, still-existing workspace: the branch is gone but the
+        // directory is not, so the row says `branch deleted`.
+        let still = root.join("still");
+        fs::create_dir_all(&still).unwrap();
+        let still = format!("{}", still.display());
+        let mut work = store::Work::default();
+        let mut record = branch_record("i1", 1_000, Some(3_000));
+        record.inputs.worktree_path = Some(missing.clone());
+        record.inputs.admin_id = Some("adm1".to_owned());
+        record.activities = vec![store::ActivityEvent {
+            source: store::ActivitySource::Commit,
+            occurred_at_ms: 2_000,
+            reasons: vec!["aaaaaaa tip".to_owned()],
+        }];
+        work.branches.insert("i1".to_owned(), record);
+        let mut kept = branch_record("i2", 1_000, Some(3_000));
+        kept.ref_name = "kept".to_owned();
+        kept.inputs.worktree_path = Some(still.clone());
+        kept.inputs.admin_id = Some("adm2".to_owned());
+        work.branches.insert("i2".to_owned(), kept);
+        // A branch-only close records nothing a reference could name.
+        let mut bare = branch_record("i0", 1_000, Some(3_000));
+        bare.ref_name = "bare".to_owned();
+        work.branches.insert("i0".to_owned(), bare);
+        // A closed path record whose folder is gone but still named: it
+        // reads its own retained source activity too.
+        let space = format!("{}/gone-space", root.display());
+        let space_record = store::PathRecord {
+            repo: Some("/r/.git".to_owned()),
+            parked: false,
+            inputs: store::LifecycleInputs::default(),
+            activities: vec![store::ActivityEvent {
+                source: store::ActivitySource::Conversation,
+                occurred_at_ms: 1_500,
+                reasons: vec!["turn".to_owned()],
+            }],
+            observations: Vec::new(),
+            session_activity: std::collections::BTreeMap::new(),
+        };
+        work.paths.insert(space.clone(), space_record);
+        // Two live panes bound by their stored worktree edges - the
+        // summary says `2 panes` - plus one that binds nowhere.
+        let mut pane = tmux_pane("/sock/a", "%9", 50);
+        pane.wt_adminid = Some("adm1".to_owned());
+        let mut pane2 = tmux_pane("/sock/a", "%10", 51);
+        pane2.wt_adminid = Some("adm1".to_owned());
+        let mut pane3 = tmux_pane("/sock/a", "%11", 52);
+        pane3.wt_adminid = Some("adm2".to_owned());
+        let stray = tmux_pane("/sock/a", "%12", 53);
+        // A live agent session anchored inside the gone path, one inside
+        // it without an attachment, and one somewhere else entirely.
+        let mut c = live_row("cccccccc-1", 99);
+        c.cwd = Some(PathBuf::from(&missing));
+        let mut no_attach = conversation_row(
+            &conversation(Some(live()), None),
+            None,
+            derived(Exec::Busy, Attention::None),
+            None,
+            None,
+            None,
+            EvidenceIn::default(),
+        );
+        no_attach.cwd = Some(PathBuf::from(&missing));
+        let mut outside = live_row("dddddddd-1", 88);
+        outside.cwd = Some(PathBuf::from("/elsewhere"));
+        // A live agent session sitting in the gone space keeps the path
+        // record's row.
+        let mut in_space = live_row("eeeeeeee-1", 90);
+        in_space.cwd = Some(PathBuf::from(&space));
+        let model = Model {
+            conversations: vec![c, no_attach, outside, in_space],
+            ..Default::default()
+        };
+        let live_rt = runtime(
+            vec![prow(99, 50), prow(88, 1), prow(90, 60)],
+            vec![pane, pane2, pane3, stray],
+        );
+        let live_paths = HashSet::new();
+        let rows = gone_rows(&model, &work, &live_rt, &live_paths);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let space_row = rows
+            .iter()
+            .find(|r| r.kind == WorkKind::ProjectSpace)
+            .expect("the space row");
+        assert_eq!(space_row.last_activity, Some(1), "{space_row:?}");
+        let row = &rows[0];
+        assert_eq!(row.gone.as_deref(), Some("branch and worktree gone"));
+        // Its age is the retained source activity (2s), never the
+        // incarnation's end (3s) or last sighting - detection times do
+        // not make gone work look new.
+        assert_eq!(row.last_activity, Some(2));
+        let kinds: Vec<ReferenceKind> = row.references.iter().map(|r| r.kind).collect();
+        for kind in [
+            ReferenceKind::Pane,
+            ReferenceKind::Window,
+            ReferenceKind::TmuxSession,
+            ReferenceKind::Process,
+            ReferenceKind::AgentSession,
+        ] {
+            assert!(kinds.contains(&kind), "{kind:?} missing: {kinds:?}");
+        }
+        assert_eq!(row.section, WorkSection::CleanupReview);
+        assert!(row.summary.contains("2 panes"), "{}", row.summary);
+        assert!(row.summary.contains("1 agent session"), "{}", row.summary);
+        // The still-present workspace reads `branch deleted`.
+        let row = rows.iter().find(|r| r.name == "kept").unwrap();
+        assert_eq!(row.gone.as_deref(), Some("branch deleted"));
+        // Nothing referencing it: the record stays retained in the store
+        // but lists nowhere.
+        let quiet = runtime(vec![], vec![]);
+        let model = Model::default();
+        assert!(gone_rows(&model, &work, &quiet, &live_paths).is_empty());
+        // The same workspace live under a new anchor: the closed record
+        // does not resurrect as gone.
+        let live_paths: HashSet<String> = [missing.clone()].into_iter().collect();
+        assert!(gone_rows(&model, &work, &quiet, &live_paths).is_empty());
+        // A vanished project space follows the same rule.
+        let space =
+            std::env::temp_dir().join(format!("agent-sessions-gone-{}-b", std::process::id()));
+        let space = format!("{}", space.display());
+        let mut paths = store::Work::default();
+        paths.paths.insert(
+            space.clone(),
+            store::PathRecord {
+                repo: None,
+                parked: false,
+                activities: Vec::new(),
+                inputs: store::LifecycleInputs::default(),
+                observations: Vec::new(),
+                session_activity: Default::default(),
+            },
+        );
+        let detached = format!("{}/detached", root.display());
+        paths.paths.insert(
+            detached.clone(),
+            store::PathRecord {
+                repo: Some("/r/.git".to_owned()),
+                parked: false,
+                activities: Vec::new(),
+                inputs: store::LifecycleInputs {
+                    worktree: Some(true),
+                    ..Default::default()
+                },
+                observations: Vec::new(),
+                session_activity: Default::default(),
+            },
+        );
+        let mut c = live_row("cccccccc-2", 77);
+        c.cwd = Some(PathBuf::from(&space));
+        let mut c2 = live_row("eeeeeeee-2", 76);
+        c2.cwd = Some(PathBuf::from(&detached));
+        let model = Model {
+            conversations: vec![c, c2],
+            ..Default::default()
+        };
+        let rows = gone_rows(&model, &paths, &quiet, &live_paths);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, WorkKind::Detached);
+        assert_eq!(rows[0].gone.as_deref(), Some("worktree gone"));
+        // The detached row lists under the repo its record carries; a
+        // legacy record without one falls back to its own path.
+        assert_eq!(rows[0].repo, "/r/.git");
+        assert_eq!(rows[0].repo_name, "r");
+        assert_eq!(rows[1].gone.as_deref(), Some("project folder gone"));
+        assert_eq!(rows[1].kind, WorkKind::ProjectSpace);
+        assert_eq!(rows[1].repo, space);
+    }
+
+    #[test]
+    fn one_vanished_path_is_one_gone_row_whatever_closed_there() {
+        // A same-name branch recreated at the same worktree path, a pooled
+        // directory another branch reused, and a detached checkout there
+        // too: once the path is gone, one pane still in it is one dangling
+        // workspace - one row, attributed to the newest closed record.
+        let path = format!(
+            "{}/agent-sessions-gone-{}-dup",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let mut work = store::Work::default();
+        for (id, name, ended) in [
+            ("i1", "feat", 3_000),
+            ("i2", "feat", 9_000),
+            ("i3", "other", 6_000),
+        ] {
+            let mut r = branch_record(id, 1_000, Some(ended));
+            r.ref_name = name.to_owned();
+            r.inputs.worktree_path = Some(path.clone());
+            r.inputs.admin_id = Some("adm".to_owned());
+            work.branches.insert(id.to_owned(), r);
+        }
+        work.paths.insert(
+            path.clone(),
+            store::PathRecord {
+                repo: None,
+                parked: false,
+                activities: Vec::new(),
+                inputs: store::LifecycleInputs {
+                    worktree: Some(true),
+                    ..Default::default()
+                },
+                observations: Vec::new(),
+                session_activity: Default::default(),
+            },
+        );
+        let mut pane = tmux_pane("/sock/a", "%9", 50);
+        pane.wt_adminid = Some("adm".to_owned());
+        let rt = runtime(vec![], vec![pane]);
+        // A live agent session inside the path references the detached
+        // record too.
+        let mut agent = live_row("cccccccc-3", 99);
+        agent.cwd = Some(PathBuf::from(&path));
+        let model = Model {
+            conversations: vec![agent],
+            ..Default::default()
+        };
+        let rows = gone_rows(&model, &work, &rt, &HashSet::new());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].identity.as_deref(), Some("i2"));
+        assert_eq!(
+            rows[0]
+                .references
+                .iter()
+                .filter(|r| r.kind == ReferenceKind::Pane)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_commit_names_the_one_conversation_whose_touch_covered_it() {
+        let commit = |at: u64| CommitRow {
+            sha: format!("{at:040}"),
+            subject: "s".to_owned(),
+            at,
+            conversation: None,
+        };
+        // a touched i1 over [1000, 2000), b from 1500 on, c touched only
+        // another incarnation.
+        let mut a = live_row("aaaaaaaa-1", 1);
+        a.touches = vec![TouchRow {
+            valid_until: Some(2_000),
+            ..open_touch("i1")
+        }];
+        let mut b = live_row("bbbbbbbb-1", 2);
+        b.touches = vec![TouchRow {
+            valid_from: 1_500,
+            ..open_touch("i1")
+        }];
+        let mut c = live_row("cccccccc-1", 3);
+        c.touches = vec![open_touch("i2")];
+        let convs = vec![a, b, c];
+        let mut commits = Some(vec![
+            commit(1_200),
+            commit(1_700),
+            commit(2_000),
+            commit(900),
+        ]);
+        attribute_commits(&mut commits, "i1", &convs);
+        let named: Vec<Option<&str>> = commits
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|c| c.conversation.as_deref())
+            .collect();
+        // Only a covers 1200; a and b both cover 1700 - no guess; a's
+        // interval ends before 2000, leaving b; nothing covers 900.
+        assert_eq!(named, vec![Some("aaaaaaaa"), None, Some("bbbbbbbb"), None]);
+        // An unknown list stays unknown.
+        let mut unknown = None;
+        attribute_commits(&mut unknown, "i1", &convs);
+        assert!(unknown.is_none());
+    }
+
+    #[test]
+    fn a_gone_row_keeps_its_own_placement_in_classification() {
+        let mut row = space_row("/r", Path::new("/r"));
+        row.gone = Some("project folder gone".to_owned());
+        row.summary = "project folder gone · 1 process".to_owned();
+        let summary = row.summary.clone();
+        classify_work(&mut row, &[], Duration::from_secs(1), 2_000_000_000);
+        assert_eq!(row.summary, summary);
+        assert_eq!(row.section, WorkSection::FollowUp);
+        row.section = WorkSection::CleanupReview;
+        classify_work(&mut row, &[], Duration::from_secs(1), 2_000_000_000);
+        assert_eq!(row.section, WorkSection::CleanupReview);
+    }
+
+    #[test]
+    fn inside_path_matches_canonicalized_descent() {
+        let root =
+            std::env::temp_dir().join(format!("agent-sessions-inside-{}", std::process::id()));
+        let real = root.join("real");
+        fs::create_dir_all(real.join("sub")).unwrap();
+        let link = root.join("link");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // A symlinked spelling of the same directory still binds.
+        assert!(inside_path(&link.join("sub"), &real));
+        assert!(inside_path(&real.join("sub"), &link));
+        assert!(inside_path(&real, &real));
+        assert!(!inside_path(&real, &real.join("sub")));
+        fs::remove_dir_all(&root).unwrap();
+        // A path that no longer exists compares by literal spelling.
+        let gone = root.join("gone");
+        assert!(inside_path(&gone.join("x"), &gone));
+        assert!(!inside_path(&gone, &gone.join("x")));
+    }
+
+    #[test]
+    fn pass_activities_date_each_source_at_its_own_evidence() {
+        let dir = std::env::temp_dir().join(format!("asd-pass-act-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let edit = dir.join("edit.txt");
+        fs::write(&edit, "x").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&edit)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(30))
+            .unwrap();
+        let mut state = vector::WorkState {
+            repo: git::Repo {
+                common_dir: PathBuf::from("/r/.git"),
+            },
+            anchor: Anchor::Branch {
+                name: "feat".to_owned(),
+            },
+            remote_url: None,
+            base: Evidence::Unknown("no base asked".to_owned()),
+            forge: ForgeStatus {
+                item: WorkItem::Closed,
+                pipeline: Pipeline::Unknown,
+                label: Some("PR #5".to_owned()),
+                url: None,
+                reason: None,
+                occurred_at_ms: Some(40_000),
+            },
+            broken: None,
+            vector: vector::StateVector {
+                worktree: Some(dir.clone()),
+                windows: WindowCount::default(),
+                live_pids: 0,
+                live_agent_sessions: 0,
+                past_agent_sessions: 0,
+                dirty: Evidence::Known(true),
+                working_tree: Evidence::Known(b" M edit.txt\0".to_vec()),
+                commits_ahead_of_base: Evidence::Known(1),
+                commits_behind_of_base: Evidence::Known(0),
+                commits_not_on_base: Evidence::Known(vec![git::LogCommit {
+                    sha: "aaaaaaaaaaaaaaaa".to_owned(),
+                    at: 20,
+                    subject: "landed".to_owned(),
+                }]),
+                upstream_state: UpstreamState::NotApplicable,
+                unpushed_commits: Evidence::Known(0),
+                landed: Evidence::Unknown("none asked".to_owned()),
+                reflog_activity: Some(UNIX_EPOCH + Duration::from_secs(10)),
+                commit_activity: Some(UNIX_EPOCH + Duration::from_secs(20)),
+                last_git_activity: Some(UNIX_EPOCH + Duration::from_secs(20)),
+            },
+        };
+        let events = pass_activities(&state, Some("aaaaaaaaaaaaaaaa"));
+        assert_eq!(
+            events,
+            vec![
+                store::ActivityEvent {
+                    source: store::ActivitySource::Commit,
+                    occurred_at_ms: 20_000,
+                    reasons: vec!["aaaaaaa landed".to_owned()],
+                },
+                store::ActivityEvent {
+                    source: store::ActivitySource::Reflog,
+                    occurred_at_ms: 10_000,
+                    reasons: vec!["reflog work".to_owned()],
+                },
+                store::ActivityEvent {
+                    source: store::ActivitySource::WorkingTree,
+                    occurred_at_ms: 30_000,
+                    reasons: vec!["modified edit.txt".to_owned()],
+                },
+                store::ActivityEvent {
+                    source: store::ActivitySource::Forge,
+                    occurred_at_ms: 40_000,
+                    reasons: vec!["PR #5 closed".to_owned()],
+                },
+            ]
+        );
+        // No head names the tip generically, and nothing else moves.
+        state.vector.commits_not_on_base = Evidence::Unknown("none asked".to_owned());
+        let events = pass_activities(&state, None);
+        assert_eq!(events[0].reasons, vec!["tip commit".to_owned()]);
+        // An unlabelled forge item reasons generically.
+        state.forge.label = None;
+        let events = pass_activities(&state, None);
+        assert_eq!(
+            events[3].reasons,
+            vec!["work item closed".to_owned()],
+            "{events:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

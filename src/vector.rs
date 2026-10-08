@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::evidence::Evidence;
-use crate::forge;
+use crate::forge::{self, ForgeStatus, Pipeline, WorkItem};
 use crate::git::{self, Head, RemoteHead, RemoteListing, Repo, Track, UpstreamConfig};
 
 /// What a Work row is anchored on. Branch incarnations and detached
@@ -28,6 +28,7 @@ pub enum Anchor {
         locked: bool,
         /// The repository's own checkout; `git worktree remove` refuses it.
         main: bool,
+        prunable: Option<String>,
     },
     /// A local branch with no worktree anywhere.
     Branch { name: String },
@@ -65,6 +66,7 @@ pub fn anchors(repo: &Repo) -> Result<Vec<Anchor>, git::Error> {
             head: wt.head,
             locked: wt.locked,
             main: wt.main,
+            prunable: wt.prunable,
         });
     }
     let names = repo.local_branches()?; // coverage: off - needs refs broken where worktree list succeeded
@@ -153,6 +155,10 @@ pub struct WorkState {
     /// URL of the upstream remote, when the branch has one.
     pub remote_url: Option<String>,
     pub base: Evidence<Base>,
+    /// The forge work-item overlay: `Unknown(PENDING)` until the forge
+    /// stage lands an answer, like every remote-owned field.
+    pub forge: ForgeStatus,
+    pub broken: Option<String>,
     pub vector: StateVector,
 }
 
@@ -166,7 +172,14 @@ pub struct StateVector {
     pub past_agent_sessions: usize,
     /// Tracked and untracked changes; `Known(false)` for a branch-only row.
     pub dirty: Evidence<bool>,
+    pub working_tree: Evidence<Vec<u8>>,
     pub commits_ahead_of_base: Evidence<u64>,
+    /// Commits on the proven base the row's tip lacks - the behind half of
+    /// the ahead/behind pair.
+    pub commits_behind_of_base: Evidence<u64>,
+    /// The newest commits on the tip that the proven base lacks, at most
+    /// [`COMMIT_LIST_LIMIT`]; `commits_ahead_of_base` says how many exist.
+    pub commits_not_on_base: Evidence<Vec<git::LogCommit>>,
     pub upstream_state: UpstreamState,
     /// Commits not reachable from the configured upstream. For a
     /// never-pushed branch every commit past the base is unpushed by
@@ -174,8 +187,16 @@ pub struct StateVector {
     /// all - the ones removal actually loses.
     pub unpushed_commits: Evidence<u64>,
     pub landed: Evidence<Landed>,
-    /// Newest of the worktree HEAD (or branch) reflog's last entry and its
-    /// mtime.
+    /// Newest real work the anchor's reflogs record: the worktree HEAD
+    /// log's and the branch log's last work entries, at their own
+    /// timestamps.
+    pub reflog_activity: Option<SystemTime>,
+    /// The tip's committerdate, when it provably dates work on this
+    /// incarnation (it postdates the ref's creation, or no creation is
+    /// proven).
+    pub commit_activity: Option<SystemTime>,
+    /// Newest of `reflog_activity` and `commit_activity` - the aggregate
+    /// readers that do not need the source distinction keep using.
     pub last_git_activity: Option<SystemTime>,
 }
 
@@ -282,8 +303,16 @@ struct AnchorLocal {
     /// A detached anchor's unreachable-commit count - already collected,
     /// since it is a local `rev-list`, not remote evidence.
     unreachable: Option<Evidence<u64>>,
+    working_tree: Evidence<Vec<u8>>,
     dirty: Evidence<bool>,
-    last_git_activity: Option<SystemTime>,
+    reflog_activity: Option<SystemTime>,
+    commit_activity: Option<SystemTime>,
+    /// The branch tip's OID, from the batch or the old-git fallback.
+    head_oid: Option<String>,
+    /// The newest null-old creation the branch's own reflog proves.
+    creation: Option<git::RefCreation>,
+    /// The short name a `Branch: renamed` reflog line moved this ref from.
+    renamed_from: Option<String>,
 }
 
 /// One anchor with its local facts and current vector state.
@@ -308,11 +337,29 @@ impl AnchorWork {
         }
     }
 
+    /// The tip OID the pass proved for the anchor's branch, if any.
+    pub fn ref_head(&self) -> Option<&str> {
+        self.local.head_oid.as_deref()
+    }
+
+    /// The newest null-old creation the branch's reflog proves.
+    pub fn ref_creation(&self) -> Option<&git::RefCreation> {
+        self.local.creation.as_ref()
+    }
+
+    /// The short name a `Branch: renamed` reflog line moved this ref
+    /// from - the exact evidence that preserves identity across names.
+    pub fn renamed_from(&self) -> Option<&str> {
+        self.local.renamed_from.as_deref()
+    }
+
     /// Patch the remote-owned fields from a finished [`apply_remote`].
     pub fn apply(&mut self, applied: RemoteApplied) {
         self.state.base = applied.base;
         self.state.vector.upstream_state = applied.upstream_state;
         self.state.vector.commits_ahead_of_base = applied.commits_ahead;
+        self.state.vector.commits_behind_of_base = applied.commits_behind;
+        self.state.vector.commits_not_on_base = applied.commits_listed;
         self.state.vector.unpushed_commits = applied.unpushed;
         self.state.vector.landed = applied.landed;
     }
@@ -324,6 +371,8 @@ pub struct RemoteApplied {
     pub upstream_state: UpstreamState,
     pub base: Evidence<Base>,
     pub commits_ahead: Evidence<u64>,
+    pub commits_behind: Evidence<u64>,
+    pub commits_listed: Evidence<Vec<git::LogCommit>>,
     pub unpushed: Evidence<u64>,
     pub landed: Evidence<Landed>,
 }
@@ -343,6 +392,14 @@ pub struct RepoLocal {
     pub asks: Vec<String>,
 }
 
+impl RepoLocal {
+    /// The configured remote names, when `git remote` answered; `None` on
+    /// the read's own error.
+    pub fn remote_names(&self) -> Option<&[String]> {
+        self.remotes.as_ref().ok().map(Vec::as_slice)
+    }
+}
+
 /// Stage 2 for one repository: worktrees, branches and every fact local
 /// Git proves, from one `for-each-ref` when the platform's git batches
 /// (>= 2.41) and the per-branch probes otherwise. `runtime_of` supplies the
@@ -353,8 +410,12 @@ pub fn collect_local_repo(
     runtime_of: impl Fn(&Anchor) -> RuntimeFacts,
 ) -> Result<RepoLocal, git::Error> {
     // The batch is best-effort: an older git rejects the atom format and
-    // every batched fact falls back to its per-branch probe.
+    // every batched fact falls back to its per-branch probe - except the
+    // tip OIDs, which the fallback reads in one `for-each-ref`.
     let facts = repo.ref_facts().ok();
+    let tips = facts
+        .is_none()
+        .then(|| repo.branch_tips().unwrap_or_default()); // coverage: off - needs a git too old for the atoms
     let mut anchors = Vec::new();
     let mut checked_out = std::collections::HashSet::new();
     for wt in repo.worktrees()? {
@@ -370,6 +431,7 @@ pub fn collect_local_repo(
             head: wt.head,
             locked: wt.locked,
             main: wt.main,
+            prunable: wt.prunable,
         });
     }
     match facts.as_ref() {
@@ -395,7 +457,7 @@ pub fn collect_local_repo(
         .into_iter()
         .map(|anchor| {
             let runtime = runtime_of(&anchor);
-            anchor_work(repo, anchor, facts.as_ref(), runtime)
+            anchor_work(repo, anchor, facts.as_ref(), tips.as_ref(), runtime)
         })
         .collect();
     let remotes = repo.remotes();
@@ -456,11 +518,36 @@ fn anchor_work(
     repo: &Repo,
     anchor: Anchor,
     facts: Option<&git::RefFacts>,
+    tips: Option<&HashMap<String, String>>,
     runtime: RuntimeFacts,
 ) -> AnchorWork {
     let branch = anchor.branch();
     let fact = branch.and_then(|b| facts.and_then(|f| f.branches.get(b)));
     let config = branch.map(|b| upstream_config(repo, b, fact));
+    // The branch's own reflog is the incarnation evidence: the newest
+    // null-old entry proves this incarnation's creation, and a
+    // `Branch: renamed` line proves continuity through a rename.
+    let lifecycle = branch.map(|name| repo.ref_lifecycle(name));
+    let head_oid = branch.and_then(|name| {
+        fact.and_then(|f| f.head.clone())
+            .or_else(|| tips.and_then(|m| m.get(name).cloned()))
+    });
+    let working_tree = match &anchor {
+        Anchor::Worktree {
+            path,
+            admin_id,
+            prunable: Some(_),
+            ..
+        } => match admin_id {
+            Some(id) => repo.admin_status(id, path),
+            None => Evidence::Unknown(
+                "git status: prunable worktree has no resolvable admin dir".to_owned(),
+            ),
+        },
+        Anchor::Worktree { path, .. } => repo.status(path),
+        Anchor::Branch { .. } => Evidence::Unknown("no worktree".to_owned()),
+    };
+    let (reflog_activity, commit_activity) = git_activity(repo, &anchor, fact);
     let local = AnchorLocal {
         remote_url: remote_url(repo, &config),
         config,
@@ -479,16 +566,33 @@ fn anchor_work(
             _ => None,
         },
         dirty: match &anchor {
-            Anchor::Worktree { path, .. } => repo.dirty(path),
+            Anchor::Worktree { .. } => working_tree.clone().map(|bytes| !bytes.is_empty()),
             Anchor::Branch { .. } => Evidence::Known(false),
         },
-        last_git_activity: last_git_activity(repo, &anchor, fact),
+        working_tree,
+        reflog_activity,
+        commit_activity,
+        head_oid,
+        creation: lifecycle.as_ref().and_then(|l| l.creation.clone()),
+        renamed_from: lifecycle.and_then(|l| l.renamed_from),
     };
     let state = WorkState {
         repo: repo.clone(),
         anchor: anchor.clone(),
         remote_url: local.remote_url.clone(),
         base: Evidence::Unknown(PENDING.to_owned()),
+        forge: ForgeStatus {
+            item: WorkItem::Unknown,
+            pipeline: Pipeline::Unknown,
+            label: None,
+            url: None,
+            reason: Some(PENDING.to_owned()),
+            occurred_at_ms: None,
+        },
+        broken: match &anchor {
+            Anchor::Worktree { prunable, .. } => prunable.clone(),
+            Anchor::Branch { .. } => None,
+        },
         vector: StateVector {
             worktree: match &anchor {
                 Anchor::Worktree { path, .. } => Some(path.clone()),
@@ -499,39 +603,59 @@ fn anchor_work(
             live_agent_sessions: runtime.live_agent_sessions,
             past_agent_sessions: runtime.past_agent_sessions,
             dirty: local.dirty.clone(),
+            working_tree: local.working_tree.clone(),
             commits_ahead_of_base: Evidence::Unknown(PENDING.to_owned()),
+            commits_behind_of_base: Evidence::Unknown(PENDING.to_owned()),
+            commits_not_on_base: Evidence::Unknown(PENDING.to_owned()),
             upstream_state: UpstreamState::Unknown(PENDING.to_owned()),
             unpushed_commits: local
                 .unreachable
                 .clone()
                 .unwrap_or_else(|| Evidence::Unknown(PENDING.to_owned())),
             landed: Evidence::Unknown(PENDING.to_owned()),
-            last_git_activity: local.last_git_activity,
+            reflog_activity: local.reflog_activity,
+            commit_activity: local.commit_activity,
+            last_git_activity: [local.reflog_activity, local.commit_activity]
+                .into_iter()
+                .flatten()
+                .max(),
         },
     };
     AnchorWork { state, local } // coverage: off - the unexecuted instantiation's region edge
 }
 
-/// Newest of the reflog's last entry, its mtime, and - when the batch
-/// supplied it - the tip's committerdate. The committerdate matters when a // coverage: off - the unexecuted instantiation's region edge
-/// branch moved without a reflog write; a probe path keeps reflog only.
-fn last_git_activity(
+/// The anchor's source-distinguished Git activity, `(reflog, commit)`:
+/// real work the worktree HEAD and branch reflogs record, and the tip's
+/// committerdate when it provably dates this incarnation. The branch log
+/// matters for a worktree added over commits made elsewhere, whose HEAD
+/// log holds only the add; the committerdate matters when a branch moved
+/// without a reflog write; a probe path keeps reflog only.
+fn git_activity(
     repo: &Repo,
     anchor: &Anchor,
     fact: Option<&git::BranchFact>,
-) -> Option<SystemTime> {
-    let committed = fact
-        .and_then(|f| f.committer_date)
-        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
-    match anchor {
-        Anchor::Worktree { admin_id, main, .. } => {
-            worktree_head_log(*main, admin_id.as_deref()).and_then(|log| repo.reflog_activity(&log))
-        }
-        Anchor::Branch { name } => {
-            let reflog = repo.reflog_activity(&PathBuf::from(format!("logs/refs/heads/{name}")));
-            [reflog, committed].into_iter().flatten().max()
-        }
+) -> (Option<SystemTime>, Option<SystemTime>) {
+    // The HEAD reflog's real work only: the add's creation line and a
+    // `checkout:` line are lifecycle events, not activity.
+    let head = match anchor {
+        Anchor::Worktree { admin_id, main, .. } => worktree_head_log(*main, admin_id.as_deref())
+            .and_then(|log| repo.reflog_times(&log).worked_at),
+        Anchor::Branch { .. } => None,
+    };
+    let (mut branch, mut committed) = (None, None);
+    if let Some(name) = anchor.branch() {
+        let times = repo.reflog_times(&PathBuf::from(format!("logs/refs/heads/{name}")));
+        branch = times.worked_at;
+        committed = fact
+            .and_then(|f| f.committer_date)
+            .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
+        // A tip commit counts only when it strictly postdates the ref's
+        // creation: `git branch feat old-sha` borrows an old commit's
+        // date without doing work. When the log proves no creation, the
+        // committer date is the fallback it always was.
+        committed = committed.filter(|t| times.created_at.is_none_or(|c| *t > c));
     }
+    ([head, branch].into_iter().flatten().max(), committed)
 } // coverage: off - the unexecuted instantiation's exit edge
 
 /// `branch.<name>.remote`/`.merge`: the batch's `upstream:remotename` and
@@ -630,20 +754,24 @@ pub fn apply_remote(
         .iter()
         .zip(resolved)
         .map(|(work, (upstream, base))| {
-            let (commits_ahead, landed, unpushed) = match &work.local.head {
+            let (commits_ahead, commits_behind, commits_listed, landed, unpushed) = match &work.local.head {
                 None /* // coverage: off - the unborn arm's second region is an unexecuted-instantiation edge */ => (
+                    Evidence::Unknown("unborn HEAD".to_owned()),
+                    Evidence::Unknown("unborn HEAD".to_owned()),
                     Evidence::Unknown("unborn HEAD".to_owned()),
                     Evidence::Unknown("unborn HEAD".to_owned()),
                     Evidence::Unknown("unborn HEAD".to_owned()),
                 ),
                 Some(head) => {
-                    let ahead = base.known().and_then(|b| {
+                    let counts = base.known().and_then(|b| {
                         head.strip_prefix("refs/heads/").and_then(|name| {
                             batches.get(&b.local_ref)?.get(name).copied() // coverage: off - every proven base was batched above
                         })
                     });
-                    let commits = commits_ahead(repo, head, &base, ahead.map(|(a, _)| a));
-                    let landed = landed(repo, head, &base, ahead.map(|(a, _)| a == 0));
+                    let commits = commits_ahead(repo, head, &base, counts.map(|(a, _)| a));
+                    let behind = commits_behind(repo, head, &base, counts.map(|(_, b)| b));
+                    let listed = commits_listed(repo, head, &base, &commits);
+                    let landed = landed(repo, head, &base, counts.map(|(a, _)| a == 0));
                     let unpushed = match &work.local.unreachable {
                         // A detached HEAD has no upstream; the unreachable
                         // count collected in stage 2 is what removal loses.
@@ -656,13 +784,15 @@ pub fn apply_remote(
                             &commits,
                         ),
                     };
-                    (commits, landed, unpushed)
+                    (commits, behind, listed, landed, unpushed)
                 }
             };
             RemoteApplied {
                 upstream_state: upstream,
                 base,
                 commits_ahead,
+                commits_behind,
+                commits_listed,
                 unpushed,
                 landed,
             }
@@ -821,6 +951,51 @@ fn commits_ahead(
     }
 }
 
+/// How many commits past the base a row lists: the detail view's
+/// recent history, not an archive - `commits_ahead_of_base` counts the
+/// rest.
+pub const COMMIT_LIST_LIMIT: usize = 20;
+
+/// `log <base>..<head>`, at most [`COMMIT_LIST_LIMIT`] - skipped when the
+/// ahead count already proved there is nothing to list.
+fn commits_listed(
+    repo: &Repo,
+    head: &str,
+    base: &Evidence<Base>,
+    ahead: &Evidence<u64>,
+) -> Evidence<Vec<git::LogCommit>> {
+    match (base, ahead) {
+        (Evidence::Unknown(reason), _) => Evidence::Unknown(format!("no proven base ({reason})")),
+        (_, Evidence::Known(0)) => Evidence::Known(Vec::new()),
+        (Evidence::Known(base), _) => {
+            match repo.log_range(&base.local_ref, head, COMMIT_LIST_LIMIT) {
+                Ok(commits) => Evidence::Known(commits),
+                Err(e) => Evidence::Unknown(format!("log: {e}")),
+            }
+        }
+    }
+}
+
+/// `rev-list --count <head>..<base>` - the commits the base has that the
+/// tip lacks - or the batch's behind count when the branch was in one.
+fn commits_behind(
+    repo: &Repo,
+    head: &str,
+    base: &Evidence<Base>,
+    behind: Option<u64>,
+) -> Evidence<u64> {
+    match base {
+        Evidence::Unknown(reason) => Evidence::Unknown(format!("no proven base ({reason})")),
+        Evidence::Known(base) => match behind {
+            Some(count) => Evidence::Known(count),
+            None => match repo.rev_list_count(head, &base.local_ref) {
+                Ok(count) => Evidence::Known(count),
+                Err(e) => Evidence::Unknown(format!("rev-list: {e}")),
+            },
+        },
+    }
+}
+
 /// Ancestry first; when HEAD is no ancestor, the squash/rebase shape is
 /// checked by requiring every path HEAD changed relative to the merge base
 /// to be identical on the base. No delta at all is not landed. `ancestor`
@@ -938,7 +1113,8 @@ fn probe_repo_local(
     runtime: RuntimeFacts,
     remotes: Result<Vec<String>, git::Error>,
 ) -> RepoLocal {
-    let work = anchor_work(repo, anchor, None, runtime);
+    let tips = repo.branch_tips().unwrap_or_default();
+    let work = anchor_work(repo, anchor, None, Some(&tips), runtime);
     let asks = remote_asks(std::slice::from_ref(&work), &remotes);
     let local_heads = local_heads(repo, &asks, None);
     RepoLocal {
@@ -1010,6 +1186,31 @@ mod tests {
     }
 
     #[test]
+    fn a_prunable_anchor_with_no_admin_dir_fails_closed_on_dirty() {
+        let repo = broken_repo();
+        let state = collect(
+            &repo,
+            &Anchor::Worktree {
+                path: PathBuf::from("/nonexistent"),
+                admin_id: None,
+                head: Head::Detached("deadbeef".to_owned()),
+                locked: false,
+                main: false,
+                prunable: Some("gitdir file points to non-existent location".to_owned()),
+            },
+            RuntimeFacts::default(),
+        );
+        assert_eq!(
+            state.broken.as_deref(),
+            Some("gitdir file points to non-existent location")
+        );
+        assert!(matches!(
+            &state.vector.dirty,
+            Evidence::Unknown(r) if r.contains("no resolvable admin dir")
+        ));
+    }
+
+    #[test]
     fn a_detached_anchor_on_a_broken_repo_collects_unknowns() {
         // The unreachable-commit count needs no upstream and no base, but
         // it still needs git to answer - on a broken repo it is Unknown,
@@ -1023,6 +1224,7 @@ mod tests {
                 head: Head::Detached("deadbeef".to_owned()),
                 locked: false,
                 main: false,
+                prunable: None,
             },
             RuntimeFacts::default(),
         );
@@ -1033,6 +1235,7 @@ mod tests {
             label: None,
             url: None,
             reason: None,
+            occurred_at_ms: None,
         };
         let (removal, _) = crate::verdict::cleanup(&state, &forge);
         assert!(matches!(removal.verdict, crate::verdict::Verdict::Blocked)); // coverage: off - miss edge is the assert failing

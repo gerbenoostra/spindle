@@ -3,9 +3,11 @@
 //! resolution walks.
 //!
 //! Process start times are compared as epoch seconds within one second.
-//! The platform reports elapsed time (`ps -o etime`), which pins a start to
-//! a one-second window, and provider-formatted start times are normalized
-//! to the same epoch before comparing. A process the platform cannot date
+//! The platform reports the kernel's start time (`ps -o lstart`, read in
+//! UTC) truncated to the second, and provider-formatted start times are
+//! normalized to the same epoch before comparing. Elapsed time (`etime`)
+//! is not used: deriving a start from it depends on when `ps` sampled, and
+//! a loaded machine's `ps -A` can take over a second. A process the platform cannot date
 //! is lower-authority evidence: the pid is alive, but reuse cannot be ruled
 //! out. A pid alone is never identity - lock files and session records
 //! outlive the processes they name, and a recycled pid would otherwise
@@ -13,11 +15,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// When a process started, for telling a live pid from a recycled one.
 ///
-/// Compared within one second: `etime` quantizes to whole seconds and
+/// Compared within one second: `lstart` truncates to whole seconds and
 /// providers report their own quantized times, so an exact match would
 /// reject the true instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,11 +89,10 @@ impl Liveness {
 pub struct ProcessRow {
     pub pid: u32,
     pub ppid: u32,
-    /// Start time derived from `etime`: the snapshot time minus elapsed.
-    /// Sub-second error stays inside the one-second comparison window.
-    /// `Unavailable` when `ps` reported no parseable elapsed - the pid is
-    /// observably live, so the row is kept as pid-only evidence rather
-    /// than dropped and reaped as dead.
+    /// The kernel's start time from `lstart`, epoch seconds. `Unavailable`
+    /// when `ps` reported no parseable start - the pid is observably live,
+    /// so the row is kept as pid-only evidence rather than dropped and
+    /// reaped as dead.
     pub start: ProcessStart,
     /// The executable basename: `comm`'s path stripped, and the `-` login
     /// shell marker (`-zsh`) removed. `None` where the platform gave nothing.
@@ -142,24 +143,25 @@ impl std::error::Error for Error {}
 
 impl ProcessTable {
     /// `ps -A -o ...`: every process, as one snapshot. `LC_ALL=C` keeps the
-    /// field formats stable across locales.
+    /// field formats stable across locales; the POSIX `TZ=UTC0` makes
+    /// `lstart` a UTC ctime without consulting a timezone database.
     pub fn snapshot() -> Result<ProcessTable, Error> {
-        let argv = "ps -A -o pid=,ppid=,etime=,stat=,tty=,comm=";
+        let argv = "ps -A -o pid=,ppid=,lstart=,stat=,tty=,comm=";
         #[rustfmt::skip]
         let out = std::process::Command::new("ps")
-            .args(["-A", "-o", "pid=,ppid=,etime=,stat=,tty=,comm="])
+            .args(["-A", "-o", "pid=,ppid=,lstart=,stat=,tty=,comm="])
             .env("LC_ALL", "C")
+            .env("TZ", "UTC0")
             .output()
             .map_err(|e| Error { argv: argv.to_owned(), code: None, detail: e.to_string() })?; // coverage: off - needs a PATH without ps
         if !out.status.success() {
             #[rustfmt::skip]
             return Err(Error { argv: argv.to_owned(), code: out.status.code(), detail: String::from_utf8_lossy(&out.stderr).trim().to_owned() }); // coverage: off - `ps -A` with these fields does not fail
         }
-        let taken = SystemTime::now();
         Ok(ProcessTable {
             rows: String::from_utf8_lossy(&out.stdout)
                 .lines()
-                .filter_map(|line| parse_row(line, taken))
+                .filter_map(parse_row)
                 .map(|row| (row.pid, row))
                 .collect(),
         })
@@ -256,17 +258,17 @@ fn exe_mismatch(expected: &str, observed: &str) -> bool {
     expected != observed && !(observed.len() >= 15 && expected.starts_with(observed))
 }
 
-/// One `ps` output row: `pid ppid etime stat tty comm...`. `comm` is the
-/// rest of the line - an argv0 with a space stays one field.
-fn parse_row(line: &str, taken: SystemTime) -> Option<ProcessRow> {
+/// One `ps` output row: `pid ppid <lstart: 5 fields> stat tty comm...`.
+/// `comm` is the rest of the line - an argv0 with a space stays one field.
+fn parse_row(line: &str) -> Option<ProcessRow> {
     let fields: Vec<&str> = line.split_whitespace().collect();
-    let [pid, ppid, etime, stat, tty, comm @ ..] = fields.as_slice() else {
-        return None;
-    };
+    let head = fields.get(..9)?;
+    let (pid, ppid, lstart, stat, tty) = (head[0], head[1], &head[2..7], head[7], head[8]);
+    let comm = &fields[9..];
     let pid = pid.parse().ok()?;
     let ppid = ppid.parse().ok()?;
-    let start = parse_etime(etime)
-        .map(|elapsed| start_from_elapsed(taken, elapsed))
+    let start = parse_utc_ctime(&lstart.join(" "))
+        .map(ProcessStart::At)
         .unwrap_or(ProcessStart::Unavailable);
     let state = stat.chars().next()?; // coverage: off - split_whitespace yields no empty fields
     let tty = normalize_tty(tty);
@@ -280,39 +282,6 @@ fn parse_row(line: &str, taken: SystemTime) -> Option<ProcessRow> {
         tty,
         state,
     })
-}
-
-/// `[[dd-]hh:]mm:ss` as `ps -o etime` prints it. Seconds are always the
-/// last field; hours and days extend to the left.
-fn parse_etime(text: &str) -> Option<u64> {
-    let (days, rest) = match text.split_once('-') {
-        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
-        None => (0, text),
-    };
-    let mut parts = rest.rsplitn(3, ':');
-    let secs = parts
-        .next()? // coverage: off - rsplitn always yields the first field
-        .parse::<u64>()
-        .ok()?;
-    let mins = parts.next()?.parse::<u64>().ok()?;
-    let hours = match parts.next() {
-        Some(h) => h.parse::<u64>().ok()?,
-        None => 0,
-    };
-    Some(days * 86_400 + hours * 3_600 + mins * 60 + secs)
-}
-
-/// Elapsed time into an approximate start epoch. `etime` is truncated to
-/// whole seconds, so the estimate is late by under a second - inside the
-/// one-second window instances are compared within.
-fn start_from_elapsed(taken: SystemTime, elapsed_secs: u64) -> ProcessStart {
-    let epoch = taken
-        .checked_sub(Duration::from_secs(elapsed_secs))
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok());
-    match epoch {
-        Some(d) => ProcessStart::At(d.as_secs()),
-        None => ProcessStart::Unavailable, // coverage: off - needs a start before the epoch
-    }
 }
 
 /// The executable basename of a `comm` value: a path becomes its last
@@ -338,10 +307,9 @@ fn normalize_tty(tty: &str) -> Option<String> {
 /// A provider-published start time normalized to epoch seconds.
 ///
 /// Provider records format starts as UTC ctime (`Tue Sep 22 16:18:53 2026`
-/// for Claude's `procStart`); the platform reports elapsed time in local
-/// terms. Normalizing the published form to epoch makes the two comparable
-/// inside the one-second window, which is what the `pid_start` pair exists
-/// for.
+/// for Claude's `procStart`), the same form `ps -o lstart` prints under
+/// `TZ=UTC`. Normalizing both to epoch makes them comparable inside the
+/// one-second window, which is what the `pid_start` pair exists for.
 pub fn parse_utc_ctime(text: &str) -> Option<u64> {
     // `<wday> <month> <day> <hh:mm:ss> <year>`; the weekday carries no
     // information beyond a sanity hint and is ignored.
@@ -402,62 +370,49 @@ mod tests {
     }
 
     #[test]
-    fn etime_parses_every_ps_shape() {
-        assert_eq!(parse_etime("00:07"), Some(7));
-        assert_eq!(parse_etime("58:07"), Some(3_487));
-        assert_eq!(parse_etime("02:03:04"), Some(7_384));
-        assert_eq!(parse_etime("05-02:03:04"), Some(439_384));
-        assert_eq!(parse_etime(""), None);
-        assert_eq!(parse_etime("garbage"), None);
-        assert_eq!(parse_etime("1:2:3:4"), None);
-        assert_eq!(parse_etime("x-00:00"), None);
-        // ps always prints at least `mm:ss`: a bare field is not an etime.
-        assert_eq!(parse_etime("07"), None);
-        assert_eq!(parse_etime("x:07"), None);
-        // A tty that arrives already absolute keeps its path.
+    fn a_tty_that_arrives_absolute_keeps_its_path() {
         assert_eq!(normalize_tty("/dev/pts/4").as_deref(), Some("/dev/pts/4"));
     }
 
     #[test]
     fn ps_rows_parse_and_normalize() {
-        let taken = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        const L: &str = "Mon Jan 12 13:46:40 1970";
         let row =
-            parse_row("  3091  3090 05-05:58:07 S+   ttys042  -/bin/zsh", taken).expect("a ps row");
+            parse_row(&format!("  3091  3090 {L} S+   ttys042  -/bin/zsh")).expect("a ps row");
         assert_eq!(row.pid, 3091);
         assert_eq!(row.ppid, 3090);
-        // 5 days, 5:58:07 = 453_487 s before the snapshot.
-        assert_eq!(row.start, ProcessStart::At(1_000_000 - 453_487));
+        // `lstart` under `TZ=UTC` is the start itself, to the second.
+        assert_eq!(row.start, ProcessStart::At(1_000_000));
         assert_eq!(row.state, 'S');
         assert_eq!(row.tty.as_deref(), Some("/dev/ttys042"));
         assert_eq!(row.exe.as_deref(), Some("zsh"));
 
-        let full_path =
-            parse_row("  1     0 38-23:29:04 Ss   ??       /sbin/launchd", taken).unwrap();
+        let full_path = parse_row(&format!("  1     0 {L} Ss   ??       /sbin/launchd")).unwrap();
         assert_eq!(full_path.tty, None);
         assert_eq!(full_path.exe.as_deref(), Some("launchd"));
         assert!(!full_path.is_zombie());
 
-        let zombie = parse_row("  5     1 00:00 Z    ?       <defunct>", taken).unwrap();
+        let zombie = parse_row(&format!("  5     1 {L} Z    ?       <defunct>")).unwrap();
         assert!(zombie.is_zombie());
         assert_eq!(zombie.exe.as_deref(), Some("<defunct>"));
 
         // A missing command column and a nonsense line both fail cleanly.
-        let bare = parse_row("  9     1 00:01 S    -", taken).unwrap();
+        let bare = parse_row(&format!("  9     1 {L} S    -")).unwrap();
         assert_eq!(bare.exe, None);
         assert_eq!(bare.tty, None);
-        assert!(parse_row("not a process row", taken).is_none());
-        assert!(parse_row("", taken).is_none());
+        assert!(parse_row("not a process row").is_none());
+        assert!(parse_row("").is_none());
         // A row whose pid or ppid does not parse is not a process row.
         for bad in [
-            "  x     1 00:01 S    ttys0  zsh",
-            "  9     x 00:01 S    ttys0  zsh",
+            format!("  x     1 {L} S    ttys0  zsh"),
+            format!("  9     x {L} S    ttys0  zsh"),
         ] {
-            assert!(parse_row(bad, taken).is_none(), "{bad}");
+            assert!(parse_row(&bad).is_none(), "{bad}");
         }
-        // An unparseable etime keeps the row with an unavailable start:
+        // An unparseable start keeps the row with an unavailable start:
         // the pid is observably live, so it is pid-only evidence, not
         // a dead one.
-        let undated = parse_row("  9     1 xx:xx S    ttys0  zsh", taken).unwrap();
+        let undated = parse_row("  9     1 Mon Xxx 12 13:46:40 1970 S    ttys0  zsh").unwrap();
         assert_eq!(undated.start, ProcessStart::Unavailable);
         let table = ProcessTable::from_rows(vec![undated]);
         let claim = ProcessInstance {
@@ -569,7 +524,7 @@ mod tests {
         assert!(matches!(live, Liveness::PidOnly(_))); // coverage: off - miss edge is the assert failing
         // A wrong start time is a different instance, not a weak one.
         let ProcessStart::At(at) = start else {
-            panic!("the test process has a start time") // coverage: off - etime always parses on a live row
+            panic!("the test process has a start time") // coverage: off - lstart always parses on a live row
         };
         let later = ProcessInstance {
             pid,

@@ -374,6 +374,169 @@ fn forge_status_is_a_plain_value() {
         label: None,
         url: None,
         reason: Some("offline".to_owned()),
+        occurred_at_ms: None,
     };
     assert_eq!(status.item, WorkItem::Unknown);
+}
+
+#[test]
+fn merge_and_close_dates_are_the_items_occurrence_time() {
+    // `gh`: the merged and closed dates are requested and read; the
+    // merged date wins.
+    let dir = TempDir::new("forge-gh-occurred");
+    stub(
+        &dir,
+        "gh",
+        r#"[{"number":5,"state":"MERGED","url":"https://github.com/o/r/pull/5","statusCheckRollup":[],"mergedAt":"2024-06-01T10:00:00Z","closedAt":"2024-06-01T11:00:00Z"}]"#,
+        0,
+    );
+    let status = forge_at(&dir).status("https://github.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Closed);
+    assert_eq!(status.occurred_at_ms, Some(1_717_236_000_000));
+    let argv = calls(&dir, "gh").join(" ");
+    assert!(argv.contains("mergedAt"), "{argv}");
+    assert!(argv.contains("closedAt"), "{argv}");
+
+    // A closed-only PR dates at its close.
+    let dir = TempDir::new("forge-gh-closedat");
+    stub(
+        &dir,
+        "gh",
+        r#"[{"number":6,"state":"CLOSED","url":"https://github.com/o/r/pull/6","statusCheckRollup":[],"closedAt":"2024-06-02T11:30:00.500Z"}]"#,
+        0,
+    );
+    let status = forge_at(&dir).status("https://github.com/o/r", "b");
+    assert_eq!(status.occurred_at_ms, Some(1_717_327_800_500));
+
+    // `glab`: merged_at and closed_at are the same evidence.
+    let dir = TempDir::new("forge-glab-occurred");
+    stub(
+        &dir,
+        "glab",
+        r#"[{"iid":7,"state":"merged","web_url":"https://gitlab.com/o/r/-/merge_requests/7","merged_at":"2024-07-04T00:00:00.000Z","closed_at":"2024-07-05T00:00:00.000Z"}]"#,
+        0,
+    );
+    let status = forge_at(&dir).status("https://gitlab.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Closed);
+    assert_eq!(status.occurred_at_ms, Some(1_720_051_200_000));
+    let dir = TempDir::new("forge-glab-closedat");
+    stub(
+        &dir,
+        "glab",
+        r#"[{"iid":8,"state":"closed","web_url":"https://gitlab.com/o/r/-/merge_requests/8","closed_at":"2024-07-04T00:00:00.000Z"}]"#,
+        0,
+    );
+    let status = forge_at(&dir).status("https://gitlab.com/o/r", "b");
+    assert_eq!(status.occurred_at_ms, Some(1_720_051_200_000));
+}
+
+#[test]
+fn open_and_pipeline_dates_never_count_as_occurrences() {
+    // An open item's updatedAt is publication time, not work: no
+    // occurrence is proven.
+    let dir = TempDir::new("forge-gh-open-dates");
+    stub(
+        &dir,
+        "gh",
+        r#"[{"number":9,"state":"OPEN","url":"https://github.com/o/r/pull/9","statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2024-06-01T00:00:00Z"}],"updatedAt":"2024-06-01T00:00:00Z"}]"#,
+        0,
+    );
+    let status = forge_at(&dir).status("https://github.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Open);
+    assert_eq!(status.pipeline, Pipeline::Succeeded);
+    assert_eq!(status.occurred_at_ms, None);
+
+    // Missing occurrence fields fail closed to `None`.
+    let dir = TempDir::new("forge-gh-undated");
+    stub(&dir, "gh", &gh_pr(2, "CLOSED", "[]"), 0);
+    let status = forge_at(&dir).status("https://github.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Closed);
+    assert_eq!(status.occurred_at_ms, None);
+
+    let dir = TempDir::new("forge-glab-undated");
+    stub(&dir, "glab", &glab_mr(3, "closed", "null"), 0);
+    let status = forge_at(&dir).status("https://gitlab.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Closed);
+    assert_eq!(status.occurred_at_ms, None);
+}
+
+#[test]
+fn a_malformed_occurrence_date_is_none_not_invalid() {
+    // The item state stays valid; only the unparseable date is dropped -
+    // and a malformed merge date never falls through to the close date.
+    let dir = TempDir::new("forge-gh-bad-date");
+    stub(
+        &dir,
+        "gh",
+        r#"[{"number":5,"state":"MERGED","url":"https://github.com/o/r/pull/5","statusCheckRollup":[],"mergedAt":"not a date","closedAt":"2024-06-01T11:00:00Z"}]"#,
+        0,
+    );
+    let status = forge_at(&dir).status("https://github.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Closed);
+    assert_eq!(status.label.as_deref(), Some("PR #5"));
+    assert_eq!(status.occurred_at_ms, None);
+
+    let dir = TempDir::new("forge-glab-bad-date");
+    stub(
+        &dir,
+        "glab",
+        r#"[{"iid":7,"state":"closed","web_url":"https://gitlab.com/o/r/-/merge_requests/7","closed_at":"yesterday","merged_at":"2024-07-04T00:00:00.000Z"}]"#,
+        0,
+    );
+    let status = forge_at(&dir).status("https://gitlab.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Closed);
+    assert_eq!(status.occurred_at_ms, None);
+}
+
+#[test]
+fn only_the_item_states_own_date_is_an_occurrence() {
+    // An open PR carrying a syntactically valid close date still proves
+    // no occurrence - the state names which date may count, not the
+    // payload.
+    let dir = TempDir::new("forge-gh-open-dated");
+    stub(
+        &dir,
+        "gh",
+        r#"[{"number":9,"state":"OPEN","url":"https://github.com/o/r/pull/9","statusCheckRollup":[],"closedAt":"2024-06-01T11:00:00Z","mergedAt":"2024-06-01T10:00:00Z"}]"#,
+        0,
+    );
+    let status = forge_at(&dir).status("https://github.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Open);
+    assert_eq!(status.occurred_at_ms, None);
+
+    // A merged PR's closedAt is never read either - its own date alone
+    // counts.
+    let dir = TempDir::new("forge-gh-merged-only");
+    stub(
+        &dir,
+        "gh",
+        r#"[{"number":5,"state":"MERGED","url":"https://github.com/o/r/pull/5","statusCheckRollup":[],"closedAt":"2024-06-01T11:00:00Z"}]"#,
+        0,
+    );
+    let status = forge_at(&dir).status("https://github.com/o/r", "b");
+    assert_eq!(status.occurred_at_ms, None);
+
+    // glab `locked` maps to Closed but proves no occurrence, and
+    // `opened` carrying merged_at stays undated.
+    let dir = TempDir::new("forge-glab-locked");
+    stub(
+        &dir,
+        "glab",
+        r#"[{"iid":7,"state":"locked","web_url":"https://gitlab.com/o/r/-/merge_requests/7","closed_at":"2024-07-04T00:00:00.000Z"}]"#,
+        0,
+    );
+    let status = forge_at(&dir).status("https://gitlab.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Closed);
+    assert_eq!(status.occurred_at_ms, None);
+
+    let dir = TempDir::new("forge-glab-open-dated");
+    stub(
+        &dir,
+        "glab",
+        r#"[{"iid":8,"state":"opened","web_url":"https://gitlab.com/o/r/-/merge_requests/8","merged_at":"2024-07-04T00:00:00.000Z"}]"#,
+        0,
+    );
+    let status = forge_at(&dir).status("https://gitlab.com/o/r", "b");
+    assert_eq!(status.item, WorkItem::Open);
+    assert_eq!(status.occurred_at_ms, None);
 }

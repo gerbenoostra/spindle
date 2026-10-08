@@ -14,8 +14,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
 /// State of the pull request or merge request a branch feeds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkItem {
     /// Not asked, not asked successfully, or no CLI can ask this host.
     Unknown,
@@ -26,13 +29,38 @@ pub enum WorkItem {
     Closed,
 }
 
+impl WorkItem {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkItem::Unknown => "unknown",
+            WorkItem::NotExisting => "not_existing",
+            WorkItem::Open => "open",
+            WorkItem::Closed => "closed",
+        }
+    }
+}
+
 /// Pipeline state of an open work item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Pipeline {
     Busy,
     Succeeded,
     Failed,
     Unknown,
+}
+
+impl Pipeline {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Pipeline::Busy => "busy",
+            Pipeline::Succeeded => "succeeded",
+            Pipeline::Failed => "failed",
+            Pipeline::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +73,10 @@ pub struct ForgeStatus {
     pub url: Option<String>,
     /// Why `item` is `Unknown`, when it is.
     pub reason: Option<String>,
+    /// The item's own occurrence time - the merge or close date, epoch
+    /// milliseconds. `None` on open items, undated answers and
+    /// malformed dates: no forge date is ever guessed or borrowed.
+    pub occurred_at_ms: Option<u64>,
 }
 
 impl ForgeStatus {
@@ -55,6 +87,7 @@ impl ForgeStatus {
             label: None,
             url: None,
             reason: Some(reason.into()),
+            occurred_at_ms: None,
         }
     }
 
@@ -65,6 +98,7 @@ impl ForgeStatus {
             label: None,
             url: None,
             reason: None,
+            occurred_at_ms: None,
         }
     }
 }
@@ -180,7 +214,7 @@ impl Forge {
                 "--state".to_owned(),
                 state.to_owned(),
                 "--json".to_owned(),
-                "number,state,url,statusCheckRollup".to_owned(),
+                "number,state,url,statusCheckRollup,mergedAt,closedAt".to_owned(),
                 "--limit".to_owned(),
                 "20".to_owned(),
             ]
@@ -214,6 +248,16 @@ impl Forge {
             url: item["url"].as_str().map(str::to_owned),
             reason: (state != "OPEN" && state != "CLOSED" && state != "MERGED")
                 .then(|| format!("gh reports PR state {state:?}")),
+            // The state's own date alone: a merged PR dates at
+            // `mergedAt`, a closed one at `closedAt`. Nothing else - not
+            // an open item's update, not a pipeline run - is an
+            // occurrence, and a malformed merge date does not borrow
+            // the close date.
+            occurred_at_ms: match state {
+                "MERGED" => occurred_ms(item, "mergedAt"),
+                "CLOSED" => occurred_ms(item, "closedAt"),
+                _ => None,
+            },
         };
         if status.item == WorkItem::Open {
             status.pipeline = gh_pipeline(&item["statusCheckRollup"]);
@@ -273,6 +317,14 @@ impl Forge {
             url: item["web_url"].as_str().map(str::to_owned),
             reason: (!matches!(state, "opened" | "closed" | "merged" | "locked"))
                 .then(|| format!("glab reports MR state {state:?}")),
+            // The state's own date alone: `merged` dates at
+            // `merged_at`, `closed` at `closed_at`; `locked` and every
+            // other state prove no occurrence.
+            occurred_at_ms: match state {
+                "merged" => occurred_ms(item, "merged_at"),
+                "closed" => occurred_ms(item, "closed_at"),
+                _ => None,
+            },
         };
         if status.item == WorkItem::Open {
             status.pipeline = glab_pipeline(&item["head_pipeline"]);
@@ -296,6 +348,16 @@ impl Forge {
             .cloned()
             .ok_or_else(|| ForgeStatus::unknown(format!("{program} output is not a list")))
     }
+}
+
+/// The item's occurrence time: `key`'s value as a parseable RFC3339
+/// date, epoch milliseconds. A missing or malformed date fails closed
+/// to `None` without invalidating the item it rode in on.
+fn occurred_ms(item: &serde_json::Value, key: &str) -> Option<u64> {
+    let text = item[key].as_str()?;
+    let at =
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()?;
+    u64::try_from(at.unix_timestamp_nanos() / 1_000_000).ok()
 }
 
 /// A host containing "github" is served by `gh`, one containing "gitlab" by
@@ -412,7 +474,9 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Keeps network facts off the render path: a cached answer is served until
-/// `ttl` old, and only an explicit collection asks the CLI again.
+/// `ttl` old, and only an explicit collection asks the CLI again. `fresh`,
+/// `seed` and `peek` are the split a fanned-out collector uses: enumerate
+/// stale asks, fetch them in parallel, seed the answers back, then read.
 pub struct ForgeCache {
     ttl: Duration,
     entries: HashMap<(String, String), (Instant, ForgeStatus)>,
@@ -426,6 +490,27 @@ impl ForgeCache {
         }
     }
 
+    /// Whether the stored answer for `(remote_url, branch)` still stands.
+    pub fn fresh(&self, remote_url: &str, branch: &str, now: Instant) -> bool {
+        let key = (remote_url.to_owned(), branch.to_owned());
+        self.entries
+            .get(&key)
+            .is_some_and(|(at, _)| now.duration_since(*at) < self.ttl)
+    }
+
+    /// Store a freshly asked status.
+    pub fn seed(&mut self, remote_url: &str, branch: &str, status: ForgeStatus, now: Instant) {
+        let key = (remote_url.to_owned(), branch.to_owned());
+        self.entries.insert(key, (now, status));
+    }
+
+    /// The stored status, without asking. `None` only when the pair was
+    /// never asked - callers that enumerate their asks first never miss.
+    pub fn peek(&self, remote_url: &str, branch: &str) -> Option<&ForgeStatus> {
+        let key = (remote_url.to_owned(), branch.to_owned());
+        self.entries.get(&key).map(|(_, status)| status)
+    }
+
     /// `now` is a parameter so tests drive expiry without sleeping.
     pub fn status(
         &mut self,
@@ -434,14 +519,14 @@ impl ForgeCache {
         branch: &str,
         now: Instant,
     ) -> ForgeStatus {
-        let key = (remote_url.to_owned(), branch.to_owned());
-        if let Some((at, status)) = self.entries.get(&key)
-            && now.duration_since(*at) < self.ttl
-        {
-            return status.clone();
+        if self.fresh(remote_url, branch, now) {
+            return self
+                .peek(remote_url, branch)
+                .cloned()
+                .unwrap_or_else(|| ForgeStatus::unknown("cache entry vanished")); // coverage: off - the peek miss arm is unreachable: fresh just proved the entry
         }
         let status = forge.status(remote_url, branch);
-        self.entries.insert(key, (now, status.clone()));
+        self.seed(remote_url, branch, status.clone(), now);
         status
     }
 }

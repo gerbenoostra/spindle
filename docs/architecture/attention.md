@@ -1,7 +1,9 @@
 # Attention architecture
 
 How hook events, provider state and acknowledgement become a row's glyph.
-User-visible behavior is in [attention](../attention.md).
+User-visible behavior is in [attention](../attention.md); work identity,
+history and navigation semantics are in
+[work-lifecycle](work-lifecycle.md).
 
 ## Data flow
 
@@ -13,16 +15,18 @@ User-visible behavior is in [attention](../attention.md).
    the not-busy mark, the provider's published state and process liveness
    into an execution state and an attention value. It is a pure function:
    `now` is an argument.
-4. The collector writes the focus acknowledgement. It is the only write a
-   refresh makes, and it re-derives the row from what was stored.
+4. The collector writes the focus acknowledgement and reconciles the
+   work records - identities, touches, session cursors and the
+   source-dated activities and scan-time observations. It preserves
+   authored parked flags.
 5. Work rows roll up their bound conversations' attention and pick their
    section on every publish. The TUI's `space` writes seen-state or a mark,
    and the next refresh reflects it.
 
 ## Invariants
 
-- The journal is the only shared mutable file, and `journal.lock` serializes
-  every mutation: append, compaction and the authored-file rewrites.
+- `journal.lock` serializes journal appends, compaction and every
+  authored-file rewrite in the store.
 - Reduction is a pure function of commit order. Replaying the journal,
   before or after compaction, yields the same folds.
 - A record with a future schema, an empty session id, or bytes that do not
@@ -68,6 +72,10 @@ User-visible behavior is in [attention](../attention.md).
 - Compaction drops latches seen-state has acknowledged - because Vibe
   publishes no `start`, so its turn-end latches would otherwise accumulate
   forever.
+- Compaction carries the newest 16 rejected (stale or duplicate) records
+  per conversation into the checkpoint - because the evidence view shows
+  what the winning state outranked, and compaction runs every 128 records;
+  bounded so a stuck producer cannot grow the checkpoint.
 - Compaction defers while the journal holds a frame the reduction cannot
   carry - because rewriting would lose those bytes; the cost is a journal
   that grows until the frame is repaired. Rewriting only the retained tail

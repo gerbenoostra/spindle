@@ -1,5 +1,6 @@
 //! One dashboard for every agentic session and worktree.
 
+pub mod action;
 pub mod attention;
 pub mod claude;
 pub mod config;

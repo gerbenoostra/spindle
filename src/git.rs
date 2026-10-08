@@ -207,6 +207,10 @@ fn in_dir(dir: &Path, args: &[&str]) -> Result<String, Error> {
     git(&[OsString::from("-C"), dir.as_os_str().to_owned()], args)
 }
 
+fn in_dir_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
+    git_bytes(&[OsString::from("-C"), dir.as_os_str().to_owned()], args)
+}
+
 /// `-C <repo_dir>` makes repo reads behave as if launched inside the
 /// repository: remote names, `.` remotes and relative-path remote URLs
 /// resolve against it, not against whatever directory launched the tool.
@@ -257,6 +261,7 @@ fn parse_worktrees(bytes: &[u8], common_dir: &Path) -> Vec<Worktree> {
                 main: found.is_empty(),
                 bare: false,
                 locked: false,
+                prunable: None,
             });
         } else if let Some(wt) = current.as_mut() {
             let line = String::from_utf8_lossy(field);
@@ -280,6 +285,8 @@ fn parse_worktrees(bytes: &[u8], common_dir: &Path) -> Vec<Worktree> {
                 wt.bare = true;
             } else if line.starts_with("locked") {
                 wt.locked = true;
+            } else if let Some(reason) = line.strip_prefix("prunable") {
+                wt.prunable = Some(reason.trim().to_owned());
             }
         } // coverage: off - porcelain fields only follow a worktree record
     }
@@ -321,6 +328,7 @@ pub struct Worktree {
     pub main: bool,
     pub bare: bool,
     pub locked: bool,
+    pub prunable: Option<String>,
 }
 
 /// The resolved meaning of an input path.
@@ -384,6 +392,9 @@ pub struct BranchFact {
     /// reported for a worktree whose directory was deleted, which matches
     /// `worktree list`'s prunable records.
     pub worktree: Option<PathBuf>,
+    /// `%(objectname)`: the branch tip's OID - what a continuity check
+    /// compares the persisted creation evidence's head against.
+    pub head: Option<String>,
 }
 
 /// The batched ref read: every local branch's [`BranchFact`] plus every
@@ -557,7 +568,7 @@ impl Repo {
             self,
             &[
                 "for-each-ref",
-                "--format=%(refname)%00%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream:track)%00%(committerdate:unix)%00%(worktreepath)%00%(symref)",
+                "--format=%(refname)%00%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream:track)%00%(committerdate:unix)%00%(worktreepath)%00%(symref)%00%(objectname)",
                 "refs/heads",
                 "refs/remotes",
             ],
@@ -634,11 +645,83 @@ impl Repo {
         }
     }
 
+    /// Every local branch's tip OID from one `for-each-ref`: the fallback
+    /// the `ref_facts` error arm keeps for tip evidence on a git too old
+    /// for the upstream atoms - `refname` and `objectname` are the oldest
+    /// atoms the command knows.
+    pub fn branch_tips(&self) -> Result<HashMap<String, String>, Error> {
+        let text = in_repo(
+            self,
+            &[
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)",
+                "refs/heads/",
+            ],
+        )?; // coverage: off - needs a git too old for the ref_facts atoms
+        Ok(parse_branch_tips(&text)) // coverage: off - same
+    }
+
+    /// The incarnation evidence one branch's own reflog proves: the newest
+    /// null-old entry names the head and moment this incarnation came to
+    /// be, and the latest `Branch: renamed` line names the ref the log
+    /// moved from. A deleted ref's log is gone with it; a recreated ref's
+    /// log starts on a fresh null-old line, and a rename carries the whole
+    /// log - original creation line included - to the new name.
+    pub fn ref_lifecycle(&self, branch: &str) -> RefLifecycle {
+        let path = self.common_dir.join(format!("logs/refs/heads/{branch}"));
+        let mut lifecycle = RefLifecycle::default();
+        let Ok(text) = fs::read_to_string(&path) else {
+            return lifecycle;
+        };
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let Some(entry) = ReflogEntry::parse(line) else {
+                continue;
+            };
+            if entry.creation {
+                lifecycle.creation = Some(RefCreation {
+                    head: entry.head.clone(),
+                    at: entry.at,
+                });
+            }
+            if let Some((old, new)) = &entry.renamed
+                && new == branch
+            {
+                lifecycle.renamed_from = Some(old.clone());
+            }
+        }
+        lifecycle
+    }
+
     /// Whether `refname` resolves locally (`rev-parse --verify -q`).
     pub fn has_ref(&self, refname: &str) -> bool {
         in_repo(self, &["rev-parse", "--verify", "-q", refname])
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
+    }
+
+    /// `log <a>..<b>`, newest first, at most `limit` commits: what `b`
+    /// carries that `a` lacks, each with its sha, committer time and
+    /// subject.
+    pub fn log_range(
+        &self,
+        from_exclusive: &str,
+        to: &str,
+        limit: usize,
+    ) -> Result<Vec<LogCommit>, Error> {
+        let range = format!("{from_exclusive}..{to}");
+        let max = format!("--max-count={limit}");
+        let text = in_repo(
+            self,
+            &[
+                "log",
+                "-z",
+                "--no-show-signature",
+                "--format=%H%x1f%ct%x1f%s",
+                &max,
+                &range,
+            ],
+        )?;
+        Ok(parse_log(&text))
     }
 
     /// `rev-list --count <a>..<b>`.
@@ -723,30 +806,164 @@ impl Repo {
     /// untracked changes, so configuration hiding untracked files cannot make
     /// a dirty tree look disposable. // coverage: off - the unexecuted instantiation's region edge
     #[rustfmt::skip]
-    pub fn dirty(&self, checkout: &Path) -> Evidence<bool> {
-        match in_dir(checkout, &["status", "--porcelain", "--untracked-files=all"]) { // coverage: off - the unexecuted instantiation's region edge
-            Ok(text) => Evidence::Known(!text.trim().is_empty()),
+    pub fn status(&self, checkout: &Path) -> Evidence<Vec<u8>> {
+        match in_dir_bytes(checkout, &["status", "--porcelain=v1", "-z", "--untracked-files=all"]) {
+            Ok(bytes) => Evidence::Known(bytes),
             Err(e) => Evidence::Unknown(format!("git status: {e}")),
         }
     }
 
-    /// Last entry time of a worktree's HEAD reflog, or of a branch reflog,
-    /// taken with the log file's mtime: the newest of the two is the activity
-    /// signal. // coverage: off - the unexecuted instantiation's region edge
-    pub fn reflog_activity(&self, log: &Path) -> Option<SystemTime> {
-        // coverage: off - same
-        let path = self.common_dir.join(log); // coverage: off - `join`'s empty-path arm is the missed region; a reflog name is never empty
-        let text = fs::read_to_string(&path).ok()?;
-        let last = text.lines().rev().find(|l| !l.trim().is_empty())?;
-        // `<old> <new> <ident> <epoch> <tz>\t<msg>`: the epoch is the second
-        // token before the tab when read from the right, which is robust
-        // against spaces inside the identity.
-        let fields = last.split('\t').next().unwrap_or(last);
-        let epoch: u64 = fields.split_whitespace().nth_back(1)?.parse().ok()?;
-        let entry = UNIX_EPOCH + Duration::from_secs(epoch);
-        let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
-        Some(mtime.map_or(entry, |m| m.max(entry)))
+    #[rustfmt::skip]
+    pub fn dirty(&self, checkout: &Path) -> Evidence<bool> {
+        self.status(checkout).map(|bytes| !bytes.is_empty())
     }
+
+    #[rustfmt::skip]
+    pub fn admin_status(&self, admin_id: &str, checkout: &Path) -> Evidence<Vec<u8>> {
+        let gitdir = self.common_dir.join("worktrees").join(admin_id);
+        match git_bytes(
+            &admin_globals(&gitdir, checkout),
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        ) {
+            Ok(bytes) => Evidence::Known(bytes),
+            Err(e) => Evidence::Unknown(format!("git status: {e}")),
+        }
+    }
+
+    /// How a reflog reads for activity: `created_at` is the moment the ref
+    /// or checkout came to be - the null-old entry every reflog starts
+    /// with; `worked_at` is the newest entry that moved the ref for real -
+    /// a commit, merge, reset or rebase. Creation entries other than an
+    /// initial commit, bookkeeping lines (`checkout:`, `Branch: renamed`)
+    /// and entries whose old and new tips agree are not work. The file's
+    /// mtime never counts: it timestamps the last write, and writes that
+    /// add nothing - a `reflog expire` rewriting identical bytes - would
+    /// otherwise manufacture activity out of maintenance.
+    pub fn reflog_times(&self, log: &Path) -> ReflogTimes {
+        let path = self.common_dir.join(log); // coverage: off - `join`'s empty-path arm is the missed region; a reflog name is never empty
+        let mut times = ReflogTimes::default();
+        let Ok(text) = fs::read_to_string(&path) else {
+            return times;
+        };
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let Some(entry) = ReflogEntry::parse(line) else {
+                continue;
+            };
+            if entry.creation && times.created_at.is_none() {
+                times.created_at = Some(entry.at);
+            }
+            if entry.work {
+                times.worked_at = Some(times.worked_at.map_or(entry.at, |w| w.max(entry.at)));
+            }
+        }
+        times
+    }
+}
+
+/// What a branch's own reflog proves about this incarnation of the ref.
+#[derive(Debug, Clone, Default)]
+pub struct RefLifecycle {
+    /// The newest null-old entry: the head and moment this incarnation
+    /// came to be.
+    pub creation: Option<RefCreation>,
+    /// The short name a `Branch: renamed` entry moved this log from.
+    pub renamed_from: Option<String>,
+}
+
+/// A ref's creation as its reflog's newest null-old entry proves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefCreation {
+    /// The tip the ref was created at - `new` on the null-old line.
+    pub head: String,
+    /// The committer-clock time stamped on the creation entry.
+    pub at: SystemTime,
+}
+
+/// What one reflog proves about its ref's lifecycle.
+#[derive(Debug, Default)]
+pub struct ReflogTimes {
+    /// The ref's creation/checkout epoch - the null-old entry's time.
+    pub created_at: Option<SystemTime>,
+    /// The newest real work entry's own timestamp.
+    pub worked_at: Option<SystemTime>,
+}
+
+/// One reflog line: `<old> <new> <ident> <epoch> <tz>\t<msg>`.
+struct ReflogEntry {
+    /// The line's `old` was the null sha: the entry created the ref.
+    creation: bool,
+    /// The entry moved the tip or tree: an initial commit, or a
+    /// non-creation entry whose message is not bookkeeping and whose old
+    /// and new differ.
+    work: bool,
+    /// The committer-clock epoch stamped on the line.
+    at: SystemTime,
+    /// The line's `new` sha: the tip after this entry.
+    head: String,
+    /// `(old, new)` short names when the message is exactly
+    /// `Branch: renamed refs/heads/<old> to refs/heads/<new>`.
+    renamed: Option<(String, String)>,
+}
+
+impl ReflogEntry {
+    /// Messages Git writes on an existing ref for lifecycle bookkeeping
+    /// rather than work: `checkout: moving from X to Y` and `Branch:
+    /// renamed`. A `branch: Reset to` entry is not here - when it moves the
+    /// tip it is real work like any reset.
+    const BOOKKEEPING: &'static [&'static str] = &["checkout:", "Branch: renamed"];
+
+    fn parse(line: &str) -> Option<ReflogEntry> {
+        let fields = line.split('\t').next().unwrap_or(line);
+        let mut fields = fields.split_whitespace();
+        let old = fields.next()?; // coverage: off - the caller only parses non-empty lines, which always have a first token
+        let new = fields.next()?;
+        // The epoch is the second token before the tab when read from the
+        // right - robust against spaces inside the identity.
+        let epoch: u64 = fields.nth_back(1)?.parse().ok()?;
+        let message = line.split('\t').nth(1).unwrap_or("");
+        let creation = !old.is_empty() && old.bytes().all(|b| b == b'0');
+        // A creation entry records the ref coming to be - `branch: Created
+        // from`, `clone: from`, or the message-less line `git worktree add`
+        // writes - and is work only when it is the repository's first
+        // commit (`commit (initial): ...`).
+        let work = if creation {
+            message.starts_with("commit (initial)")
+        } else {
+            old != new
+                && !Self::BOOKKEEPING
+                    .iter()
+                    .any(|prefix| message.starts_with(prefix))
+        };
+        Some(ReflogEntry {
+            creation,
+            work,
+            at: UNIX_EPOCH + Duration::from_secs(epoch),
+            head: new.to_owned(),
+            renamed: parse_rename(message),
+        })
+    }
+}
+
+/// `Branch: renamed refs/heads/<old> to refs/heads/<new>` -> `(<old>,
+/// <new>)` as short names, exact. Anything else is not rename evidence.
+fn parse_rename(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("Branch: renamed refs/heads/")?;
+    let (old, new) = rest.split_once(" to refs/heads/")?;
+    Some((old.to_owned(), new.to_owned()))
+}
+
+/// The `branch_tips` output: `refs/heads/<name>\0<oid>` per line; a
+/// malformed line is dropped rather than guessed at.
+fn parse_branch_tips(text: &str) -> HashMap<String, String> {
+    let mut tips = HashMap::new();
+    for line in text.lines() {
+        if let Some((refname, oid)) = line.split_once('\0')
+            && let Some(name) = refname.strip_prefix("refs/heads/")
+        {
+            tips.insert(name.to_owned(), oid.to_owned());
+        }
+    }
+    tips
 }
 
 /// The `ref_facts` output: one line per ref - refnames can never contain a
@@ -770,6 +987,9 @@ fn parse_ref_facts(text: &str) -> RefFacts {
             let track = fields.next().and_then(parse_track);
             let committer_date = fields.next().and_then(|d| d.parse::<u64>().ok());
             let worktree = fields.next().filter(|w| !w.is_empty()).map(PathBuf::from);
+            // `%(symref)` sits between worktreepath and objectname; a local
+            // branch is never a symref, so the field is skipped unread.
+            let head = fields.nth(1).filter(|h| !h.is_empty()).map(str::to_owned);
             facts.branches.insert(
                 branch.to_owned(),
                 BranchFact {
@@ -777,11 +997,13 @@ fn parse_ref_facts(text: &str) -> RefFacts {
                     track,
                     committer_date,
                     worktree,
+                    head,
                 },
             );
         } else if let Some(rest) = refname.strip_prefix("refs/remotes/") {
-            // `%(symref)` is the last field: non-empty only for the
-            // `<remote>/HEAD` symbolic refs.
+            // `%(symref)` is field six: non-empty only for the
+            // `<remote>/HEAD` symbolic refs. `%(objectname)` after it is
+            // branch-tip evidence the remotes arm does not read.
             let symref = fields.nth(5).unwrap_or("");
             if let Some(remote) = rest.strip_suffix("/HEAD")
                 && let Some(target) = symref
@@ -795,6 +1017,34 @@ fn parse_ref_facts(text: &str) -> RefFacts {
         }
     }
     facts
+}
+
+/// One commit of [`Repo::log_range`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LogCommit {
+    pub sha: String,
+    /// Committer time, epoch seconds.
+    pub at: u64,
+    /// The first line of the message.
+    pub subject: String,
+}
+
+/// The `log_range` output: NUL-separated records of `sha`, committer
+/// time and subject, unit-separated. A record that does not parse is
+/// skipped.
+fn parse_log(text: &str) -> Vec<LogCommit> {
+    text.split('\0')
+        .filter_map(|record| {
+            let (sha, rest) = record.trim_start_matches('\n').split_once('\x1f')?;
+            let (at, subject) = rest.split_once('\x1f')?;
+            let at = at.parse().ok()?;
+            Some(LogCommit {
+                sha: sha.to_owned(),
+                at,
+                subject: subject.to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// The `ahead_behind` output: `refs/heads/<name>\0<ahead> <behind>` per
@@ -848,7 +1098,7 @@ fn parse_track(field: &str) -> Option<Track> {
 fn admin_id(path: &Path, common_dir: &Path) -> Option<String> {
     let dotgit = path.join(".git");
     if !dotgit.is_file() {
-        return None;
+        return admin_id_retained(path, common_dir);
     }
     let text = fs::read_to_string(&dotgit).ok()?;
     let target = text.trim().strip_prefix("gitdir:")?.trim();
@@ -857,6 +1107,133 @@ fn admin_id(path: &Path, common_dir: &Path) -> Option<String> {
         admin.file_name().map(|n| n.to_string_lossy().into_owned())
     } else {
         None
+    }
+}
+
+fn admin_id_retained(path: &Path, common_dir: &Path) -> Option<String> {
+    let want = path.join(".git");
+    let mut found = None;
+    for entry in fs::read_dir(common_dir.join("worktrees")).ok()?.flatten() {
+        let admin = entry.path();
+        if !admin.is_dir() {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let target = Path::new(text.trim());
+        let same = target == want
+            || (target.file_name() == Some(std::ffi::OsStr::new(".git"))
+                && target
+                    .parent()
+                    .is_some_and(|p| p.canonicalize().as_deref().ok() == Some(path)));
+        if !same {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = admin.file_name().map(|n| n.to_string_lossy().into_owned());
+    }
+    found
+}
+
+pub struct Status {
+    pub fingerprint: String,
+    pub reasons: Vec<String>,
+    /// The newest mtime among the changed paths' successfully read
+    /// metadata: when work on the tree last touched a file it still
+    /// carries. `None` when nothing changed, or when every changed path's
+    /// metadata failed to read - a deleted file proves no occurrence
+    /// time, and a clean tree has no paths to date.
+    pub newest_changed_mtime: Option<SystemTime>,
+}
+
+pub fn status(bytes: &[u8], root: &Path) -> Status {
+    let mut reasons = Vec::new();
+    let mut material = bytes.to_vec();
+    let mut newest = None;
+    let mut records = bytes.split(|b| *b == 0);
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+        let (x, y) = (record[0], record[1]);
+        let path = &record[3..];
+        let text = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+        if x == b'!' {
+            continue;
+        }
+        let mtime = fingerprint_path(&mut material, root, path);
+        newest = newest.max(mtime);
+        if x == b'?' {
+            reasons.push(format!("untracked {}", text(path)));
+        } else if x == b'R' || y == b'R' || x == b'C' || y == b'C' {
+            let verb = if x == b'R' || y == b'R' {
+                "renamed"
+            } else {
+                "copied"
+            };
+            let old = records.next().unwrap_or_default();
+            if !old.is_empty() {
+                let mtime = fingerprint_path(&mut material, root, old);
+                newest = newest.max(mtime);
+            }
+            reasons.push(format!("{verb} {} -> {}", text(old), text(path)));
+        } else if x == b'A' || y == b'A' {
+            reasons.push(format!("added {}", text(path)));
+        } else if x == b'D' || y == b'D' {
+            reasons.push(format!("deleted {}", text(path)));
+        } else {
+            reasons.push(format!("modified {}", text(path)));
+        }
+    }
+    reasons.sort_unstable();
+    reasons.dedup();
+    if reasons.len() > 10 {
+        let more = reasons.len() - 10;
+        reasons.truncate(10);
+        reasons.push(format!("{more} more changes"));
+    }
+    if reasons.is_empty() {
+        reasons.push("working tree clean".to_owned());
+    }
+    Status {
+        fingerprint: material.iter().map(|b| format!("{b:02x}")).collect(),
+        reasons,
+        newest_changed_mtime: newest,
+    }
+}
+
+fn admin_globals(gitdir: &Path, checkout: &Path) -> [OsString; 2] {
+    let mut gitdir_arg = OsString::from("--git-dir=");
+    gitdir_arg.push(gitdir.as_os_str());
+    let mut worktree_arg = OsString::from("--work-tree=");
+    worktree_arg.push(checkout.as_os_str());
+    [gitdir_arg, worktree_arg]
+}
+
+/// The path's contribution to the fingerprint material, and its mtime
+/// when metadata read: a missing or unreadable path proves no occurrence
+/// time either way.
+fn fingerprint_path(out: &mut Vec<u8>, root: &Path, raw: &[u8]) -> Option<SystemTime> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    out.push(0);
+    out.extend_from_slice(raw);
+    match fs::symlink_metadata(root.join(std::ffi::OsStr::from_bytes(raw))) {
+        Ok(meta) => {
+            out.push(1);
+            out.extend_from_slice(&meta.mode().to_be_bytes());
+            out.extend_from_slice(&meta.size().to_be_bytes());
+            out.extend_from_slice(&meta.mtime().to_be_bytes());
+            out.extend_from_slice(&meta.mtime_nsec().to_be_bytes());
+            meta.modified().ok()
+        }
+        Err(_) => {
+            out.push(0);
+            None
+        }
     }
 }
 
@@ -1009,15 +1386,25 @@ mod tests {
             b"worktree /tmp/main\nrepo\0HEAD deadbeef\0branch refs/heads/main\0\0",
         );
         bytes.extend_from_slice(b"worktree /tmp/wt-\xff x\0HEAD cafef00d\0detached\0\0");
+        bytes.extend_from_slice(
+            b"worktree /tmp/gone\0HEAD bee5dead\0branch refs/heads/lost\0prunable gitdir file points to non-existent location\0\0",
+        );
         let found = parse_worktrees(&bytes, Path::new("/tmp/.git"));
 
-        assert_eq!(found.len(), 2);
+        assert_eq!(found.len(), 3);
         assert!(found[0].main);
         assert_eq!(found[0].path.as_os_str().as_bytes(), b"/tmp/main\nrepo");
         assert_eq!(found[0].head, Head::Branch("main".to_owned()));
+        assert_eq!(found[0].prunable, None);
         assert!(!found[1].main);
         assert_eq!(found[1].path.as_os_str().as_bytes(), b"/tmp/wt-\xff x");
         assert_eq!(found[1].head, Head::Detached("cafef00d".to_owned()));
+        assert_eq!(found[1].prunable, None);
+        assert_eq!(found[2].head, Head::Branch("lost".to_owned()));
+        assert_eq!(
+            found[2].prunable.as_deref(),
+            Some("gitdir file points to non-existent location")
+        );
     }
 
     /// `check_argv` without inlining, so its unfired arms stay in their own
@@ -1128,7 +1515,11 @@ mod tests {
         assert!(!repo.paths_match("a", "b", &["x".to_owned()]).is_known());
         assert!(repo.ref_facts().is_err());
         assert!(repo.ahead_behind("refs/heads/main").is_err());
-        assert!(repo.reflog_activity(Path::new("logs/HEAD")).is_none());
+        assert!(
+            repo.reflog_times(Path::new("logs/HEAD"))
+                .worked_at
+                .is_none()
+        );
         assert!(!repo.dirty(Path::new("/also/not/here")).is_known());
     }
 
@@ -1317,49 +1708,293 @@ mod tests {
     }
 
     #[test]
-    fn reflog_activity_reads_the_last_entry_and_mtime() {
+    fn the_admin_id_falls_back_to_the_retained_gitdir_files() {
+        let temp = Temp::new();
+        let common = temp.0.join("repo").join(".git");
+        let admin = common.join("worktrees").join("wt1");
+        let linked = temp.0.join("linked");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(admin_id(&linked, &common).as_deref(), Some("wt1"));
+
+        let admin2 = common.join("worktrees").join("wt2");
+        fs::create_dir_all(&admin2).unwrap();
+        fs::write(
+            admin2.join("gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(admin_id(&linked, &common), None);
+        fs::remove_dir_all(&admin2).unwrap();
+
+        let other = temp.0.join("other");
+        fs::create_dir_all(&other).unwrap();
+        assert_eq!(admin_id(&other, &common), None);
+        let admin3 = common.join("worktrees").join("wt3");
+        fs::create_dir_all(&admin3).unwrap();
+        fs::write(admin3.join("gitdir"), "/plain/dir\n").unwrap();
+        assert_eq!(admin_id(&other, &common), None);
+        fs::write(common.join("worktrees").join("stray"), "x").unwrap();
+        assert_eq!(admin_id(&other, &common), None);
+
+        let gone = temp.0.join("gone-checkout");
+        fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", gone.join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(admin_id(&gone, &common).as_deref(), Some("wt1"));
+
+        let bare = temp.0.join("bare");
+        fs::create_dir_all(&bare).unwrap();
+        assert_eq!(admin_id(&bare, &common.join("elsewhere")), None);
+    }
+
+    #[test]
+    fn a_prunable_worktree_reads_dirty_through_its_admin_dir() {
+        let temp = Temp::new();
+        let dir = temp.0.join("repo");
+        git_ok(&temp.0, &["init", dir.to_str().unwrap()]);
+        fs::write(dir.join("f.txt"), "x").unwrap();
+        git_ok(&dir, &["add", "f.txt"]);
+        git_ok(&dir, &["commit", "-qm", "c"]);
+        let linked = temp.0.join("linked");
+        git_ok(
+            &dir,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+        fs::write(linked.join("untracked.txt"), "new").unwrap();
+        fs::remove_file(linked.join(".git")).unwrap();
+        let repo = Repo::discover(&dir).unwrap().expect("a repo");
+
+        let worktrees = repo.worktrees().unwrap();
+        let wt = worktrees
+            .iter()
+            .find(|w| w.path == linked)
+            .expect("the linked worktree is still listed");
+        assert!(wt.prunable.is_some(), "{:?}", wt.prunable);
+        let id = wt
+            .admin_id
+            .as_deref()
+            .expect("the retained admin dir resolves");
+        let status = repo.admin_status(id, &linked);
+        assert!(status.is_known(), "{status:?}");
+        assert!(!status.known().expect("known").is_empty(), "dirty shows");
+        assert!(!repo.dirty(&linked).is_known());
+    }
+
+    #[test]
+    fn admin_status_globals_preserve_non_utf8_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let checkout = Path::new(OsStr::from_bytes(b"co\xffwt"));
+        let [gitdir_arg, worktree_arg] = admin_globals(Path::new("/common/worktrees/id"), checkout);
+        assert_eq!(
+            gitdir_arg.as_os_str().as_bytes(),
+            b"--git-dir=/common/worktrees/id"
+        );
+        assert_eq!(
+            worktree_arg.as_os_str().as_bytes(),
+            b"--work-tree=co\xffwt",
+            "a lossy display() would smuggle in a replacement character"
+        );
+    }
+
+    #[test]
+    fn reflog_times_reads_work_entries_not_bookkeeping() {
         let temp = Temp::new();
         let repo = Repo {
             common_dir: temp.0.clone(),
         };
+        let log = Path::new("logs/HEAD");
         // No log at all is no evidence.
-        assert_eq!(repo.reflog_activity(Path::new("logs/HEAD")), None);
+        let times = repo.reflog_times(log);
+        assert_eq!(times.created_at, None);
+        assert_eq!(times.worked_at, None);
 
         let log_dir = temp.0.join("logs");
         fs::create_dir_all(&log_dir).unwrap();
         // A log of only blank lines has no entry to read.
         fs::write(log_dir.join("HEAD"), "  \n\n").unwrap();
-        assert_eq!(repo.reflog_activity(Path::new("logs/HEAD")), None);
+        assert_eq!(repo.reflog_times(log).worked_at, None);
         // Garbage parses to nothing rather than to a guessed time: a line
         // without an epoch field, and a line whose epoch is not a number.
         fs::write(log_dir.join("HEAD"), "onefield\n").unwrap();
-        assert_eq!(repo.reflog_activity(Path::new("logs/HEAD")), None);
+        assert_eq!(repo.reflog_times(log).worked_at, None);
         fs::write(log_dir.join("HEAD"), "not a reflog line\n").unwrap();
-        assert_eq!(repo.reflog_activity(Path::new("logs/HEAD")), None);
+        assert_eq!(repo.reflog_times(log).worked_at, None);
+        fs::write(log_dir.join("HEAD"), "old new\n").unwrap();
+        assert_eq!(repo.reflog_times(log).worked_at, None);
 
+        // A creation-only log records the moment but proves no work.
         fs::write(
             log_dir.join("HEAD"),
-            "0000 1111 A Name <a@b> 1700000000 +0200\tcommit: x\n",
+            "0000 1111 A Name <a@b> 1700000000 +0200\tbranch: Created from main\n",
         )
         .unwrap();
-        let at = repo
-            .reflog_activity(Path::new("logs/HEAD"))
-            .expect("a parseable log has a time");
-        assert!(at >= UNIX_EPOCH + Duration::from_secs(1700000000));
+        let times = repo.reflog_times(log);
+        assert_eq!(
+            times.created_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000000))
+        );
+        assert_eq!(times.worked_at, None, "{times:?}");
+
+        // A worktree just added is the same. `git worktree add` writes a
+        // message-less creation line (no tab at all) and then a same-tip
+        // `reset: moving to HEAD` - the shape git 2.54 writes verbatim.
+        fs::write(
+            log_dir.join("HEAD"),
+            "0000 1111 A Name <a@b> 1700000001 +0200\n\
+             1111 1111 A Name <a@b> 1700000001 +0200\treset: moving to HEAD\n",
+        )
+        .unwrap();
+        let times = repo.reflog_times(log);
+        assert_eq!(
+            times.created_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000001))
+        );
+        assert_eq!(times.worked_at, None, "{times:?}");
+
+        // A repository's first commit creates its branch and is work.
+        fs::write(
+            log_dir.join("HEAD"),
+            "0000 1111 A Name <a@b> 1700000002 +0200\tcommit (initial): one\n",
+        )
+        .unwrap();
+        let times = repo.reflog_times(log);
+        assert_eq!(
+            times.worked_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000002)),
+            "{times:?}"
+        );
+
+        // A later commit is work.
+        fs::write(
+            log_dir.join("HEAD"),
+            "0000 1111 A Name <a@b> 1700000000 +0200\tbranch: Created from main\n\
+             1111 2222 A Name <a@b> 1700000500 +0200\tcommit: real work\n",
+        )
+        .unwrap();
+        let times = repo.reflog_times(log);
+        assert_eq!(
+            times.worked_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000500)),
+            "{times:?}"
+        );
+        // And a checkout written after that commit is still not work.
+        fs::write(
+            log_dir.join("HEAD"),
+            "1111 2222 A Name <a@b> 1700000500 +0200\tcommit: real work\n\
+             2222 3333 A Name <a@b> 1700000999 +0200\tcheckout: moving to other\n",
+        )
+        .unwrap();
+        let times = repo.reflog_times(log);
+        assert_eq!(
+            times.worked_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000500)),
+            "{times:?}"
+        );
+        // A `branch: Reset to` entry is not creation bookkeeping: it moved
+        // the tip, so it is work like any other reset.
+        fs::write(
+            log_dir.join("HEAD"),
+            "0000 1111 A Name <a@b> 1700000000 +0200\tbranch: Created from main\n\
+             1111 2222 A Name <a@b> 1700000900 +0200\tbranch: Reset to target\n",
+        )
+        .unwrap();
+        let times = repo.reflog_times(log);
+        assert_eq!(
+            times.created_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000000))
+        );
+        assert_eq!(
+            times.worked_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1700000900)),
+            "{times:?}"
+        );
+    }
+
+    #[test]
+    fn ref_lifecycle_reads_creation_head_and_rename() {
+        let temp = Temp::new();
+        let repo = Repo {
+            common_dir: temp.0.clone(),
+        };
+        // No log at all is no evidence.
+        let lifecycle = repo.ref_lifecycle("feat");
+        assert!(lifecycle.creation.is_none());
+        assert!(lifecycle.renamed_from.is_none());
+
+        fs::create_dir_all(temp.0.join("logs/refs/heads")).unwrap();
+        // The newest null-old line is the incarnation's creation; the
+        // latest rename INTO this name is its source. Unparseable lines
+        // and renames that moved the log AWAY do not count.
+        fs::write(
+            temp.0.join("logs/refs/heads/feat"),
+            "0000 aaaa A Name <a@b> 1700000000 +0200\tbranch: Created from main\n\
+             aaaa bbbb A Name <a@b> 1700000100 +0200\tcommit: work\n\
+             a line that is not a reflog entry\n\
+             bbbb bbbb A Name <a@b> 1700000200 +0200\tBranch: renamed refs/heads/old to refs/heads/feat\n\
+             bbbb bbbb A Name <a@b> 1700000300 +0200\tBranch: renamed refs/heads/feat to refs/heads/elsewhere\n",
+        )
+        .unwrap();
+        let lifecycle = repo.ref_lifecycle("feat");
+        let creation = lifecycle.creation.expect("the creation line");
+        assert_eq!(creation.head, "aaaa");
+        assert_eq!(creation.at, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        assert_eq!(lifecycle.renamed_from.as_deref(), Some("old"));
+
+        // A second null-old line - the shape a recreated ref's fresh log
+        // shows - is the newest creation, not the first.
+        fs::write(
+            temp.0.join("logs/refs/heads/feat"),
+            "0000 cccc A Name <a@b> 1700001000 +0200\tbranch: Created from main\n",
+        )
+        .unwrap();
+        let lifecycle = repo.ref_lifecycle("feat");
+        assert_eq!(lifecycle.creation.unwrap().head, "cccc");
+        assert!(lifecycle.renamed_from.is_none());
+    }
+
+    #[test]
+    fn rename_and_tip_lines_parse_only_their_real_shapes() {
+        // The rename evidence is exact: the fixed prefix, then ` to
+        // refs/heads/`; anything looser is not a rename.
+        assert_eq!(
+            parse_rename("Branch: renamed refs/heads/a to refs/heads/b"),
+            Some(("a".to_owned(), "b".to_owned()))
+        );
+        assert_eq!(parse_rename("commit: work"), None);
+        assert_eq!(parse_rename("Branch: renamed a to b"), None);
+        assert_eq!(
+            parse_rename("Branch: renamed refs/heads/a to something-else"),
+            None
+        );
+        // The tips output keeps heads lines only; a malformed line drops.
+        let tips = parse_branch_tips("refs/heads/a\0aaaa\nrefs/remotes/r/a\0bbbb\nno-separator\n");
+        assert_eq!(tips["a"], "aaaa");
+        assert_eq!(tips.len(), 1);
     }
 
     #[test]
     fn ref_facts_parses_every_atom_shape() {
-        // refname, upstream pair, track, committerdate, worktreepath, symref.
+        // refname, upstream pair, track, committerdate, worktreepath,
+        // symref, objectname.
         let text = concat!(
-            "refs/heads/main\0origin\0refs/heads/main\0\01700000000\0/wt/main\0\n",
-            "refs/heads/feat\0origin\0refs/heads/feat\0[ahead 2, behind 1]\01700000001\0\0\n",
-            "refs/heads/gone\0origin\0refs/heads/gone\0[gone]\01700000002\0/wt/gone\0\n",
-            "refs/heads/lone\0\0\0\01700000003\0\0\n",
-            "refs/remotes/origin/main\0\0\0[behind 4]\01700000000\0\0\n",
-            "refs/remotes/origin/HEAD\0\0\0\0\0\0refs/remotes/origin/main\n",
+            "refs/heads/main\0origin\0refs/heads/main\0\01700000000\0/wt/main\0\0aaaa\n",
+            "refs/heads/feat\0origin\0refs/heads/feat\0[ahead 2, behind 1]\01700000001\0\0\0bbbb\n",
+            "refs/heads/gone\0origin\0refs/heads/gone\0[gone]\01700000002\0/wt/gone\0\0cccc\n",
+            "refs/heads/lone\0\0\0\01700000003\0\0\0dddd\n",
+            "refs/remotes/origin/main\0\0\0[behind 4]\01700000000\0\0\0eeee\n",
+            "refs/remotes/origin/HEAD\0\0\0\0\0\0refs/remotes/origin/main\0ffff\n",
             "garbage-without-fields\n",
-            "refs/tags/v1\0\0\0\0\0\0\0\n",
+            "refs/tags/v1\0\0\0\0\0\0\0\0gggg\n",
         );
         let facts = parse_ref_facts(text);
 
@@ -1373,6 +2008,7 @@ mod tests {
         );
         assert_eq!(main.worktree.as_deref(), Some(Path::new("/wt/main")));
         assert_eq!(main.committer_date, Some(1700000000));
+        assert_eq!(main.head.as_deref(), Some("aaaa"));
         // An empty track field is "in sync", not "no data".
         assert_eq!(main.track, None);
 
@@ -1428,6 +2064,28 @@ mod tests {
     }
 
     #[test]
+    fn log_records_parse_and_skip_noise() {
+        let text = "aaa\x1f10\x1ffirst: a\x1fb\0bbb\x1f9\x1fsecond\0junk\0ddd\x1f5\0ccc\x1fnot-a-time\x1fx\0";
+        let commits = parse_log(text);
+        assert_eq!(
+            commits,
+            vec![
+                LogCommit {
+                    sha: "aaa".to_owned(),
+                    at: 10,
+                    subject: "first: a\x1fb".to_owned(),
+                },
+                LogCommit {
+                    sha: "bbb".to_owned(),
+                    at: 9,
+                    subject: "second".to_owned(),
+                },
+            ]
+        );
+        assert!(bogus_repo().log_range("a", "b", 5).is_err());
+    }
+
+    #[test]
     fn ahead_behind_parses_counts_and_skips_noise() {
         // Every malformed shape is dropped, not guessed at: a line without
         // the NUL, counts that are not two numbers, and a non-heads ref.
@@ -1446,5 +2104,134 @@ mod tests {
         assert!(!counts.contains_key("bad"));
         assert!(!counts.contains_key("origin/main"));
         assert_eq!(counts.len(), 2);
+    }
+
+    #[test]
+    fn status_parses_every_porcelain_record_shape() {
+        let s = status(
+            b" M src/a.rs\0D  gone.txt\0?? new file.txt\0A  staged.rs\0R  new name.txt\0old name.txt\0C  copy.rs\0orig.rs\0!! ignored.log\0R  orphan.txt",
+            Path::new("/missing"),
+        );
+        assert_eq!(
+            s.reasons,
+            [
+                "added staged.rs",
+                "copied orig.rs -> copy.rs",
+                "deleted gone.txt",
+                "modified src/a.rs",
+                "renamed  -> orphan.txt",
+                "renamed old name.txt -> new name.txt",
+                "untracked new file.txt",
+            ]
+        );
+        assert!(
+            s.fingerprint
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
+        let clean = status(b"", Path::new("/missing"));
+        assert_eq!(clean.reasons, ["working tree clean"]);
+        assert_eq!(clean.fingerprint, "");
+    }
+
+    #[test]
+    fn a_status_named_source_path_is_still_the_rename_origin() {
+        let s = status(
+            b"R  new.txt\0 M old.txt\0C  copy.txt\0A  orig.txt\0 M plain.rs\0",
+            Path::new("/missing"),
+        );
+        assert_eq!(
+            s.reasons,
+            [
+                "copied A  orig.txt -> copy.txt",
+                "modified plain.rs",
+                "renamed  M old.txt -> new.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn status_fingerprints_metadata_past_identical_porcelain() {
+        let temp = Temp::new();
+        let dir = temp.0.join("wt");
+        fs::create_dir(&dir).unwrap();
+        let tracked = dir.join("a.txt");
+        fs::write(&tracked, "12345").unwrap();
+        let bytes = b" M a.txt\0";
+        let first = status(bytes, &dir).fingerprint;
+        fs::write(&tracked, "67890").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&tracked)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        assert_ne!(
+            status(bytes, &dir).fingerprint,
+            first,
+            "identical porcelain over a re-edited file must re-fingerprint"
+        );
+
+        let untracked = dir.join("loose.txt");
+        fs::write(&untracked, "x").unwrap();
+        let bytes = b"?? loose.txt\0";
+        let first = status(bytes, &dir).fingerprint;
+        fs::write(&untracked, "y").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&untracked)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(120))
+            .unwrap();
+        assert_ne!(status(bytes, &dir).fingerprint, first);
+
+        let bytes = b" D gone.txt\0";
+        assert_eq!(
+            status(bytes, &dir).fingerprint,
+            status(bytes, &dir).fingerprint,
+            "a missing path fingerprints deterministically"
+        );
+    }
+
+    #[test]
+    fn status_fingerprints_the_exact_bytes_past_utf8() {
+        let utf8 = status("?? caf\u{e9}.txt\0".as_bytes(), Path::new("/missing"));
+        let latin = status(b"?? caf\xe9.txt\0", Path::new("/missing"));
+        assert_ne!(utf8.fingerprint, latin.fingerprint);
+        assert_eq!(latin.reasons, ["untracked caf\u{fffd}.txt"]);
+        assert_ne!(
+            status(b"?? a.txt\0", Path::new("/missing")).fingerprint,
+            status(b"?? b.txt\0", Path::new("/missing")).fingerprint
+        );
+        assert_eq!(
+            status(b"?? a.txt\0", Path::new("/missing")).fingerprint,
+            status(b"?? a.txt\0", Path::new("/missing")).fingerprint
+        );
+    }
+
+    #[test]
+    fn status_caps_reasons_and_counts_the_rest() {
+        let mut bytes = Vec::new();
+        for i in 0..12u8 {
+            bytes.extend_from_slice(format!("?? f{i:02}.txt\0").as_bytes());
+        }
+        let s = status(&bytes, Path::new("/missing"));
+        assert_eq!(s.reasons.len(), 11, "{:?}", s.reasons);
+        assert_eq!(s.reasons[10], "2 more changes");
+        assert!(s.fingerprint.len() > bytes.len() * 2);
+    }
+
+    #[test]
+    fn status_reports_a_healthy_worktrees_porcelain_bytes() {
+        let temp = Temp::new();
+        let dir = temp.0.join("repo");
+        git_ok(&temp.0, &["init", dir.to_str().unwrap()]);
+        fs::write(dir.join("dirty file.txt"), "x").unwrap();
+        let repo = Repo::discover(&dir).unwrap().expect("a repo");
+        let bytes = repo.status(&dir);
+        let bytes = bytes.known().expect("status");
+        assert_eq!(status(bytes, &dir).reasons, ["untracked dirty file.txt"]);
+        assert_eq!(repo.dirty(&dir), Evidence::Known(true));
+        assert!(repo.status(&dir.join("missing")).known().is_none());
     }
 }

@@ -90,7 +90,7 @@ fn fake_agent(dir: &TempDir) -> String {
 fn session_file(home: &TempDir, pid: u32, id: &str, status: &str, worktree: &Path) {
     let sessions = home.join(".claude/sessions");
     fs::create_dir_all(&sessions).expect("mkdir");
-    let start = proc_start(pid);
+    let start = support::proc_start(pid);
     fs::write(
         sessions.join(format!("{pid}.json")),
         format!(
@@ -113,38 +113,6 @@ fn transcript(home: &TempDir, slug: &str, id: &str, cwd: &Path) {
         ),
     )
     .expect("transcript writes");
-}
-
-/// The live process's start as Claude's `procStart` ctime (UTC).
-fn proc_start(pid: u32) -> String {
-    let out = Command::new("ps")
-        .args(["-o", "etime=", "-p", &pid.to_string()])
-        .output()
-        .expect("ps runs");
-    let text = String::from_utf8_lossy(&out.stdout);
-    let secs: u64 = {
-        let t = text.trim();
-        let (days, rest) = match t.split_once('-') {
-            Some((d, r)) => (d.parse::<u64>().unwrap(), r),
-            None => (0, t),
-        };
-        let mut parts = rest.rsplitn(3, ':');
-        let s = parts.next().unwrap().parse::<u64>().unwrap();
-        let m = parts.next().map_or(0, |p| p.parse().unwrap());
-        let h = parts.next().map_or(0, |p| p.parse().unwrap());
-        days * 86400 + h * 3600 + m * 60 + s
-    };
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        - secs;
-    // UTC ctime via `date -u -r`: the platforms both know it.
-    let out = Command::new("date")
-        .args(["-u", "-r", &epoch.to_string(), "+%a %b %e %H:%M:%S %Y"])
-        .output()
-        .expect("date runs");
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
 /// The world: one repo, one worktree, one fake agent in its own tmux
@@ -396,7 +364,7 @@ fn attention_flows_end_to_end() {
         .iter()
         .find(|w| w.name == "feat-login")
         .expect("the work row");
-    assert_eq!(work.section, Some(WorkSection::Active));
+    assert_eq!(work.section, WorkSection::Active);
     assert_eq!(work.attention, Attention::Working);
 
     // Waiting: a permission prompt latches `waiting`, the row moves to
@@ -416,7 +384,7 @@ fn attention_flows_end_to_end() {
         .iter()
         .find(|w| w.name == "feat-login")
         .unwrap();
-    assert_eq!(work.section, Some(WorkSection::NeedsYou));
+    assert_eq!(work.section, WorkSection::NeedsYou);
     assert!(work.summary.contains("waiting"), "{}", work.summary);
 
     // `list --json` carries the same reading - the contract surface.
@@ -532,7 +500,7 @@ fn attention_flows_end_to_end() {
         .iter()
         .find(|w| w.name == "feat-login")
         .unwrap();
-    assert_eq!(work.section, None);
+    assert_eq!(work.section, WorkSection::FollowUp);
 
     // Kill the agent: within one refresh the process claim is dead, the
     // latch is acknowledged already - nothing ghost-busy, nothing lost.
@@ -565,7 +533,7 @@ fn attention_flows_end_to_end() {
         .iter()
         .find(|w| w.name == "feat-login")
         .unwrap();
-    assert_eq!(work.section, Some(WorkSection::NeedsYou));
+    assert_eq!(work.section, WorkSection::NeedsYou);
     let _ = client.kill();
     let _ = client.wait();
 }
@@ -587,7 +555,7 @@ fn an_undated_published_wait_stays_acknowledged_across_polls() {
             "{{\"pid\":{},\"sessionId\":\"{LIVE_ID}\",\"status\":\"waiting\",\"waitingFor\":\"permission prompt\",\"cwd\":\"{}\",\"procStart\":\"{}\"}}",
             world.pid,
             world.worktree.display(),
-            proc_start(world.pid)
+            support::proc_start(world.pid)
         ),
     )
     .expect("session file writes");
@@ -660,6 +628,11 @@ fn cursor_movement_writes_no_seen_state() {
             repo: None,
             worktree: None,
             branch: None,
+            touches: Vec::new(),
+            current_incarnation: None,
+            started_at: None,
+            related: Vec::new(),
+            evidence: agent_sessions::snapshot::EvidenceRow::default(),
         });
     let mut app = agent_sessions::tui::App::new(snapshot).with_store(store);
     for key in [

@@ -11,13 +11,18 @@ needs you takes a glance instead of a window tour.
 
 > Status: early. The binary builds, packages and releases; the dashboard
 > renders the four-pane shell - repos, work, the conversation inbox and a
-> header detail - over Claude's live sessions and durable transcripts, and
-> `list --json` prints the same complete snapshot. Attention works end to
-> end for Claude: `agent-sessions hook` records agent events, and rows
+> detail pane for the selected repo, work or conversation, with `e` for the
+> evidence behind it - over Claude's live sessions and durable transcripts,
+> and `list --json` prints the same complete snapshot. Attention works end
+> to end for Claude: `agent-sessions hook` records agent events, and rows
 > needing you sit under `Needs you` until you have seen them (see
-> [attention](docs/attention.md)). Detail views, navigation actions, cleanup
-> and hook registration still land piecemeal; any subcommand that has not
-> shipped is a usage error.
+> [attention](docs/attention.md)). Work rows are sectioned by what they
+> need and carry their branch's observed incarnation (`#N`, with `h` for
+> excluded same-name history); `enter` jumps to a conversation's live pane
+> - or resumes a stopped one in place, in a project folder when it has no
+> checkout - and `o` opens a work row's pull or merge request (see
+> [work](docs/work.md)). Cleanup and hook registration still land
+> piecemeal, and any subcommand that has not shipped is a usage error.
 
 `agent-sessions` is the binary and the state directory; `spindle` is this
 repository.
@@ -128,7 +133,16 @@ is read from Git with `GIT_OPTIONAL_LOCKS=0`. Facts that cannot be proven are
 | `upstream_state` | `never_pushed` / `tracked` / `remote_gone` | proven by `ls-remote`; no fetch, no local mutation |
 | `unpushed_commits` | `git rev-list --count @{u}..HEAD`; vs the proven base when never pushed; commits no `refs/*` reaches when detached | the real data-loss risk on removal |
 | `landed` | `no` / `ancestor-merged` / `content-merged` | ancestry first, then path-scoped tree comparison |
-| `last_git_activity` | worktree HEAD reflog; branch reflog when there is no worktree | the reflog is per worktree, a real recency signal |
+| `last_git_activity` | the timestamps of real work entries in the worktree HEAD reflog, the branch reflog and the tip's committer date when it postdates the branch's creation | creation, checkout and clone bookkeeping never count as activity; the reflog file's mtime never counts either |
+
+`list --json` prints the whole snapshot under `schema_version` 2. Work rows
+carry two timestamped histories: `activities` (when the work itself happened,
+as `occurred_at_ms`) and `observations` (when a collection pass learned
+something, as `observed_at_ms`), both Unix epoch milliseconds, plus
+`last_activity`, the newest source-backed occurrence in epoch seconds or
+`null`. Incarnation identity, conversation placements and the
+activity/observation split are specified in
+[docs/architecture/work-lifecycle.md](docs/architecture/work-lifecycle.md).
 
 ## Development
 

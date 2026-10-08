@@ -10,13 +10,16 @@
 
 use std::path::PathBuf;
 
+use serde::Serialize;
+
 use crate::evidence::Evidence;
 use crate::forge::{ForgeStatus, WorkItem};
 use crate::git::Head;
 use crate::vector::{Anchor, Landed, UpstreamState, WorkState};
 
 /// The verdict on one cleanup action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// The action is provably lossless.
     Safe,
@@ -33,7 +36,20 @@ pub enum Verdict {
     NotApplicable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Verdict {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Safe => "safe",
+            Verdict::SafeAfterWorktreeRemoval => "safe_after_worktree_removal",
+            Verdict::Review => "review",
+            Verdict::Blocked => "blocked",
+            Verdict::NotApplicable => "not_applicable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActionVerdict {
     pub verdict: Verdict,
     pub reasons: Vec<String>,
@@ -288,4 +304,25 @@ pub fn cleanup(state: &WorkState, forge: &ForgeStatus) -> (ActionVerdict, Action
     let removal = worktree_removal(state, forge);
     let deletion = branch_deletion(state, &removal, forge);
     (removal, deletion)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdicts_spell_their_wire_names() {
+        for (v, word) in [
+            (Verdict::Safe, "safe"),
+            (
+                Verdict::SafeAfterWorktreeRemoval,
+                "safe_after_worktree_removal",
+            ),
+            (Verdict::Review, "review"),
+            (Verdict::Blocked, "blocked"),
+            (Verdict::NotApplicable, "not_applicable"),
+        ] {
+            assert_eq!(v.as_str(), word);
+        }
+    }
 }

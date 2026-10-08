@@ -7,9 +7,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Unfinished work with no live process enters `Forgotten` after this much
-/// time without meaningful activity.
-const DEFAULT_FORGOTTEN_AFTER: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// The default `forgotten_after`: two weeks of silence marks unfinished
+/// work forgotten.
+pub const DEFAULT_FORGOTTEN_AFTER: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Config {
