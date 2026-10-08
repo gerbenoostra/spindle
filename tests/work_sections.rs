@@ -1748,3 +1748,179 @@ fn gone_branch_and_detached_path_rows_keep_their_summaries() {
     }
     panic!("the gone feat-gone row never focused");
 }
+
+/// A real qualifying reflog operation reaches the detail pane: the
+/// activity reason names the selected entry - short new sha plus its raw
+/// message - at the entry's own time. Branch-only rows, a linked
+/// worktree's own HEAD attribution, and a stopped record's retained
+/// history all read the same contract.
+#[test]
+fn reflog_reasons_name_the_selected_entry_at_its_own_time() {
+    let home = TempDir::new("work-reflog-reasons");
+    let a = FixtureRepo::new("origin");
+
+    // Branch-only: the branch log's own commit entry is the work.
+    a.branch_with_commits("feat-solo", 1, false);
+    let solo_sha = a
+        .git(&a.main, &["rev-parse", "feat-solo"])
+        .trim()
+        .to_owned();
+
+    // A linked worktree: amending inside it lands in its own HEAD log
+    // and the branch log as identical tuples - one selected entry. The
+    // message carries Unicode, stored raw.
+    a.branch_with_commits("feat-linked", 1, false);
+    let wt = a.add_worktree("linked", Some("feat-linked"));
+    // A minute into the future on the committer clock: the reflog entry
+    // takes that date, so the amend is unambiguously the newest.
+    let amend_epoch = now() + 60;
+    let amend = fixture::command(Some(&wt), &["commit", "--amend", "-m", "amended 日本"])
+        .env("GIT_COMMITTER_DATE", format!("@{amend_epoch} +0000"))
+        .env("GIT_AUTHOR_DATE", format!("@{amend_epoch} +0000"))
+        .output()
+        .expect("the amend runs");
+    assert!(
+        amend.status.success(),
+        "amend failed: {}",
+        String::from_utf8_lossy(&amend.stderr)
+    );
+    let linked_sha = a.git(&wt, &["rev-parse", "HEAD"]).trim().to_owned();
+
+    // A merge in a second linked worktree: a real `merge` entry.
+    a.branch_with_commits("feat-tomerge", 1, false);
+    a.branch_with_commits("feat-merge", 1, false);
+    let wt_merge = a.add_worktree("merge", Some("feat-merge"));
+    let merge_epoch = now() + 120;
+    let merged_out = fixture::command(
+        Some(&wt_merge),
+        &["merge", "--no-ff", "-m", "merge msg", "feat-tomerge"],
+    )
+    .env("GIT_COMMITTER_DATE", format!("@{merge_epoch} +0000"))
+    .env("GIT_AUTHOR_DATE", format!("@{merge_epoch} +0000"))
+    .output()
+    .expect("the merge runs");
+    assert!(
+        merged_out.status.success(),
+        "merge failed: {}",
+        String::from_utf8_lossy(&merged_out.stderr)
+    );
+    let merge_sha = a.git(&wt_merge, &["rev-parse", "HEAD"]).trim().to_owned();
+
+    // A transcript rooted in the main checkout: what places the repo in
+    // the world at all.
+    transcript(&home, OTHER_ID, &a.main);
+
+    let world = World {
+        home,
+        a,
+        b: FixtureRepo::new("origin"),
+        agent: None,
+    };
+    let first = collect(&world);
+    assert!(first.complete, "{:?}", first.errors);
+
+    let reflog = |row: &agent_sessions::snapshot::WorkRow| {
+        row.activities
+            .iter()
+            .find(|e| e.source == ActivitySource::Reflog)
+            .cloned()
+            .unwrap_or_else(|| panic!("a reflog event on {}: {:?}", row.name, row.activities))
+    };
+    let solo = reflog(work(&first, "feat-solo"));
+    assert_eq!(
+        solo.reasons,
+        vec![format!("{} commit: feat-solo 0", &solo_sha[..7])]
+    );
+    // The event time is the selected entry's own committer clock, read
+    // back from the same log line the pass read - not the scan's - and
+    // `last_activity` agrees with it.
+    let solo_repo = agent_sessions::git::Repo::discover(&world.a.main)
+        .expect("the fixture repo discovers")
+        .expect("the main checkout is a repo");
+    let solo_times = solo_repo.reflog_times(Path::new("logs/refs/heads/feat-solo"));
+    let solo_at = solo_times.newest_work.expect("the solo work entry").at;
+    assert_eq!(
+        solo.occurred_at_ms,
+        agent_sessions::store::epoch_ms(solo_at),
+        "the event carries the selected line's own time: {solo:?}"
+    );
+    assert_eq!(
+        work(&first, "feat-solo").last_activity,
+        Some(solo.occurred_at_ms / 1000)
+    );
+
+    // The linked worktree's amend is attributed at its own entry - not
+    // to the main checkout's HEAD log, which never saw it.
+    let linked_row = first
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .expect("the linked worktree row");
+    let linked = reflog(linked_row);
+    assert_eq!(
+        linked.reasons,
+        vec![format!("{} commit (amend): amended 日本", &linked_sha[..7])]
+    );
+    // The pinned committer clock is the entry's own timestamp.
+    assert_eq!(linked.occurred_at_ms, amend_epoch * 1000);
+    assert_eq!(linked_row.last_activity, Some(amend_epoch));
+
+    let merge_row = first
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt_merge.as_path()))
+        .expect("the merge worktree row");
+    let merged = reflog(merge_row);
+    assert!(
+        merged.reasons[0].starts_with(&format!("{} merge feat-tomerge:", &merge_sha[..7])),
+        "the merge entry: {:?}",
+        merged.reasons
+    );
+    assert_eq!(merged.occurred_at_ms, merge_epoch * 1000);
+    assert_eq!(merge_row.last_activity, Some(merge_epoch));
+
+    // The detail pane renders the reason escaped, at both widths.
+    let mut app = App::new(first).with_store(store(&world.home));
+    app.key(Key::Char('2'));
+    let index = 1 + app
+        .snapshot
+        .work
+        .iter()
+        .position(|w| w.name == "feat-linked")
+        .expect("the linked row in the detail list");
+    for _ in 0..index {
+        app.key(Key::Char('j'));
+    }
+    for width in [55, 200] {
+        let text = render(&app, width, 44);
+        assert!(text.contains("reflog:"), "{text}");
+        assert!(text.contains(&linked_sha[..7]), "{text}");
+        assert!(text.contains("amended 日"), "{text}");
+    }
+
+    // Stopped and gone: the worktree removed and the branch deleted, the
+    // record keeps the reason it captured while the work was live.
+    world.a.git(
+        &world.a.main,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    world.a.git(&world.a.main, &["branch", "-D", "feat-linked"]);
+    let second = collect(&world);
+    assert!(second.complete, "{:?}", second.errors);
+    let (work_state, errors) = store(&world.home).work();
+    assert!(errors.is_empty(), "{errors:?}");
+    let record = work_state
+        .branches
+        .values()
+        .find(|r| r.ref_name == "feat-linked")
+        .expect("the closed record stays");
+    assert!(record.ended_at.is_some(), "the record closed: {record:?}");
+    assert!(
+        record.activities.iter().any(|e| {
+            e.source == ActivitySource::Reflog
+                && e.reasons[0] == format!("{} commit (amend): amended 日本", &linked_sha[..7])
+        }),
+        "the record retains the captured reason: {:?}",
+        record.activities
+    );
+}

@@ -393,6 +393,45 @@ fn activity_and_observation_histories_render_separately_and_cap_at_seven() {
 }
 
 #[test]
+fn reflog_activity_reasons_render_escaped_at_both_widths() {
+    let mut snapshot = fixture();
+    snapshot.work[0].activities = vec![
+        // The newest event's reason is the entry's short sha plus its raw
+        // message - controls and Unicode escape exactly once at render.
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 60) * 1000,
+            reasons: vec!["abc1234 commit: fix\tlabels\n日本\u{7}".to_owned()],
+        },
+        // A persisted generic trail from before reasons carried metadata
+        // keeps its fallback text.
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 120) * 1000,
+            reasons: vec!["reflog work".to_owned()],
+        },
+    ];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        assert!(text.contains("reflog:"), "{text}");
+        // At 55 the long reason wraps mid-escape; at 200 it reads whole.
+        // Wide glyphs pad to two cells, so the text checks fragments.
+        for fragment in ["abc1234 commit: fix\\tla", "\\n日", "\\u0007"] {
+            assert!(text.contains(fragment), "{text}");
+        }
+        assert!(text.contains("reflog work"), "{text}");
+        assert!(
+            text.find("abc1234").unwrap() < text.find("reflog work").unwrap(),
+            "newest event first: {text}"
+        );
+        // Nothing raw leaked into the cells.
+        assert!(!text.contains('\t') && !text.contains('\u{7}'), "{text}");
+    }
+}
+
+#[test]
 fn work_detail_renders_question_marks_for_unproven_fields() {
     let mut row = work();
     row.base = None;

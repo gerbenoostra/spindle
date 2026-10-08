@@ -191,6 +191,10 @@ pub struct StateVector {
     /// log's and the branch log's last work entries, at their own
     /// timestamps.
     pub reflog_activity: Option<SystemTime>,
+    /// The one reflog entry `reflog_activity` timestamps - its old/new
+    /// sha and raw message travel with the moment, never from another
+    /// line.
+    pub reflog_entry: Option<git::ReflogWork>,
     /// The tip's committerdate, when it provably dates work on this
     /// incarnation (it postdates the ref's creation, or no creation is
     /// proven).
@@ -306,6 +310,7 @@ struct AnchorLocal {
     working_tree: Evidence<Vec<u8>>,
     dirty: Evidence<bool>,
     reflog_activity: Option<SystemTime>,
+    reflog_entry: Option<git::ReflogWork>,
     commit_activity: Option<SystemTime>,
     /// The branch tip's OID, from the batch or the old-git fallback.
     head_oid: Option<String>,
@@ -547,7 +552,8 @@ fn anchor_work(
         Anchor::Worktree { path, .. } => repo.status(path),
         Anchor::Branch { .. } => Evidence::Unknown("no worktree".to_owned()),
     };
-    let (reflog_activity, commit_activity) = git_activity(repo, &anchor, fact);
+    let (reflog_entry, commit_activity) = git_activity(repo, &anchor, fact);
+    let reflog_activity = reflog_entry.as_ref().map(|w| w.at);
     let local = AnchorLocal {
         remote_url: remote_url(repo, &config),
         config,
@@ -571,6 +577,7 @@ fn anchor_work(
         },
         working_tree,
         reflog_activity,
+        reflog_entry,
         commit_activity,
         head_oid,
         creation: lifecycle.as_ref().and_then(|l| l.creation.clone()),
@@ -614,6 +621,7 @@ fn anchor_work(
                 .unwrap_or_else(|| Evidence::Unknown(PENDING.to_owned())),
             landed: Evidence::Unknown(PENDING.to_owned()),
             reflog_activity: local.reflog_activity,
+            reflog_entry: local.reflog_entry.clone(),
             commit_activity: local.commit_activity,
             last_git_activity: [local.reflog_activity, local.commit_activity]
                 .into_iter()
@@ -634,18 +642,18 @@ fn git_activity(
     repo: &Repo,
     anchor: &Anchor,
     fact: Option<&git::BranchFact>,
-) -> (Option<SystemTime>, Option<SystemTime>) {
+) -> (Option<git::ReflogWork>, Option<SystemTime>) {
     // The HEAD reflog's real work only: the add's creation line and a
     // `checkout:` line are lifecycle events, not activity.
     let head = match anchor {
         Anchor::Worktree { admin_id, main, .. } => worktree_head_log(*main, admin_id.as_deref())
-            .and_then(|log| repo.reflog_times(&log).worked_at),
+            .and_then(|log| repo.reflog_times(&log).newest_work),
         Anchor::Branch { .. } => None,
     };
     let (mut branch, mut committed) = (None, None);
     if let Some(name) = anchor.branch() {
         let times = repo.reflog_times(&PathBuf::from(format!("logs/refs/heads/{name}")));
-        branch = times.worked_at;
+        branch = times.newest_work;
         committed = fact
             .and_then(|f| f.committer_date)
             .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
@@ -655,6 +663,9 @@ fn git_activity(
         // committer date is the fallback it always was.
         committed = committed.filter(|t| times.created_at.is_none_or(|c| *t > c));
     }
+    // HEAD and branch entries compete as whole tuples: newest wins, and a
+    // same-time tie resolves on `(old, new, message)` so the selected
+    // moment and metadata always name the same line.
     ([head, branch].into_iter().flatten().max(), committed)
 } // coverage: off - the unexecuted instantiation's exit edge
 
@@ -1260,6 +1271,236 @@ mod tests {
             Some(PathBuf::from("worktrees/wt1/logs/HEAD"))
         );
         assert_eq!(worktree_head_log(false, None), None);
+    }
+
+    /// A `Repo` over a fabricated common dir whose reflog files alone
+    /// exist: `logs` maps each relative log path to its contents.
+    fn reflog_repo(logs: &[(&str, &str)]) -> Repo {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "agent-sessions-reflog-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (rel, body) in logs {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        Repo { common_dir: dir }
+    }
+
+    /// A worktree anchor over `head`, `main` marking the repository's own
+    /// checkout and `admin_id` naming the linked one's admin dir.
+    fn worktree(head: Head, main: bool, admin_id: Option<&str>) -> Anchor {
+        Anchor::Worktree {
+            path: PathBuf::from("/wt"),
+            admin_id: admin_id.map(str::to_owned),
+            head,
+            locked: false,
+            main,
+            prunable: None,
+        }
+    }
+
+    #[test]
+    fn reflog_activity_selects_the_newest_entry_across_head_and_branch() {
+        // The branch log's newer entry wins as a whole tuple: its own
+        // time, shas and message, not a mix of lines.
+        let repo = reflog_repo(&[
+            (
+                "logs/HEAD",
+                "aaaa bbbb A <a@b> 1700001000 +0200\tcommit: head work\n",
+            ),
+            (
+                "logs/refs/heads/feat",
+                "cccc dddd A <a@b> 1700002000 +0200\tcommit: branch work\n",
+            ),
+        ]);
+        let anchor = worktree(Head::Branch("feat".to_owned()), true, None);
+        let (entry, _) = git_activity(&repo, &anchor, None);
+        let entry = entry.expect("the branch entry is newer");
+        assert_eq!(entry.at, UNIX_EPOCH + Duration::from_secs(1_700_002_000));
+        assert_eq!(
+            (entry.old_sha.as_str(), entry.new_sha.as_str()),
+            ("cccc", "dddd")
+        );
+        assert_eq!(entry.message, "commit: branch work");
+
+        // Reversed: the HEAD log's newer entry wins the same way.
+        let repo = reflog_repo(&[
+            (
+                "logs/HEAD",
+                "aaaa bbbb A <a@b> 1700002000 +0200\tcommit: head work\n",
+            ),
+            (
+                "logs/refs/heads/feat",
+                "cccc dddd A <a@b> 1700001000 +0200\tcommit: branch work\n",
+            ),
+        ]);
+        let (entry, _) = git_activity(&repo, &anchor, None);
+        let entry = entry.expect("the head entry is newer");
+        assert_eq!(entry.message, "commit: head work");
+        assert_eq!(entry.new_sha, "bbbb");
+    }
+
+    #[test]
+    fn reflog_activity_breaks_same_time_ties_on_the_whole_tuple() {
+        let anchor = worktree(Head::Branch("feat".to_owned()), true, None);
+        // Same epoch in both logs: `(old, new, message)` decides, one
+        // discriminator at a time.
+        for (head_shas, branch_shas, want) in [
+            ("aaaa bbbb", "cccc dddd", "dddd"), // old decides
+            ("cccc dddd", "aaaa bbbb", "dddd"), // the head log can win too
+            ("aaaa bbbb", "aaaa cccc", "cccc"), // new decides
+        ] {
+            let repo = reflog_repo(&[
+                (
+                    "logs/HEAD",
+                    &format!("{head_shas} A <a@b> 1700001000 +0200\tcommit: same\n"),
+                ),
+                (
+                    "logs/refs/heads/feat",
+                    &format!("{branch_shas} A <a@b> 1700001000 +0200\tcommit: same\n"),
+                ),
+            ]);
+            let (entry, _) = git_activity(&repo, &anchor, None);
+            assert_eq!(
+                entry.expect("an entry").new_sha,
+                want,
+                "head {head_shas} vs branch {branch_shas}"
+            );
+        }
+        // Equal shas: the greater message decides.
+        let repo = reflog_repo(&[
+            (
+                "logs/HEAD",
+                "aaaa bbbb A <a@b> 1700001000 +0200\tcommit: z\n",
+            ),
+            (
+                "logs/refs/heads/feat",
+                "aaaa bbbb A <a@b> 1700001000 +0200\tcommit: a\n",
+            ),
+        ]);
+        let (entry, _) = git_activity(&repo, &anchor, None);
+        assert_eq!(entry.expect("an entry").message, "commit: z");
+        // Identical tuples in both logs collapse to that one entry.
+        let body = "aaaa bbbb A <a@b> 1700001000 +0200\tcommit: same\n";
+        let repo = reflog_repo(&[("logs/HEAD", body), ("logs/refs/heads/feat", body)]);
+        let (entry, _) = git_activity(&repo, &anchor, None);
+        let entry = entry.expect("an entry");
+        assert_eq!(entry.new_sha, "bbbb");
+        assert_eq!(entry.message, "commit: same");
+    }
+
+    #[test]
+    fn reflog_activity_reads_each_anchor_shape_own_log() {
+        // A branch-only anchor has no HEAD log to read: the branch's own
+        // log is the whole story.
+        let repo = reflog_repo(&[
+            (
+                "logs/HEAD",
+                "aaaa bbbb A <a@b> 1700002000 +0200\tcommit: head work\n",
+            ),
+            (
+                "logs/refs/heads/feat",
+                "cccc dddd A <a@b> 1700001000 +0200\tcommit: branch work\n",
+            ),
+        ]);
+        let anchor = Anchor::Branch {
+            name: "feat".to_owned(),
+        };
+        let (entry, _) = git_activity(&repo, &anchor, None);
+        let entry = entry.expect("the branch entry");
+        assert_eq!(entry.message, "commit: branch work");
+        assert_eq!(entry.at, UNIX_EPOCH + Duration::from_secs(1_700_001_000));
+
+        // A detached worktree reads its HEAD log and no branch's.
+        let anchor = worktree(Head::Detached("deadbeef".to_owned()), true, None);
+        let (entry, _) = git_activity(&repo, &anchor, None);
+        let entry = entry.expect("the head entry");
+        assert_eq!(entry.message, "commit: head work");
+
+        // A linked worktree reads `worktrees/<id>/logs/HEAD`: the main
+        // worktree's newer entry must not be attributed to it.
+        let repo = reflog_repo(&[
+            (
+                "logs/HEAD",
+                "aaaa bbbb A <a@b> 1700002000 +0200\tcommit: main work\n",
+            ),
+            (
+                "worktrees/wt9/logs/HEAD",
+                "cccc dddd A <a@b> 1700001000 +0200\tcommit: linked work\n",
+            ),
+        ]);
+        let anchor = worktree(Head::Detached("deadbeef".to_owned()), false, Some("wt9"));
+        let (entry, _) = git_activity(&repo, &anchor, None);
+        let entry = entry.expect("the linked worktree's own entry");
+        assert_eq!(entry.message, "commit: linked work");
+        assert_eq!(entry.at, UNIX_EPOCH + Duration::from_secs(1_700_001_000));
+
+        // A linked worktree whose admin id never resolved reads no HEAD
+        // log at all.
+        let anchor = worktree(Head::Detached("deadbeef".to_owned()), false, None);
+        let (entry, _) = git_activity(&repo, &anchor, None);
+        assert!(entry.is_none(), "{entry:?}");
+    }
+
+    #[test]
+    fn commit_activity_still_filters_to_post_creation_tip_dates() {
+        let repo = reflog_repo(&[(
+            "logs/refs/heads/feat",
+            "0000 aaaa A <a@b> 1700001000 +0200\tbranch: Created from main\n",
+        )]);
+        let anchor = Anchor::Branch {
+            name: "feat".to_owned(),
+        };
+        let fact = |date: u64| git::BranchFact {
+            upstream: None,
+            track: None,
+            committer_date: Some(date),
+            worktree: None,
+            head: None,
+        };
+        // A tip dated after the proven creation counts; one dated at or
+        // before it is the borrowed date of `git branch feat old-sha`.
+        let (_, committed) = git_activity(&repo, &anchor, Some(&fact(1_700_002_000)));
+        assert_eq!(
+            committed,
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_002_000))
+        );
+        let (_, committed) = git_activity(&repo, &anchor, Some(&fact(1_700_001_000)));
+        assert_eq!(committed, None);
+        // No reflog at all: the committerdate stays the fallback it was.
+        let repo = reflog_repo(&[]);
+        let (_, committed) = git_activity(&repo, &anchor, Some(&fact(1_700_001_000)));
+        assert_eq!(
+            committed,
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_001_000))
+        );
+    }
+
+    #[test]
+    fn reflog_entry_reaches_the_vector_with_its_own_time() {
+        // Through collect(): the selected entry and `reflog_activity`
+        // agree, and `last_git_activity` stays the newest of the sources.
+        let repo = reflog_repo(&[(
+            "logs/refs/heads/feat",
+            "aaaa bbbb A <a@b> 1700001000 +0200\tcommit: real work\n",
+        )]);
+        let state = collect(
+            &repo,
+            &Anchor::Branch {
+                name: "feat".to_owned(),
+            },
+            RuntimeFacts::default(),
+        );
+        let entry = state.vector.reflog_entry.as_ref().expect("the entry");
+        assert_eq!(entry.message, "commit: real work");
+        assert_eq!(entry.new_sha, "bbbb");
+        assert_eq!(state.vector.reflog_activity, Some(entry.at));
+        assert_eq!(state.vector.last_git_activity, Some(entry.at));
     }
 
     #[test]

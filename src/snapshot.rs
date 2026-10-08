@@ -2376,10 +2376,23 @@ fn pass_activities(state: &vector::WorkState, head: Option<&str>) -> Vec<store::
         });
     }
     if let Some(at) = v.reflog_activity {
+        // The reason describes the one entry the timestamp was selected
+        // from - its short new sha plus the raw message (renderers escape
+        // once). A timestamp without matching metadata - inconsistent or
+        // fabricated in-memory evidence, never a real selection - keeps
+        // the generic reason rather than borrowing another line's work;
+        // generic reasons persisted earlier stay untouched.
+        let reason = match &v.reflog_entry {
+            Some(entry) if entry.at == at && !entry.message.is_empty() => {
+                format!("{} {}", short_sha(&entry.new_sha), entry.message)
+            }
+            Some(entry) if entry.at == at => short_sha(&entry.new_sha).to_owned(),
+            _ => "reflog work".to_owned(),
+        };
         events.push(store::ActivityEvent {
             source: store::ActivitySource::Reflog,
             occurred_at_ms: store::epoch_ms(at),
-            reasons: vec!["reflog work".to_owned()],
+            reasons: vec![reason],
         });
     }
     if let Some(status) = worktree_status(state)
@@ -3963,6 +3976,7 @@ mod tests {
                 unpushed_commits: Evidence::Unknown("none asked".to_owned()),
                 landed: Evidence::Unknown("none asked".to_owned()),
                 reflog_activity: None,
+                reflog_entry: None,
                 commit_activity: None,
                 last_git_activity: None,
             },
@@ -4024,6 +4038,7 @@ mod tests {
                 unpushed_commits: Evidence::Unknown("none asked".to_owned()),
                 landed: Evidence::Unknown("none asked".to_owned()),
                 reflog_activity: None,
+                reflog_entry: None,
                 commit_activity: None,
                 last_git_activity: None,
             },
@@ -5530,6 +5545,7 @@ mod tests {
                 unpushed_commits: Evidence::Known(0),
                 landed: Evidence::Unknown("none asked".to_owned()),
                 reflog_activity: Some(UNIX_EPOCH + Duration::from_secs(10)),
+                reflog_entry: None,
                 commit_activity: Some(UNIX_EPOCH + Duration::from_secs(20)),
                 last_git_activity: Some(UNIX_EPOCH + Duration::from_secs(20)),
             },
@@ -5573,6 +5589,93 @@ mod tests {
             "{events:?}"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `WorkState` holding only reflog evidence: `entry` and the
+    /// `reflog_activity` timestamp the selection produced.
+    fn reflog_state(entry: Option<git::ReflogWork>) -> vector::WorkState {
+        vector::WorkState {
+            repo: git::Repo {
+                common_dir: PathBuf::from("/r/.git"),
+            },
+            anchor: Anchor::Branch {
+                name: "feat".to_owned(),
+            },
+            remote_url: None,
+            base: Evidence::Unknown("no base asked".to_owned()),
+            forge: ForgeStatus {
+                item: WorkItem::Unknown,
+                pipeline: Pipeline::Unknown,
+                label: None,
+                url: None,
+                reason: None,
+                occurred_at_ms: None,
+            },
+            broken: None,
+            vector: vector::StateVector {
+                worktree: None,
+                windows: WindowCount::default(),
+                live_pids: 0,
+                live_agent_sessions: 0,
+                past_agent_sessions: 0,
+                dirty: Evidence::Known(false),
+                working_tree: Evidence::Unknown("no worktree".to_owned()),
+                commits_ahead_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_behind_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_not_on_base: Evidence::Unknown("none asked".to_owned()),
+                upstream_state: UpstreamState::NotApplicable,
+                unpushed_commits: Evidence::Unknown("none asked".to_owned()),
+                landed: Evidence::Unknown("none asked".to_owned()),
+                reflog_activity: entry.as_ref().map(|e| e.at),
+                reflog_entry: entry,
+                commit_activity: None,
+                last_git_activity: None,
+            },
+        }
+    }
+
+    #[test]
+    fn pass_activities_describes_the_selected_reflog_entry() {
+        let at = UNIX_EPOCH + Duration::from_secs(10);
+        let entry = |message: &str, at: SystemTime| git::ReflogWork {
+            at,
+            old_sha: "aaaaaaaaaaaaaaaa".to_owned(),
+            new_sha: "bbbbbbbbbbbbbbbb".to_owned(),
+            message: message.to_owned(),
+        };
+        let reason = |state: &vector::WorkState| {
+            pass_activities(state, None)
+                .into_iter()
+                .find(|e| e.source == store::ActivitySource::Reflog)
+                .map(|e| e.reasons[0].clone())
+        };
+
+        // The selected entry's short new sha and raw message, at its own
+        // time - the renderer escapes the raw text, never the store.
+        let state = reflog_state(Some(entry("commit: raw\ttext", at)));
+        let event = pass_activities(&state, None)
+            .into_iter()
+            .find(|e| e.source == store::ActivitySource::Reflog)
+            .expect("the reflog event");
+        assert_eq!(event.occurred_at_ms, 10_000);
+        assert_eq!(event.reasons, vec!["bbbbbbb commit: raw\ttext"]);
+
+        // No message: the short sha alone is the reason.
+        let state = reflog_state(Some(entry("", at)));
+        assert_eq!(reason(&state).as_deref(), Some("bbbbbbb"));
+
+        // A timestamp the metadata does not match - inconsistent or
+        // fabricated in-memory evidence, which a real selection never
+        // produces - keeps the generic reason rather than borrowing
+        // another line's message.
+        let mut state = reflog_state(Some(entry("commit: else", at)));
+        state.vector.reflog_activity = Some(UNIX_EPOCH + Duration::from_secs(20));
+        assert_eq!(reason(&state).as_deref(), Some("reflog work"));
+        let state = reflog_state(None);
+        assert_eq!(reason(&state), None);
+        let mut state = reflog_state(None);
+        state.vector.reflog_activity = Some(at);
+        assert_eq!(reason(&state).as_deref(), Some("reflog work"));
     }
 
     #[test]

@@ -52,6 +52,19 @@ rather than "noticed 30 days ago".
 - Reflog activity is dated by the work entries' own timestamps - because
   maintenance rewrites the logs without adding work; not the file's mtime
   (a last-write time cannot prove an event).
+- The reflog activity reason describes the one selected work entry -
+  because qualifying entries compete as whole `(time, old, new, message)`
+  tuples across the HEAD and branch logs, so the displayed sha, message
+  and timestamp provably come from the same line; not a separately chosen
+  newest entry per field (a same-second commit and amend could attribute
+  one entry's message to another's time). Same-time ties resolve
+  lexicographically on `(old, new, message)` and identical tuples
+  collapse, so selection is deterministic. The message is stored raw and
+  escaped once at render; a timestamp without matching in-memory
+  metadata - fabricated or inconsistent evidence, never a real
+  selection - keeps the generic `reflog work` text rather than borrowing
+  another line's, and generic reasons persisted earlier stay untouched
+  (history is never backfilled from current metadata).
 - A conversation's first recorded turn backfills source-dated activity -
   because the source's own timestamp is real work history however old; not
   seating the cursor alone (recency and history then disagree).
