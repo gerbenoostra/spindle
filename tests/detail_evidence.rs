@@ -10,13 +10,14 @@ use agent_sessions::forge::{Pipeline, WorkItem};
 use agent_sessions::provider::SourceError;
 use agent_sessions::runtime::{EvidenceSource, PaneSource, Provider};
 use agent_sessions::snapshot::{
-    AttachmentLiveness, AttachmentRow, CommitRow, ConversationRow, ConversationState, EvidenceRow,
-    IncarnationRow, LatchRow, PaneRow, ReferenceKind, ReferenceRow, RelatedRow, RelationStrength,
-    RepoCounts, RepoRow, SCHEMA_VERSION, Snapshot, Upstream, WorkKind, WorkRow, WorkSection,
+    AttachmentLiveness, AttachmentRow, CommitRow, ConversationRow, ConversationState,
+    ConversationSummary, EvidenceRow, IncarnationRow, LatchRow, PaneRow, ReferenceKind,
+    ReferenceRow, RelatedRow, RelationStrength, RepoCounts, RepoRow, SCHEMA_VERSION, Snapshot,
+    Upstream, WorkKind, WorkRow, WorkSection,
 };
 use agent_sessions::store::{
     ActivityEvent, ActivitySource, Confidence, ContinuityEvidence, Exec, Mark, NormEvent,
-    ObservationEvent, ObservationSource, RejectedRecord, TouchProvenance,
+    ObservationEvent, ObservationSource, RejectedRecord, SessionContext, TouchProvenance,
 };
 use agent_sessions::tui::{App, Key};
 use agent_sessions::verdict::{ActionVerdict, Verdict};
@@ -102,6 +103,7 @@ fn work() -> WorkRow {
         dirty: Some(true),
         broken: None,
         activities: Vec::new(),
+        conversation_summaries: Vec::new(),
         observations: Vec::new(),
         commits_ahead: Some(3),
         unpushed: Some(3),
@@ -345,7 +347,41 @@ fn activity_and_observation_histories_render_separately_and_cap_at_seven() {
         assert!(!text.contains("last change"), "{text}");
     }
     let text = render(&app, 200, 50);
+    // No cursor-backed summaries: the raw conversation trail stays - the
+    // legacy fallback a record without cursors renders.
     assert!(text.contains("8f423bbb update pane labels"), "{text}");
+    assert!(!text.contains("last activity"), "{text}");
+
+    // Two observation sources tied on their newest time order by name;
+    // within a source, events sort newest first.
+    let mut tied = fixture();
+    tied.work[0].observations = vec![
+        ObservationEvent {
+            source: ObservationSource::Forge,
+            observed_at_ms: (NOW - 60) * 1000,
+            reasons: vec!["forge old".to_owned()],
+        },
+        ObservationEvent {
+            source: ObservationSource::Forge,
+            observed_at_ms: (NOW - 30) * 1000,
+            reasons: vec!["forge new".to_owned()],
+        },
+        ObservationEvent {
+            source: ObservationSource::Lifecycle,
+            observed_at_ms: (NOW - 30) * 1000,
+            reasons: vec!["lifecycle tied".to_owned()],
+        },
+    ];
+    let mut tied = App::new(tied);
+    press(&mut tied, &[Key::Char('2'), Key::Char('j')]);
+    let text = render(&tied, 200, 40);
+    let forge = text.find("  forge:").expect("forge group");
+    let lifecycle = text.find("  lifecycle:").expect("lifecycle group");
+    assert!(forge < lifecycle, "tied groups order by name: {text}");
+    assert!(
+        text.find("forge new").unwrap() < text.find("forge old").unwrap(),
+        "events newest first: {text}"
+    );
 
     let mut quiet = App::new(fixture());
     press(&mut quiet, &[Key::Char('2'), Key::Char('j')]);
@@ -1087,4 +1123,255 @@ fn a_rejected_journal_record_reaches_the_snapshot_evidence() {
         "{:?}",
         conv.evidence.rejected
     );
+}
+
+/// A conversation summary as the store projects it onto the row.
+fn summary(
+    key: &str,
+    at_ms: u64,
+    title: Option<&str>,
+    prompt: Option<&str>,
+) -> ConversationSummary {
+    ConversationSummary {
+        key: key.to_owned(),
+        occurred_at_ms: at_ms,
+        context: (title.is_some() || prompt.is_some()).then(|| SessionContext {
+            title: title.map(str::to_owned),
+            prompt_excerpt: prompt.map(str::to_owned),
+        }),
+    }
+}
+
+#[test]
+fn conversation_summaries_compact_turns_into_one_row_per_conversation() {
+    let mut snapshot = fixture();
+    let row = &mut snapshot.work[0];
+    // The raw history keeps every turn; the compacted group replaces it.
+    row.activities = vec![
+        ActivityEvent {
+            source: ActivitySource::Conversation,
+            occurred_at_ms: (NOW - 120) * 1000,
+            reasons: vec!["8f423bbb update pane labels".to_owned()],
+        },
+        ActivityEvent {
+            source: ActivitySource::Conversation,
+            occurred_at_ms: (NOW - 60) * 1000,
+            reasons: vec![
+                "8f423bbb update pane labels".to_owned(),
+                "aaaa1111 first".to_owned(),
+            ],
+        },
+        ActivityEvent {
+            source: ActivitySource::WorkingTree,
+            occurred_at_ms: (NOW - 30) * 1000,
+            reasons: vec!["modified main.rs".to_owned()],
+        },
+    ];
+    // Two conversations at one timestamp keep two summaries in stable
+    // full-key order - the provider-qualified keys with the same
+    // eight-character session prefix stay distinct.
+    row.conversation_summaries = vec![
+        summary(
+            "claude\u{0}aaaa1111-2222",
+            (NOW - 60) * 1000,
+            None,
+            Some("fix the login form"),
+        ),
+        summary(
+            "other\u{0}aaaa1111-9999",
+            (NOW - 60) * 1000,
+            Some("a titled one"),
+            None,
+        ),
+        summary("claude\u{0}8f423bbb-3333", (NOW - 120) * 1000, None, None),
+    ];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        assert!(text.contains("  conversation:"), "{text}");
+        // One row per conversation, newest occurrence first then key:
+        // `claude\0aaaa...` sorts before `other\0aaaa...` at equal time.
+        // Wrapping may split a row's id from its detail at 55 columns, so
+        // the order check walks `last activity` occurrences in the text.
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("last activity"))
+            .collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].contains("60s aaaa1111"), "{text}");
+        assert!(lines[1].contains("60s aaaa1111"), "{text}");
+        assert!(lines[2].contains("2m 8f423bbb"), "{text}");
+        let prompt_at = text.find("prompt: fix the login form").expect("prompt");
+        let title_at = text.find("a titled one").expect("title");
+        assert!(prompt_at < title_at, "full-key order at equal time: {text}");
+        assert!(
+            !lines[2].contains(" - "),
+            "id alone where the record captured no context: {text}"
+        );
+        // The raw turn reasons compacted away from the activity section
+        // (the conversation list's own title column still shows it), and
+        // the working-tree source's own group stays - newest first:
+        // working tree (30s) beats conversation (60s).
+        let activity = &text[text.find("activity:").unwrap()..text.find("commits not on").unwrap()];
+        assert!(!activity.contains("update pane labels"), "{text}");
+        assert!(text.contains("modified main.rs"), "{text}");
+        assert!(
+            text.find("  working tree:").unwrap() < text.find("  conversation:").unwrap(),
+            "source groups order by their newest event: {text}"
+        );
+        // Wrapped cells never carry a terminal control.
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+    }
+}
+
+#[test]
+fn conversation_summaries_cap_at_seven_and_escape_context() {
+    let mut snapshot = fixture();
+    let row = &mut snapshot.work[0];
+    // Eight conversations compacted from twice as many raw events: the
+    // seven newest keys show; the eighth - oldest - does not.
+    let mut activities = Vec::new();
+    row.conversation_summaries = (0..8u64)
+        .map(|i| {
+            // The eight-char short id distinguishes every key.
+            let key = format!("claude\u{0}s{i:07}-xxxx");
+            for turn in 0..2 {
+                activities.push(ActivityEvent {
+                    source: ActivitySource::Conversation,
+                    occurred_at_ms: (NOW - 1000 + i * 10 + turn) * 1000,
+                    reasons: vec![format!("s{i:07} turn{turn}")],
+                });
+            }
+            // The oldest row's prompt carries escapes; it compacts out
+            // with the row, so a prompt with controls must show on a
+            // surviving row instead.
+            let prompt = (i == 7).then(|| "tab\there\nand \u{7}bell".to_owned());
+            summary(
+                &key,
+                (NOW - 1000 + i * 10 + 1) * 1000,
+                None,
+                prompt.as_deref(),
+            )
+        })
+        .collect();
+    row.activities = activities;
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("last activity"))
+            .collect();
+        assert_eq!(lines.len(), 7, "{text}");
+        assert!(text.contains("s0000007"), "{text}");
+        assert!(
+            !text.contains("s0000000"),
+            "the eighth compacts out: {text}"
+        );
+        assert!(!text.contains("s0000000 turn"), "{text}");
+        assert!(!text.contains("turn1"), "{text}");
+    }
+    // The control characters in the stored excerpt render escaped,
+    // never as terminal input - asserted unwrapped on the wide frame.
+    let text = render(&app, 200, 60);
+    assert!(
+        text.contains("prompt: tab\\there\\nand \\u0007bell"),
+        "{text}"
+    );
+    assert!(!text.contains('\t') && !text.contains('\u{7}'), "{text}");
+}
+
+#[test]
+fn a_unicode_control_prompt_renders_bounded_and_escaped() {
+    // The excerpt the store persists is raw and cell-bounded; the detail
+    // renders it escaped once - no terminal control survives, at either
+    // width.
+    let temp = support::tempdir::TempDir::new("unicode-excerpt");
+    let store = agent_sessions::store::Store::open(temp.path().to_path_buf());
+    let obs = |name: &str| agent_sessions::store::ObservedRef {
+        name: name.to_owned(),
+        head: None,
+        rewritten: false,
+        creation: None,
+        renamed_from: None,
+        commit: None,
+        activities: Vec::new(),
+        inputs: agent_sessions::store::LifecycleInputs::default(),
+    };
+    store
+        .sync_repo("/r/.git", &[obs("feat")], 1_000)
+        .expect("sync");
+    let id = store
+        .load()
+        .work
+        .branch("/r/.git", "feat")
+        .expect("the record")
+        .id
+        .clone();
+    // CJK double-width, a combining mark, raw tab/newline/escape and a
+    // tail long enough to force truncation past the cell bound.
+    let prompt = format!(
+        "日本語のe\u{301}xcerpt\ttab\nnewline\u{1b}[0m {}",
+        "長い尾部".repeat(40)
+    );
+    store
+        .sync_session_updates(&[agent_sessions::store::SessionUpdate {
+            identity: agent_sessions::store::UpdateIdentity::Branch(id.clone()),
+            conversation: agent_sessions::store::conversation_key("claude", "u0n1c0de-zz"),
+            at_ms: 5_000,
+            reason: "turn".to_owned(),
+            context: SessionContext {
+                title: None,
+                prompt_excerpt: Some(prompt),
+            },
+        }])
+        .expect("update");
+    let record = store
+        .load()
+        .work
+        .branches
+        .get(&id)
+        .expect("the record")
+        .clone();
+    let excerpt = record.session_context
+        [&agent_sessions::store::conversation_key("claude", "u0n1c0de-zz")]
+        .prompt_excerpt
+        .clone()
+        .expect("the bounded excerpt");
+    // Raw storage, bounded on escape: it keeps control bytes verbatim but
+    // never renders past 120 cells once escaped.
+    assert!(excerpt.contains('\t') && excerpt.contains('\u{1b}'));
+    assert!(excerpt.ends_with('…'));
+
+    let mut snapshot = fixture();
+    snapshot.work[0].conversation_summaries = vec![summary(
+        "claude\u{0}u0n1c0de-zz",
+        (NOW - 60) * 1000,
+        None,
+        Some(&excerpt),
+    )];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'), "{text}");
+        // Wrapping splits the row mid-string; the detail pane's cells,
+        // rejoined past the pane borders, restore each logical line.
+        let detail: String = text
+            .lines()
+            .filter_map(|l| l.rsplit('│').nth(1).map(str::to_owned))
+            .map(|s| s.trim_end().to_owned())
+            .collect();
+        // The escaped controls and double-width text print literally -
+        // buffer cells pad each wide glyph with a space, so the needles
+        // are the fragments padding cannot split.
+        assert!(detail.contains("prompt: 日"), "{text}");
+        assert!(detail.contains("xcerpt"), "{text}");
+        assert!(detail.contains("\\ttab"), "{text}");
+        assert!(detail.contains("\\nnewline"), "{text}");
+        assert!(detail.contains("\\u001b"), "{text}");
+        assert!(detail.contains("…"), "{text}");
+    }
 }

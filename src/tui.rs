@@ -29,11 +29,12 @@ use crate::attention::{Attention, ClaimOutcome};
 use crate::config;
 use crate::forge::{Pipeline, WorkItem};
 use crate::snapshot::{
-    AttachmentLiveness, AttachmentRow, ConversationRow, ConversationState, IncarnationRow,
-    ReferenceKind, RelationStrength, RepoRow, Snapshot, Upstream, WorkKind, WorkRow, WorkSection,
-    to_json,
+    AttachmentLiveness, AttachmentRow, ConversationRow, ConversationState, ConversationSummary,
+    IncarnationRow, ReferenceKind, RelationStrength, RepoRow, Snapshot, Upstream, WorkKind,
+    WorkRow, WorkSection, to_json,
 };
 use crate::store::{self, Store};
+use crate::text::escape_text;
 use crate::tmux::{self, PaneRef};
 
 /// The four panes, in `Tab` order.
@@ -1403,18 +1404,7 @@ impl App {
             ),
             width,
         );
-        for line in event_lines(
-            &w.activities,
-            |e| {
-                serde_json::to_value(e.source)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_default()
-            },
-            |e| e.occurred_at_ms,
-            |e| &e.reasons,
-            now.saturating_mul(1000),
-        ) {
+        for line in activity_lines(w, now.saturating_mul(1000)) {
             push_text(out, line, width);
         }
         if !w.observations.is_empty() {
@@ -2409,22 +2399,6 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Provider text made printable on one line: control characters become
-/// visible escapes so a prompt or reason cannot paint over the pane.
-fn escape_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// The string, or `?` where the field never proved one.
 fn opt(s: &Option<String>) -> String {
     s.clone().unwrap_or_else(|| "?".to_owned())
@@ -2464,6 +2438,85 @@ fn ref_kind(kind: ReferenceKind) -> &'static str {
 }
 
 const EVENT_DISPLAY_PER_SOURCE: usize = 7;
+
+/// The activity source's serialized name - the label a group header
+/// renders with `_` as spaces.
+fn activity_source_name(e: &store::ActivityEvent) -> String {
+    serde_json::to_value(e.source)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// The conversation's short id for a summary row: the first eight
+/// characters of the session part of its provider-qualified key, or of
+/// the whole key where an opaque legacy key carries no provider prefix.
+fn short_conversation_id(key: &str) -> String {
+    let session = key.split_once('\u{0}').map(|(_, s)| s).unwrap_or(key);
+    session.chars().take(8).collect()
+}
+
+/// The `activity:` section's lines: every source's events grouped and
+/// ordered exactly as `event_lines` renders them, except the conversation
+/// group - where the record carries cursor-backed summaries it shows one
+/// compact row per conversation (newest occurrence first, then full key,
+/// capped at [`EVENT_DISPLAY_PER_SOURCE`] after compaction) in place of
+/// the raw per-turn reasons. A record without summaries keeps the raw
+/// trail as its fallback.
+fn activity_lines(w: &WorkRow, now_ms: u64) -> Vec<String> {
+    let mut by_source: std::collections::BTreeMap<String, Vec<&store::ActivityEvent>> =
+        std::collections::BTreeMap::new();
+    for event in &w.activities {
+        if event.source == store::ActivitySource::Conversation
+            && !w.conversation_summaries.is_empty()
+        {
+            continue;
+        }
+        by_source
+            .entry(activity_source_name(event))
+            .or_default()
+            .push(event);
+    }
+    let mut groups: Vec<(u64, String, Vec<String>)> = Vec::new();
+    for (source, mut events) in by_source {
+        let newest = events.iter().map(|e| e.occurred_at_ms).max().unwrap_or(0);
+        let mut lines = vec![format!("  {}:", source.replace('_', " "))];
+        events.sort_by_key(|e| std::cmp::Reverse(e.occurred_at_ms));
+        for event in events.iter().take(EVENT_DISPLAY_PER_SOURCE) {
+            let when = age_ms(now_ms, event.occurred_at_ms);
+            for reason in &event.reasons {
+                lines.push(format!("    {when} {}", escape_text(reason)));
+            }
+        }
+        groups.push((newest, source, lines));
+    }
+    if !w.conversation_summaries.is_empty() {
+        let mut summaries: Vec<&ConversationSummary> = w.conversation_summaries.iter().collect();
+        summaries.sort_by(|a, b| {
+            b.occurred_at_ms
+                .cmp(&a.occurred_at_ms)
+                .then(a.key.cmp(&b.key))
+        });
+        let newest = summaries.first().map(|s| s.occurred_at_ms).unwrap_or(0);
+        let mut lines = vec!["  conversation:".to_owned()];
+        for summary in summaries.into_iter().take(EVENT_DISPLAY_PER_SOURCE) {
+            let when = age_ms(now_ms, summary.occurred_at_ms);
+            let id = escape_text(&short_conversation_id(&summary.key));
+            let context = summary.context.as_ref();
+            let prompt = context.and_then(|c| c.prompt_excerpt.as_deref());
+            let title = context.and_then(|c| c.title.as_deref());
+            let detail = match (prompt, title) {
+                (Some(prompt), _) => format!(" - prompt: {}", escape_text(prompt)),
+                (None, Some(title)) => format!(" - {}", escape_text(title)),
+                (None, None) => String::new(),
+            };
+            lines.push(format!("    last activity {when} {id}{detail}"));
+        }
+        groups.push((newest, "conversation".to_owned(), lines));
+    }
+    groups.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    groups.into_iter().flat_map(|(_, _, lines)| lines).collect()
+}
 
 /// A row's events rendered grouped by source, groups ordered by their
 /// newest event and each event listed at its own `at` - the shape the
@@ -2975,6 +3028,7 @@ mod tests {
                     dirty: Some(true),
                     broken: None,
                     activities: Vec::new(),
+                    conversation_summaries: Vec::new(),
                     observations: Vec::new(),
                     commits_ahead: Some(3),
                     unpushed: Some(3),
@@ -3022,6 +3076,7 @@ mod tests {
                     dirty: Some(false),
                     broken: None,
                     activities: Vec::new(),
+                    conversation_summaries: Vec::new(),
                     observations: Vec::new(),
                     commits_ahead: Some(7),
                     unpushed: Some(7),
@@ -3069,6 +3124,7 @@ mod tests {
                     dirty: None,
                     broken: None,
                     activities: Vec::new(),
+                    conversation_summaries: Vec::new(),
                     observations: Vec::new(),
                     commits_ahead: None,
                     unpushed: None,

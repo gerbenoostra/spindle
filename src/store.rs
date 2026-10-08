@@ -40,6 +40,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::provider::SourceError;
+use crate::text;
 
 /// The record schema this build reads and writes for the journal,
 /// checkpoint, seen and marks files. `0` - an unversioned record from
@@ -586,12 +587,27 @@ pub enum UpdateIdentity {
     Path(String),
 }
 
+/// The latest-known conversation context one record captured: the
+/// provider title and a bounded excerpt of the latest submitted prompt -
+/// context for the summary row, never a claim that the newest activity
+/// occurrence dates the prompt, and never a full transcript.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContext {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub prompt_excerpt: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionUpdate {
     pub identity: UpdateIdentity,
     pub conversation: String,
     pub at_ms: u64,
     pub reason: String,
+    /// The raw context the pass read; the store normalizes and bounds it
+    /// before persisting so a caller cannot bypass the bound.
+    pub context: SessionContext,
 }
 
 impl LifecycleInputs {
@@ -970,6 +986,11 @@ pub struct BranchRecord {
     pub inputs: LifecycleInputs,
     #[serde(default)]
     pub session_activity: BTreeMap<String, u64>,
+    /// Latest-known context per `session_activity` key, captured for this
+    /// record only - a conversation's later context never leaks into a
+    /// record it moved away from.
+    #[serde(default)]
+    pub session_context: BTreeMap<String, SessionContext>,
 }
 
 /// A path-anchored record: a detached worktree or a non-Git project space,
@@ -992,6 +1013,10 @@ pub struct PathRecord {
     pub inputs: LifecycleInputs,
     #[serde(default)]
     pub session_activity: BTreeMap<String, u64>,
+    /// Latest-known context per `session_activity` key; see
+    /// [`BranchRecord::session_context`].
+    #[serde(default)]
+    pub session_context: BTreeMap<String, SessionContext>,
 }
 
 /// The `work.json` payload: the authored Work state.
@@ -1148,6 +1173,7 @@ fn open_incarnation(
             observations: Vec::new(),
             inputs: obs.inputs.clone(),
             session_activity: BTreeMap::new(),
+            session_context: BTreeMap::new(),
         },
     );
     let record = work.branches.get_mut(&id).expect("just inserted");
@@ -1452,34 +1478,95 @@ fn absorb_path_evidence(
     changed
 }
 
+/// `text` where it carries content, `None` where it is empty or
+/// whitespace-only - text that renders nothing is not context.
+fn context_text(text: Option<&str>) -> Option<String> {
+    text.filter(|t| !t.trim().is_empty()).map(str::to_owned)
+}
+
 fn session_update(
     activities: &mut Vec<ActivityEvent>,
     cursors: &mut BTreeMap<String, u64>,
+    contexts: &mut BTreeMap<String, SessionContext>,
     update: &SessionUpdate,
 ) -> bool {
-    // An update at or before the cursor is stale: the source-backed event
-    // is already recorded (or already superseded), so it changes nothing.
-    if cursors
-        .get(&update.conversation)
-        .is_some_and(|cursor| update.at_ms <= *cursor)
-    {
-        return false;
+    // The update's context, normalized and bounded at the store boundary:
+    // an empty text is missing, a prompt persists only as a raw excerpt
+    // whose escaped rendering fits the bound.
+    let title = context_text(update.context.title.as_deref());
+    let prompt = update
+        .context
+        .prompt_excerpt
+        .as_deref()
+        .and_then(text::prompt_excerpt);
+    match cursors.get(&update.conversation).copied() {
+        // An update before the cursor is stale: the source-backed event is
+        // already superseded, so it changes nothing - context included.
+        Some(cursor) if update.at_ms < cursor => false,
+        // At the cursor the event already landed: enrich context only,
+        // filling fields the record still lacks - never replacing what an
+        // earlier update captured, never touching cursor or activity.
+        Some(cursor) if update.at_ms == cursor => {
+            let existing = contexts.get(&update.conversation);
+            if existing.is_some_and(|c| c.title.is_some() && c.prompt_excerpt.is_some())
+                || (title.is_none() && prompt.is_none())
+            {
+                return false;
+            }
+            let context = contexts.entry(update.conversation.clone()).or_default();
+            let mut changed = false;
+            if context.title.is_none() && title.is_some() {
+                context.title = title;
+                changed = true;
+            }
+            if context.prompt_excerpt.is_none() && prompt.is_some() {
+                context.prompt_excerpt = prompt;
+                changed = true;
+            }
+            changed
+        }
+        // First sightings backfill like newer turns do: the conversation's own
+        // timestamp is real source history, whether it predates this record or
+        // this store. The incoming context wins where it carries a value;
+        // absent fields keep what the record already knows.
+        _ => {
+            cursors.insert(update.conversation.clone(), update.at_ms);
+            append_activity(
+                activities,
+                ActivityEvent {
+                    source: ActivitySource::Conversation,
+                    occurred_at_ms: update.at_ms,
+                    reasons: vec![update.reason.clone()],
+                },
+            );
+            // The cursor moved, so the record changed even when the event
+            // merged into an identical one another conversation already
+            // supplied.
+            merge_context(contexts, &update.conversation, title, prompt);
+            true
+        }
     }
-    // First sightings backfill like newer turns do: the conversation's own
-    // timestamp is real source history, whether it predates this record or
-    // this store.
-    cursors.insert(update.conversation.clone(), update.at_ms);
-    append_activity(
-        activities,
-        ActivityEvent {
-            source: ActivitySource::Conversation,
-            occurred_at_ms: update.at_ms,
-            reasons: vec![update.reason.clone()],
-        },
-    );
-    // The cursor moved, so the record changed even when the event merged
-    // into an identical one another conversation already supplied.
-    true
+}
+
+/// `title`/`prompt` over the conversation's stored context: incoming
+/// values replace, absent ones retain. Only writes when something
+/// actually changed, and never fabricates an empty entry.
+fn merge_context(
+    contexts: &mut BTreeMap<String, SessionContext>,
+    conversation: &str,
+    title: Option<String>,
+    prompt: Option<String>,
+) {
+    if title.is_none() && prompt.is_none() && !contexts.contains_key(conversation) {
+        return;
+    }
+    let context = contexts.entry(conversation.to_owned()).or_default();
+    if title.is_some() {
+        context.title = title;
+    }
+    if prompt.is_some() {
+        context.prompt_excerpt = prompt;
+    }
 }
 
 /// Close every open touch interval naming `branch` at `at_ms`: an
@@ -2269,6 +2356,7 @@ impl Store {
                     observations: Vec::new(),
                     inputs: inputs.clone(),
                     session_activity: BTreeMap::new(),
+                    session_context: BTreeMap::new(),
                 };
                 for event in activities {
                     append_activity(&mut record.activities, event.clone());
@@ -2293,10 +2381,20 @@ impl Store {
         for update in updates {
             let applied = match &update.identity {
                 UpdateIdentity::Branch(id) => work.branches.get_mut(id).map(|record| {
-                    session_update(&mut record.activities, &mut record.session_activity, update)
+                    session_update(
+                        &mut record.activities,
+                        &mut record.session_activity,
+                        &mut record.session_context,
+                        update,
+                    )
                 }),
                 UpdateIdentity::Path(path) => work.paths.get_mut(path).map(|record| {
-                    session_update(&mut record.activities, &mut record.session_activity, update)
+                    session_update(
+                        &mut record.activities,
+                        &mut record.session_activity,
+                        &mut record.session_context,
+                        update,
+                    )
                 }),
             };
             changed |= applied.unwrap_or(false);
@@ -5112,6 +5210,7 @@ mod tests {
                 conversation: "c".to_owned(),
                 at_ms: 1,
                 reason: "r".to_owned(),
+                context: SessionContext::default(),
             }])
             .unwrap();
         let conv = conversation_key("claude", "s1");
@@ -5120,6 +5219,7 @@ mod tests {
             conversation: conv.clone(),
             at_ms,
             reason: reason.to_owned(),
+            context: SessionContext::default(),
         };
         let branch = UpdateIdentity::Branch(id.clone());
         let path = UpdateIdentity::Path("/spaces/a".to_owned());
@@ -5181,6 +5281,7 @@ mod tests {
             conversation: conv2.clone(),
             at_ms,
             reason: reason.to_owned(),
+            context: SessionContext::default(),
         };
         let conv3 = conversation_key("claude", "s3");
         let update3 = |at_ms: u64, reason: &str| SessionUpdate {
@@ -5188,6 +5289,7 @@ mod tests {
             conversation: conv3.clone(),
             at_ms,
             reason: reason.to_owned(),
+            context: SessionContext::default(),
         };
         store
             .sync_session_updates(&[
@@ -5256,6 +5358,7 @@ mod tests {
             conversation: conv4.clone(),
             at_ms,
             reason: reason.to_owned(),
+            context: SessionContext::default(),
         };
         store
             .sync_session_updates(&[update4(7_000, "aaaa")])
@@ -5315,8 +5418,275 @@ mod tests {
         let record = work.branches.get("i1").expect("the record");
         assert!(record.activities.is_empty() && record.observations.is_empty());
         assert!(record.session_activity.is_empty());
+        assert!(record.session_context.is_empty());
         let path = work.path("/p").expect("the path");
         assert!(path.activities.is_empty() && path.observations.is_empty());
+        assert!(path.session_context.is_empty());
+    }
+
+    /// A record with a conversation cursor and context written by this
+    /// build reads back identically - additive fields round-trip.
+    #[test]
+    fn session_context_roundtrips_through_the_file() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        store.sync_repo(repo, &[obs("feat", false)], 1_000).unwrap();
+        let id = store
+            .load()
+            .work
+            .branch(repo, "feat")
+            .expect("active")
+            .id
+            .clone();
+        let conv = conversation_key("claude", "s1");
+        store
+            .sync_session_updates(&[SessionUpdate {
+                identity: UpdateIdentity::Branch(id.clone()),
+                conversation: conv.clone(),
+                at_ms: 5_000,
+                reason: "8f423bbb title".to_owned(),
+                context: SessionContext {
+                    title: Some("a title".to_owned()),
+                    prompt_excerpt: Some("do the thing".to_owned()),
+                },
+            }])
+            .unwrap();
+        let record = store
+            .load()
+            .work
+            .branches
+            .get(&id)
+            .expect("the record")
+            .clone();
+        assert_eq!(
+            record.session_context.get(&conv),
+            Some(&SessionContext {
+                title: Some("a title".to_owned()),
+                prompt_excerpt: Some("do the thing".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn session_context_enriches_equal_time_and_yields_to_newer() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        store.sync_repo(repo, &[obs("feat", false)], 1_000).unwrap();
+        store
+            .sync_path(
+                "/spaces/a",
+                "/spaces/a",
+                &LifecycleInputs::default(),
+                &[],
+                1_000,
+            )
+            .unwrap();
+        let id = store
+            .load()
+            .work
+            .branch(repo, "feat")
+            .expect("active")
+            .id
+            .clone();
+        let conv = conversation_key("claude", "s1");
+        let update = |at_ms: u64, title: Option<&str>, prompt: Option<&str>| SessionUpdate {
+            identity: UpdateIdentity::Branch(id.clone()),
+            conversation: conv.clone(),
+            at_ms,
+            reason: "turn".to_owned(),
+            context: SessionContext {
+                title: title.map(str::to_owned),
+                prompt_excerpt: prompt.map(str::to_owned),
+            },
+        };
+        // A first sighting captures what it carries - raw, never the
+        // whole prompt beyond the bound.
+        let long = "p".repeat(200);
+        store
+            .sync_session_updates(&[update(5_000, Some("first title"), Some(&long))])
+            .unwrap();
+        let record = store
+            .load()
+            .work
+            .branches
+            .get(&id)
+            .expect("the record")
+            .clone();
+        let context = record.session_context.get(&conv).expect("context");
+        assert_eq!(context.title.as_deref(), Some("first title"));
+        let stored = context.prompt_excerpt.as_deref().expect("excerpt");
+        assert!(
+            unicode_width::UnicodeWidthStr::width(text::escape_text(stored).as_str())
+                <= text::PROMPT_EXCERPT_CELLS,
+            "the stored excerpt renders within the bound: {stored}"
+        );
+        assert!(stored.ends_with('…'));
+        assert!(stored.len() < long.len(), "the full prompt never persists");
+        assert_eq!(record.activities.len(), 1);
+
+        // Equal-time updates fill only missing fields: the stored
+        // context stays, no event lands, the cursor never moves.
+        store
+            .sync_session_updates(&[update(5_000, Some("other title"), Some("other prompt"))])
+            .unwrap();
+        let record = store.load().work.branches.get(&id).unwrap().clone();
+        assert_eq!(
+            record.session_context.get(&conv).unwrap().title.as_deref(),
+            Some("first title"),
+            "equal-time context never replaces"
+        );
+        assert_eq!(record.activities.len(), 1, "enrichment lands no event");
+        assert_eq!(newest_activity(&record.activities), Some(5_000));
+
+        // A stale update is a complete no-op, context included: the
+        // file's bytes do not move.
+        let bytes = fs::read(temp.path(WORK)).unwrap();
+        store
+            .sync_session_updates(&[update(4_000, Some("stale"), Some("stale prompt"))])
+            .unwrap();
+        assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes);
+
+        // A newer turn carrying no prompt keeps the captured excerpt as
+        // fallback while a changed title replaces.
+        store
+            .sync_session_updates(&[update(6_000, Some("second title"), None)])
+            .unwrap();
+        let record = store.load().work.branches.get(&id).unwrap().clone();
+        let context = record.session_context.get(&conv).unwrap();
+        assert_eq!(context.title.as_deref(), Some("second title"));
+        assert_eq!(context.prompt_excerpt.as_deref(), Some(stored));
+        assert_eq!(newest_activity(&record.activities), Some(6_000));
+
+        // The whitespace-only and empty texts count as missing.
+        store
+            .sync_session_updates(&[update(7_000, Some("  \t "), Some("   "))])
+            .unwrap();
+        let record = store.load().work.branches.get(&id).unwrap().clone();
+        let context = record.session_context.get(&conv).unwrap();
+        assert_eq!(context.title.as_deref(), Some("second title"));
+        assert_eq!(context.prompt_excerpt.as_deref(), Some(stored));
+
+        // An equal-time update fills a still-missing field without
+        // disturbing the rest: a fresh conversation on the same record
+        // gains context while its cursor and event land once.
+        let conv2 = conversation_key("claude", "s2");
+        let update2 = |at_ms: u64, title: Option<&str>, prompt: Option<&str>| SessionUpdate {
+            identity: UpdateIdentity::Path("/spaces/a".to_owned()),
+            conversation: conv2.clone(),
+            at_ms,
+            reason: "turn".to_owned(),
+            context: SessionContext {
+                title: title.map(str::to_owned),
+                prompt_excerpt: prompt.map(str::to_owned),
+            },
+        };
+        store
+            .sync_session_updates(&[update2(8_000, Some("space title"), None)])
+            .unwrap();
+        store
+            .sync_session_updates(&[update2(8_000, None, Some("late prompt"))])
+            .unwrap();
+        let work = store.load().work;
+        let path = work.path("/spaces/a").expect("the path record");
+        let context = path.session_context.get(&conv2).expect("context");
+        assert_eq!(context.title.as_deref(), Some("space title"));
+        assert_eq!(context.prompt_excerpt.as_deref(), Some("late prompt"));
+        assert_eq!(path.activities.len(), 1, "one event for the sighting");
+        assert_eq!(path.session_activity.get(&conv2), Some(&8_000));
+
+        // The mirror fill order: a record holding only a prompt gains the
+        // title at equal time, its prompt untouched by the update's own.
+        let conv3 = conversation_key("claude", "s3");
+        let update3 = |title: Option<&str>, prompt: Option<&str>| SessionUpdate {
+            identity: UpdateIdentity::Path("/spaces/a".to_owned()),
+            conversation: conv3.clone(),
+            at_ms: 9_000,
+            reason: "turn".to_owned(),
+            context: SessionContext {
+                title: title.map(str::to_owned),
+                prompt_excerpt: prompt.map(str::to_owned),
+            },
+        };
+        store
+            .sync_session_updates(&[update3(None, Some("first prompt"))])
+            .unwrap();
+        store
+            .sync_session_updates(&[update3(Some("added title"), Some("other"))])
+            .unwrap();
+        let work = store.load().work;
+        let path = work.path("/spaces/a").expect("the path record");
+        let context = path.session_context.get(&conv3).expect("context");
+        assert_eq!(context.title.as_deref(), Some("added title"));
+        assert_eq!(context.prompt_excerpt.as_deref(), Some("first prompt"));
+
+        // Context is per record: the same conversation key on the path
+        // record never read the branch record's capture, and neither
+        // record's context shows under the other.
+        assert!(!path.session_context.contains_key(&conv));
+        let branch = work.branches.get(&id).unwrap();
+        assert!(!branch.session_context.contains_key(&conv2));
+    }
+
+    #[test]
+    fn session_context_fills_a_cursor_only_record_without_new_activity() {
+        // A record written before context existed carries the cursor but
+        // no capture: the next equal-time update compacts it in place.
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        store.sync_repo(repo, &[obs("feat", false)], 1_000).unwrap();
+        let id = store
+            .load()
+            .work
+            .branch(repo, "feat")
+            .expect("active")
+            .id
+            .clone();
+        let conv = conversation_key("claude", "s1");
+        let update = |context: SessionContext| SessionUpdate {
+            identity: UpdateIdentity::Branch(id.clone()),
+            conversation: conv.clone(),
+            at_ms: 5_000,
+            reason: "turn".to_owned(),
+            context,
+        };
+        store
+            .sync_session_updates(&[update(SessionContext::default())])
+            .unwrap();
+        let record = store.load().work.branches.get(&id).unwrap().clone();
+        assert_eq!(record.session_activity.get(&conv), Some(&5_000));
+        assert_eq!(record.activities.len(), 1);
+        assert!(!record.session_context.contains_key(&conv));
+        let last = newest_activity(&record.activities);
+        // The equal-time enrichment: context lands, cursor and activity
+        // stay exactly where they were.
+        store
+            .sync_session_updates(&[update(SessionContext {
+                title: Some("the title".to_owned()),
+                prompt_excerpt: Some("the prompt".to_owned()),
+            })])
+            .unwrap();
+        let record = store.load().work.branches.get(&id).unwrap().clone();
+        assert_eq!(
+            record.session_context.get(&conv),
+            Some(&SessionContext {
+                title: Some("the title".to_owned()),
+                prompt_excerpt: Some("the prompt".to_owned()),
+            })
+        );
+        assert_eq!(record.activities.len(), 1, "no event for enrichment");
+        assert_eq!(newest_activity(&record.activities), last);
+        // A repeated identical enrichment is a byte-exact no-op.
+        let bytes = fs::read(temp.path(WORK)).unwrap();
+        store
+            .sync_session_updates(&[update(SessionContext {
+                title: Some("the title".to_owned()),
+                prompt_excerpt: Some("the prompt".to_owned()),
+            })])
+            .unwrap();
+        assert_eq!(fs::read(temp.path(WORK)).unwrap(), bytes);
     }
 
     #[test]
@@ -5567,6 +5937,7 @@ mod tests {
                     conversation: "claude:s1".to_owned(),
                     at_ms: 5_000,
                     reason: "old turn".to_owned(),
+                    context: SessionContext::default(),
                 }])
                 .unwrap();
             let work = store.load().work;
@@ -5583,6 +5954,7 @@ mod tests {
                     conversation: "claude:s1".to_owned(),
                     at_ms: 5_000,
                     reason: "old turn".to_owned(),
+                    context: SessionContext::default(),
                 }])
                 .unwrap();
             let work = store.load().work;

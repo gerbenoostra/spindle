@@ -28,6 +28,8 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use support::fixture::{self, FixtureRepo, Landing};
 use support::tempdir::TempDir;
+use support::tmux::TmuxServer;
+use support::tmux_or_skip;
 
 const NEEDS_ID: &str = "11000000-1111-2222-3333-444444444444";
 const RESUME_ID: &str = "22000000-1111-2222-3333-444444444444";
@@ -65,6 +67,14 @@ fn now() -> u64 {
 
 fn collect(world: &World) -> Snapshot {
     collect_with(world, None, None)
+}
+
+/// As `collect`, over a runtime that sees the given tmux sockets.
+fn collect_on(world: &World, sockets: &[std::path::PathBuf]) -> Snapshot {
+    let runtime = Runtime::observe_over(sockets);
+    Collector::new(claude(&world.home))
+        .with_store(state(&world.home))
+        .collect(&runtime, None)
 }
 
 fn collect_with(world: &World, config: Option<Loaded>, forge: Option<Forge>) -> Snapshot {
@@ -1325,4 +1335,416 @@ fn a_dated_project_space_turn_backfills_source_activity() {
     assert!(!text.contains("activity: ?"), "{text}");
     assert!(text.contains("conversation:"), "{text}");
     assert!(text.contains("the task"), "{text}");
+}
+
+/// Turn `text` appended to conversation `id`'s transcript at `cwd`.
+fn append_turn(home: &TempDir, id: &str, cwd: &Path, text: &str) {
+    let transcript = home.join(format!(".claude/projects/t/{id}.jsonl"));
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .expect("the transcript");
+    use std::io::Write;
+    f.write_all(support::claude_turn(id, cwd, text).as_bytes())
+        .expect("the turn appends");
+}
+
+/// The one summary row `name`'s work row carries.
+fn only_summary<'a>(
+    snapshot: &'a Snapshot,
+    name: &str,
+) -> &'a agent_sessions::snapshot::ConversationSummary {
+    let row = work(snapshot, name);
+    assert_eq!(
+        row.conversation_summaries.len(),
+        1,
+        "{name}: {:?}",
+        row.conversation_summaries
+    );
+    &row.conversation_summaries[0]
+}
+
+#[test]
+fn conversation_summaries_compact_turns_through_the_pipeline() {
+    // A live agent on one branch's worktree: repeated transcript turns
+    // compact into one summary at the newest source time; moving the
+    // conversation leaves its captured context behind on the old row.
+    let home = TempDir::new("conversation-summaries");
+    let a = FixtureRepo::new("origin");
+    a.branch_with_commits("feat-one", 1, true);
+    let wt_one = a.add_worktree("one", Some("feat-one"));
+    a.branch_with_commits("feat-two", 1, true);
+    let wt_two = a.add_worktree("two", Some("feat-two"));
+    let id = "66000000-1111-2222-3333-444444444444";
+    transcript(&home, id, &wt_one);
+    let mut agent = support::live_claude(&home, id, "busy", &wt_one);
+    let world = World {
+        home,
+        a,
+        b: FixtureRepo::new("origin"),
+        agent: None,
+    };
+
+    let first = collect(&world);
+    let summary = only_summary(&first, "feat-one");
+    assert_eq!(
+        summary.key,
+        agent_sessions::store::conversation_key("claude", id)
+    );
+    assert_eq!(
+        summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        Some("the task")
+    );
+    let first_at = summary.occurred_at_ms;
+
+    // A repeated turn is still one row, at the newer source time, with
+    // the newer prompt captured - the per-turn reasons stay raw history
+    // underneath, never displayed per turn.
+    // `last_activity` carries second precision: a turn must land a
+    // whole second later to count as newer.
+    std::thread::sleep(Duration::from_millis(1_100));
+    append_turn(&world.home, id, &wt_one, "the follow-up");
+    let second = collect(&world);
+    let summary = only_summary(&second, "feat-one");
+    assert!(summary.occurred_at_ms > first_at, "{summary:?}");
+    assert_eq!(
+        summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        Some("the follow-up")
+    );
+    let row = work(&second, "feat-one");
+    assert!(
+        row.activities
+            .iter()
+            .filter(|e| e.source == ActivitySource::Conversation)
+            .count()
+            >= 2,
+        "raw history retained: {:?}",
+        row.activities
+    );
+
+    // The conversation moves to the other branch's worktree: its newest
+    // context lands on that record alone; the old record keeps the
+    // excerpt it captured - a prompt never leaks across rows.
+    agent.kill().expect("kill");
+    let _ = agent.wait();
+    let mut agent = support::live_claude(&world.home, id, "busy", &wt_two);
+    // `last_activity` carries second precision: a turn must land a
+    // whole second later to count as newer.
+    std::thread::sleep(Duration::from_millis(1_100));
+    append_turn(&world.home, id, &wt_two, "moved task");
+    let third = collect(&world);
+    assert_eq!(
+        only_summary(&third, "feat-two")
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        Some("moved task")
+    );
+    assert_eq!(
+        only_summary(&third, "feat-one")
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        Some("the follow-up"),
+        "the old row retains its own capture"
+    );
+
+    // Provider-absent: the transcript gone, the agent dead - the record's
+    // persisted summary still speaks, no current provider state reads in.
+    // A second quiet conversation keeps the repo itself in scope: a repo
+    // exists to the snapshot only while one resolves into it.
+    agent.kill().expect("kill");
+    let _ = agent.wait();
+    let keeper_id = "77000000-1111-2222-3333-444444444444";
+    transcript(&world.home, keeper_id, &world.a.main);
+    let mut keeper = support::live_claude(&world.home, keeper_id, "idle", &world.a.main);
+    fs::remove_file(world.home.join(format!(".claude/projects/t/{id}.jsonl")))
+        .expect("the transcript deletes");
+    fs::remove_file(
+        world
+            .home
+            .join(format!(".claude/sessions/{}.json", agent.id())),
+    )
+    .expect("the dead session file clears");
+    let fourth = collect(&world);
+    keeper.kill().expect("kill");
+    let _ = keeper.wait();
+    let summary = only_summary(&fourth, "feat-two");
+    assert_eq!(
+        summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        Some("moved task"),
+        "persisted fallback without the provider"
+    );
+    // The detail view renders the compacted row: one `last activity`
+    // line, no raw turn reasons.
+    let mut app = App::new(fourth);
+    app.key(Key::Char('2'));
+    let mut seen = String::new();
+    for _ in 0..12 {
+        let text = render(&app, 200, 40);
+        seen.push_str(&text);
+        if text.contains("Work - feat-two") {
+            assert!(text.contains("last activity"), "{text}");
+            assert!(text.contains("prompt: moved task"), "{text}");
+            assert!(!text.contains("moved task moved task"), "{text}");
+            break;
+        }
+        app.key(Key::Char('j'));
+    }
+    assert!(seen.contains("Work - feat-two"), "feat-two focused: {seen}");
+}
+
+/// Strip `session_context` from every record in `work.json`, keeping the
+/// cursors - the file a pre-context build would have written.
+fn strip_session_context(home: &TempDir) {
+    let path = state(home).join("work.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("work.json")).expect("json");
+    let data = doc["data"].as_object_mut().expect("data");
+    for key in ["branches", "paths"] {
+        for record in data[key].as_object_mut().expect(key).values_mut() {
+            record.as_object_mut().unwrap().remove("session_context");
+        }
+    }
+    fs::write(&path, serde_json::to_vec(&doc).unwrap()).expect("work.json writes");
+}
+
+#[test]
+fn cursor_only_records_compact_when_the_provider_is_absent() {
+    // A record holding cursors but no context - written before context
+    // existed - still compacts to one summary row once its provider is
+    // gone, without a new activity event or a moved `last_activity`.
+    let home = TempDir::new("cursor-only");
+    let a = FixtureRepo::new("origin");
+    a.branch_with_commits("feat-only", 1, true);
+    let wt = a.add_worktree("only", Some("feat-only"));
+    let id = "88000000-1111-2222-3333-444444444444";
+    transcript(&home, id, &wt);
+    let mut agent = support::live_claude(&home, id, "busy", &wt);
+    let world = World {
+        home,
+        a,
+        b: FixtureRepo::new("origin"),
+        agent: None,
+    };
+    let first = collect(&world);
+    let before = work(&first, "feat-only");
+    let before_at = before.conversation_summaries[0].occurred_at_ms;
+    let before_activities = before.activities.clone();
+    let before_last = before.last_activity;
+
+    // The provider goes silent and the file predates context.
+    agent.kill().expect("kill");
+    let _ = agent.wait();
+    fs::remove_file(world.home.join(format!(".claude/projects/t/{id}.jsonl")))
+        .expect("the transcript deletes");
+    fs::remove_dir_all(world.home.join(".claude/sessions")).expect("sessions clear");
+    strip_session_context(&world.home);
+    // A quiet conversation keeps the repo in scope.
+    let keeper_id = "99000000-1111-2222-3333-444444444444";
+    transcript(&world.home, keeper_id, &world.a.main);
+
+    let second = collect(&world);
+    let summary = only_summary(&second, "feat-only");
+    assert_eq!(
+        summary.key,
+        agent_sessions::store::conversation_key("claude", id)
+    );
+    assert_eq!(summary.occurred_at_ms, before_at);
+    assert!(
+        summary.context.is_none(),
+        "no context was ever captured: {summary:?}"
+    );
+    let after = work(&second, "feat-only");
+    assert_eq!(after.activities, before_activities, "no new activity");
+    assert_eq!(after.last_activity, before_last);
+
+    // Rendered: the id alone carries the row - no title, no prompt. The
+    // row sits in a cleanup section, collapsed under `all`, so scope to
+    // the repo first to expand it.
+    let mut app = App::new(second);
+    app.key(Key::Char('1'));
+    app.key(Key::Char('j'));
+    app.key(Key::Char('2'));
+    for _ in 0..12 {
+        let text = render(&app, 200, 40);
+        if text.contains("Work - feat-only") {
+            let line = text
+                .lines()
+                .find(|l| l.contains("last activity"))
+                .expect("the summary row renders: {text}");
+            assert!(line.contains("88000000"), "{text}");
+            assert!(!line.contains(" - "), "{text}");
+            return;
+        }
+        app.key(Key::Char('j'));
+    }
+    panic!("feat-only never focused");
+}
+
+#[test]
+fn gone_branch_and_detached_path_rows_keep_their_summaries() {
+    if !tmux_or_skip() {
+        return;
+    }
+    // A conversation per anchor, both captured; then both workspaces
+    // vanish under panes that still sit inside them - the gone rows keep
+    // the summaries their records captured, not the provider's present.
+    let home = TempDir::new("gone-summaries");
+    let tmux = TmuxServer::new();
+    let a = FixtureRepo::new("origin");
+    a.branch_with_commits("feat-gone", 1, true);
+    let wt = a.add_worktree("gone", Some("feat-gone"));
+    let det = a.add_worktree("det", None);
+    let gid = "aa110000-1111-2222-3333-444444444444";
+    let did = "bb220000-1111-2222-3333-444444444444";
+    let kid = "cc330000-1111-2222-3333-444444444444";
+    transcript(&home, gid, &wt);
+    transcript(&home, did, &det);
+    transcript(&home, kid, &a.main);
+    let mut agent_g = support::live_claude(&home, gid, "busy", &wt);
+    let mut agent_d = support::live_claude(&home, did, "busy", &det);
+    // Panes parked inside both workspaces: what retains the gone rows.
+    tmux.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "g",
+        "-x",
+        "100",
+        "-y",
+        "24",
+        "-c",
+        wt.to_str().unwrap(),
+        "sleep 300",
+    ]);
+    tmux.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "d",
+        "-x",
+        "100",
+        "-y",
+        "24",
+        "-c",
+        det.to_str().unwrap(),
+        "sleep 300",
+    ]);
+    let world = World {
+        home,
+        a,
+        b: FixtureRepo::new("origin"),
+        agent: None,
+    };
+    let sockets = [tmux.socket.clone()];
+    let first = collect_on(&world, &sockets);
+    let branch_row = work(&first, "feat-gone");
+    let branch_summary = only_summary(&first, "feat-gone").clone();
+    let det_row = first
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(det.as_path()))
+        .expect("the detached row");
+    let det_summary = det_row
+        .conversation_summaries
+        .iter()
+        .find(|s| s.key.contains(did))
+        .expect("the detached summary")
+        .clone();
+    let branch_last = branch_row.last_activity;
+    let det_last = det_row.last_activity;
+
+    // Both gone: worktrees removed, the branch deleted - while the panes
+    // and agents still sit inside. The agents die too, so nothing about
+    // the provider's present can substitute for the captured context.
+    agent_g.kill().expect("kill");
+    let _ = agent_g.wait();
+    agent_d.kill().expect("kill");
+    let _ = agent_d.wait();
+    world.a.git(
+        &world.a.main,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    world.a.git(
+        &world.a.main,
+        &["worktree", "remove", "--force", det.to_str().unwrap()],
+    );
+    world.a.git(&world.a.main, &["branch", "-D", "feat-gone"]);
+
+    let second = collect_on(&world, &sockets);
+    let gone_branch = second
+        .work
+        .iter()
+        .find(|w| w.name == "feat-gone" && w.gone.is_some())
+        .expect("the gone branch row");
+    let summary = gone_branch
+        .conversation_summaries
+        .iter()
+        .find(|s| s.key == branch_summary.key)
+        .expect("the retained summary");
+    assert_eq!(summary.occurred_at_ms, branch_summary.occurred_at_ms);
+    assert_eq!(
+        summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        branch_summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        "the gone row keeps the record's own capture: {summary:?}"
+    );
+    assert!(summary.context.is_some());
+    assert_eq!(gone_branch.last_activity, branch_last);
+
+    let gone_det = second
+        .work
+        .iter()
+        .find(|w| w.kind == WorkKind::Detached && w.gone.is_some())
+        .expect("the gone detached row");
+    let summary = gone_det
+        .conversation_summaries
+        .iter()
+        .find(|s| s.key == det_summary.key)
+        .expect("the retained detached summary");
+    assert_eq!(summary.occurred_at_ms, det_summary.occurred_at_ms);
+    assert_eq!(
+        summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        det_summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref())
+    );
+    assert_eq!(gone_det.last_activity, det_last);
+
+    // Rendered: the gone branch's row still shows the compacted summary.
+    // It sits in cleanup review, collapsed under `all` - scope to the
+    // repo to expand it.
+    let mut app = App::new(second);
+    app.key(Key::Char('1'));
+    app.key(Key::Char('j'));
+    app.key(Key::Char('2'));
+    for _ in 0..16 {
+        let text = render(&app, 200, 40);
+        if text.contains("Work - feat-gone") {
+            assert!(text.contains("last activity"), "{text}");
+            assert!(text.contains("aa110000"), "{text}");
+            return;
+        }
+        app.key(Key::Char('j'));
+    }
+    panic!("the gone feat-gone row never focused");
 }

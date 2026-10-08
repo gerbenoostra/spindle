@@ -14,7 +14,8 @@ use agent_sessions::runtime::Runtime;
 use agent_sessions::snapshot::{Collector, Snapshot, WorkKind, WorkRow, to_json};
 use agent_sessions::store::{
     ActivitySource, BranchRecord, Confidence, ContinuityEvidence, DatedTouch, LifecycleInputs,
-    ObservationSource, ObservedRef, RefCreationEvidence, Store, TouchPlacement, TouchProvenance,
+    ObservationSource, ObservedRef, RefCreationEvidence, SessionContext, SessionUpdate, Store,
+    TouchPlacement, TouchProvenance, UpdateIdentity, conversation_key,
 };
 use agent_sessions::tui::{App, Key};
 use ratatui::Terminal;
@@ -1779,5 +1780,128 @@ fn a_dirty_tree_activity_reads_the_files_own_mtime_and_a_deletion_nothing() {
                 .collect::<Vec<_>>()
         ),
         Some(1_000_000_000)
+    );
+}
+
+#[test]
+fn session_context_is_captured_per_record_across_paths_and_incarnations() {
+    let world = world();
+    let store = store(&world.home);
+    let repo = repo_id(&world.repo);
+    // One branch record and one path record; the same provider-qualified
+    // conversation key updates both with different captures.
+    store
+        .sync_repo(&repo, &[obs("feat", None, None)], 1_000)
+        .unwrap();
+    store
+        .sync_path(
+            "/spaces/x",
+            "/spaces/x",
+            &LifecycleInputs::default(),
+            &[],
+            1_000,
+        )
+        .unwrap();
+    let id1 = store
+        .load()
+        .work
+        .branch(&repo, "feat")
+        .expect("active")
+        .id
+        .clone();
+    let key = conversation_key("claude", "shared-session");
+    let update = |identity: UpdateIdentity, title: &str, prompt: &str| SessionUpdate {
+        identity,
+        conversation: key.clone(),
+        at_ms: 5_000,
+        reason: "turn".to_owned(),
+        context: SessionContext {
+            title: Some(title.to_owned()),
+            prompt_excerpt: Some(prompt.to_owned()),
+        },
+    };
+    store
+        .sync_session_updates(&[
+            update(
+                UpdateIdentity::Branch(id1.clone()),
+                "branch title",
+                "branch prompt",
+            ),
+            update(
+                UpdateIdentity::Path("/spaces/x".to_owned()),
+                "path title",
+                "path prompt",
+            ),
+        ])
+        .unwrap();
+    let work = store.load().work;
+    let branch = work.branches.get(&id1).expect("the branch record");
+    let path = work.path("/spaces/x").expect("the path record");
+    assert_eq!(
+        branch.session_context[&key].prompt_excerpt.as_deref(),
+        Some("branch prompt")
+    );
+    assert_eq!(
+        path.session_context[&key].prompt_excerpt.as_deref(),
+        Some("path prompt"),
+        "the same key on another record keeps its own capture"
+    );
+
+    // The branch closes and the name reopens as a new incarnation: the
+    // new record starts empty - no cursor, no context inherited - while
+    // the closed one keeps its own capture unchanged.
+    store.sync_repo(&repo, &[], 2_000).unwrap();
+    store
+        .sync_repo(
+            &repo,
+            &[obs(
+                "feat",
+                None,
+                Some(RefCreationEvidence {
+                    head: "aaa1111".to_owned(),
+                    at_ms: 2_500,
+                }),
+            )],
+            3_000,
+        )
+        .unwrap();
+    let work = store.load().work;
+    let id2 = work
+        .branch(&repo, "feat")
+        .expect("the new incarnation")
+        .id
+        .clone();
+    assert_ne!(id1, id2, "a recreated name is a new incarnation");
+    assert!(work.branches.get(&id2).unwrap().session_context.is_empty());
+    store
+        .sync_session_updates(&[update(
+            UpdateIdentity::Branch(id2.clone()),
+            "new title",
+            "new prompt",
+        )])
+        .unwrap();
+    let work = store.load().work;
+    let old = work.branches.get(&id1).expect("the closed record");
+    assert!(old.ended_at.is_some());
+    assert_eq!(
+        old.session_context[&key].prompt_excerpt.as_deref(),
+        Some("branch prompt"),
+        "the old incarnation keeps its own capture"
+    );
+    let new = work.branches.get(&id2).unwrap();
+    assert_eq!(
+        new.session_context[&key].prompt_excerpt.as_deref(),
+        Some("new prompt")
+    );
+    assert_eq!(
+        new.session_context[&key].title.as_deref(),
+        Some("new title")
+    );
+    // The path record is untouched by any of it.
+    assert_eq!(
+        work.path("/spaces/x").unwrap().session_context[&key]
+            .prompt_excerpt
+            .as_deref(),
+        Some("path prompt")
     );
 }

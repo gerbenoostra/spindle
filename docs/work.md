@@ -49,6 +49,17 @@ The `[4]` detail pane follows the focused row. `e` shows the evidence behind
 a claim - which source won and what was outranked, `?` where nothing proved
 it. The full vocabulary is in [attention](attention.md).
 
+Under **Activity**, each conversation the row's record has observed gets one
+row - `last activity` at its newest source-backed occurrence - rather than one
+line per turn. The row shows a short id plus the latest-known submitted prompt,
+kept as a bounded excerpt; the excerpt is context, not a claim that the
+activity dates that prompt. Where no prompt was captured the provider title
+stands in, then the bare id. At most seven conversations show, newest first,
+after the per-turn events compact; a record without conversation cursors keeps
+its raw per-turn trail, and the other sources' raw histories are unchanged.
+Context is captured per work row, so a later prompt after moving to other work
+does not overwrite the earlier row's captured context.
+
 ## Navigation
 
 - `enter` on a live conversation selects the bound socket-qualified pane the
