@@ -1297,3 +1297,98 @@ fn take_action_is_the_only_thing_the_app_spawns() {
         Some(ActionRequest::EnterConversation { .. })
     ));
 }
+
+/// `enter` on a stopped conversation in a non-git project space resumes
+/// at the space's canonical root: the row carries no worktree of its own,
+/// so the root comes from the project-space work row it binds to - never
+/// from the bare cwd string. The transcript's cwd here is a symlink to
+/// the project, which is exactly how a canonicalization slip would show.
+#[test]
+fn enter_resumes_a_project_space_conversation_at_its_root() {
+    let _locked = locked();
+    let home = TempDir::new("nav-project-home");
+    let project = TempDir::new("nav-project");
+    let linkroot = TempDir::new("nav-project-link");
+    let alias = linkroot.join("alias");
+    std::os::unix::fs::symlink(project.path(), &alias).expect("the alias links");
+    transcript(&home, "project", STOPPED_ID, &alias);
+    let mut collector = Collector::new(home.join(".claude")).with_store(store_dir(&home));
+    let snap = collector.collect(&Runtime::observe_over(&[]), None);
+    let row = snap
+        .work
+        .iter()
+        .find(|w| w.kind == WorkKind::ProjectSpace)
+        .expect("the project space collects");
+    assert_eq!(row.worktree.as_deref(), Some(project.path()));
+
+    // The app path exactly: [3] scopes the conversation list, j picks the
+    // row, enter stages the request; `act` re-resolves it on a fresh
+    // snapshot.
+    let mut app = tui::App::new(collector.collect(&Runtime::observe_over(&[]), None))
+        .with_store(Store::open(store_dir(&home)));
+    app.key(tui::Key::Char('3'));
+    app.key(tui::Key::Char('j'));
+    app.key(tui::Key::Enter);
+    let request = app.take_action().expect("enter stages a request");
+
+    // `act` re-resolves on a snapshot collected fresh after the
+    // keypress, the way the production loop does.
+    let fresh = collector.collect(&Runtime::observe_over(&[]), None);
+    let bin = TempDir::new("nav-project-bin");
+    let exe = stub(&bin, "claude", "");
+    let outcome = run(&request, &fresh, None, Some(bin.path().as_os_str()));
+    let ActionOutcome::Resume(plan) = outcome else {
+        panic!("a project-space conversation resumes: {outcome:?}")
+    };
+    assert_eq!(plan.executable, exe.as_os_str());
+    assert_eq!(plan.cwd, project.path());
+    assert_eq!(
+        plan.argv,
+        [OsString::from("--resume"), OsString::from(STOPPED_ID)]
+    );
+    let out = enact(&plan);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(bin.join("argv")).expect("argv recorded"),
+        format!("--resume\n{STOPPED_ID}\n")
+    );
+    assert_eq!(
+        fs::read_to_string(bin.join("cwd"))
+            .expect("cwd recorded")
+            .trim(),
+        project.path().display().to_string()
+    );
+
+    // A real, existing directory the snapshot carries no project-space
+    // row for is still no root: the bare cwd string is never trusted,
+    // the rowless snapshot reports rather than resuming anywhere.
+    let stripped = snapshot_of(
+        Vec::new(),
+        vec![
+            snap.conversations
+                .iter()
+                .find(|c| c.session_id == STOPPED_ID)
+                .expect("the conversation")
+                .clone(),
+        ],
+    );
+    assert!(project.path().is_dir());
+    let outcome = run(&request, &stripped, None, Some(bin.path().as_os_str()));
+    match &outcome {
+        ActionOutcome::Failed(m) => assert!(m.contains("work root"), "{m}"),
+        other => panic!("a row-less project reports: {other:?}"),
+    }
+
+    // And once the project directory itself is gone, the same report.
+    fs::remove_dir_all(project.path()).expect("the project removes");
+    let snap = collector.collect(&Runtime::observe_over(&[]), None);
+    let outcome = run(&request, &snap, None, Some(bin.path().as_os_str()));
+    match &outcome {
+        ActionOutcome::Failed(m) => assert!(m.contains("work root"), "{m}"),
+        other => panic!("a gone project space reports: {other:?}"),
+    }
+}

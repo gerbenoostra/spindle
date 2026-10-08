@@ -23,7 +23,7 @@ use std::process::{Command, Stdio};
 
 use crate::forge::WorkItem;
 use crate::runtime::Provider;
-use crate::snapshot::{ConversationRow, Snapshot, WorkRow};
+use crate::snapshot::{ConversationRow, Snapshot, WorkKind, WorkRow, binds};
 use crate::store::{self, Store};
 use crate::tmux::PaneTarget;
 
@@ -164,7 +164,7 @@ fn conversation(
             None => failed("live, no bound pane"),
         };
     }
-    resume(row, path)
+    resume(row, snapshot, path)
 }
 
 /// `select-window`, then `select-pane` - the acknowledgement lands only
@@ -187,12 +187,23 @@ fn jump(row: &ConversationRow, target: &PaneTarget, store: Option<&Store>) -> Ac
 /// `enter` on a stopped conversation: the provider's own argv split for
 /// exec, the recorded Work root as cwd, the pending acknowledgement
 /// deferred into the plan. Every gap reports and launches nothing.
-fn resume(row: &ConversationRow, path: Option<&OsStr>) -> ActionOutcome {
+fn resume(row: &ConversationRow, snapshot: &Snapshot, path: Option<&OsStr>) -> ActionOutcome {
     let Some(argv0) = row.resume_argv.first() else {
         // No verified resume invocation - the provider carries none.
         return failed("no resume");
     };
-    let Some(cwd) = row.worktree.as_deref() else {
+    // The recorded checkout wins; a conversation in a non-git project
+    // space carries no worktree of its own, so its root is the project
+    // space row it binds to. A bare cwd or repo string is never trusted:
+    // only a row the collector placed carries a proven root.
+    let cwd = row.worktree.as_deref().or_else(|| {
+        snapshot
+            .work
+            .iter()
+            .find(|w| w.kind == WorkKind::ProjectSpace && w.gone.is_none() && binds(w, row))
+            .and_then(|w| w.worktree.as_deref())
+    });
+    let Some(cwd) = cwd else {
         return failed("no work root");
     };
     if !cwd.is_dir() {
