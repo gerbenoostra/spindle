@@ -124,17 +124,14 @@ pub struct BranchMark {
     pub branch: Option<String>,
 }
 
-/// One scan's output: the merged conversations plus the failures and skips
-/// the evidence view keeps.
+/// One scan's output: the merged conversations plus the failures the
+/// evidence view keeps; rejected non-transcripts are dropped silently.
 #[derive(Debug, Default)]
 pub struct Inventory {
     pub conversations: Vec<Conversation>,
     /// Malformed files, unreadable entries, records without a session id -
     /// each excluded and retained, none of them fatal.
     pub errors: Vec<SourceError>,
-    /// Entries rejected by the safety rules (non-UUID names, symlinks,
-    /// non-regular or empty files). Not errors: they were never transcripts.
-    pub skipped: Vec<PathBuf>,
 }
 
 /// What a transcript file was when last parsed: device, inode, length and
@@ -312,7 +309,7 @@ impl Claude {
     pub fn scan(&mut self) -> Inventory {
         let mut inventory = Inventory::default();
         let live = self.scan_sessions(&mut inventory.errors);
-        let transcripts = self.scan_transcripts(&mut inventory.errors, &mut inventory.skipped);
+        let transcripts = self.scan_transcripts(&mut inventory.errors);
 
         let mut by_id: HashMap<String, Conversation> = HashMap::new();
         for transcript in transcripts {
@@ -402,15 +399,11 @@ impl Claude {
     /// that only grew re-reads from the last consumed offset - transcripts
     /// are append-only, so an active session's transcript costs its tail,
     /// not its whole history, per pass.
-    fn scan_transcripts(
-        &mut self,
-        errors: &mut Vec<SourceError>,
-        skipped: &mut Vec<PathBuf>,
-    ) -> Vec<Arc<Transcript>> {
+    fn scan_transcripts(&mut self, errors: &mut Vec<SourceError>) -> Vec<Arc<Transcript>> {
         let dir = self.root.join("projects");
         let mut candidates = Vec::new();
         match fs::read_dir(&dir) {
-            Ok(_) => collect_transcripts(&dir, &mut candidates, skipped, errors),
+            Ok(_) => collect_transcripts(&dir, &mut candidates, errors),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => errors.push(SourceError {
                 source: "claude transcripts".to_owned(),
@@ -514,7 +507,6 @@ fn pid_name(path: &Path) -> Option<u32> {
 fn collect_transcripts(
     dir: &Path,
     out: &mut Vec<(PathBuf, String, fs::Metadata)>,
-    skipped: &mut Vec<PathBuf>,
     errors: &mut Vec<SourceError>,
 ) {
     let entries = match fs::read_dir(dir) {
@@ -546,11 +538,10 @@ fn collect_transcripts(
             }
         };
         if meta.is_dir() {
-            collect_transcripts(&path, out, skipped, errors);
+            collect_transcripts(&path, out, errors);
             continue;
         }
         if !meta.is_file() || meta.len() == 0 || !uuid_name(&path) {
-            skipped.push(path);
             continue;
         }
         let slug = path
@@ -958,7 +949,6 @@ mod tests {
         let inv = claude.scan();
         assert!(inv.conversations.is_empty());
         assert!(inv.errors.is_empty());
-        assert!(inv.skipped.is_empty());
     }
 
     #[test]
@@ -1081,7 +1071,6 @@ mod tests {
         let inv = claude.scan();
         assert_eq!(inv.conversations.len(), 2, "{:?}", inv.errors);
         assert!(inv.errors.is_empty(), "{:?}", inv.errors);
-        assert_eq!(inv.skipped.len(), 5, "{:?}", inv.skipped);
 
         let a = &inv.conversations[0];
         let t = a.transcript.as_ref().unwrap();

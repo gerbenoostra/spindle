@@ -37,10 +37,12 @@ use crate::verdict::{self, Verdict};
 /// rename or change of meaning bumps it. v1 -> v2: `transition_at`,
 /// `git_activity_at` and `updates` gave way to `activities` and
 /// `observations`, and `last_activity` carries source-backed occurrence
-/// times only - detection times can no longer order rows.
-pub const SCHEMA_VERSION: u32 = 2;
+/// times only - detection times can no longer order rows. v2 -> v3:
+/// `skipped`, the rejected-path evidence, went away.
+pub const SCHEMA_VERSION: u32 = 3;
 
-/// One refresh's complete, unfiltered view.
+/// One refresh's complete, unfiltered view; entries a provider's safety
+/// rules reject are never collected.
 #[derive(Debug, Serialize)]
 pub struct Snapshot {
     pub schema_version: u32,
@@ -58,10 +60,6 @@ pub struct Snapshot {
     pub conversations: Vec<ConversationRow>,
     /// Collector failures, isolated per record.
     pub errors: Vec<SourceError>,
-    /// Entries a provider's safety rules rejected without ever parsing -
-    /// non-UUID names, symlinks, non-regular or empty files. Retained for
-    /// the evidence view, as lossy display strings.
-    pub skipped: Vec<String>,
     /// tmux socket files no server listens on. tmux never unlinks its
     /// socket, so these pile up; each is skipped without a `tmux` spawn,
     /// and the count keeps a socket dir full of them visible.
@@ -82,7 +80,6 @@ impl Snapshot {
             work: Vec::new(),
             conversations: Vec::new(),
             errors: Vec::new(),
-            skipped: Vec::new(),
             stale_sockets: 0,
         }
     }
@@ -826,7 +823,6 @@ struct Model {
     /// not write to `work.json`.
     ref_observed: HashMap<String, u64>,
     errors: Vec<SourceError>,
-    skipped: Vec<String>,
     stale_sockets: usize,
     complete: bool,
 }
@@ -943,11 +939,6 @@ impl Collector {
         self.model.errors.extend(self.warnings.iter().cloned());
         self.model.work = std::mem::take(&mut loaded.work);
         self.model.work_stamp = work_stamp;
-        self.model.skipped = inventory
-            .skipped
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
         self.model.stale_sockets = runtime.panes.stale_sockets;
         self.model.complete = false;
 
@@ -1749,7 +1740,6 @@ impl Collector {
             work,
             conversations,
             errors: self.model.errors.clone(),
-            skipped: self.model.skipped.clone(),
             stale_sockets: self.model.stale_sockets,
         })
     }

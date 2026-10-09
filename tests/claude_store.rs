@@ -235,8 +235,8 @@ fn world() -> World {
         "not json at all\n",
     )
     .unwrap();
-    // A file the safety rules reject without parsing lands in `skipped`,
-    // not in conversations or errors.
+    // A file the safety rules reject without parsing is dropped - never a
+    // conversation, never an error.
     fs::write(home.join(".claude/projects/-r-login/notes.jsonl"), "x").unwrap();
 
     World {
@@ -473,16 +473,24 @@ fn list_json_is_the_complete_unfiltered_snapshot() {
     assert_eq!(live["attachment"]["pane_source"], "published");
     assert_eq!(live["attachment"]["liveness"], "instance");
     // Parsed detail the evidence view later renders is already in the
-    // document: the transcript's malformed-line count and the skip list.
+    // document: the transcript's malformed-line count. The rejected
+    // notes.jsonl surfaces nowhere - the contract carries no `skipped`.
     assert_eq!(live["malformed_lines"], 0);
+    assert!(json.get("skipped").is_none(), "{json}");
     assert!(
-        json["skipped"]
+        !conversations
+            .iter()
+            .any(|c| c.to_string().contains("notes.jsonl")),
+        "{conversations:?}"
+    );
+    assert!(
+        !json["errors"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|p| p.as_str().is_some_and(|p| p.ends_with("notes.jsonl"))),
+            .any(|e| e.to_string().contains("notes.jsonl")),
         "{:?}",
-        json["skipped"]
+        json["errors"]
     );
 
     // Non-live history carries no attachment and an unknown state.

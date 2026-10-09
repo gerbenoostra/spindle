@@ -135,7 +135,7 @@ is read from Git with `GIT_OPTIONAL_LOCKS=0`. Facts that cannot be proven are
 | `landed` | `no` / `ancestor-merged` / `content-merged` | ancestry first, then path-scoped tree comparison |
 | `last_git_activity` | the timestamps of real work entries in the worktree HEAD reflog, the branch reflog and the tip's committer date when it postdates the branch's creation | creation, checkout and clone bookkeeping never count as activity; the reflog file's mtime never counts either |
 
-`list --json` prints the whole snapshot under `schema_version` 2. Work rows
+`list --json` prints the whole snapshot under `schema_version` 3. Work rows
 carry two timestamped histories: `activities` (when the work itself happened,
 as `occurred_at_ms`) and `observations` (when a collection pass learned
 something, as `observed_at_ms`), both Unix epoch milliseconds, plus
