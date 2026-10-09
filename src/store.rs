@@ -976,7 +976,7 @@ pub struct ObservedRef {
 /// `repo`. A deleted ref closes the record (`ended_at`); a ref that
 /// reappears opens a fresh record with a new `id` and `parked: false` - a
 /// name is a label, not an identity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchRecord {
     /// Opaque stable identity of this incarnation.
     pub id: String,
@@ -1034,7 +1034,7 @@ pub struct BranchRecord {
 
 /// A path-anchored record: a detached worktree or a non-Git project space,
 /// keyed by its canonical path.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathRecord {
     /// The repository the path belongs to - a detached worktree's repo,
     /// a project space's own path - so a row outliving the directory
@@ -1059,7 +1059,7 @@ pub struct PathRecord {
 }
 
 /// The `work.json` payload: the authored Work state.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Work {
     /// Incarnation id -> the record, active or closed. Closed records are
     /// retained: they are the incarnation history a later pass numbers
