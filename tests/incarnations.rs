@@ -1443,6 +1443,29 @@ fn a_row_records_commit_working_tree_and_session_updates() {
     let world = world();
     world.repo.branch_with_commits("feat-login", 1, false);
     let wt = world.repo.add_worktree("feat", Some("feat-login"));
+    let repo = agent_sessions::git::Repo::discover(&wt)
+        .expect("the worktree resolves a repository")
+        .expect("the worktree's repository exists");
+    let created_at = repo
+        .reflog_times(Path::new("logs/refs/heads/feat-login"))
+        .created_at
+        .expect("the branch's creation entry");
+    let epoch = created_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the creation is dated")
+        .as_secs()
+        + 1;
+    let date = format!("@{epoch} +0000");
+    let out = fixture::command(Some(&wt), &["commit", "--amend", "--no-edit"])
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .output()
+        .expect("git commit runs");
+    assert!(
+        out.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     transcript(&world.home, CONV, &wt);
     let first = collect(&world);
     let row = work(&first, "feat-login");
@@ -1455,8 +1478,24 @@ fn a_row_records_commit_working_tree_and_session_updates() {
         !row.activities.is_empty(),
         "the first pass already proves source-backed work"
     );
-
-    world.repo.commit(&wt, "a.txt", "x", "retry handling");
+    let tip_sha = world
+        .repo
+        .git(&wt, &["rev-parse", "--short=7", "HEAD"])
+        .trim()
+        .to_owned();
+    let tip_reason = format!("{tip_sha} feat-login 0");
+    fs::write(wt.join("a.txt"), "x").expect("write");
+    world.repo.git(&wt, &["add", "a.txt"]);
+    let out = fixture::command(Some(&wt), &["commit", "-m", "retry handling"])
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .output()
+        .expect("git commit runs");
+    assert!(
+        out.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     fs::write(wt.join("loose change.txt"), "y").expect("write");
     turn_at(
         &world.home,
@@ -1475,10 +1514,26 @@ fn a_row_records_commit_working_tree_and_session_updates() {
     // commit activity the first pass backfilled.
     let landed: Vec<_> = commits
         .iter()
-        .filter(|c| c.reasons[0].ends_with(" retry handling"))
+        .filter(|c| c.reasons.iter().any(|r| r.ends_with(" retry handling")))
         .collect();
     assert_eq!(landed.len(), 1, "{:?}", row.activities);
-    assert_eq!(landed[0].reasons[0].split(' ').next().unwrap().len(), 7);
+    let reason = landed[0]
+        .reasons
+        .iter()
+        .find(|r| r.ends_with(" retry handling"))
+        .expect("the pinned commit's reason");
+    assert_eq!(reason.split(' ').next().unwrap().len(), 7);
+    assert_eq!(
+        landed[0].occurred_at_ms,
+        epoch * 1000,
+        "the pinned commit merges at the tip's own time: {:?}",
+        row.activities
+    );
+    assert!(
+        landed[0].reasons.contains(&tip_reason),
+        "the merged event keeps both reasons: {:?}",
+        landed[0].reasons
+    );
     let trees: Vec<_> = row
         .observations
         .iter()
