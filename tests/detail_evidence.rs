@@ -398,6 +398,72 @@ fn activity_and_observation_histories_render_separately_and_cap_at_seven() {
 }
 
 #[test]
+fn activity_and_observation_raw_groups_share_ordering_capping_and_escaping() {
+    let mut snapshot = fixture();
+    let row = &mut snapshot.work[0];
+    row.activities = vec![ActivityEvent {
+        source: ActivitySource::WorkingTree,
+        occurred_at_ms: (NOW - 60) * 1000,
+        reasons: vec!["modified\tREADME.md".to_owned()],
+    }];
+    for i in (0..8u64).rev() {
+        row.activities.push(ActivityEvent {
+            source: ActivitySource::Commit,
+            occurred_at_ms: (NOW - 60 - i * 60) * 1000,
+            reasons: vec![format!("commit{i}")],
+        });
+    }
+    row.observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 60,
+        &["moved\tworktree"],
+    )];
+    for i in (0..8u64).rev() {
+        row.observations.push(ObservationEvent {
+            covered_by: None,
+            source: ObservationSource::Forge,
+            observed_at_ms: (NOW - 60 - i * 60) * 1000,
+            reasons: vec![format!("forge{i}")],
+        });
+    }
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    let text = render(&app, 200, 60);
+    let activity_at = text.find("activity:").expect("activity section");
+    let observations_at = text.find("observations:").expect("observations section");
+    let activity = &text[activity_at..observations_at];
+    let observations = &text[observations_at..];
+    assert!(
+        activity.find("  commit:").unwrap() < activity.find("  working tree:").unwrap(),
+        "tied activity groups order by name: {activity}"
+    );
+    assert!(
+        observations.find("  forge:").unwrap() < observations.find("  lifecycle:").unwrap(),
+        "tied observation groups order by name: {observations}"
+    );
+    for section in [activity, observations] {
+        let first = if section.contains("commit0") {
+            "commit"
+        } else {
+            "forge"
+        };
+        assert!(
+            section.find(&format!("{first}0")).unwrap()
+                < section.find(&format!("{first}1")).unwrap(),
+            "events newest first inside the source: {section}"
+        );
+        assert!(
+            !section.contains(&format!("{first}7")),
+            "the eighth event is past the display cap: {section}"
+        );
+    }
+    assert!(activity.contains("modified\\tREADME.md"), "{activity}");
+    assert!(!activity.contains("modified\tREADME.md"), "{activity}");
+    assert!(observations.contains("moved\\tworktree"), "{observations}");
+    assert!(!observations.contains("moved\tworktree"), "{observations}");
+}
+
+#[test]
 fn a_covered_working_tree_observation_hides_behind_its_activity() {
     let tree = |covered: Option<u64>, at: u64, reasons: &[&str]| ObservationEvent {
         covered_by: covered.map(|at| ActivityReference {

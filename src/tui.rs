@@ -2473,32 +2473,21 @@ fn short_conversation_id(key: &str) -> String {
 /// the raw per-turn reasons. A record without summaries keeps the raw
 /// trail as its fallback.
 fn activity_lines(w: &WorkRow, now_ms: u64) -> Vec<String> {
-    let mut by_source: std::collections::BTreeMap<String, Vec<&store::ActivityEvent>> =
-        std::collections::BTreeMap::new();
-    for event in &w.activities {
-        if event.source == store::ActivitySource::Conversation
-            && !w.conversation_summaries.is_empty()
-        {
-            continue;
-        }
-        by_source
-            .entry(activity_source_name(event))
-            .or_default()
-            .push(event);
-    }
-    let mut groups: Vec<(u64, String, Vec<String>)> = Vec::new();
-    for (source, mut events) in by_source {
-        let newest = events.iter().map(|e| e.occurred_at_ms).max().unwrap_or(0);
-        let mut lines = vec![format!("  {}:", source.replace('_', " "))];
-        events.sort_by_key(|e| std::cmp::Reverse(e.occurred_at_ms));
-        for event in events.iter().take(EVENT_DISPLAY_PER_SOURCE) {
-            let when = age_ms(now_ms, event.occurred_at_ms);
-            for reason in &event.reasons {
-                lines.push(format!("    {when} {}", escape_text(reason)));
-            }
-        }
-        groups.push((newest, source, lines));
-    }
+    let raw: Vec<&store::ActivityEvent> = w
+        .activities
+        .iter()
+        .filter(|event| {
+            event.source != store::ActivitySource::Conversation
+                || w.conversation_summaries.is_empty()
+        })
+        .collect();
+    let mut groups = event_groups(
+        &raw,
+        |e| activity_source_name(e),
+        |e| e.occurred_at_ms,
+        |e| e.reasons.as_slice(),
+        now_ms,
+    );
     if !w.conversation_summaries.is_empty() {
         let mut summaries: Vec<&ConversationSummary> = w.conversation_summaries.iter().collect();
         summaries.sort_by(|a, b| {
@@ -2523,8 +2512,7 @@ fn activity_lines(w: &WorkRow, now_ms: u64) -> Vec<String> {
         }
         groups.push((newest, "conversation".to_owned(), lines));
     }
-    groups.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    groups.into_iter().flat_map(|(_, _, lines)| lines).collect()
+    grouped_lines(groups)
 }
 
 /// A row's events rendered grouped by source, groups ordered by their
@@ -2538,34 +2526,41 @@ fn event_lines<E>(
     reasons: impl Fn(&E) -> &[String],
     now_ms: u64,
 ) -> Vec<String> {
+    grouped_lines(event_groups(events, source, at, reasons, now_ms))
+}
+
+fn event_groups<E>(
+    events: &[E],
+    source: impl Fn(&E) -> String,
+    at: impl Fn(&E) -> u64,
+    reasons: impl Fn(&E) -> &[String],
+    now_ms: u64,
+) -> Vec<(u64, String, Vec<String>)> {
     let mut by_source: std::collections::BTreeMap<String, Vec<&E>> =
         std::collections::BTreeMap::new();
     for event in events {
         by_source.entry(source(event)).or_default().push(event);
     }
-    let mut groups: Vec<(u64, String, Vec<&E>)> = by_source
+    by_source
         .into_iter()
-        .map(|(source, events)| {
-            (
-                events.iter().map(|e| at(e)).max().unwrap_or(0),
-                source,
-                events,
-            )
-        })
-        .collect();
-    groups.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    let mut lines = Vec::new();
-    for (_, source, mut events) in groups {
-        lines.push(format!("  {}:", source.replace('_', " ")));
-        events.sort_by_key(|e| std::cmp::Reverse(at(e)));
-        for event in events.iter().take(EVENT_DISPLAY_PER_SOURCE) {
-            let when = age_ms(now_ms, at(event));
-            for reason in reasons(event) {
-                lines.push(format!("    {when} {}", escape_text(reason)));
+        .map(|(source, mut events)| {
+            let newest = events.iter().map(|e| at(e)).max().unwrap_or(0);
+            let mut lines = vec![format!("  {}:", source.replace('_', " "))];
+            events.sort_by_key(|e| std::cmp::Reverse(at(e)));
+            for event in events.iter().take(EVENT_DISPLAY_PER_SOURCE) {
+                let when = age_ms(now_ms, at(event));
+                for reason in reasons(event) {
+                    lines.push(format!("    {when} {}", escape_text(reason)));
+                }
             }
-        }
-    }
-    lines
+            (newest, source, lines)
+        })
+        .collect()
+}
+
+fn grouped_lines(mut groups: Vec<(u64, String, Vec<String>)>) -> Vec<String> {
+    groups.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    groups.into_iter().flat_map(|(_, _, lines)| lines).collect()
 }
 
 fn partition_work_observations(
