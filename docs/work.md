@@ -60,6 +60,19 @@ its raw per-turn trail, and the other sources' raw histories are unchanged.
 Context is captured per work row, so a later prompt after moving to other work
 does not overwrite the earlier row's captured context.
 
+Directly under the activity groups, a `git state (observed)` subgroup lists
+the delivery-count transitions a pass observed: `ahead:`, `behind:` and
+`unpushed:` readings, each dated `observed <age>` at the time the collector
+saw the change. That timestamp is a detection, not work - a remote push or a
+base move shifts the counts without any local reflog entry, so the subgroup
+is never paired with one and `activity:` still names only source-backed
+occurrences (`?` when none exist). Only lifecycle reasons with the exact
+`ahead: `, `behind: ` or `unpushed: ` prefix move there; every other
+observation reason stays under `observations:`, an event left with no other
+reasons leaves no empty group, and the subgroup itself is omitted when no
+counts were observed. At most seven count events show, newest scan first
+with ties ordered by their reason list.
+
 ## Navigation
 
 - `enter` on a live conversation selects the bound socket-qualified pane the

@@ -83,6 +83,20 @@ rather than "noticed 30 days ago".
   filter runs before the section check and the seven-per-source cap, and
   the field serializes only when set so legacy records read unchanged
   under the same `WORK_SCHEMA`.
+- Lifecycle `ahead`/`behind`/`unpushed` transitions render under a separate
+  `git state (observed)` subgroup in the work detail - because they are
+  scan-time readings of delivery counts, not work: a remote-only push or a
+  base move changes them with no local reflog entry, so each is labeled
+  `observed` at its detection time and never paired with a reflog row. The
+  split is a render-time projection on exact prefixes only - a `Lifecycle`
+  reason starting `ahead: `, `behind: ` or `unpushed: ` moves, every other
+  reason and source stays under `observations:`, and a cloned event carries
+  the projected subset so the stored history is untouched. The subgroup
+  follows the source-backed groups (whose order it never joins), omits
+  itself when empty, and caps at seven events after partitioning, newest
+  scan first with same-scan ties on the sorted reason list; `activity:`,
+  recency, age filtering and `Forgotten` classification keep reading only
+  source timestamps.
 - `work.json` versions separately under `WORK_SCHEMA` and older files reset
   rather than migrate while pre-release - because backwards compatibility is
   not promised before release and the collector rebuilds the state; not

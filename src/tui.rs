@@ -1412,11 +1412,10 @@ impl App {
         // the raw history but drops from the display. The filter runs
         // before the section check and the per-source cap, so a covered
         // newest event cannot push an uncovered older one out.
-        let observations: Vec<&store::ObservationEvent> = w
-            .observations
-            .iter()
-            .filter(|e| !e.is_covered_by(&w.activities))
-            .collect();
+        let (observations, git_state) = partition_work_observations(w);
+        for line in git_state_lines(&git_state, now.saturating_mul(1000)) {
+            push_text(out, line, width);
+        }
         if !observations.is_empty() {
             push_head(out, "observations:".to_owned(), width);
             for line in event_lines(
@@ -2564,6 +2563,68 @@ fn event_lines<E>(
             for reason in reasons(event) {
                 lines.push(format!("    {when} {}", escape_text(reason)));
             }
+        }
+    }
+    lines
+}
+
+fn partition_work_observations(
+    w: &WorkRow,
+) -> (Vec<store::ObservationEvent>, Vec<store::ObservationEvent>) {
+    const GIT_STATE_PREFIXES: [&str; 3] = ["ahead: ", "behind: ", "unpushed: "];
+    let is_count = |r: &&String| GIT_STATE_PREFIXES.iter().any(|p| r.starts_with(p));
+    let mut remaining = Vec::new();
+    let mut git_state = Vec::new();
+    for event in w
+        .observations
+        .iter()
+        .filter(|e| !e.is_covered_by(&w.activities))
+    {
+        if event.source != store::ObservationSource::Lifecycle {
+            remaining.push(event.clone());
+            continue;
+        }
+        let mut counts: Vec<String> = event.reasons.iter().filter(is_count).cloned().collect();
+        if counts.is_empty() {
+            remaining.push(event.clone());
+            continue;
+        }
+        counts.sort();
+        git_state.push(store::ObservationEvent {
+            reasons: counts,
+            ..event.clone()
+        });
+        let rest: Vec<String> = event
+            .reasons
+            .iter()
+            .filter(|r| !is_count(r))
+            .cloned()
+            .collect();
+        if !rest.is_empty() {
+            remaining.push(store::ObservationEvent {
+                reasons: rest,
+                ..event.clone()
+            });
+        }
+    }
+    (remaining, git_state)
+}
+
+fn git_state_lines(events: &[store::ObservationEvent], now_ms: u64) -> Vec<String> {
+    if events.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&store::ObservationEvent> = events.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.observed_at_ms
+            .cmp(&a.observed_at_ms)
+            .then(a.reasons.cmp(&b.reasons))
+    });
+    let mut lines = vec!["  git state (observed):".to_owned()];
+    for event in sorted.iter().take(EVENT_DISPLAY_PER_SOURCE) {
+        let when = age_ms(now_ms, event.observed_at_ms);
+        for reason in &event.reasons {
+            lines.push(format!("    observed {when} {}", escape_text(reason)));
         }
     }
     lines

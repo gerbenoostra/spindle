@@ -4515,6 +4515,61 @@ mod tests {
     }
 
     #[test]
+    fn observed_counts_never_reclassify_or_reorder_quiet_work() {
+        let now = 2_000_000_000u64;
+        let count = || store::ObservationEvent {
+            source: store::ObservationSource::Lifecycle,
+            observed_at_ms: now * 1000,
+            reasons: vec!["ahead: 0 -> 1".to_owned()],
+            covered_by: None,
+        };
+        let quiet = |observations: Vec<store::ObservationEvent>,
+                     last_activity: Option<u64>,
+                     identity: &str| WorkRow {
+            kind: WorkKind::Branch,
+            branch: Some("b".to_owned()),
+            dirty: Some(false),
+            commits_ahead: Some(1),
+            unpushed: Some(0),
+            upstream: Upstream::Tracked,
+            landed: Some(Landed::No),
+            last_activity,
+            identity: Some(identity.to_owned()),
+            observations,
+            ..space_row("r", Path::new("/r"))
+        };
+        let threshold = Duration::from_secs(10);
+        let mut bare = quiet(Vec::new(), Some(now - 100_000), "i-bare");
+        classify_work(&mut bare, &[], threshold, now);
+        let mut observed = quiet(vec![count()], Some(now - 100_000), "i-obs");
+        classify_work(&mut observed, &[], threshold, now);
+        assert_eq!(observed.section, WorkSection::Forgotten);
+        assert_eq!(observed.section, bare.section);
+        assert_eq!(observed.summary, bare.summary);
+        assert_eq!(observed.last_activity, Some(now - 100_000));
+
+        let mut silent = quiet(vec![count()], None, "i-none");
+        classify_work(&mut silent, &[], threshold, now);
+        assert_eq!(silent.last_activity, None);
+
+        let mut fresher_old = quiet(Vec::new(), Some(now - 50_000), "i-old2");
+        classify_work(&mut fresher_old, &[], threshold, now);
+        assert_eq!(fresher_old.section, WorkSection::Forgotten);
+        let mut fresh = quiet(Vec::new(), Some(now - 10), "i-fresh");
+        classify_work(&mut fresh, &[], threshold, now);
+
+        let mut rows = vec![observed, fresh, bare, fresher_old];
+        sort_work(&mut rows);
+        assert_eq!(rows[0].identity.as_deref(), Some("i-fresh"));
+        assert_eq!(rows[1].identity.as_deref(), Some("i-old2"));
+        assert_eq!(rows[1].section, WorkSection::Forgotten);
+        assert_eq!(rows[2].identity.as_deref(), Some("i-bare"));
+        assert_eq!(rows[3].identity.as_deref(), Some("i-obs"));
+        assert_eq!(rows[2].last_activity, Some(now - 100_000));
+        assert_eq!(rows[3].last_activity, Some(now - 100_000));
+    }
+
+    #[test]
     fn repos_order_activity_then_name_then_id() {
         let row = |name: &str, id: &str, last: Option<u64>| RepoRow {
             name: name.to_owned(),

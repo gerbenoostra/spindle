@@ -1538,3 +1538,379 @@ fn a_unicode_control_prompt_renders_bounded_and_escaped() {
         assert!(detail.contains("…"), "{text}");
     }
 }
+
+fn obs(source: ObservationSource, at: u64, reasons: &[&str]) -> ObservationEvent {
+    ObservationEvent {
+        covered_by: None,
+        source,
+        observed_at_ms: at * 1000,
+        reasons: reasons.iter().map(|r| r.to_string()).collect(),
+    }
+}
+
+#[test]
+fn lifecycle_counts_render_under_an_observed_git_state_subgroup() {
+    let mut snapshot = fixture();
+    let activities = vec![
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 300) * 1000,
+            reasons: vec!["aaa1111 commit: earlier".to_owned()],
+        },
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 200) * 1000,
+            reasons: vec!["bbb2222 commit: later".to_owned()],
+        },
+        ActivityEvent {
+            source: ActivitySource::Commit,
+            occurred_at_ms: (NOW - 120) * 1000,
+            reasons: vec!["bbb2222 later".to_owned()],
+        },
+    ];
+    let observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 90,
+        &["upstream: a -> b", "ahead: 1 -> 2", "unpushed: 0 -> 1"],
+    )];
+    snapshot.work[0].activities = activities.clone();
+    snapshot.work[0].observations = observations.clone();
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        assert!(text.contains("activity: 2m"), "{text}");
+        let subgroup = text
+            .find("  git state (observed):")
+            .expect("the git-state subgroup: {text}");
+        assert!(text.find("  reflog:").unwrap() < subgroup, "{text}");
+        assert!(text.find("  commit:").unwrap() < subgroup, "{text}");
+        let observations_at = text.find("observations:").expect("observations");
+        assert!(subgroup < observations_at, "{text}");
+        let git = &text[subgroup..observations_at];
+        assert!(git.contains("observed"), "{text}");
+        let rest = &text[observations_at..];
+        assert!(rest.contains("upstream: a -> b"), "{text}");
+        assert!(!rest.contains("ahead: 1 -> 2"), "{text}");
+        if width == 200 {
+            assert_eq!(text.matches("ahead: 1 -> 2").count(), 1, "{text}");
+            assert_eq!(text.matches("unpushed: 0 -> 1").count(), 1, "{text}");
+            assert!(git.contains("observed 1m ahead: 1 -> 2"), "{text}");
+            assert!(git.contains("observed 1m unpushed: 0 -> 1"), "{text}");
+            assert!(text.contains("5m aaa1111 commit: earlier"), "{text}");
+            assert!(text.contains("3m bbb2222 commit: later"), "{text}");
+        }
+    }
+    assert_eq!(app.snapshot.work[0].activities, activities);
+    assert_eq!(app.snapshot.work[0].observations, observations);
+}
+
+#[test]
+fn observed_counts_alone_never_count_as_activity() {
+    let mut snapshot = fixture();
+    snapshot.work[0].activities = Vec::new();
+    snapshot.work[0].last_activity = None;
+    snapshot.work[0].observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 30,
+        &["ahead: 0 -> 2"],
+    )];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        assert!(text.contains("activity: ?"), "{text}");
+        let subgroup = text
+            .find("  git state (observed):")
+            .expect("the git-state subgroup");
+        let end = text.find("commits not on").unwrap_or(text.len());
+        let detail: Vec<&str> = text[subgroup..end]
+            .lines()
+            .filter(|l| l.contains("ahead: 0 -> 2"))
+            .collect();
+        assert!(!detail.is_empty(), "{text}");
+        assert!(
+            detail.iter().all(|l| l.contains("observed 30s")),
+            "every line is scan-dated: {text}"
+        );
+        assert!(
+            !text.contains("observations:"),
+            "the count left nothing behind: {text}"
+        );
+    }
+}
+
+#[test]
+fn unknown_and_other_source_count_like_reasons_stay_observations() {
+    let mut snapshot = fixture();
+    snapshot.work[0].observations = vec![
+        obs(
+            ObservationSource::Lifecycle,
+            NOW - 60,
+            &[
+                "ahead:1 -> 2",
+                "Ahead: 2 -> 3",
+                "ahead count: 4",
+                "landed: no -> yes",
+            ],
+        ),
+        obs(ObservationSource::Forge, NOW - 50, &["ahead: 9 -> 9"]),
+        obs(
+            ObservationSource::WorkingTree,
+            NOW - 40,
+            &["unpushed: 0 -> 1"],
+        ),
+    ];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        assert!(
+            !text.contains("git state"),
+            "no count-shaped reason matched exactly: {text}"
+        );
+        let observations_at = text.find("observations:").expect("observations");
+        for kept in [
+            "ahead:1 -> 2",
+            "Ahead: 2 -> 3",
+            "ahead count: 4",
+            "landed: no -> yes",
+            "ahead: 9 -> 9",
+            "unpushed: 0 -> 1",
+        ] {
+            assert!(text[observations_at..].contains(kept), "{text}");
+        }
+    }
+}
+
+#[test]
+fn a_remote_only_count_change_leaves_source_activity_unchanged() {
+    let mut snapshot = fixture();
+    let activities = vec![ActivityEvent {
+        source: ActivitySource::Reflog,
+        occurred_at_ms: (NOW - 5400) * 1000,
+        reasons: vec!["ccc3333 commit: earlier work".to_owned()],
+    }];
+    let observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 5,
+        &["behind: 0 -> 3"],
+    )];
+    snapshot.work[0].activities = activities.clone();
+    snapshot.work[0].observations = observations.clone();
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        assert!(text.contains("activity: 1h"), "{text}");
+        let subgroup = text
+            .find("  git state (observed):")
+            .expect("the git-state subgroup");
+        assert!(text.find("  reflog:").unwrap() < subgroup, "{text}");
+        let end = text.find("commits not on").unwrap_or(text.len());
+        let git = &text[subgroup..end];
+        assert!(git.contains("observed 5s"), "{text}");
+        assert!(git.contains("behind: 0"), "{text}");
+        assert!(text.contains("ccc3333"), "{text}");
+        assert!(
+            !text.contains("observations:"),
+            "nothing else was observed: {text}"
+        );
+    }
+    let text = render(&app, 200, 60);
+    assert!(text.contains("1h ccc3333 commit: earlier work"), "{text}");
+    let subgroup = text.find("  git state (observed):").unwrap();
+    let end = text.find("commits not on").unwrap();
+    assert!(
+        text[subgroup..end].contains("observed 5s behind: 0 -> 3"),
+        "{text}"
+    );
+    assert_eq!(app.snapshot.work[0].activities, activities);
+    assert_eq!(app.snapshot.work[0].observations, observations);
+}
+
+#[test]
+fn git_state_sorts_by_scan_time_and_caps_after_partitioning() {
+    let mut snapshot = fixture();
+    snapshot.work[0].activities = vec![
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 7200) * 1000,
+            reasons: vec!["aaa1111 commit: old".to_owned()],
+        },
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 5400) * 1000,
+            reasons: vec!["bbb2222 commit: mid".to_owned()],
+        },
+    ];
+    let mut observations: Vec<ObservationEvent> = (0..8u64)
+        .map(|i| {
+            let reasons = if i == 7 {
+                vec![
+                    "ahead: 7 -> 8".to_owned(),
+                    "behind: 0 -> 5".to_owned(),
+                    "unpushed: 6 -> 7".to_owned(),
+                ]
+            } else {
+                vec![format!("ahead: {i} -> {}", i + 1)]
+            };
+            ObservationEvent {
+                covered_by: None,
+                source: ObservationSource::Lifecycle,
+                observed_at_ms: (NOW - 800 + i * 10) * 1000,
+                reasons,
+            }
+        })
+        .collect();
+    observations.push(obs(
+        ObservationSource::Lifecycle,
+        NOW - 5,
+        &["landed: no -> ancestor"],
+    ));
+    snapshot.work[0].observations = observations;
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 70);
+        assert!(text.contains("activity: 1h"), "{text}");
+        let subgroup = text.find("  git state (observed):").expect("subgroup");
+        let observations_at = text.find("observations:").expect("observations");
+        assert!(subgroup < observations_at, "{text}");
+        assert!(text.find("  reflog:").unwrap() < subgroup, "{text}");
+        let git = &text[subgroup..observations_at];
+        assert!(!git.contains("ahead: 0 -> 1"), "{text}");
+        assert!(!git.contains("landed"), "{text}");
+        assert!(text.contains("landed: no -> ancestor"), "{text}");
+        if width == 200 {
+            assert!(text.contains("2h aaa1111 commit: old"), "{text}");
+            assert!(text.contains("1h bbb2222 commit: mid"), "{text}");
+            assert_eq!(git.matches("observed ").count(), 9, "{text}");
+            assert!(git.contains("observed 12m ahead: 7 -> 8"), "{text}");
+            assert!(git.contains("behind: 0 -> 5"), "{text}");
+            assert!(git.contains("unpushed: 6 -> 7"), "{text}");
+            assert!(git.contains("observed 13m ahead: 1 -> 2"), "{text}");
+            for i in 1..7u64 {
+                assert!(git.contains(&format!("ahead: {i} -> {}", i + 1)), "{text}");
+            }
+            assert!(
+                git.find("ahead: 7 -> 8").unwrap() < git.find("ahead: 1 -> 2").unwrap(),
+                "newest observed first: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn git_state_ties_and_reasons_render_deterministically() {
+    let render_order = |first: &[&str], second: &[&str]| {
+        let mut snapshot = fixture();
+        snapshot.work[0].observations = vec![
+            obs(ObservationSource::Lifecycle, NOW - 60, first),
+            obs(ObservationSource::Lifecycle, NOW - 60, second),
+        ];
+        let mut app = App::new(snapshot);
+        press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+        let text = render(&app, 200, 60);
+        let subgroup = text.find("  git state (observed):").expect("subgroup");
+        let end = text.find("commits not on").unwrap_or(text.len());
+        text[subgroup..end]
+            .lines()
+            .filter(|l| l.contains("observed "))
+            .map(|l| l.trim().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let forward = render_order(&["behind: 0 -> 1"], &["ahead: 2 -> 3"]);
+    let reversed = render_order(&["ahead: 2 -> 3"], &["behind: 0 -> 1"]);
+    assert_eq!(forward, reversed, "{forward:?} vs {reversed:?}");
+    assert!(
+        forward[0].contains("ahead: 2 -> 3"),
+        "the smaller reason list wins the tie: {forward:?}"
+    );
+    let mixed = render_order(&["unpushed: 1 -> 2", "ahead: 3 -> 4"], &["behind: 0 -> 1"]);
+    let ahead = mixed
+        .iter()
+        .position(|l| l.contains("ahead: 3 -> 4"))
+        .unwrap();
+    let unpushed = mixed
+        .iter()
+        .position(|l| l.contains("unpushed: 1 -> 2"))
+        .unwrap();
+    assert!(ahead < unpushed, "{mixed:?}");
+}
+
+#[test]
+fn git_state_reasons_escape_and_wrap_and_leave_raw_history() {
+    let mut snapshot = fixture();
+    let raw = "ahead: 0 -> 1 日本\ttab\u{7}".to_owned();
+    let long = format!("unpushed: 0 -> 1 {}", "tail".repeat(30));
+    snapshot.work[0].observations =
+        vec![obs(ObservationSource::Lifecycle, NOW - 60, &[&raw, &long])];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        assert!(text.contains("git state (observed):"), "{text}");
+        assert!(!text.contains('\t') && !text.contains('\u{7}'), "{text}");
+        assert!(text.contains("unpushed: 0 ->"), "{text}");
+    }
+    let text = render(&app, 200, 60);
+    assert!(text.contains("\\ttab\\u0007"), "{text}");
+    assert!(text.contains("unpushed: 0 -> 1"), "{text}");
+    assert_eq!(
+        app.snapshot.work[0].observations[0].reasons,
+        vec![raw, long]
+    );
+}
+
+#[test]
+fn observed_counts_do_not_defeat_the_age_filter() {
+    let mut snapshot = fixture();
+    let mut unknown = work();
+    unknown.name = "feat/unknown".to_owned();
+    unknown.identity = Some("i222".to_owned());
+    unknown.incarnation = Some(incarnation("i222", "feat/unknown", 1));
+    unknown.last_activity = None;
+    unknown.observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 5,
+        &["ahead: 0 -> 1"],
+    )];
+    let mut stale = work();
+    stale.name = "feat/stale".to_owned();
+    stale.identity = Some("i333".to_owned());
+    stale.incarnation = Some(incarnation("i333", "feat/stale", 1));
+    stale.last_activity = Some(NOW - 100_000);
+    stale.observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 5,
+        &["behind: 0 -> 3"],
+    )];
+    snapshot.work.push(unknown);
+    snapshot.work.push(stale);
+    let mut app = App::new(snapshot);
+    press(
+        &mut app,
+        &[
+            Key::Char('2'),
+            Key::Char('/'),
+            Key::Char('a'),
+            Key::Char('g'),
+            Key::Char('e'),
+            Key::Char(':'),
+            Key::Char('1'),
+            Key::Char('h'),
+            Key::Enter,
+        ],
+    );
+    let text = render(&app, 200, 30);
+    assert!(text.contains("feat/login"), "{text}");
+    assert!(
+        !text.contains("feat/unknown"),
+        "an unknown age fails closed, observed counts notwithstanding: {text}"
+    );
+    assert!(
+        !text.contains("feat/stale"),
+        "a scan-time count never refreshes last_activity: {text}"
+    );
+}
