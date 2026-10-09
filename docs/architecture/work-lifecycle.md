@@ -144,3 +144,10 @@ rather than "noticed 30 days ago".
   unchanged - because resetting it discards incarnation and parking
   history; not versioning an additive change (legacy records can default
   absent fields).
+- Linux pane matching recognizes the kernel's trailing ` (deleted)`
+  annotation only when both the reported literal path and recorded root
+  are proven absent - because deleted-cwd panes still retain gone work;
+  not unconditional suffix stripping (real suffix-named directories and
+  recreated roots must not be rebound). tmux reads the cwd verbatim from
+  `/proc/<pid>/cwd` on Linux, where the kernel appends the suffix:
+  [osdep-linux.c](https://github.com/tmux/tmux/blob/master/osdep-linux.c).

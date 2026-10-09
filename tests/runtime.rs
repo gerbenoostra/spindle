@@ -813,3 +813,202 @@ fn a_recorded_warning_keeps_the_rest_of_the_inventory() {
     assert!(rt.panes.panes.iter().any(|p| p.session_name == "holder"));
     assert!(rt.panes.servers.iter().all(|s| s.error.is_none()));
 }
+
+fn pane_in_directory(
+    server: &TmuxServer,
+    session: &str,
+    cwd: &std::path::Path,
+) -> agent_sessions::tmux::Pane {
+    server.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        session,
+        "-c",
+        cwd.to_str().unwrap(),
+        "-x",
+        "100",
+        "-y",
+        "24",
+        "sleep 300",
+    ]);
+    until(|| {
+        let rt = observe(server);
+        rt.panes
+            .panes
+            .iter()
+            .find(|p| {
+                p.session_name == session
+                    && p.cwd.as_deref() == Some(cwd)
+                    && (p.command == "sleep" || p.command == "coreutils")
+            })
+            .cloned()
+    })
+}
+
+#[test]
+fn a_pane_in_a_removed_directory_still_binds_its_recorded_root() {
+    if !support::tmux_or_skip() {
+        return;
+    }
+    let server = TmuxServer::new();
+    let root = TempDir::new("deleted-cwd");
+    let child = root.join("child");
+    std::fs::create_dir(&child).unwrap();
+    pane_in_directory(&server, "gone", &child);
+    std::fs::remove_dir(&child).unwrap();
+    let expected = if cfg!(target_os = "linux") {
+        std::path::PathBuf::from(format!("{} (deleted)", child.display()))
+    } else {
+        child.clone()
+    };
+    let pane = until(|| {
+        let rt = observe(&server);
+        rt.panes
+            .panes
+            .iter()
+            .find(|p| p.session_name == "gone" && p.cwd.as_deref() == Some(expected.as_path()))
+            .cloned()
+    });
+    assert_eq!(pane.cwd.as_deref(), Some(expected.as_path()));
+    assert!(pane.binds_worktree(None, &child));
+    let mut mismatched = pane.clone();
+    mismatched.wt_adminid = Some("other".to_owned());
+    assert!(!mismatched.binds_worktree(Some("adm"), &child));
+}
+
+#[test]
+fn a_literal_deleted_suffix_directory_binds_only_itself() {
+    if !support::tmux_or_skip() {
+        return;
+    }
+    let server = TmuxServer::new();
+    let root = TempDir::new("literal-deleted");
+    let marked = root.join("name (deleted)");
+    std::fs::create_dir(&marked).unwrap();
+    let pane = pane_in_directory(&server, "marked", &marked);
+    assert_eq!(pane.cwd.as_deref(), Some(marked.as_path()));
+    assert!(pane.binds_worktree(None, &marked));
+    assert!(!pane.binds_worktree(None, &root.join("name")));
+}
+
+#[test]
+fn a_recreated_root_is_not_rebound_by_a_deleted_cwd_annotation() {
+    if !support::tmux_or_skip() {
+        return;
+    }
+    let server = TmuxServer::new();
+    let root = TempDir::new("recreated");
+    let child = root.join("child");
+    std::fs::create_dir(&child).unwrap();
+    pane_in_directory(&server, "back", &child);
+    std::fs::remove_dir(&child).unwrap();
+    let expected = if cfg!(target_os = "linux") {
+        std::path::PathBuf::from(format!("{} (deleted)", child.display()))
+    } else {
+        child.clone()
+    };
+    let pane = until(|| {
+        let rt = observe(&server);
+        rt.panes
+            .panes
+            .iter()
+            .find(|p| p.session_name == "back" && p.cwd.as_deref() == Some(expected.as_path()))
+            .cloned()
+    });
+    std::fs::create_dir(&child).unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(!pane.binds_worktree(None, &child));
+    #[cfg(not(target_os = "linux"))]
+    assert!(pane.binds_worktree(None, &child));
+}
+
+#[test]
+fn a_doubled_deleted_suffix_strips_once() {
+    if !support::tmux_or_skip() {
+        return;
+    }
+    let server = TmuxServer::new();
+    let root = TempDir::new("doubled");
+    let marked = root.join("name (deleted)");
+    std::fs::create_dir(&marked).unwrap();
+    pane_in_directory(&server, "twice", &marked);
+    std::fs::remove_dir(&marked).unwrap();
+    let expected = if cfg!(target_os = "linux") {
+        std::path::PathBuf::from(format!("{} (deleted)", marked.display()))
+    } else {
+        marked.clone()
+    };
+    let pane = until(|| {
+        let rt = observe(&server);
+        rt.panes
+            .panes
+            .iter()
+            .find(|p| p.session_name == "twice" && p.cwd.as_deref() == Some(expected.as_path()))
+            .cloned()
+    });
+    assert_eq!(pane.cwd.as_deref(), Some(expected.as_path()));
+    assert!(pane.binds_worktree(None, &marked));
+    assert!(!pane.binds_worktree(None, &root.join("name")));
+}
+
+#[test]
+fn a_non_utf8_deleted_cwd_binds_its_original_bytes() {
+    if !support::tmux_or_skip() {
+        return;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let server = TmuxServer::new();
+    let rt = until(|| {
+        let rt = observe(&server);
+        rt.panes
+            .panes
+            .iter()
+            .any(|p| p.session_name == "holder")
+            .then_some(rt)
+    });
+    let mut pane = pane_in(&rt, "holder").clone();
+    let root = TempDir::new("nonutf8");
+    let missing = root.join(std::ffi::OsStr::from_bytes(b"dir\xff"));
+    let mut annotated = missing.as_os_str().as_bytes().to_vec();
+    annotated.extend_from_slice(b" (deleted)");
+    pane.cwd = Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &annotated,
+    )));
+    #[cfg(target_os = "linux")]
+    assert!(pane.binds_worktree(None, &missing));
+    #[cfg(not(target_os = "linux"))]
+    assert!(!pane.binds_worktree(None, &missing));
+}
+
+#[test]
+fn an_unreadable_ancestor_is_not_absence() {
+    if !support::tmux_or_skip() {
+        return;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let server = TmuxServer::new();
+    let rt = until(|| {
+        let rt = observe(&server);
+        rt.panes
+            .panes
+            .iter()
+            .any(|p| p.session_name == "holder")
+            .then_some(rt)
+    });
+    let mut pane = pane_in(&rt, "holder").clone();
+    let root = TempDir::new("unreadable");
+    let locked = root.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let missing = locked.join("child");
+    let mut annotated = missing.as_os_str().as_bytes().to_vec();
+    annotated.extend_from_slice(b" (deleted)");
+    pane.cwd = Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &annotated,
+    )));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let binds = pane.binds_worktree(None, &missing);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!binds);
+}

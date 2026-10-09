@@ -145,8 +145,26 @@ impl Pane {
         let root = worktree
             .canonicalize()
             .unwrap_or_else(|_| worktree.to_owned());
-        cwd.starts_with(root)
+        deleted_cwd_binds(&cwd, &root)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn deleted_cwd_binds(cwd: &Path, root: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    match cwd.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+        Some(stripped)
+            if matches!(cwd.try_exists(), Ok(false)) && matches!(root.try_exists(), Ok(false)) =>
+        {
+            Path::new(std::ffi::OsStr::from_bytes(stripped)).starts_with(root)
+        }
+        _ => cwd.starts_with(root),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn deleted_cwd_binds(cwd: &Path, root: &Path) -> bool {
+    cwd.starts_with(root)
 }
 
 /// A tmux read that failed. `code` is the client exit status.
