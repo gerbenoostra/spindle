@@ -16,8 +16,9 @@ use agent_sessions::snapshot::{
     Upstream, WorkKind, WorkRow, WorkSection,
 };
 use agent_sessions::store::{
-    ActivityEvent, ActivitySource, Confidence, ContinuityEvidence, Exec, Mark, NormEvent,
-    ObservationEvent, ObservationSource, RejectedRecord, SessionContext, TouchProvenance,
+    ActivityEvent, ActivityReference, ActivitySource, Confidence, ContinuityEvidence, Exec, Mark,
+    NormEvent, ObservationEvent, ObservationSource, RejectedRecord, SessionContext,
+    TouchProvenance,
 };
 use agent_sessions::tui::{App, Key};
 use agent_sessions::verdict::{ActionVerdict, Verdict};
@@ -309,6 +310,7 @@ fn activity_and_observation_histories_render_separately_and_cap_at_seven() {
     });
     snapshot.work[0].activities = activities;
     snapshot.work[0].observations = vec![ObservationEvent {
+        covered_by: None,
         source: ObservationSource::Lifecycle,
         observed_at_ms: (NOW - 90) * 1000,
         reasons: vec!["upstream: a -> b".to_owned(), "ahead: 1 -> 2".to_owned()],
@@ -357,16 +359,19 @@ fn activity_and_observation_histories_render_separately_and_cap_at_seven() {
     let mut tied = fixture();
     tied.work[0].observations = vec![
         ObservationEvent {
+            covered_by: None,
             source: ObservationSource::Forge,
             observed_at_ms: (NOW - 60) * 1000,
             reasons: vec!["forge old".to_owned()],
         },
         ObservationEvent {
+            covered_by: None,
             source: ObservationSource::Forge,
             observed_at_ms: (NOW - 30) * 1000,
             reasons: vec!["forge new".to_owned()],
         },
         ObservationEvent {
+            covered_by: None,
             source: ObservationSource::Lifecycle,
             observed_at_ms: (NOW - 30) * 1000,
             reasons: vec!["lifecycle tied".to_owned()],
@@ -390,6 +395,125 @@ fn activity_and_observation_histories_render_separately_and_cap_at_seven() {
         !text.contains("observations:"),
         "a row with no observations renders no section: {text}"
     );
+}
+
+#[test]
+fn a_covered_working_tree_observation_hides_behind_its_activity() {
+    let tree = |covered: Option<u64>, at: u64, reasons: &[&str]| ObservationEvent {
+        covered_by: covered.map(|at| ActivityReference {
+            source: ActivitySource::WorkingTree,
+            occurred_at_ms: at * 1000,
+        }),
+        source: ObservationSource::WorkingTree,
+        observed_at_ms: at * 1000,
+        reasons: reasons.iter().map(|r| r.to_string()).collect(),
+    };
+    let mut snapshot = fixture();
+    snapshot.work[0].activities = vec![ActivityEvent {
+        source: ActivitySource::WorkingTree,
+        occurred_at_ms: (NOW - 60) * 1000,
+        reasons: vec!["modified dup.rs".to_owned(), "untracked b.rs".to_owned()],
+    }];
+    snapshot.work[0].observations = vec![
+        // The proven duplicate: every reason sits in the linked,
+        // retained activity - it renders only under `activity:`.
+        tree(Some(NOW - 60), NOW - 50, &["modified dup.rs"]),
+        // Unlinked legacy and undated detections stay visible.
+        tree(None, NOW - 40, &["legacy dirty read"]),
+        tree(None, NOW - 30, &["deleted c.rs"]),
+        // A link naming the wrong source or a missing occurrence keeps
+        // the observation, and so does a pruned counterpart.
+        ObservationEvent {
+            covered_by: Some(ActivityReference {
+                source: ActivitySource::Commit,
+                occurred_at_ms: (NOW - 60) * 1000,
+            }),
+            source: ObservationSource::WorkingTree,
+            observed_at_ms: (NOW - 29) * 1000,
+            reasons: vec!["wrong source link".to_owned()],
+        },
+        tree(Some(NOW - 55), NOW - 28, &["stale link"]),
+        // A partial match: one reason the counterpart carries and one it
+        // never carried - the whole observation stays.
+        tree(Some(NOW - 60), NOW - 27, &["untracked b.rs", "ghost.rs"]),
+        // A linked Lifecycle event is never covered: only WorkingTree
+        // observations participate.
+        ObservationEvent {
+            covered_by: Some(ActivityReference {
+                source: ActivitySource::WorkingTree,
+                occurred_at_ms: (NOW - 60) * 1000,
+            }),
+            source: ObservationSource::Lifecycle,
+            observed_at_ms: (NOW - 26) * 1000,
+            reasons: vec!["dirty: clean -> dirty".to_owned()],
+        },
+    ];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        // The proof appears once, under `activity:` - the covered
+        // detection adds no second copy under `observations:`.
+        assert_eq!(text.matches("modified dup.rs").count(), 1, "{text}");
+        // The partial observation stays and re-shows the shared reason.
+        assert_eq!(text.matches("untracked b.rs").count(), 2, "{text}");
+        for kept in [
+            "legacy dirty read",
+            "deleted c.rs",
+            "wrong source link",
+            "stale link",
+            "ghost.rs",
+            "dirty: clean -> dirty",
+        ] {
+            assert!(text.contains(kept), "{text}");
+        }
+    }
+
+    // A row whose working-tree observations are all covered renders no
+    // `observations:` section, while the raw history still holds them.
+    let mut all = fixture();
+    all.work[0].activities = vec![ActivityEvent {
+        source: ActivitySource::WorkingTree,
+        occurred_at_ms: (NOW - 60) * 1000,
+        reasons: vec!["modified a.rs".to_owned()],
+    }];
+    all.work[0].observations = vec![tree(Some(NOW - 60), NOW - 50, &["modified a.rs"])];
+    let mut app = App::new(all);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        assert!(text.contains("modified a.rs"), "{text}");
+        assert!(
+            !text.contains("observations:"),
+            "the filtered section is empty: {text}"
+        );
+    }
+    assert_eq!(
+        app.snapshot.work[0].observations.len(),
+        1,
+        "the raw history is untouched by the display filter"
+    );
+
+    // The filter runs before the seven-per-source cap: seven newer
+    // covered events cannot push the older uncovered one out.
+    let mut capped = fixture();
+    capped.work[0].activities = vec![ActivityEvent {
+        source: ActivitySource::WorkingTree,
+        occurred_at_ms: (NOW - 60) * 1000,
+        reasons: vec!["modified a.rs".to_owned()],
+    }];
+    let mut observations = vec![tree(None, NOW - 100, &["older uncovered"])];
+    for i in 0..7u64 {
+        observations.push(tree(Some(NOW - 60), NOW - 90 + i, &["modified a.rs"]));
+    }
+    capped.work[0].observations = observations;
+    let mut app = App::new(capped);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        assert!(text.contains("older uncovered"), "{text}");
+        assert_eq!(text.matches("modified a.rs").count(), 1, "{text}");
+    }
 }
 
 #[test]

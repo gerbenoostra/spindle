@@ -68,6 +68,21 @@ rather than "noticed 30 days ago".
 - A conversation's first recorded turn backfills source-dated activity -
   because the source's own timestamp is real work history however old; not
   seating the cursor alone (recency and history then disagree).
+- A dated working-tree transition links its observation to the activity
+  the same transition emits - because both events describe one fact and
+  the provenance is known only at emission; the optional `covered_by`
+  field records the counterpart's `(source, occurred_at_ms)`, never a
+  retroactive match (a later pass cannot prove which activity the
+  detection duplicated). The detail hides such an observation only while
+  its linked WorkingTree activity stays retained and carries every
+  observation reason - a pruned counterpart, a partial reason match, an
+  unlinked legacy event and every clean or deleted transition whose
+  remaining changed paths prove no mtime all stay visible. Suppression
+  is display-only: the raw history, scan times, recency and retention
+  bounds are untouched, the
+  filter runs before the section check and the seven-per-source cap, and
+  the field serializes only when set so legacy records read unchanged
+  under the same `WORK_SCHEMA`.
 - `work.json` versions separately under `WORK_SCHEMA` and older files reset
   rather than migrate while pre-release - because backwards compatibility is
   not promised before release and the collector rebuilds the state; not

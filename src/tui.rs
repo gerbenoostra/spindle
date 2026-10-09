@@ -1407,10 +1407,20 @@ impl App {
         for line in activity_lines(w, now.saturating_mul(1000)) {
             push_text(out, line, width);
         }
-        if !w.observations.is_empty() {
+        // A working-tree observation whose linked activity still covers
+        // every reason is the same evidence rendered twice: it stays in
+        // the raw history but drops from the display. The filter runs
+        // before the section check and the per-source cap, so a covered
+        // newest event cannot push an uncovered older one out.
+        let observations: Vec<&store::ObservationEvent> = w
+            .observations
+            .iter()
+            .filter(|e| !e.is_covered_by(&w.activities))
+            .collect();
+        if !observations.is_empty() {
             push_head(out, "observations:".to_owned(), width);
             for line in event_lines(
-                &w.observations,
+                &observations,
                 |e| {
                     serde_json::to_value(e.source)
                         .ok()

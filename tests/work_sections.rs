@@ -21,7 +21,8 @@ use agent_sessions::forge::{Forge, Pipeline, WorkItem};
 use agent_sessions::runtime::Runtime;
 use agent_sessions::snapshot::{Collector, Snapshot, WorkKind, WorkSection, to_json};
 use agent_sessions::store::{
-    ActivitySource, LifecycleInputs, NormEvent, Record, Store, WorkIdentity,
+    ActivityReference, ActivitySource, LifecycleInputs, NormEvent, ObservationSource, Record,
+    Store, WorkIdentity,
 };
 use agent_sessions::tui::{App, Key};
 use ratatui::Terminal;
@@ -1923,4 +1924,322 @@ fn reflog_reasons_name_the_selected_entry_at_its_own_time() {
         "the record retains the captured reason: {:?}",
         record.activities
     );
+}
+
+/// A dirty working-tree transition stores its observation beside the
+/// activity the same transition emits - linked by source and occurrence,
+/// still dated at the scan - and the detail renders the evidence once,
+/// under `activity:`. The follow-up clean transition proves no remaining
+/// mtime, so its observation stays unlinked and visible. Real collection
+/// to detail, over both a branch and a detached-path record.
+#[test]
+fn a_covered_dirty_observation_is_stored_but_not_rendered_twice() {
+    let world = world();
+    let dirty_wt = world.a.dir.join("wt-dirty");
+    let detached_wt = world.a.dir.join("wt-detached");
+    // The first pass is a silent baseline for every record: the
+    // pre-seeded `dirty.txt` is already part of it.
+    collect(&world);
+
+    // Pin every changed file's mtime far in the past so the activity's
+    // occurrence provably differs from the pass's detection time.
+    let pin = UNIX_EPOCH + Duration::from_secs(1_000_000);
+    for path in [
+        dirty_wt.join("later.txt"),
+        dirty_wt.join("dirty.txt"),
+        detached_wt.join("loose.txt"),
+    ] {
+        fs::write(&path, "x").expect("write");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(pin)
+            .expect("mtime");
+    }
+    let mut second = collect(&world);
+    assert!(second.complete, "{:?}", second.errors);
+
+    let linked = ActivityReference {
+        source: ActivitySource::WorkingTree,
+        occurred_at_ms: 1_000_000_000,
+    };
+    let covered = |row: &agent_sessions::snapshot::WorkRow| {
+        let observation = row
+            .observations
+            .iter()
+            .find(|e| e.source == ObservationSource::WorkingTree)
+            .expect("the dirty transition observed");
+        assert!(
+            observation.observed_at_ms > 1_000_000_000,
+            "the observation dates at the scan, not the mtime: {observation:?}"
+        );
+        assert_eq!(observation.covered_by, Some(linked));
+        assert!(
+            observation.is_covered_by(&row.activities),
+            "the retained activity holds every reason: {:?} vs {:?}",
+            observation,
+            row.activities
+        );
+        observation.clone()
+    };
+    let branch = work(&second, "feat-dirty").clone();
+    let branch_obs = covered(&branch);
+    let detached = second
+        .work
+        .iter()
+        .find(|w| w.kind == WorkKind::Detached)
+        .expect("the detached row")
+        .clone();
+    let detached_obs = covered(&detached);
+    assert_eq!(
+        branch
+            .activities
+            .iter()
+            .find(|e| e.source == ActivitySource::WorkingTree)
+            .map(|e| e.occurred_at_ms),
+        Some(1_000_000_000),
+        "the activity is the pinned mtime: {:?}",
+        branch.activities
+    );
+
+    // The store holds the same raw history: the linked observation at
+    // its scan time, beside the activity it duplicates - suppression is
+    // display-only.
+    let (work_state, errors) = store(&world.home).work();
+    assert!(errors.is_empty(), "{errors:?}");
+    let record = work_state
+        .branches
+        .values()
+        .find(|r| r.ref_name == "feat-dirty")
+        .expect("the branch record");
+    assert!(record.observations.contains(&branch_obs));
+    let path_record = work_state
+        .paths
+        .iter()
+        .find(|(path, _)| path.contains("wt-detached"))
+        .map(|(_, record)| record)
+        .expect("the detached path record");
+    assert!(path_record.observations.contains(&detached_obs));
+
+    // Detail on the branch row: the proven reason appears once, under
+    // `activity:`, and the fully covered working-tree section is gone.
+    second.work = vec![branch.clone(), detached.clone()];
+    let mut app = App::new(second);
+    app.key(Key::Char('2'));
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        assert_eq!(
+            text.matches("untracked later.txt").count(),
+            1,
+            "the covered detection does not repeat under observations: {text}"
+        );
+        assert!(!text.contains("observations:"), "{text}");
+    }
+    // And the path row the same.
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        assert_eq!(text.matches("untracked loose.txt").count(), 1, "{text}");
+        assert!(!text.contains("observations:"), "{text}");
+    }
+
+    // The clean transition - every change gone - proves no remaining
+    // path's mtime: the next observation stays unlinked and visible.
+    fs::remove_file(dirty_wt.join("later.txt")).expect("remove");
+    fs::remove_file(dirty_wt.join("dirty.txt")).expect("remove");
+    fs::remove_file(detached_wt.join("loose.txt")).expect("remove");
+    let third = collect(&world);
+    let branch = work(&third, "feat-dirty").clone();
+    let trees: Vec<_> = branch
+        .observations
+        .iter()
+        .filter(|e| e.source == ObservationSource::WorkingTree)
+        .collect();
+    assert_eq!(trees.len(), 2, "{:?}", branch.observations);
+    let clean = trees[1];
+    assert!(clean.observed_at_ms > branch_obs.observed_at_ms);
+    assert_eq!(clean.covered_by, None);
+    assert!(!clean.is_covered_by(&branch.activities));
+
+    let mut third = third;
+    third.work = vec![branch.clone()];
+    let mut app = App::new(third);
+    app.key(Key::Char('2'));
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        // The linked detection stays hidden; the clean one renders.
+        assert!(text.contains("observations:"), "{text}");
+        assert_eq!(text.matches("untracked later.txt").count(), 1, "{text}");
+        // The raw history still holds both detections.
+        assert_eq!(app.snapshot.work[0].observations.len(), 2);
+    }
+}
+
+/// A transition whose only change is a tracked file's deletion proves no
+/// remaining changed-path mtime: the observation gets no link and stays
+/// visible, no activity is emitted, and the row's recency and section do
+/// not move. The follow-up restore is a clean transition - also
+/// unlinked. Real collection to detail, branch and detached-path
+/// records, both widths.
+#[test]
+fn a_deleted_only_transition_stays_visible_on_branch_and_path() {
+    let world = world();
+    let dirty_wt = world.a.dir.join("wt-dirty");
+    let detached_wt = world.a.dir.join("wt-detached");
+    // A resumable transcript keeps the detached row listed when clean -
+    // Cleanup-section rows collapse into a count and are unselectable.
+    transcript(
+        &world.home,
+        "66000000-1111-2222-3333-444444444444",
+        &detached_wt,
+    );
+    collect(&world);
+    // Drop the pre-seeded untracked file so the tracked-file deletion is
+    // the next dirty transition's only change.
+    fs::remove_file(dirty_wt.join("dirty.txt")).expect("remove");
+    let second = collect(&world);
+    let branch_before = work(&second, "feat-dirty").clone();
+    let detached_before = second
+        .work
+        .iter()
+        .find(|w| w.kind == WorkKind::Detached)
+        .expect("the detached row")
+        .clone();
+    // The return to clean is already an unlinked observation.
+    let clean = branch_before
+        .observations
+        .iter()
+        .find(|e| e.source == ObservationSource::WorkingTree)
+        .expect("the clean transition observed");
+    assert_eq!(clean.covered_by, None);
+
+    fs::remove_file(dirty_wt.join("feat-dirty-0.txt")).expect("rm tracked");
+    fs::remove_file(detached_wt.join("seed.txt")).expect("rm tracked");
+    let third = collect(&world);
+    assert!(third.complete, "{:?}", third.errors);
+
+    let branch = work(&third, "feat-dirty").clone();
+    let deleted_branch = branch
+        .observations
+        .iter()
+        .rfind(|e| e.source == ObservationSource::WorkingTree)
+        .expect("the deletion observed");
+    assert!(
+        deleted_branch
+            .reasons
+            .iter()
+            .any(|r| r.contains("deleted") && r.contains("feat-dirty-0.txt")),
+        "{deleted_branch:?}"
+    );
+    assert_eq!(deleted_branch.covered_by, None);
+    assert!(!deleted_branch.is_covered_by(&branch.activities));
+    // Observation-only transitions add no work: the activity history and
+    // the recency/classification derived from it are unchanged.
+    assert_eq!(branch.activities, branch_before.activities);
+    assert_eq!(branch.last_activity, branch_before.last_activity);
+    // The classification does follow the dirty flag - what it never
+    // follows is detection evidence.
+    assert_eq!(branch.section, WorkSection::FollowUp);
+
+    let detached = third
+        .work
+        .iter()
+        .find(|w| w.kind == WorkKind::Detached)
+        .expect("the detached row")
+        .clone();
+    let deleted_detached = detached
+        .observations
+        .iter()
+        .rfind(|e| e.source == ObservationSource::WorkingTree)
+        .expect("the deletion observed");
+    assert!(
+        deleted_detached
+            .reasons
+            .iter()
+            .any(|r| r.contains("deleted") && r.contains("seed.txt")),
+        "{deleted_detached:?}"
+    );
+    assert_eq!(deleted_detached.covered_by, None);
+    assert_eq!(detached.activities, detached_before.activities);
+    assert_eq!(detached.last_activity, detached_before.last_activity);
+    assert_eq!(detached.section, WorkSection::FollowUp);
+
+    // Both deletion reasons render under `observations:` at both widths.
+    let mut app_snapshot = third;
+    app_snapshot.work = vec![branch.clone(), detached.clone()];
+    let mut app = App::new(app_snapshot);
+    app.key(Key::Char('2'));
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        assert!(text.contains("observations:"), "{text}");
+        assert!(text.contains("feat-dirty-0.txt"), "{text}");
+        // Rendering moved nothing: the row's stored fields are as read.
+        assert_eq!(app.snapshot.work[0].last_activity, branch.last_activity);
+    }
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        assert!(text.contains("seed.txt"), "{text}");
+    }
+
+    // Restoring the tracked files is a clean transition on each record:
+    // unlinked, visible, and the earlier detections' scan times stay put.
+    world
+        .a
+        .git(&dirty_wt, &["checkout", "--", "feat-dirty-0.txt"]);
+    world.a.git(&detached_wt, &["checkout", "--", "seed.txt"]);
+    let fourth = collect(&world);
+    let branch = work(&fourth, "feat-dirty");
+    let trees: Vec<_> = branch
+        .observations
+        .iter()
+        .filter(|e| e.source == ObservationSource::WorkingTree)
+        .collect();
+    assert_eq!(trees.len(), 3, "{:?}", branch.observations);
+    assert!(
+        trees.iter().all(|e| e.covered_by.is_none()),
+        "no observation-only transition ever links: {trees:?}"
+    );
+    assert_eq!(trees[1].observed_at_ms, deleted_branch.observed_at_ms);
+    assert!(trees[2].observed_at_ms > trees[1].observed_at_ms);
+    assert_eq!(branch.activities, branch_before.activities);
+    assert_eq!(branch.last_activity, branch_before.last_activity);
+    assert_eq!(branch.section, branch_before.section);
+    let detached = fourth
+        .work
+        .iter()
+        .find(|w| w.kind == WorkKind::Detached)
+        .expect("the detached row")
+        .clone();
+    let trees: Vec<_> = detached
+        .observations
+        .iter()
+        .filter(|e| e.source == ObservationSource::WorkingTree)
+        .collect();
+    assert_eq!(trees.len(), 2, "{:?}", detached.observations);
+    assert!(trees.iter().all(|e| e.covered_by.is_none()));
+    assert_eq!(trees[0].observed_at_ms, deleted_detached.observed_at_ms);
+    assert_eq!(detached.last_activity, detached_before.last_activity);
+    assert_eq!(detached.section, detached_before.section);
+
+    // The path record's clean transition renders the same way. A clean
+    // detached row collapses into the `all`-scope Cleanup count, so the
+    // detail is reached under its repo's scope.
+    let mut app_snapshot = fourth;
+    app_snapshot.work = vec![detached.clone()];
+    let mut app = App::new(app_snapshot);
+    app.key(Key::Char('1'));
+    app.key(Key::Char('j'));
+    app.key(Key::Char('2'));
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        assert!(text.contains("observations:"), "{text}");
+        assert!(text.contains("working tree clean"), "{text}");
+        assert!(text.contains("seed.txt"), "{text}");
+    }
 }

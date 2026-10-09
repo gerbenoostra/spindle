@@ -532,6 +532,17 @@ pub struct ActivityEvent {
     pub reasons: Vec<String>,
 }
 
+/// A pointer from an [`ObservationEvent`] to the [`ActivityEvent`] the
+/// same transition emitted: the source and occurrence identify the
+/// counterpart, never a serial position, so a merged or retained event
+/// still matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityReference {
+    pub source: ActivitySource,
+    /// The counterpart's occurrence, epoch milliseconds.
+    pub occurred_at_ms: u64,
+}
+
 /// Where an [`ObservationEvent`]'s detection time came from: the pass
 /// that learned a fact or proved a transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -559,6 +570,34 @@ pub struct ObservationEvent {
     /// When the pass observed the fact, epoch milliseconds.
     pub observed_at_ms: u64,
     pub reasons: Vec<String>,
+    /// The activity event this detection duplicates: set only by the
+    /// transition that emitted both, never matched retroactively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_by: Option<ActivityReference>,
+}
+
+impl ObservationEvent {
+    /// Whether the event's linked activity still covers it: the
+    /// reference must name a WorkingTree observation's own counterpart -
+    /// same source and occurrence - and that retained event must carry
+    /// every observation reason. An unlinked event, a pruned counterpart
+    /// and a partial match all keep the observation visible.
+    pub fn is_covered_by(&self, activities: &[ActivityEvent]) -> bool {
+        if self.source != ObservationSource::WorkingTree {
+            return false;
+        }
+        let Some(reference) = self.covered_by else {
+            return false;
+        };
+        if reference.source != ActivitySource::WorkingTree {
+            return false;
+        }
+        activities.iter().any(|event| {
+            event.source == reference.source
+                && event.occurred_at_ms == reference.occurred_at_ms
+                && self.reasons.iter().all(|r| event.reasons.contains(r))
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1334,6 +1373,7 @@ fn commit_transition(
         _ => append_observation(
             observations,
             ObservationEvent {
+                covered_by: None,
                 source: ObservationSource::Commit,
                 observed_at_ms: observed_ms,
                 reasons: vec![reason],
@@ -1360,9 +1400,18 @@ fn working_tree_transition(
     if new.fingerprint == old.fingerprint {
         return false;
     }
+    // The same transition that emits source-backed activity links the
+    // observation to it: the occurrence the snapshot's newest mtime
+    // dates. A transition whose remaining changed paths prove no mtime
+    // - a clean tree, a lone deletion, unreadable metadata - stays
+    // unlinked: nothing covered it.
     let mut changed = append_observation(
         observations,
         ObservationEvent {
+            covered_by: new.newest_mtime_ms.map(|at_ms| ActivityReference {
+                source: ActivitySource::WorkingTree,
+                occurred_at_ms: at_ms,
+            }),
             source: ObservationSource::WorkingTree,
             observed_at_ms: observed_ms,
             reasons: new.reasons.clone(),
@@ -1417,6 +1466,7 @@ fn absorb_evidence(record: &mut BranchRecord, obs: &ObservedRef, observed_ms: u6
         changed |= append_observation(
             &mut record.observations,
             ObservationEvent {
+                covered_by: None,
                 source: ObservationSource::Lifecycle,
                 observed_at_ms: observed_ms,
                 reasons,
@@ -1464,6 +1514,7 @@ fn absorb_path_evidence(
         changed |= append_observation(
             &mut record.observations,
             ObservationEvent {
+                covered_by: None,
                 source: ObservationSource::Lifecycle,
                 observed_at_ms: observed_ms,
                 reasons,
@@ -2089,6 +2140,7 @@ impl Store {
             append_observation(
                 &mut record.observations,
                 ObservationEvent {
+                    covered_by: None,
                     source: ObservationSource::Lifecycle,
                     observed_at_ms: observed_ms,
                     reasons: vec!["branch gone".to_owned()],
@@ -2130,6 +2182,7 @@ impl Store {
                         append_observation(
                             &mut record.observations,
                             ObservationEvent {
+                                covered_by: None,
                                 source: ObservationSource::Lifecycle,
                                 observed_at_ms: observed_ms,
                                 reasons: vec!["branch incarnation changed".to_owned()],
@@ -2184,6 +2237,7 @@ impl Store {
                         append_observation(
                             &mut record.observations,
                             ObservationEvent {
+                                covered_by: None,
                                 source: ObservationSource::Lifecycle,
                                 observed_at_ms: observed_ms,
                                 reasons: vec!["branch found".to_owned()],
@@ -3934,6 +3988,7 @@ mod tests {
         assert_eq!(
             feat.observations,
             vec![ObservationEvent {
+                covered_by: None,
                 source: ObservationSource::Lifecycle,
                 observed_at_ms: 2_000,
                 reasons: vec!["dirty: clean -> dirty".to_owned()],
@@ -3956,11 +4011,13 @@ mod tests {
             closed.observations,
             vec![
                 ObservationEvent {
+                    covered_by: None,
                     source: ObservationSource::Lifecycle,
                     observed_at_ms: 2_000,
                     reasons: vec!["dirty: clean -> dirty".to_owned()],
                 },
                 ObservationEvent {
+                    covered_by: None,
                     source: ObservationSource::Lifecycle,
                     observed_at_ms: 3_000,
                     reasons: vec!["branch gone".to_owned()],
@@ -3983,6 +4040,7 @@ mod tests {
         assert_eq!(
             feat.observations,
             vec![ObservationEvent {
+                covered_by: None,
                 source: ObservationSource::Lifecycle,
                 observed_at_ms: 4_000,
                 reasons: vec!["branch found".to_owned()],
@@ -4094,6 +4152,7 @@ mod tests {
         assert_eq!(
             record.observations,
             vec![ObservationEvent {
+                covered_by: None,
                 source: ObservationSource::Lifecycle,
                 observed_at_ms: 4_000,
                 reasons: vec!["forge: open -> closed".to_owned()],
@@ -4146,6 +4205,7 @@ mod tests {
         assert_eq!(
             record.observations,
             vec![ObservationEvent {
+                covered_by: None,
                 source: ObservationSource::Lifecycle,
                 observed_at_ms: 3_000,
                 reasons: vec!["forge: open -> closed".to_owned()],
@@ -4273,6 +4333,7 @@ mod tests {
         assert_eq!(
             record.observations,
             vec![ObservationEvent {
+                covered_by: None,
                 source: ObservationSource::Lifecycle,
                 observed_at_ms: 3_000,
                 reasons: vec!["dirty: clean -> dirty".to_owned()],
@@ -4713,11 +4774,13 @@ mod tests {
             record.observations,
             vec![
                 ObservationEvent {
+                    covered_by: None,
                     source: ObservationSource::Lifecycle,
                     observed_at_ms: 2_000,
                     reasons: vec!["worktree gone".to_owned(), ".git missing".to_owned()],
                 },
                 ObservationEvent {
+                    covered_by: None,
                     source: ObservationSource::Lifecycle,
                     observed_at_ms: 3_000,
                     reasons: vec!["worktree found".to_owned(), ".git restored".to_owned()],
@@ -4739,11 +4802,13 @@ mod tests {
             record.observations,
             vec![
                 ObservationEvent {
+                    covered_by: None,
                     source: ObservationSource::Lifecycle,
                     observed_at_ms: 2_000,
                     reasons: vec!["worktree gone".to_owned(), ".git missing".to_owned()],
                 },
                 ObservationEvent {
+                    covered_by: None,
                     source: ObservationSource::Lifecycle,
                     observed_at_ms: 3_000,
                     reasons: vec!["worktree found".to_owned(), ".git restored".to_owned()],
@@ -4794,11 +4859,13 @@ mod tests {
             record.observations,
             vec![
                 ObservationEvent {
+                    covered_by: None,
                     source: ObservationSource::WorkingTree,
                     observed_at_ms: 2_000,
                     reasons: vec!["modified bb.rs".to_owned()],
                 },
                 ObservationEvent {
+                    covered_by: None,
                     source: ObservationSource::Lifecycle,
                     observed_at_ms: 2_000,
                     reasons: vec!["worktree state: healthy -> broken: .git missing".to_owned()],
@@ -4867,11 +4934,13 @@ mod tests {
             record.observations,
             vec![
                 ObservationEvent {
+                    covered_by: None,
                     source: ObservationSource::Commit,
                     observed_at_ms: 2_000,
                     reasons: vec!["bbbbbbb".to_owned()],
                 },
                 ObservationEvent {
+                    covered_by: None,
                     source: ObservationSource::WorkingTree,
                     observed_at_ms: 2_000,
                     reasons: vec!["modified bb.rs".to_owned()],
@@ -4949,6 +5018,7 @@ mod tests {
         // is a no-op, a different detection at the same time is kept.
         let mut observations = Vec::new();
         let observation = |source: ObservationSource, at_ms: u64, reason: &str| ObservationEvent {
+            covered_by: None,
             source,
             observed_at_ms: at_ms,
             reasons: vec![reason.to_owned()],
@@ -5102,6 +5172,7 @@ mod tests {
         assert_eq!(
             record.observations,
             vec![ObservationEvent {
+                covered_by: None,
                 source: ObservationSource::Lifecycle,
                 observed_at_ms: 2_000,
                 reasons: vec![
@@ -5142,6 +5213,7 @@ mod tests {
         assert_eq!(
             record.observations,
             vec![ObservationEvent {
+                covered_by: None,
                 source: ObservationSource::Commit,
                 observed_at_ms: 2_000,
                 reasons: vec!["bbbbbbb".to_owned()],
@@ -5172,6 +5244,7 @@ mod tests {
         assert_eq!(
             record.observations,
             vec![ObservationEvent {
+                covered_by: None,
                 source: ObservationSource::Lifecycle,
                 observed_at_ms: 2_000,
                 reasons: vec!["dirty: clean -> dirty".to_owned()],
@@ -5785,6 +5858,10 @@ mod tests {
         assert_eq!(
             record.observations,
             vec![ObservationEvent {
+                covered_by: Some(ActivityReference {
+                    source: ActivitySource::WorkingTree,
+                    occurred_at_ms: 300,
+                }),
                 source: ObservationSource::WorkingTree,
                 observed_at_ms: 2_000,
                 reasons: vec!["modified a.rs".to_owned()],
@@ -5828,6 +5905,227 @@ mod tests {
                 .filter(|e| e.source == ObservationSource::WorkingTree)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn a_dated_dirty_transition_links_its_observation_to_the_activity() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        // A fixed reason under changing fingerprints: the same changed
+        // path recurs, each occurrence its own link.
+        let inputs = |fingerprint: &str, mtime: Option<u64>| LifecycleInputs {
+            working_tree: Some(WorkingTreeSnapshot {
+                fingerprint: fingerprint.to_owned(),
+                reasons: vec!["modified repeated.rs".to_owned()],
+                newest_mtime_ms: mtime,
+            }),
+            ..LifecycleInputs::default()
+        };
+        // The first reading seeds the baseline; every later fingerprint
+        // is a transition.
+        let mut o = obs("feat", false);
+        o.inputs = inputs("aa", Some(100));
+        store.sync_repo(repo, &[o], 1_000).unwrap();
+        // A dated dirty transition emits both events in one pass: the
+        // observation links to the activity it duplicates by source and
+        // occurrence, while its own time stays the pass's - never the
+        // mtime's.
+        let mut o = obs("feat", false);
+        o.inputs = inputs("bb", Some(300));
+        store.sync_repo(repo, &[o], 2_000).unwrap();
+        let record = store.load().work.branch(repo, "feat").unwrap().clone();
+        let observation = &record.observations[0];
+        assert_eq!(observation.observed_at_ms, 2_000);
+        assert_eq!(
+            observation.covered_by,
+            Some(ActivityReference {
+                source: ActivitySource::WorkingTree,
+                occurred_at_ms: 300,
+            })
+        );
+        assert!(observation.is_covered_by(&record.activities));
+        // The link round-trips through the file, and a legacy event with
+        // no `covered_by` reads as unlinked under the same schema.
+        let json = serde_json::to_value(observation).unwrap();
+        assert_eq!(
+            json["covered_by"],
+            serde_json::json!({"source": "working_tree", "occurred_at_ms": 300})
+        );
+        let mut legacy = json.clone();
+        legacy.as_object_mut().unwrap().remove("covered_by");
+        let legacy: ObservationEvent = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.covered_by, None);
+        assert_eq!(legacy.observed_at_ms, 2_000);
+        // An unlinked event serializes no key at all.
+        assert!(serde_json::to_value(&legacy).unwrap()["covered_by"].is_null());
+        // The same dirty path again at a newer mtime links to its own
+        // occurrence: two same-named observations stay distinguishable.
+        let mut o = obs("feat", false);
+        o.inputs = inputs("cc", Some(500));
+        store.sync_repo(repo, &[o], 3_000).unwrap();
+        let record = store.load().work.branch(repo, "feat").unwrap().clone();
+        let links: Vec<u64> = record
+            .observations
+            .iter()
+            .map(|e| e.covered_by.unwrap().occurred_at_ms)
+            .collect();
+        assert_eq!(links, vec![300, 500], "{:?}", record.observations);
+        assert_eq!(
+            record.observations[0].reasons, record.observations[1].reasons,
+            "the repeated path reads identically; only the link times differ"
+        );
+        assert!(
+            record
+                .observations
+                .iter()
+                .all(|e| e.is_covered_by(&record.activities))
+        );
+        // A clean, deleted or metadata-less transition proves no mtime:
+        // its observation stays unlinked.
+        let mut o = obs("feat", false);
+        o.inputs = inputs("dd", None);
+        store.sync_repo(repo, &[o], 4_000).unwrap();
+        let record = store.load().work.branch(repo, "feat").unwrap().clone();
+        let last = record.observations.last().unwrap();
+        assert_eq!(last.observed_at_ms, 4_000);
+        assert_eq!(last.covered_by, None);
+        assert!(!last.is_covered_by(&record.activities));
+        // An unchanged fingerprint emits nothing at all.
+        let mut o = obs("feat", false);
+        o.inputs = inputs("dd", None);
+        store.sync_repo(repo, &[o], 5_000).unwrap();
+        let record = store.load().work.branch(repo, "feat").unwrap().clone();
+        assert_eq!(record.observations.len(), 3, "{:?}", record.observations);
+        // A path record links the same way.
+        let path = "/wt";
+        let path_inputs = |f: &str, m: Option<u64>| {
+            let mut i = inputs(f, m);
+            i.dirty = Some(true);
+            i
+        };
+        store
+            .sync_path(path, "/r/.git", &path_inputs("aa", Some(700)), &[], 1_000)
+            .unwrap();
+        store
+            .sync_path(path, "/r/.git", &path_inputs("bb", Some(900)), &[], 2_000)
+            .unwrap();
+        let record = store.load().work.path(path).unwrap().clone();
+        let observation = &record.observations[0];
+        assert_eq!(observation.observed_at_ms, 2_000);
+        assert_eq!(
+            observation.covered_by,
+            Some(ActivityReference {
+                source: ActivitySource::WorkingTree,
+                occurred_at_ms: 900,
+            })
+        );
+        assert!(observation.is_covered_by(&record.activities));
+    }
+
+    #[test]
+    fn an_observation_is_covered_only_by_a_counterpart_holding_every_reason() {
+        let activities = vec![
+            ActivityEvent {
+                source: ActivitySource::WorkingTree,
+                occurred_at_ms: 300,
+                // A merge kept the emitted reasons and added another:
+                // the superset still covers.
+                reasons: vec!["modified a.rs".to_owned(), "untracked b.rs".to_owned()],
+            },
+            ActivityEvent {
+                source: ActivitySource::Commit,
+                occurred_at_ms: 300,
+                reasons: vec!["modified a.rs".to_owned()],
+            },
+        ];
+        let covered = ObservationEvent {
+            covered_by: Some(ActivityReference {
+                source: ActivitySource::WorkingTree,
+                occurred_at_ms: 300,
+            }),
+            source: ObservationSource::WorkingTree,
+            observed_at_ms: 2_000,
+            reasons: vec!["modified a.rs".to_owned()],
+        };
+        assert!(covered.is_covered_by(&activities));
+        // A reason the counterpart never carried is a partial match.
+        let mut extra = covered.clone();
+        extra.reasons.push("deleted c.rs".to_owned());
+        assert!(!extra.is_covered_by(&activities));
+        // A non-working-tree observation is never covered, link or not.
+        let mut lifecycle = covered.clone();
+        lifecycle.source = ObservationSource::Lifecycle;
+        assert!(!lifecycle.is_covered_by(&activities));
+        // A link naming another source fails even at a matching time.
+        let mut wrong_source = covered.clone();
+        wrong_source.covered_by = Some(ActivityReference {
+            source: ActivitySource::Commit,
+            occurred_at_ms: 300,
+        });
+        assert!(!wrong_source.is_covered_by(&activities));
+        // A link naming an occurrence no retained event holds fails.
+        let mut missing = covered.clone();
+        missing.covered_by = Some(ActivityReference {
+            source: ActivitySource::WorkingTree,
+            occurred_at_ms: 999,
+        });
+        assert!(!missing.is_covered_by(&activities));
+        // No link at all stays visible, and so does a link whose
+        // counterpart was pruned from the retained history.
+        let mut unlinked = covered.clone();
+        unlinked.covered_by = None;
+        assert!(!unlinked.is_covered_by(&activities));
+        assert!(!covered.is_covered_by(&[]));
+        assert!(!covered.is_covered_by(&activities[1..]));
+    }
+
+    #[test]
+    fn a_pruned_counterpart_uncovers_its_observation() {
+        // The linked occurrence is real and retained: the observation is
+        // covered while it lives.
+        let mut activities = vec![ActivityEvent {
+            source: ActivitySource::WorkingTree,
+            occurred_at_ms: 300,
+            reasons: vec!["modified a.rs".to_owned()],
+        }];
+        let observation = ObservationEvent {
+            covered_by: Some(ActivityReference {
+                source: ActivitySource::WorkingTree,
+                occurred_at_ms: 300,
+            }),
+            source: ObservationSource::WorkingTree,
+            observed_at_ms: 2_000,
+            reasons: vec!["modified a.rs".to_owned()],
+        };
+        assert!(observation.is_covered_by(&activities));
+        // Newer occurrences push the linked one past the per-source
+        // retention bound: the observation reappears rather than
+        // staying hidden behind a pruned counterpart.
+        for i in 0..HISTORY_RETAIN_PER_SOURCE as u64 {
+            append_activity(
+                &mut activities,
+                ActivityEvent {
+                    source: ActivitySource::WorkingTree,
+                    occurred_at_ms: 400 + i,
+                    reasons: vec![format!("modified {i}.rs")],
+                },
+            );
+        }
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|e| e.source == ActivitySource::WorkingTree)
+                .count(),
+            HISTORY_RETAIN_PER_SOURCE
+        );
+        assert!(!observation.is_covered_by(&activities));
+        // The retained history kept the newest occurrences: the oldest
+        // link target is exactly what aged out.
+        assert_eq!(
+            activities[0].occurred_at_ms, 400,
+            "the linked occurrence aged out first: {activities:?}"
         );
     }
 
