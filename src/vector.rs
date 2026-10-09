@@ -18,7 +18,7 @@ use crate::git::{self, Head, RemoteHead, RemoteListing, Repo, Track, UpstreamCon
 /// What a Work row is anchored on. Branch incarnations and detached
 /// worktrees are the Git anchors; non-Git paths are project spaces and never
 /// reach the vector.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Anchor {
     /// A checkout on disk.
     Worktree {
@@ -139,7 +139,7 @@ pub enum Landed {
 /// A proven base: the remote's symbolic HEAD branch, corroborated by
 /// non-conflicting local and `ls-remote` evidence, with the local
 /// remote-tracking ref the comparisons actually run against.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Base {
     pub remote: String,
     pub branch: String,
@@ -156,7 +156,7 @@ impl Base {
 
 /// The eleven shared fields, plus the provenance (`base`, upstream detail) a
 /// verdict or view needs to explain them.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct WorkState {
     pub repo: Repo,
     pub anchor: Anchor,
@@ -170,7 +170,7 @@ pub struct WorkState {
     pub vector: StateVector,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct StateVector {
     /// The checkout path, or `None` for a branch with no workspace.
     pub worktree: Option<PathBuf>,
@@ -374,7 +374,17 @@ impl AnchorWork {
     }
 
     /// Patch the remote-owned fields from a finished [`apply_remote`].
-    pub fn apply(&mut self, applied: RemoteApplied) {
+    /// Returns whether any of the eight moved: callers merging a pass use
+    /// it to decide whether the view republishes.
+    pub fn apply(&mut self, applied: RemoteApplied) -> bool {
+        let changed = self.state.remote_url != applied.remote_url
+            || self.state.base != applied.base
+            || self.state.vector.upstream_state != applied.upstream_state
+            || self.state.vector.commits_ahead_of_base != applied.commits_ahead
+            || self.state.vector.commits_behind_of_base != applied.commits_behind
+            || self.state.vector.commits_not_on_base != applied.commits_listed
+            || self.state.vector.unpushed_commits != applied.unpushed
+            || self.state.vector.landed != applied.landed;
         self.state.remote_url = applied.remote_url;
         self.state.base = applied.base;
         self.state.vector.upstream_state = applied.upstream_state;
@@ -383,6 +393,7 @@ impl AnchorWork {
         self.state.vector.commits_not_on_base = applied.commits_listed;
         self.state.vector.unpushed_commits = applied.unpushed;
         self.state.vector.landed = applied.landed;
+        changed
     }
 }
 
@@ -1373,6 +1384,8 @@ fn probe_repo_local(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_remote_answer_expires_by_wall_clock() {
         let asked = std::time::UNIX_EPOCH + super::Duration::from_secs(1_000);
@@ -1388,7 +1401,85 @@ mod tests {
         assert!(!super::still_fresh(asked, earlier, deadline));
     }
 
-    use super::*;
+    /// The eight remote-owned fields as one answer.
+    fn applied() -> RemoteApplied {
+        RemoteApplied {
+            upstream_state: UpstreamState::NeverPushed,
+            remote_url: None,
+            base: Evidence::Unknown("no base".to_owned()),
+            commits_ahead: Evidence::Known(1),
+            commits_behind: Evidence::Known(2),
+            commits_listed: Evidence::Known(Vec::new()),
+            unpushed: Evidence::Known(3),
+            landed: Evidence::Known(Landed::No),
+        }
+    }
+
+    /// Each of the eight remote-owned fields moves the apply verdict on
+    /// its own: mutate one against the landed baseline, prove the change
+    /// reports, reapply the baseline to reset, prove that repeats clean.
+    #[test]
+    fn apply_reports_each_remote_field_moving() {
+        let repo = broken_repo();
+        let anchor = Anchor::Branch {
+            name: "x".to_owned(),
+        };
+        let mut work = anchor_work(
+            &repo,
+            anchor,
+            None,
+            None,
+            RuntimeFacts::default(),
+            &Ok(Vec::new()),
+            None,
+        );
+        // Landing the answer moves every remote-owned field off PENDING.
+        assert!(work.apply(applied()));
+        assert!(!work.apply(applied()), "the identical answer repeats clean");
+        type Mutate = fn(&mut RemoteApplied);
+        let variants: Vec<(Mutate, &str)> = vec![
+            (
+                |a| {
+                    a.upstream_state = UpstreamState::RemoteGone {
+                        remote: "origin".to_owned(),
+                        merge_ref: "x".to_owned(),
+                    };
+                },
+                "upstream_state",
+            ),
+            (
+                |a| a.remote_url = Some("https://example.com/r.git".to_owned()),
+                "remote_url",
+            ),
+            (
+                |a| a.base = Evidence::Unknown("base probe changed".to_owned()),
+                "base",
+            ),
+            (|a| a.commits_ahead = Evidence::Known(9), "commits_ahead"),
+            (|a| a.commits_behind = Evidence::Known(9), "commits_behind"),
+            (
+                |a| a.commits_listed = Evidence::Unknown("list probe failed".to_owned()),
+                "commits_listed",
+            ),
+            (|a| a.unpushed = Evidence::Known(9), "unpushed"),
+            (
+                |a| a.landed = Evidence::Known(Landed::AncestorMerged),
+                "landed",
+            ),
+        ];
+        for (mutate, field) in variants {
+            let mut moved = applied();
+            mutate(&mut moved);
+            assert!(work.apply(moved), "{field} moving must report");
+            // Back at baseline: identical repeats clean again, so the
+            // previous assertion could not pass on a stale field.
+            assert!(work.apply(applied()), "reverting {field} reports");
+            assert!(
+                !work.apply(applied()),
+                "{field} settled: identical applies clean"
+            );
+        }
+    }
 
     fn is_unknown(upstream: &UpstreamState) -> bool {
         matches!(upstream, UpstreamState::Unknown(_))
