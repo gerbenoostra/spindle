@@ -1209,6 +1209,15 @@ impl Collector {
                     .map_err(|e| anchor_error(repo_id, e)) // coverage: off - needs a repo whose worktree read fails mid-pass
                 },
                 |i, result| {
+                    // Cancellation is sticky: a refused publish ends the
+                    // pass, so a drained job whose callback arrives after
+                    // the refusal is discarded rather than merged or
+                    // published - `emit`'s own "still alive" verdict (a
+                    // clean emit returns `true`) must never resurrect the
+                    // pass.
+                    if !alive {
+                        return;
+                    }
                     let repo_id = &order[i];
                     match result {
                         Ok(local) => self.merge_repo(repo_id, local),
