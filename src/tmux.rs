@@ -11,12 +11,14 @@
 //! killed pane - would fight the user's configuration and the tools that
 //! own those writes, so the only argv this module runs is `list-panes`.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A tmux id as the server prints it: `%` for panes, `@` for windows, `$`
@@ -133,19 +135,34 @@ impl Pane {
     /// present: a window whose stored id names another worktree belongs to
     /// that worktree even if a pane has since `cd`-ed into this one.
     pub fn binds_worktree(&self, admin_id: Option<&str>, worktree: &Path) -> bool {
-        match (&self.wt_adminid, admin_id) {
-            (Some(stored), Some(id)) => return stored == id,
-            (Some(_), None) => return false,
-            _ => {}
+        if let Some(decided) = self.admin_decision(admin_id) {
+            return decided;
         }
         let Some(cwd) = self.cwd.as_deref() else {
             return false;
         };
-        let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
-        let root = worktree
-            .canonicalize()
-            .unwrap_or_else(|_| worktree.to_owned());
-        deleted_cwd_binds(&cwd, &root)
+        self.binds_derived(&canonical_spelling(cwd), &canonical_spelling(worktree))
+    }
+
+    /// The stored admin-id edge's verdict, when it decides outright: a
+    /// matching stored id binds, a stored id naming another worktree
+    /// rejects, and a stored edge is never claimed by a bare-path claim.
+    /// `None` defers to the derived cwd edge - decided before any path is
+    /// resolved, so a decided pane costs no filesystem read at all.
+    fn admin_decision(&self, admin_id: Option<&str>) -> Option<bool> {
+        match (&self.wt_adminid, admin_id) {
+            (Some(stored), Some(id)) => Some(stored == id),
+            (Some(_), None) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// The derived edge against spellings resolved already - [`BindingCache`]
+    /// callers hand the canonical pair in so one pass canonicalizes each
+    /// distinct spelling once, however many panes, anchors and emits
+    /// consult it.
+    fn binds_derived(&self, cwd: &Path, root: &Path) -> bool {
+        deleted_cwd_binds(cwd, root)
     }
 }
 
@@ -165,6 +182,116 @@ fn deleted_cwd_binds(cwd: &Path, root: &Path) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn deleted_cwd_binds(cwd: &Path, root: &Path) -> bool {
     cwd.starts_with(root)
+}
+
+/// `path`'s canonical spelling, or the raw one when it cannot be resolved -
+/// a gone path still binds literally, matching how pane bindings read.
+fn canonical_spelling(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_owned())
+}
+
+/// The pass-local canonical binding cache: one collect pass resolves every
+/// spelling through this so each distinct path canonicalizes once per pass,
+/// not once per pane per anchor per emit. Pane cwds freeze at construction
+/// since the pass's single inventory read never re-runs, while worktree
+/// roots resolve lazily on first encounter, so an anchor the pass discovers
+/// only in stage 2, or a gone row's vanished path, still binds. The roots
+/// map sits behind a mutex because `runtime_facts` resolves inside fan-out
+/// workers; the lock guards the resolution itself - a miss canonicalizes
+/// under it, which is what makes once-per-spelling safe across workers -
+/// and is never held across a pane comparison. Dropped with the pass that
+/// built it: the next pass resolves against the filesystem as it stands
+/// then.
+pub(crate) struct BindingCache {
+    /// Canonical form per distinct pane-cwd spelling the inventory carried.
+    cwds: HashMap<PathBuf, PathBuf>,
+    /// Canonical form per distinct root spelling, memoized on encounter.
+    roots: Mutex<HashMap<PathBuf, PathBuf>>,
+}
+
+impl BindingCache {
+    /// Freeze `panes`' cwd spellings: each distinct one canonicalizes once
+    /// here and the pass's comparisons never canonicalize it again.
+    pub(crate) fn new(panes: &PaneInventory) -> BindingCache {
+        Self::new_with(panes, canonical_spelling)
+    }
+
+    /// `new` with the canonicalizer injected, so tests can count actual
+    /// resolutions instead of the cache carrying instrumentation.
+    fn new_with(panes: &PaneInventory, mut resolve: impl FnMut(&Path) -> PathBuf) -> BindingCache {
+        let mut cwds = HashMap::new();
+        for cwd in panes.panes.iter().filter_map(|p| p.cwd.as_deref()) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = cwds.entry(cwd.to_owned()) {
+                entry.insert(resolve(cwd));
+            }
+        }
+        BindingCache {
+            cwds,
+            roots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `cwd`'s canonical spelling: borrowed from the frozen map on a hit,
+    /// so the per-pane path never allocates. A spelling the inventory
+    /// never carried resolves fresh, uncached - no pane appears mid-pass,
+    /// so a miss is a defensive fallback, not a second look.
+    fn cwd<'a>(&'a self, cwd: &'a Path) -> Cow<'a, Path> {
+        match self.cwds.get(cwd) {
+            Some(resolved) => Cow::Borrowed(resolved.as_path()),
+            None => Cow::Owned(canonical_spelling(cwd)), // coverage: off - every pass caller binds panes the inventory itself reported
+        }
+    }
+
+    /// `root`'s canonical spelling, resolved once per distinct spelling
+    /// however many panes, anchors or emits consult it.
+    pub(crate) fn root(&self, root: &Path) -> PathBuf {
+        self.root_with(root, canonical_spelling)
+    }
+
+    /// `root` with the canonicalizer injected, like [`Self::new_with`]: a
+    /// miss resolves under the lock so exactly one resolution runs per
+    /// distinct spelling even with fan-out workers racing it.
+    fn root_with(&self, root: &Path, resolve: impl FnOnce(&Path) -> PathBuf) -> PathBuf {
+        let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
+        roots
+            .entry(root.to_owned())
+            .or_insert_with(|| resolve(root))
+            .clone()
+    }
+
+    /// `binds` against an already-resolved `root` - the per-anchor shape:
+    /// resolve the anchor's root once, then compare each pane's frozen cwd
+    /// purely, canonicalizing nothing per pane. The stored admin-id edge
+    /// still decides before the cwd is consulted, and the Linux
+    /// `(deleted)` comparison can still stat its pair - only the
+    /// canonicalization is cached.
+    pub(crate) fn binds_at(&self, pane: &Pane, admin_id: Option<&str>, root: &Path) -> bool {
+        if let Some(decided) = pane.admin_decision(admin_id) {
+            return decided;
+        }
+        let Some(cwd) = pane.cwd.as_deref() else {
+            return false;
+        };
+        pane.binds_derived(&self.cwd(cwd), root)
+    }
+
+    /// `PaneInventory::windows_bound` through the cache: the same bound
+    /// windows, with `worktree` resolved once for the whole inventory.
+    pub(crate) fn windows_bound(
+        &self,
+        panes: &PaneInventory,
+        admin_id: Option<&str>,
+        worktree: &Path,
+    ) -> usize {
+        let root = self.root(worktree);
+        let mut windows = HashSet::new();
+        for pane in &panes.panes {
+            if self.binds_at(pane, admin_id, &root) {
+                windows.insert((&pane.socket, &pane.window));
+            }
+        }
+        windows.len()
+    }
 }
 
 /// A tmux read that failed. `code` is the client exit status.
@@ -618,6 +745,270 @@ mod tests {
         assert_eq!(inv.panes[0].id.to_string(), "%3");
         assert_eq!(inv.panes[0].window.to_string(), "@1");
         assert_eq!(inv.panes[0].session.to_string(), "$0");
+    }
+
+    impl BindingCache {
+        /// Whether `pane` binds to `worktree`: resolve the root, then the
+        /// same pure per-pane compare production runs per anchor.
+        fn binds(&self, pane: &Pane, admin_id: Option<&str>, worktree: &Path) -> bool {
+            let root = self.root(worktree);
+            self.binds_at(pane, admin_id, &root)
+        }
+    }
+
+    /// A unique scratch dir per test, removed on drop. Collision-proof by
+    /// construction: `create_dir` on an existing path retries with a fresh
+    /// counter, never deletes a stranger's tree. The path is canonicalized
+    /// once so assertions compare macOS `/tmp` and `/private/tmp`
+    /// spellings alike.
+    struct ScratchDir(PathBuf);
+    impl ScratchDir {
+        fn new(name: &str) -> ScratchDir {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            loop {
+                let dir = std::env::temp_dir().join(format!(
+                    "agent-sessions-{name}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&dir) {
+                    Ok(()) => return ScratchDir(dir.canonicalize().unwrap()),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue, // coverage: off - needs a name collision with a live sibling test
+                    Err(e) => panic!("create_dir {}: {e}", dir.display()), // coverage: off - needs an unwritable temp root
+                }
+            }
+        }
+        fn join(&self, name: impl AsRef<Path>) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_binding_cache_decides_exactly_what_binds_worktree_did() {
+        let base = ScratchDir::new("bind-semantics");
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The stored admin-id edge decides outright: it binds with no cwd
+        // at all and against a path that could never match.
+        let mut p = pane("%1", "@1", "$0");
+        p.wt_adminid = Some("adm".to_owned());
+        let cache = BindingCache::new(&inventory(vec![p.clone()]));
+        assert!(cache.binds(&p, Some("adm"), &PathBuf::from("/no/such/root")));
+        // A mismatching stored id rejects even a cwd that sits inside.
+        p.cwd = Some(link.join("sub"));
+        let cache = BindingCache::new(&inventory(vec![p.clone()]));
+        assert!(!cache.binds(&p, Some("other"), &real));
+        assert!(cache.binds(&p, Some("adm"), &real));
+        // A stored edge is never claimed by a bare-path claim.
+        assert!(!cache.binds(&p, None, &real));
+
+        // No stored edge: symlinked spellings on either side canonicalize
+        // to the same containment.
+        p.wt_adminid = None;
+        let cache = BindingCache::new(&inventory(vec![p.clone()]));
+        assert!(cache.binds(&p, None, &real));
+        assert!(cache.binds(&p, None, &link));
+        // Containment is by component, never by prefix: a sibling whose
+        // name extends the root's is outside it.
+        let sibling = base.join("real-not");
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(!cache.binds(&p, None, &sibling));
+
+        // Gone paths fall back to their literal spelling: a pane whose
+        // cwd names a deleted root's child still binds that root.
+        let gone = base.join("gone-root");
+        p.cwd = Some(gone.join("sub"));
+        let cache = BindingCache::new(&inventory(vec![p.clone()]));
+        assert!(cache.binds(&p, None, &gone));
+        assert!(!cache.binds(&p, None, &real));
+        // A cwd under a different root, and no cwd at all, both reject.
+        p.cwd = Some(real.join("sub"));
+        let cache = BindingCache::new(&inventory(vec![p.clone()]));
+        assert!(!cache.binds(&p, None, &gone));
+        p.cwd = None;
+        let cache = BindingCache::new(&inventory(vec![p.clone()]));
+        assert!(!cache.binds(&p, None, &real));
+    }
+
+    /// The Linux deleted-cwd regression through the cache: a
+    /// `cwd (deleted)` spelling binds only while both it and the root are
+    /// truly gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_binding_cache_keeps_the_deleted_cwd_semantics() {
+        let base = ScratchDir::new("bind-deleted");
+        let gone = base.join("gone");
+        let mut p = pane("%1", "@1", "$0");
+        p.cwd = Some(PathBuf::from(format!("{} (deleted)", gone.display())));
+        let cache = BindingCache::new(&inventory(vec![p.clone()]));
+        assert!(cache.binds(&p, None, &gone));
+        // The root reappearing mid-pass stays unbound: the cache froze
+        // the root spelling at first lookup, and both-gone no longer
+        // holds for a fresh cache either.
+        std::fs::create_dir(&gone).unwrap();
+        let fresh = BindingCache::new(&inventory(vec![p.clone()]));
+        assert!(!fresh.binds(&p, None, &gone));
+    }
+
+    #[test]
+    fn a_binding_cache_freezes_a_root_for_its_pass_only() {
+        let base = ScratchDir::new("bind-lifetime");
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+
+        let cache = BindingCache::new(&inventory(vec![]));
+        assert_eq!(cache.root(&link), a.canonicalize().unwrap());
+        // Repointing the symlink does not move a resolution this pass
+        // already made.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        assert_eq!(cache.root(&link), a.canonicalize().unwrap());
+        // The next pass's own cache resolves what the filesystem says now.
+        let fresh = BindingCache::new(&inventory(vec![]));
+        assert_eq!(fresh.root(&link), b.canonicalize().unwrap());
+    }
+
+    /// A panic while the roots map is locked poisons the mutex: the next
+    /// resolution recovers through `into_inner`, no binding is lost.
+    #[test]
+    fn a_poisoned_roots_lock_recovers() {
+        let base = ScratchDir::new("bind-poison");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let mut p = pane("%1", "@1", "$0");
+        p.cwd = Some(real.clone());
+        let inv = inventory(vec![p]);
+        let cache = BindingCache::new(&inv);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.roots.lock().unwrap(); // coverage: off - the panic edge is the point of the test
+            panic!("poison"); // coverage: off - unwinds by construction
+        }));
+        assert!(cache.roots.lock().is_err());
+        assert!(cache.binds(&inv.panes[0], None, &real));
+    }
+
+    /// The counting proof: 12 distinct roots bound against 29 distinct
+    /// pane-cwd spellings across 27 emit-equivalent rebuilds resolves each
+    /// distinct spelling exactly once - 12 root plus 29 cwd - not
+    /// 27 x 12 x 29 x 2. A second pane repeating a spelling adds no
+    /// resolution either.
+    #[test]
+    fn a_binding_cache_resolves_each_spelling_once_per_pass() {
+        let base = ScratchDir::new("bind-counting");
+        let roots: Vec<PathBuf> = (0..12)
+            .map(|i| {
+                let root = base.join(format!("r{i:02}"));
+                std::fs::create_dir_all(&root).unwrap();
+                root
+            })
+            .collect();
+        // 29 distinct cwd spellings inside those roots, plus a duplicate
+        // pane repeating one - it must not cost a second resolution.
+        let mut panes: Vec<Pane> = (0..29)
+            .map(|i| {
+                let cwd = roots[i % 12].join(format!("sub{i:02}"));
+                std::fs::create_dir_all(&cwd).unwrap();
+                let mut p = pane(&format!("%{}", i + 1), &format!("@{}", i + 1), "$0");
+                p.cwd = Some(cwd);
+                p
+            })
+            .collect();
+        let mut dup = pane("%99", "@99", "$0");
+        dup.cwd = panes[0].cwd.clone();
+        panes.push(dup);
+        let inv = inventory(panes);
+        // Count the resolver's actual invocations: no instrumentation on
+        // the cache, just the injected seam observing itself.
+        let cwd_calls = std::cell::Cell::new(0usize);
+        let cache = BindingCache::new_with(&inv, |p| {
+            cwd_calls.set(cwd_calls.get() + 1);
+            canonical_spelling(p)
+        });
+        assert_eq!(cwd_calls.get(), 29);
+        let root_calls = std::cell::Cell::new(0usize);
+        for _emit in 0..27 {
+            for root in &roots {
+                let resolved = cache.root_with(root, |p| {
+                    root_calls.set(root_calls.get() + 1);
+                    canonical_spelling(p)
+                });
+                let bound = inv
+                    .panes
+                    .iter()
+                    .filter(|p| cache.binds_at(p, None, &resolved))
+                    .count();
+                assert!(bound >= 2, "every root holds its panes: {bound}");
+            }
+        }
+        assert_eq!(root_calls.get(), 12);
+    }
+
+    /// An anchor spelling first seen mid-pass - a worktree root the pass
+    /// discovers only in stage 2 - still binds the panes the inventory
+    /// froze, and binding stays stable across repeated emits of the same
+    /// pass.
+    #[test]
+    fn a_binding_cache_binds_anchors_created_mid_pass() {
+        let base = ScratchDir::new("bind-midpass");
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        // The pane's cwd is frozen evidence from before the anchor's
+        // spelling existed.
+        let mut p = pane("%1", "@1", "$0");
+        p.cwd = Some(real.join("sub"));
+        let inv = inventory(vec![p]);
+        let cache = BindingCache::new(&inv);
+        // The anchor's own spelling appears mid-pass: a symlink to the
+        // root that did not exist when the cache was built.
+        let late = base.join("late");
+        std::os::unix::fs::symlink(&real, &late).unwrap();
+        let pane = &inv.panes[0];
+        // First and second emit of the pass bind alike.
+        assert!(cache.binds(pane, None, &late));
+        assert!(cache.binds(pane, None, &late));
+        assert_eq!(cache.windows_bound(&inv, None, &late), 1);
+    }
+
+    /// The frozen cwd map memoizes a symlinked spelling too: repointing
+    /// it mid-pass does not move this pass's binding, and the next pass's
+    /// cache resolves what the filesystem says then.
+    #[test]
+    fn a_binding_cache_freezes_a_cwd_symlink_for_its_pass_only() {
+        let base = ScratchDir::new("bind-cwd-symlink");
+        let a = base.join("a");
+        let b = base.join("b");
+        // `inside` must exist on both targets: canonicalize resolves every
+        // component, and a missing tail leaves the raw spelling.
+        std::fs::create_dir_all(a.join("inside")).unwrap();
+        std::fs::create_dir_all(b.join("inside")).unwrap();
+        let link = base.join("cwd");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let mut p = pane("%1", "@1", "$0");
+        p.cwd = Some(link.join("inside"));
+        let inv = inventory(vec![p]);
+        let cache = BindingCache::new(&inv);
+        assert!(cache.binds(&inv.panes[0], None, &a));
+        // Repointing the symlink keeps this pass's frozen resolution.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        assert!(cache.binds(&inv.panes[0], None, &a));
+        assert!(!cache.binds(&inv.panes[0], None, &b));
+        // A fresh pass resolves the spelling the filesystem reports now.
+        let fresh = BindingCache::new(&inv);
+        assert!(!fresh.binds(&inv.panes[0], None, &a));
+        assert!(fresh.binds(&inv.panes[0], None, &b));
     }
 
     #[test]
