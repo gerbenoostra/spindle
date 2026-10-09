@@ -929,6 +929,10 @@ impl Collector {
         // any Git subprocess runs. The store loads here too - the journal
         // and authored records are stage-1 evidence.
         let observed_at = runtime.observed_at;
+        // The pass's canonical binding cache: pane cwds freeze now, root
+        // spellings resolve lazily so an anchor discovered mid-pass still
+        // binds. Dropped when the pass ends; the next pass rebuilds it.
+        let bindings = tmux::BindingCache::new(&runtime.panes);
         let inventory = self.claude.scan();
         self.model.errors = inventory.errors;
         // Stamp before loading: a write racing the load then shows as a
@@ -1084,7 +1088,7 @@ impl Collector {
             ));
         }
         self.model.conversations = conversations;
-        if !self.emit(runtime, own_pane, publish) {
+        if !self.emit(runtime, own_pane, &bindings, publish) {
             return;
         }
 
@@ -1157,7 +1161,7 @@ impl Collector {
             .chain(spaces.iter().map(|p| p.display().to_string()))
             .collect();
         self.model.repos.retain(|id, _| keep.contains(id));
-        if !self.emit(runtime, own_pane, publish) {
+        if !self.emit(runtime, own_pane, &bindings, publish) {
             return;
         }
 
@@ -1174,7 +1178,15 @@ impl Collector {
                         common_dir: PathBuf::from(repo_id),
                     };
                     vector::collect_local_repo(&repo, |anchor| {
-                        runtime_facts(runtime, conversations, running, placements, anchor, repo_id)
+                        runtime_facts(
+                            runtime,
+                            conversations,
+                            running,
+                            placements,
+                            anchor,
+                            repo_id,
+                            &bindings,
+                        )
                     })
                     .map_err(|e| anchor_error(repo_id, e)) // coverage: off - needs a repo whose worktree read fails mid-pass
                 },
@@ -1184,7 +1196,7 @@ impl Collector {
                         Ok(local) => self.merge_repo(repo_id, local),
                         Err(error) => self.fail_repo(repo_id, error), // coverage: off - needs a repo's worktree list to fail after its cwd resolved, mid-pass
                     }
-                    alive = self.emit(runtime, own_pane, publish);
+                    alive = self.emit(runtime, own_pane, &bindings, publish);
                 },
             );
             if !alive {
@@ -1196,11 +1208,12 @@ impl Collector {
             &inventory.conversations,
             &running,
             &mut placements,
+            &bindings,
         );
         if local_only {
             // The action re-resolve ends where the network begins: no
             // remote or forge ask belongs on a keypress's path.
-            let _ = self.emit(runtime, own_pane, publish);
+            let _ = self.emit(runtime, own_pane, &bindings, publish);
             return;
         }
         // Stage 3 - remote evidence, one `ls-remote --symref` per repo and
@@ -1265,7 +1278,7 @@ impl Collector {
                 continue; // coverage: off - fan_out delivers every index
             };
             self.apply_to_repo(repo_id, applied);
-            if !self.emit(runtime, own_pane, publish) {
+            if !self.emit(runtime, own_pane, &bindings, publish) {
                 return;
             }
         }
@@ -1282,7 +1295,7 @@ impl Collector {
             self.sync_work(&store, now_ms);
         }
         self.model.complete = true;
-        self.emit(runtime, own_pane, publish);
+        self.emit(runtime, own_pane, &bindings, publish);
     }
 
     /// The forge fan-out: enumerate every branch anchor's `(remote_url,
@@ -1597,6 +1610,7 @@ impl Collector {
         &mut self,
         runtime: &Runtime,
         own_pane: Option<&PaneRef>,
+        bindings: &tmux::BindingCache,
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) -> bool {
         let now = epoch(runtime.observed_at);
@@ -1636,7 +1650,7 @@ impl Collector {
                     for anchor in &local.anchors {
                         let mut row =
                             work_row(id, &model.name, &anchor.state, anchor.ref_head(), authored);
-                        row.panes = anchor_panes(&anchor.state.anchor, &runtime.panes);
+                        row.panes = anchor_panes(&anchor.state.anchor, &runtime.panes, bindings);
                         work.push(row);
                     }
                 }
@@ -1654,7 +1668,13 @@ impl Collector {
             .iter()
             .filter_map(|w| w.worktree.as_ref().map(|p| p.display().to_string()))
             .collect();
-        work.extend(gone_rows(&self.model, authored, runtime, &live_paths));
+        work.extend(gone_rows(
+            &self.model,
+            authored,
+            runtime,
+            &live_paths,
+            bindings,
+        ));
         // A branch row's session counts are its incarnation's, not its
         // location's: runtime facts count every conversation under the
         // worktree or repo, but the row claims only the exact touches to
@@ -1778,6 +1798,7 @@ impl Collector {
         conversations: &[Conversation],
         running: &[bool],
         placements: &mut [Option<CwdPlacement>],
+        bindings: &tmux::BindingCache,
     ) {
         let mut claimed: Vec<(PathBuf, String, Option<String>)> = Vec::new();
         for (repo_id, model) in &self.model.repos {
@@ -1857,6 +1878,7 @@ impl Collector {
                     placements,
                     &work.state.anchor,
                     repo_id,
+                    bindings,
                 );
                 work.state.vector.windows = facts.windows;
                 work.state.vector.live_pids = facts.live_pids;
@@ -2044,6 +2066,7 @@ fn runtime_facts(
     placements: &[Option<CwdPlacement>],
     anchor: &Anchor,
     repo_id: &str,
+    bindings: &tmux::BindingCache,
 ) -> RuntimeFacts {
     let (path, admin_id) = match anchor {
         Anchor::Worktree { path, admin_id, .. } => (Some(path.as_path()), admin_id.as_deref()),
@@ -2056,13 +2079,13 @@ fn runtime_facts(
         past_agent_sessions: 0,
     };
     if let Some(path) = path {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned()); // coverage: off - a reported path canonicalizes
-        facts.windows.total = runtime.panes.windows_bound(admin_id, path);
+        let canonical = bindings.root(path);
+        facts.windows.total = bindings.windows_bound(&runtime.panes, admin_id, path);
         // Orphaned windows are bound by derived evidence alone: a window
         // carrying no stored worktree edge whose pane cwds land inside.
         let mut orphaned = std::collections::HashSet::new();
         for pane in &runtime.panes.panes {
-            if pane.wt_adminid.is_none() && pane.binds_worktree(admin_id, path) {
+            if pane.wt_adminid.is_none() && bindings.binds_at(pane, admin_id, &canonical) {
                 orphaned.insert((&pane.socket, &pane.window));
             }
         }
@@ -2610,14 +2633,21 @@ fn apply_path_record(row: &mut WorkRow, authored: &store::Work) {
 
 /// The panes bound to an anchor's worktree - a branch-only anchor binds
 /// nothing by path.
-fn anchor_panes(anchor: &Anchor, panes: &tmux::PaneInventory) -> Vec<PaneRow> {
+fn anchor_panes(
+    anchor: &Anchor,
+    panes: &tmux::PaneInventory,
+    bindings: &tmux::BindingCache,
+) -> Vec<PaneRow> {
     let Anchor::Worktree { path, admin_id, .. } = anchor else {
         return Vec::new();
     };
+    // The anchor's root resolves once; each pane then compares its frozen
+    // cwd spelling purely, canonicalizing nothing per pane.
+    let root = bindings.root(path);
     panes
         .panes
         .iter()
-        .filter(|p| p.binds_worktree(admin_id.as_deref(), path))
+        .filter(|p| bindings.binds_at(p, admin_id.as_deref(), &root))
         .map(|p| PaneRow {
             handle: format!("{}:{}.{}", p.session_name, p.window, p.id),
             command: p.command.clone(),
@@ -2771,6 +2801,7 @@ fn gone_rows(
     authored: &store::Work,
     runtime: &Runtime,
     live_paths: &HashSet<String>,
+    bindings: &tmux::BindingCache,
 ) -> Vec<WorkRow> {
     let mut rows = Vec::new();
     let numbers = incarnation_numbers(authored);
@@ -2806,6 +2837,7 @@ fn gone_rows(
             record.inputs.admin_id.as_deref(),
             &path,
             &model.conversations,
+            bindings,
         );
         if refs.is_empty() {
             continue;
@@ -2850,7 +2882,7 @@ fn gone_rows(
             continue;
         }
         let path = PathBuf::from(path_str);
-        let refs = references(&runtime.panes, None, &path, &model.conversations);
+        let refs = references(&runtime.panes, None, &path, &model.conversations, bindings);
         if refs.is_empty() {
             continue;
         }
@@ -2891,12 +2923,16 @@ fn references(
     admin_id: Option<&str>,
     path: &Path,
     conversations: &[ConversationRow],
+    bindings: &tmux::BindingCache,
 ) -> Vec<ReferenceRow> {
     let mut refs = Vec::new();
     let mut windows = std::collections::BTreeSet::new();
     let mut sessions = std::collections::BTreeSet::new();
+    // The gone path resolves once per pass like a live root: a vanished
+    // directory falls back to its literal spelling, same as uncached.
+    let root = bindings.root(path);
     for pane in &panes.panes {
-        if !pane.binds_worktree(admin_id, path) {
+        if !bindings.binds_at(pane, admin_id, &root) {
             continue;
         }
         refs.push(ReferenceRow {
@@ -2923,8 +2959,13 @@ fn references(
         label: session,
     }));
     for c in conversations.iter().filter(|c| c.running()) {
-        let inside = c.cwd.as_deref().is_some_and(|cwd| inside_path(cwd, path))
-            || c.worktree.as_deref().is_some_and(|w| inside_path(w, path));
+        let inside = c
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| inside_resolved(cwd, &root))
+            || c.worktree
+                .as_deref()
+                .is_some_and(|w| inside_resolved(w, &root));
         if !inside {
             continue;
         }
@@ -2949,6 +2990,13 @@ fn inside_path(cwd: &Path, root: &Path) -> bool {
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
     let root = root.canonicalize().unwrap_or_else(|_| root.to_owned());
     cwd.starts_with(&root)
+}
+
+/// `inside_path` against a `root` the binding cache already resolved: only
+/// the conversation's side still needs canonicalizing.
+fn inside_resolved(cwd: &Path, root: &Path) -> bool {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
+    cwd.starts_with(root)
 }
 
 /// The reference counts a gone row's summary names.
@@ -5307,7 +5355,13 @@ mod tests {
             vec![pane, pane2, pane3, stray],
         );
         let live_paths = HashSet::new();
-        let rows = gone_rows(&model, &work, &live_rt, &live_paths);
+        let rows = gone_rows(
+            &model,
+            &work,
+            &live_rt,
+            &live_paths,
+            &tmux::BindingCache::new(&live_rt.panes),
+        );
         assert_eq!(rows.len(), 3, "{rows:?}");
         let space_row = rows
             .iter()
@@ -5340,11 +5394,29 @@ mod tests {
         // but lists nowhere.
         let quiet = runtime(vec![], vec![]);
         let model = Model::default();
-        assert!(gone_rows(&model, &work, &quiet, &live_paths).is_empty());
+        assert!(
+            gone_rows(
+                &model,
+                &work,
+                &quiet,
+                &live_paths,
+                &tmux::BindingCache::new(&quiet.panes)
+            )
+            .is_empty()
+        );
         // The same workspace live under a new anchor: the closed record
         // does not resurrect as gone.
         let live_paths: HashSet<String> = [missing.clone()].into_iter().collect();
-        assert!(gone_rows(&model, &work, &quiet, &live_paths).is_empty());
+        assert!(
+            gone_rows(
+                &model,
+                &work,
+                &quiet,
+                &live_paths,
+                &tmux::BindingCache::new(&quiet.panes)
+            )
+            .is_empty()
+        );
         // A vanished project space follows the same rule.
         let space =
             std::env::temp_dir().join(format!("agent-sessions-gone-{}-b", std::process::id()));
@@ -5386,7 +5458,13 @@ mod tests {
             conversations: vec![c, c2],
             ..Default::default()
         };
-        let rows = gone_rows(&model, &paths, &quiet, &live_paths);
+        let rows = gone_rows(
+            &model,
+            &paths,
+            &quiet,
+            &live_paths,
+            &tmux::BindingCache::new(&quiet.panes),
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind, WorkKind::Detached);
         assert_eq!(rows[0].gone.as_deref(), Some("worktree gone"));
@@ -5448,7 +5526,13 @@ mod tests {
             conversations: vec![agent],
             ..Default::default()
         };
-        let rows = gone_rows(&model, &work, &rt, &HashSet::new());
+        let rows = gone_rows(
+            &model,
+            &work,
+            &rt,
+            &HashSet::new(),
+            &tmux::BindingCache::new(&rt.panes),
+        );
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].identity.as_deref(), Some("i2"));
         assert_eq!(
