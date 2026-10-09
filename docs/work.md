@@ -105,6 +105,11 @@ with ties ordered by their reason list.
 - `o` trusts only the URL the collected row recorded - because a local
   refresh cannot replace missing forge evidence; not re-deriving or guessing
   a URL at keypress time.
+- Each conversation gets one summary row keyed by its full
+  provider-qualified key - because labels and short ids collide and repeated
+  labels obscure which conversation a row names; not label or short-id
+  deduplication (distinct conversations would merge) and not per-turn
+  display (the noise the summary exists to remove).
 
 The architecture and failure semantics live in
 [work-lifecycle](architecture/work-lifecycle.md) and

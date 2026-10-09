@@ -128,3 +128,19 @@ rather than "noticed 30 days ago".
   because unreferenced history must stay bounded while history that is
   still in use must survive; not unbounded growth (the store becomes the
   problem) nor aggressive expiry (audit value is the point of keeping it).
+- Conversation context is captured per work record - because
+  conversations move between work records; not resolving historical rows
+  from current provider state (a later placement would overwrite earlier
+  context).
+- An equal-time session update only fills missing metadata - because
+  polling proves no newer source occurrence; not unconditional
+  replacement (it rewrites captured context without newer activity).
+- Prompt excerpts are stored bounded and raw, escaped once at render -
+  because excerpts avoid retaining transcripts and escaped-cell bounds
+  preserve safe terminal display; not byte truncation (it splits Unicode
+  or undercounts control escapes) or pre-escaped storage (it risks double
+  escaping).
+- Additive optional context and coverage metadata leave the work schema
+  unchanged - because resetting it discards incarnation and parking
+  history; not versioning an additive change (legacy records can default
+  absent fields).
