@@ -14,7 +14,8 @@ use agent_sessions::runtime::Runtime;
 use agent_sessions::snapshot::{Collector, Snapshot, WorkKind, WorkRow, to_json};
 use agent_sessions::store::{
     ActivitySource, BranchRecord, Confidence, ContinuityEvidence, DatedTouch, LifecycleInputs,
-    ObservationSource, ObservedRef, RefCreationEvidence, Store, TouchPlacement, TouchProvenance,
+    ObservationSource, ObservedRef, RefCreationEvidence, SessionContext, SessionUpdate, Store,
+    TouchPlacement, TouchProvenance, UpdateIdentity, conversation_key,
 };
 use agent_sessions::tui::{App, Key};
 use ratatui::Terminal;
@@ -1442,6 +1443,29 @@ fn a_row_records_commit_working_tree_and_session_updates() {
     let world = world();
     world.repo.branch_with_commits("feat-login", 1, false);
     let wt = world.repo.add_worktree("feat", Some("feat-login"));
+    let repo = agent_sessions::git::Repo::discover(&wt)
+        .expect("the worktree resolves a repository")
+        .expect("the worktree's repository exists");
+    let created_at = repo
+        .reflog_times(Path::new("logs/refs/heads/feat-login"))
+        .created_at
+        .expect("the branch's creation entry");
+    let epoch = created_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the creation is dated")
+        .as_secs()
+        + 1;
+    let date = format!("@{epoch} +0000");
+    let out = fixture::command(Some(&wt), &["commit", "--amend", "--no-edit"])
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .output()
+        .expect("git commit runs");
+    assert!(
+        out.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     transcript(&world.home, CONV, &wt);
     let first = collect(&world);
     let row = work(&first, "feat-login");
@@ -1454,8 +1478,24 @@ fn a_row_records_commit_working_tree_and_session_updates() {
         !row.activities.is_empty(),
         "the first pass already proves source-backed work"
     );
-
-    world.repo.commit(&wt, "a.txt", "x", "retry handling");
+    let tip_sha = world
+        .repo
+        .git(&wt, &["rev-parse", "--short=7", "HEAD"])
+        .trim()
+        .to_owned();
+    let tip_reason = format!("{tip_sha} feat-login 0");
+    fs::write(wt.join("a.txt"), "x").expect("write");
+    world.repo.git(&wt, &["add", "a.txt"]);
+    let out = fixture::command(Some(&wt), &["commit", "-m", "retry handling"])
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .output()
+        .expect("git commit runs");
+    assert!(
+        out.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     fs::write(wt.join("loose change.txt"), "y").expect("write");
     turn_at(
         &world.home,
@@ -1474,10 +1514,26 @@ fn a_row_records_commit_working_tree_and_session_updates() {
     // commit activity the first pass backfilled.
     let landed: Vec<_> = commits
         .iter()
-        .filter(|c| c.reasons[0].ends_with(" retry handling"))
+        .filter(|c| c.reasons.iter().any(|r| r.ends_with(" retry handling")))
         .collect();
     assert_eq!(landed.len(), 1, "{:?}", row.activities);
-    assert_eq!(landed[0].reasons[0].split(' ').next().unwrap().len(), 7);
+    let reason = landed[0]
+        .reasons
+        .iter()
+        .find(|r| r.ends_with(" retry handling"))
+        .expect("the pinned commit's reason");
+    assert_eq!(reason.split(' ').next().unwrap().len(), 7);
+    assert_eq!(
+        landed[0].occurred_at_ms,
+        epoch * 1000,
+        "the pinned commit merges at the tip's own time: {:?}",
+        row.activities
+    );
+    assert!(
+        landed[0].reasons.contains(&tip_reason),
+        "the merged event keeps both reasons: {:?}",
+        landed[0].reasons
+    );
     let trees: Vec<_> = row
         .observations
         .iter()
@@ -1779,5 +1835,128 @@ fn a_dirty_tree_activity_reads_the_files_own_mtime_and_a_deletion_nothing() {
                 .collect::<Vec<_>>()
         ),
         Some(1_000_000_000)
+    );
+}
+
+#[test]
+fn session_context_is_captured_per_record_across_paths_and_incarnations() {
+    let world = world();
+    let store = store(&world.home);
+    let repo = repo_id(&world.repo);
+    // One branch record and one path record; the same provider-qualified
+    // conversation key updates both with different captures.
+    store
+        .sync_repo(&repo, &[obs("feat", None, None)], 1_000)
+        .unwrap();
+    store
+        .sync_path(
+            "/spaces/x",
+            "/spaces/x",
+            &LifecycleInputs::default(),
+            &[],
+            1_000,
+        )
+        .unwrap();
+    let id1 = store
+        .load()
+        .work
+        .branch(&repo, "feat")
+        .expect("active")
+        .id
+        .clone();
+    let key = conversation_key("claude", "shared-session");
+    let update = |identity: UpdateIdentity, title: &str, prompt: &str| SessionUpdate {
+        identity,
+        conversation: key.clone(),
+        at_ms: 5_000,
+        reason: "turn".to_owned(),
+        context: SessionContext {
+            title: Some(title.to_owned()),
+            prompt_excerpt: Some(prompt.to_owned()),
+        },
+    };
+    store
+        .sync_session_updates(&[
+            update(
+                UpdateIdentity::Branch(id1.clone()),
+                "branch title",
+                "branch prompt",
+            ),
+            update(
+                UpdateIdentity::Path("/spaces/x".to_owned()),
+                "path title",
+                "path prompt",
+            ),
+        ])
+        .unwrap();
+    let work = store.load().work;
+    let branch = work.branches.get(&id1).expect("the branch record");
+    let path = work.path("/spaces/x").expect("the path record");
+    assert_eq!(
+        branch.session_context[&key].prompt_excerpt.as_deref(),
+        Some("branch prompt")
+    );
+    assert_eq!(
+        path.session_context[&key].prompt_excerpt.as_deref(),
+        Some("path prompt"),
+        "the same key on another record keeps its own capture"
+    );
+
+    // The branch closes and the name reopens as a new incarnation: the
+    // new record starts empty - no cursor, no context inherited - while
+    // the closed one keeps its own capture unchanged.
+    store.sync_repo(&repo, &[], 2_000).unwrap();
+    store
+        .sync_repo(
+            &repo,
+            &[obs(
+                "feat",
+                None,
+                Some(RefCreationEvidence {
+                    head: "aaa1111".to_owned(),
+                    at_ms: 2_500,
+                }),
+            )],
+            3_000,
+        )
+        .unwrap();
+    let work = store.load().work;
+    let id2 = work
+        .branch(&repo, "feat")
+        .expect("the new incarnation")
+        .id
+        .clone();
+    assert_ne!(id1, id2, "a recreated name is a new incarnation");
+    assert!(work.branches.get(&id2).unwrap().session_context.is_empty());
+    store
+        .sync_session_updates(&[update(
+            UpdateIdentity::Branch(id2.clone()),
+            "new title",
+            "new prompt",
+        )])
+        .unwrap();
+    let work = store.load().work;
+    let old = work.branches.get(&id1).expect("the closed record");
+    assert!(old.ended_at.is_some());
+    assert_eq!(
+        old.session_context[&key].prompt_excerpt.as_deref(),
+        Some("branch prompt"),
+        "the old incarnation keeps its own capture"
+    );
+    let new = work.branches.get(&id2).unwrap();
+    assert_eq!(
+        new.session_context[&key].prompt_excerpt.as_deref(),
+        Some("new prompt")
+    );
+    assert_eq!(
+        new.session_context[&key].title.as_deref(),
+        Some("new title")
+    );
+    // The path record is untouched by any of it.
+    assert_eq!(
+        work.path("/spaces/x").unwrap().session_context[&key]
+            .prompt_excerpt
+            .as_deref(),
+        Some("path prompt")
     );
 }

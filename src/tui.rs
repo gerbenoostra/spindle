@@ -29,11 +29,12 @@ use crate::attention::{Attention, ClaimOutcome};
 use crate::config;
 use crate::forge::{Pipeline, WorkItem};
 use crate::snapshot::{
-    AttachmentLiveness, AttachmentRow, ConversationRow, ConversationState, IncarnationRow,
-    ReferenceKind, RelationStrength, RepoRow, Snapshot, Upstream, WorkKind, WorkRow, WorkSection,
-    to_json,
+    AttachmentLiveness, AttachmentRow, ConversationRow, ConversationState, ConversationSummary,
+    IncarnationRow, ReferenceKind, RelationStrength, RepoRow, Snapshot, Upstream, WorkKind,
+    WorkRow, WorkSection, to_json,
 };
 use crate::store::{self, Store};
+use crate::text::escape_text;
 use crate::tmux::{self, PaneRef};
 
 /// The four panes, in `Tab` order.
@@ -1403,24 +1404,22 @@ impl App {
             ),
             width,
         );
-        for line in event_lines(
-            &w.activities,
-            |e| {
-                serde_json::to_value(e.source)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_default()
-            },
-            |e| e.occurred_at_ms,
-            |e| &e.reasons,
-            now.saturating_mul(1000),
-        ) {
+        for line in activity_lines(w, now.saturating_mul(1000)) {
             push_text(out, line, width);
         }
-        if !w.observations.is_empty() {
+        // A working-tree observation whose linked activity still covers
+        // every reason is the same evidence rendered twice: it stays in
+        // the raw history but drops from the display. The filter runs
+        // before the section check and the per-source cap, so a covered
+        // newest event cannot push an uncovered older one out.
+        let (observations, git_state) = partition_work_observations(w);
+        for line in git_state_lines(&git_state, now.saturating_mul(1000)) {
+            push_text(out, line, width);
+        }
+        if !observations.is_empty() {
             push_head(out, "observations:".to_owned(), width);
             for line in event_lines(
-                &w.observations,
+                &observations,
                 |e| {
                     serde_json::to_value(e.source)
                         .ok()
@@ -2409,22 +2408,6 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Provider text made printable on one line: control characters become
-/// visible escapes so a prompt or reason cannot paint over the pane.
-fn escape_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// The string, or `?` where the field never proved one.
 fn opt(s: &Option<String>) -> String {
     s.clone().unwrap_or_else(|| "?".to_owned())
@@ -2465,6 +2448,73 @@ fn ref_kind(kind: ReferenceKind) -> &'static str {
 
 const EVENT_DISPLAY_PER_SOURCE: usize = 7;
 
+/// The activity source's serialized name - the label a group header
+/// renders with `_` as spaces.
+fn activity_source_name(e: &store::ActivityEvent) -> String {
+    serde_json::to_value(e.source)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// The conversation's short id for a summary row: the first eight
+/// characters of the session part of its provider-qualified key, or of
+/// the whole key where an opaque legacy key carries no provider prefix.
+fn short_conversation_id(key: &str) -> String {
+    let session = key.split_once('\u{0}').map(|(_, s)| s).unwrap_or(key);
+    session.chars().take(8).collect()
+}
+
+/// The `activity:` section's lines: every source's events grouped and
+/// ordered exactly as `event_lines` renders them, except the conversation
+/// group - where the record carries cursor-backed summaries it shows one
+/// compact row per conversation (newest occurrence first, then full key,
+/// capped at [`EVENT_DISPLAY_PER_SOURCE`] after compaction) in place of
+/// the raw per-turn reasons. A record without summaries keeps the raw
+/// trail as its fallback.
+fn activity_lines(w: &WorkRow, now_ms: u64) -> Vec<String> {
+    let raw: Vec<&store::ActivityEvent> = w
+        .activities
+        .iter()
+        .filter(|event| {
+            event.source != store::ActivitySource::Conversation
+                || w.conversation_summaries.is_empty()
+        })
+        .collect();
+    let mut groups = event_groups(
+        &raw,
+        |e| activity_source_name(e),
+        |e| e.occurred_at_ms,
+        |e| e.reasons.as_slice(),
+        now_ms,
+    );
+    if !w.conversation_summaries.is_empty() {
+        let mut summaries: Vec<&ConversationSummary> = w.conversation_summaries.iter().collect();
+        summaries.sort_by(|a, b| {
+            b.occurred_at_ms
+                .cmp(&a.occurred_at_ms)
+                .then(a.key.cmp(&b.key))
+        });
+        let newest = summaries.first().map(|s| s.occurred_at_ms).unwrap_or(0);
+        let mut lines = vec!["  conversation:".to_owned()];
+        for summary in summaries.into_iter().take(EVENT_DISPLAY_PER_SOURCE) {
+            let when = age_ms(now_ms, summary.occurred_at_ms);
+            let id = escape_text(&short_conversation_id(&summary.key));
+            let context = summary.context.as_ref();
+            let prompt = context.and_then(|c| c.prompt_excerpt.as_deref());
+            let title = context.and_then(|c| c.title.as_deref());
+            let detail = match (prompt, title) {
+                (Some(prompt), _) => format!(" - prompt: {}", escape_text(prompt)),
+                (None, Some(title)) => format!(" - {}", escape_text(title)),
+                (None, None) => String::new(),
+            };
+            lines.push(format!("    last activity {when} {id}{detail}"));
+        }
+        groups.push((newest, "conversation".to_owned(), lines));
+    }
+    grouped_lines(groups)
+}
+
 /// A row's events rendered grouped by source, groups ordered by their
 /// newest event and each event listed at its own `at` - the shape the
 /// `activity:` and `observations:` sections share, where `at` is the
@@ -2476,31 +2526,100 @@ fn event_lines<E>(
     reasons: impl Fn(&E) -> &[String],
     now_ms: u64,
 ) -> Vec<String> {
+    grouped_lines(event_groups(events, source, at, reasons, now_ms))
+}
+
+fn event_groups<E>(
+    events: &[E],
+    source: impl Fn(&E) -> String,
+    at: impl Fn(&E) -> u64,
+    reasons: impl Fn(&E) -> &[String],
+    now_ms: u64,
+) -> Vec<(u64, String, Vec<String>)> {
     let mut by_source: std::collections::BTreeMap<String, Vec<&E>> =
         std::collections::BTreeMap::new();
     for event in events {
         by_source.entry(source(event)).or_default().push(event);
     }
-    let mut groups: Vec<(u64, String, Vec<&E>)> = by_source
+    by_source
         .into_iter()
-        .map(|(source, events)| {
-            (
-                events.iter().map(|e| at(e)).max().unwrap_or(0),
-                source,
-                events,
-            )
-        })
-        .collect();
-    groups.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    let mut lines = Vec::new();
-    for (_, source, mut events) in groups {
-        lines.push(format!("  {}:", source.replace('_', " ")));
-        events.sort_by_key(|e| std::cmp::Reverse(at(e)));
-        for event in events.iter().take(EVENT_DISPLAY_PER_SOURCE) {
-            let when = age_ms(now_ms, at(event));
-            for reason in reasons(event) {
-                lines.push(format!("    {when} {}", escape_text(reason)));
+        .map(|(source, mut events)| {
+            let newest = events.iter().map(|e| at(e)).max().unwrap_or(0);
+            let mut lines = vec![format!("  {}:", source.replace('_', " "))];
+            events.sort_by_key(|e| std::cmp::Reverse(at(e)));
+            for event in events.iter().take(EVENT_DISPLAY_PER_SOURCE) {
+                let when = age_ms(now_ms, at(event));
+                for reason in reasons(event) {
+                    lines.push(format!("    {when} {}", escape_text(reason)));
+                }
             }
+            (newest, source, lines)
+        })
+        .collect()
+}
+
+fn grouped_lines(mut groups: Vec<(u64, String, Vec<String>)>) -> Vec<String> {
+    groups.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    groups.into_iter().flat_map(|(_, _, lines)| lines).collect()
+}
+
+fn partition_work_observations(
+    w: &WorkRow,
+) -> (Vec<store::ObservationEvent>, Vec<store::ObservationEvent>) {
+    const GIT_STATE_PREFIXES: [&str; 3] = ["ahead: ", "behind: ", "unpushed: "];
+    let is_count = |r: &&String| GIT_STATE_PREFIXES.iter().any(|p| r.starts_with(p));
+    let mut remaining = Vec::new();
+    let mut git_state = Vec::new();
+    for event in w
+        .observations
+        .iter()
+        .filter(|e| !e.is_covered_by(&w.activities))
+    {
+        if event.source != store::ObservationSource::Lifecycle {
+            remaining.push(event.clone());
+            continue;
+        }
+        let mut counts: Vec<String> = event.reasons.iter().filter(is_count).cloned().collect();
+        if counts.is_empty() {
+            remaining.push(event.clone());
+            continue;
+        }
+        counts.sort();
+        git_state.push(store::ObservationEvent {
+            reasons: counts,
+            ..event.clone()
+        });
+        let rest: Vec<String> = event
+            .reasons
+            .iter()
+            .filter(|r| !is_count(r))
+            .cloned()
+            .collect();
+        if !rest.is_empty() {
+            remaining.push(store::ObservationEvent {
+                reasons: rest,
+                ..event.clone()
+            });
+        }
+    }
+    (remaining, git_state)
+}
+
+fn git_state_lines(events: &[store::ObservationEvent], now_ms: u64) -> Vec<String> {
+    if events.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&store::ObservationEvent> = events.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.observed_at_ms
+            .cmp(&a.observed_at_ms)
+            .then(a.reasons.cmp(&b.reasons))
+    });
+    let mut lines = vec!["  git state (observed):".to_owned()];
+    for event in sorted.iter().take(EVENT_DISPLAY_PER_SOURCE) {
+        let when = age_ms(now_ms, event.observed_at_ms);
+        for reason in &event.reasons {
+            lines.push(format!("    observed {when} {}", escape_text(reason)));
         }
     }
     lines
@@ -2975,6 +3094,7 @@ mod tests {
                     dirty: Some(true),
                     broken: None,
                     activities: Vec::new(),
+                    conversation_summaries: Vec::new(),
                     observations: Vec::new(),
                     commits_ahead: Some(3),
                     unpushed: Some(3),
@@ -3022,6 +3142,7 @@ mod tests {
                     dirty: Some(false),
                     broken: None,
                     activities: Vec::new(),
+                    conversation_summaries: Vec::new(),
                     observations: Vec::new(),
                     commits_ahead: Some(7),
                     unpushed: Some(7),
@@ -3069,6 +3190,7 @@ mod tests {
                     dirty: None,
                     broken: None,
                     activities: Vec::new(),
+                    conversation_summaries: Vec::new(),
                     observations: Vec::new(),
                     commits_ahead: None,
                     unpushed: None,

@@ -280,6 +280,7 @@ fn work_row(name: &str, forge: WorkItem, url: Option<&str>) -> WorkRow {
         dirty: None,
         broken: None,
         activities: Vec::new(),
+        conversation_summaries: Vec::new(),
         observations: Vec::new(),
         commits_ahead: None,
         unpushed: None,

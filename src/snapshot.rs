@@ -450,6 +450,11 @@ pub struct WorkRow {
     /// times (`occurred_at_ms`, epoch milliseconds): commit, reflog,
     /// working-tree, forge and conversation work.
     pub activities: Vec<store::ActivityEvent>,
+    /// One summary per conversation the record's cursor proves, newest
+    /// occurrence first then full key - what the detail renders in place
+    /// of raw conversation activity reasons. Empty on a record without
+    /// cursors, where the raw trail is the fallback.
+    pub conversation_summaries: Vec<ConversationSummary>,
     /// The row's scan-time diagnostics, at their detection times
     /// (`observed_at_ms`, epoch milliseconds). Kept beside activity, but
     /// never counted as it.
@@ -464,6 +469,45 @@ pub struct WorkRow {
     /// The section reason followed by the compact evidence tail (`↑3`,
     /// `~dirty`, `no remote`, `no wt`, `merged`, a PR/MR label).
     pub summary: String,
+}
+
+/// One conversation the work record's cursor proves: its full
+/// provider-qualified key, newest source-backed occurrence and the
+/// context that record captured. The prompt excerpt is latest-known
+/// context - not a claim the occurrence dates that prompt.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationSummary {
+    /// `conversation_key(provider, session)` - the full key, so same-time
+    /// summaries and same-prefix ids stay distinct.
+    pub key: String,
+    /// The newest source occurrence the record holds, epoch milliseconds.
+    pub occurred_at_ms: u64,
+    /// The title and bounded prompt excerpt captured for this record;
+    /// `None` where the record never learned either.
+    pub context: Option<store::SessionContext>,
+}
+
+/// A record's cursor map projected into sorted summaries, pairing each
+/// conversation key with the context that record - and no other -
+/// captured for it.
+fn conversation_summaries(
+    activity: &std::collections::BTreeMap<String, u64>,
+    contexts: &std::collections::BTreeMap<String, store::SessionContext>,
+) -> Vec<ConversationSummary> {
+    let mut summaries: Vec<ConversationSummary> = activity
+        .iter()
+        .map(|(key, &occurred_at_ms)| ConversationSummary {
+            key: key.clone(),
+            occurred_at_ms,
+            context: contexts.get(key).cloned(),
+        })
+        .collect();
+    summaries.sort_by(|a, b| {
+        b.occurred_at_ms
+            .cmp(&a.occurred_at_ms)
+            .then(a.key.cmp(&b.key))
+    });
+    summaries
 }
 
 /// One commit on a row's tip that its proven base lacks.
@@ -1496,6 +1540,12 @@ impl Collector {
                     || conv.short_id.clone(),
                     |title| format!("{} {}", conv.short_id, title),
                 ),
+                // Raw latest-known context; the store normalizes and
+                // bounds it at the update boundary.
+                context: store::SessionContext {
+                    title: conv.title.clone(),
+                    prompt_excerpt: conv.latest_prompt.clone(),
+                },
             });
         }
         match store.sync_session_updates(&updates) {
@@ -2092,21 +2142,28 @@ fn work_row(
     // Work identity: an active incarnation's id for a branch row, the
     // canonical path for a detached one. A branch whose record the sync
     // has not written yet carries no identity rather than a guess.
-    let (identity, parked, authored_activities, observations) = match &branch {
+    let (identity, parked, authored_activities, observations, summaries) = match &branch {
         Some(name) => match authored.branch(repo_id, name) {
             Some(r) => (
                 Some(r.id.clone()),
                 r.parked,
                 r.activities.clone(),
                 r.observations.clone(),
+                conversation_summaries(&r.session_activity, &r.session_context),
             ),
-            None => (None, false, Vec::new(), Vec::new()),
+            None => (None, false, Vec::new(), Vec::new(), Vec::new()),
         },
         None => {
             let path = v.worktree.as_ref().map(|p| p.display().to_string());
             match path.as_deref().and_then(|p| authored.path(p)) {
-                Some(r) => (path, r.parked, r.activities.clone(), r.observations.clone()),
-                None => (path, false, Vec::new(), Vec::new()),
+                Some(r) => (
+                    path,
+                    r.parked,
+                    r.activities.clone(),
+                    r.observations.clone(),
+                    conversation_summaries(&r.session_activity, &r.session_context),
+                ),
+                None => (path, false, Vec::new(), Vec::new(), Vec::new()),
             }
         }
     };
@@ -2193,6 +2250,7 @@ fn work_row(
         gone: None,
         references: Vec::new(),
         activities,
+        conversation_summaries: summaries,
         observations,
         worktree_removal: Some(removal),
         branch_deletion: Some(deletion),
@@ -2318,10 +2376,23 @@ fn pass_activities(state: &vector::WorkState, head: Option<&str>) -> Vec<store::
         });
     }
     if let Some(at) = v.reflog_activity {
+        // The reason describes the one entry the timestamp was selected
+        // from - its short new sha plus the raw message (renderers escape
+        // once). A timestamp without matching metadata - inconsistent or
+        // fabricated in-memory evidence, never a real selection - keeps
+        // the generic reason rather than borrowing another line's work;
+        // generic reasons persisted earlier stay untouched.
+        let reason = match &v.reflog_entry {
+            Some(entry) if entry.at == at && !entry.message.is_empty() => {
+                format!("{} {}", short_sha(&entry.new_sha), entry.message)
+            }
+            Some(entry) if entry.at == at => short_sha(&entry.new_sha).to_owned(),
+            _ => "reflog work".to_owned(),
+        };
         events.push(store::ActivityEvent {
             source: store::ActivitySource::Reflog,
             occurred_at_ms: store::epoch_ms(at),
-            reasons: vec!["reflog work".to_owned()],
+            reasons: vec![reason],
         });
     }
     if let Some(status) = worktree_status(state)
@@ -2537,6 +2608,8 @@ fn apply_path_record(row: &mut WorkRow, authored: &store::Work) {
         row.parked = record.parked;
         row.activities = record.activities.clone();
         row.observations = record.observations.clone();
+        row.conversation_summaries =
+            conversation_summaries(&record.session_activity, &record.session_context);
         row.last_activity = row
             .last_activity
             .into_iter()
@@ -2771,6 +2844,10 @@ fn gone_rows(
             references: refs,
             activities: record.activities.clone(),
             observations: record.observations.clone(),
+            conversation_summaries: conversation_summaries(
+                &record.session_activity,
+                &record.session_context,
+            ),
             section: WorkSection::CleanupReview,
             ..space_row(&record.repo, &path)
         });
@@ -2803,6 +2880,10 @@ fn gone_rows(
             references: refs,
             activities: record.activities.clone(),
             observations: record.observations.clone(),
+            conversation_summaries: conversation_summaries(
+                &record.session_activity,
+                &record.session_context,
+            ),
             last_activity: store::newest_activity(&record.activities).map(|ms| ms / 1000),
             section: WorkSection::CleanupReview,
             ..space_row(path_str, &path)
@@ -3266,6 +3347,7 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         gone: None,
         references: Vec::new(),
         activities: Vec::new(),
+        conversation_summaries: Vec::new(),
         observations: Vec::new(),
         worktree_removal: None,
         branch_deletion: None,
@@ -3758,6 +3840,7 @@ mod tests {
             inputs: store::LifecycleInputs::default(),
             observations: Vec::new(),
             session_activity: Default::default(),
+            session_context: Default::default(),
         }
     }
 
@@ -3893,6 +3976,7 @@ mod tests {
                 unpushed_commits: Evidence::Unknown("none asked".to_owned()),
                 landed: Evidence::Unknown("none asked".to_owned()),
                 reflog_activity: None,
+                reflog_entry: None,
                 commit_activity: None,
                 last_git_activity: None,
             },
@@ -3954,6 +4038,7 @@ mod tests {
                 unpushed_commits: Evidence::Unknown("none asked".to_owned()),
                 landed: Evidence::Unknown("none asked".to_owned()),
                 reflog_activity: None,
+                reflog_entry: None,
                 commit_activity: None,
                 last_git_activity: None,
             },
@@ -4427,6 +4512,61 @@ mod tests {
         classify_work(&mut row, &[], Duration::from_secs(10), now);
         assert_eq!(row.section, WorkSection::FollowUp, "{row:?}");
         assert!(row.summary.starts_with("open"), "{}", row.summary);
+    }
+
+    #[test]
+    fn observed_counts_never_reclassify_or_reorder_quiet_work() {
+        let now = 2_000_000_000u64;
+        let count = || store::ObservationEvent {
+            source: store::ObservationSource::Lifecycle,
+            observed_at_ms: now * 1000,
+            reasons: vec!["ahead: 0 -> 1".to_owned()],
+            covered_by: None,
+        };
+        let quiet = |observations: Vec<store::ObservationEvent>,
+                     last_activity: Option<u64>,
+                     identity: &str| WorkRow {
+            kind: WorkKind::Branch,
+            branch: Some("b".to_owned()),
+            dirty: Some(false),
+            commits_ahead: Some(1),
+            unpushed: Some(0),
+            upstream: Upstream::Tracked,
+            landed: Some(Landed::No),
+            last_activity,
+            identity: Some(identity.to_owned()),
+            observations,
+            ..space_row("r", Path::new("/r"))
+        };
+        let threshold = Duration::from_secs(10);
+        let mut bare = quiet(Vec::new(), Some(now - 100_000), "i-bare");
+        classify_work(&mut bare, &[], threshold, now);
+        let mut observed = quiet(vec![count()], Some(now - 100_000), "i-obs");
+        classify_work(&mut observed, &[], threshold, now);
+        assert_eq!(observed.section, WorkSection::Forgotten);
+        assert_eq!(observed.section, bare.section);
+        assert_eq!(observed.summary, bare.summary);
+        assert_eq!(observed.last_activity, Some(now - 100_000));
+
+        let mut silent = quiet(vec![count()], None, "i-none");
+        classify_work(&mut silent, &[], threshold, now);
+        assert_eq!(silent.last_activity, None);
+
+        let mut fresher_old = quiet(Vec::new(), Some(now - 50_000), "i-old2");
+        classify_work(&mut fresher_old, &[], threshold, now);
+        assert_eq!(fresher_old.section, WorkSection::Forgotten);
+        let mut fresh = quiet(Vec::new(), Some(now - 10), "i-fresh");
+        classify_work(&mut fresh, &[], threshold, now);
+
+        let mut rows = vec![observed, fresh, bare, fresher_old];
+        sort_work(&mut rows);
+        assert_eq!(rows[0].identity.as_deref(), Some("i-fresh"));
+        assert_eq!(rows[1].identity.as_deref(), Some("i-old2"));
+        assert_eq!(rows[1].section, WorkSection::Forgotten);
+        assert_eq!(rows[2].identity.as_deref(), Some("i-bare"));
+        assert_eq!(rows[3].identity.as_deref(), Some("i-obs"));
+        assert_eq!(rows[2].last_activity, Some(now - 100_000));
+        assert_eq!(rows[3].last_activity, Some(now - 100_000));
     }
 
     #[test]
@@ -5136,6 +5276,7 @@ mod tests {
             }],
             observations: Vec::new(),
             session_activity: std::collections::BTreeMap::new(),
+            session_context: std::collections::BTreeMap::new(),
         };
         work.paths.insert(space.clone(), space_record);
         // Two live panes bound by their stored worktree edges - the
@@ -5228,6 +5369,7 @@ mod tests {
                 inputs: store::LifecycleInputs::default(),
                 observations: Vec::new(),
                 session_activity: Default::default(),
+                session_context: Default::default(),
             },
         );
         let detached = format!("{}/detached", root.display());
@@ -5243,6 +5385,7 @@ mod tests {
                 },
                 observations: Vec::new(),
                 session_activity: Default::default(),
+                session_context: Default::default(),
             },
         );
         let mut c = live_row("cccccccc-2", 77);
@@ -5301,6 +5444,7 @@ mod tests {
                 },
                 observations: Vec::new(),
                 session_activity: Default::default(),
+                session_context: Default::default(),
             },
         );
         let mut pane = tmux_pane("/sock/a", "%9", 50);
@@ -5456,6 +5600,7 @@ mod tests {
                 unpushed_commits: Evidence::Known(0),
                 landed: Evidence::Unknown("none asked".to_owned()),
                 reflog_activity: Some(UNIX_EPOCH + Duration::from_secs(10)),
+                reflog_entry: None,
                 commit_activity: Some(UNIX_EPOCH + Duration::from_secs(20)),
                 last_git_activity: Some(UNIX_EPOCH + Duration::from_secs(20)),
             },
@@ -5499,5 +5644,135 @@ mod tests {
             "{events:?}"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `WorkState` holding only reflog evidence: `entry` and the
+    /// `reflog_activity` timestamp the selection produced.
+    fn reflog_state(entry: Option<git::ReflogWork>) -> vector::WorkState {
+        vector::WorkState {
+            repo: git::Repo {
+                common_dir: PathBuf::from("/r/.git"),
+            },
+            anchor: Anchor::Branch {
+                name: "feat".to_owned(),
+            },
+            remote_url: None,
+            base: Evidence::Unknown("no base asked".to_owned()),
+            forge: ForgeStatus {
+                item: WorkItem::Unknown,
+                pipeline: Pipeline::Unknown,
+                label: None,
+                url: None,
+                reason: None,
+                occurred_at_ms: None,
+            },
+            broken: None,
+            vector: vector::StateVector {
+                worktree: None,
+                windows: WindowCount::default(),
+                live_pids: 0,
+                live_agent_sessions: 0,
+                past_agent_sessions: 0,
+                dirty: Evidence::Known(false),
+                working_tree: Evidence::Unknown("no worktree".to_owned()),
+                commits_ahead_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_behind_of_base: Evidence::Unknown("none asked".to_owned()),
+                commits_not_on_base: Evidence::Unknown("none asked".to_owned()),
+                upstream_state: UpstreamState::NotApplicable,
+                unpushed_commits: Evidence::Unknown("none asked".to_owned()),
+                landed: Evidence::Unknown("none asked".to_owned()),
+                reflog_activity: entry.as_ref().map(|e| e.at),
+                reflog_entry: entry,
+                commit_activity: None,
+                last_git_activity: None,
+            },
+        }
+    }
+
+    #[test]
+    fn pass_activities_describes_the_selected_reflog_entry() {
+        let at = UNIX_EPOCH + Duration::from_secs(10);
+        let entry = |message: &str, at: SystemTime| git::ReflogWork {
+            at,
+            old_sha: "aaaaaaaaaaaaaaaa".to_owned(),
+            new_sha: "bbbbbbbbbbbbbbbb".to_owned(),
+            message: message.to_owned(),
+        };
+        let reason = |state: &vector::WorkState| {
+            pass_activities(state, None)
+                .into_iter()
+                .find(|e| e.source == store::ActivitySource::Reflog)
+                .map(|e| e.reasons[0].clone())
+        };
+
+        // The selected entry's short new sha and raw message, at its own
+        // time - the renderer escapes the raw text, never the store.
+        let state = reflog_state(Some(entry("commit: raw\ttext", at)));
+        let event = pass_activities(&state, None)
+            .into_iter()
+            .find(|e| e.source == store::ActivitySource::Reflog)
+            .expect("the reflog event");
+        assert_eq!(event.occurred_at_ms, 10_000);
+        assert_eq!(event.reasons, vec!["bbbbbbb commit: raw\ttext"]);
+
+        // No message: the short sha alone is the reason.
+        let state = reflog_state(Some(entry("", at)));
+        assert_eq!(reason(&state).as_deref(), Some("bbbbbbb"));
+
+        // A timestamp the metadata does not match - inconsistent or
+        // fabricated in-memory evidence, which a real selection never
+        // produces - keeps the generic reason rather than borrowing
+        // another line's message.
+        let mut state = reflog_state(Some(entry("commit: else", at)));
+        state.vector.reflog_activity = Some(UNIX_EPOCH + Duration::from_secs(20));
+        assert_eq!(reason(&state).as_deref(), Some("reflog work"));
+        let state = reflog_state(None);
+        assert_eq!(reason(&state), None);
+        let mut state = reflog_state(None);
+        state.vector.reflog_activity = Some(at);
+        assert_eq!(reason(&state).as_deref(), Some("reflog work"));
+    }
+
+    #[test]
+    fn conversation_summaries_pair_context_and_sort_newest_then_key() {
+        let mut activity: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        // Two conversations share one timestamp - the merged activity
+        // event still yields two summaries in stable full-key order - and
+        // a provider-qualified collision prefix stays distinct keys.
+        activity.insert("claude\u{0}aaa11111".to_owned(), 5_000);
+        activity.insert("other\u{0}aaa11111".to_owned(), 5_000);
+        activity.insert("claude\u{0}ccc33333".to_owned(), 9_000);
+        let mut contexts: std::collections::BTreeMap<String, store::SessionContext> =
+            std::collections::BTreeMap::new();
+        contexts.insert(
+            "claude\u{0}aaa11111".to_owned(),
+            store::SessionContext {
+                title: Some("t".to_owned()),
+                prompt_excerpt: None,
+            },
+        );
+        let summaries = conversation_summaries(&activity, &contexts);
+        let keys: Vec<&str> = summaries.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "claude\u{0}ccc33333",
+                "claude\u{0}aaa11111",
+                "other\u{0}aaa11111"
+            ]
+        );
+        assert_eq!(summaries[0].occurred_at_ms, 9_000);
+        assert_eq!(
+            summaries[1]
+                .context
+                .as_ref()
+                .and_then(|c| c.title.as_deref()),
+            Some("t")
+        );
+        assert!(summaries[2].context.is_none());
+        // An empty cursor map projects nothing - the row keeps its raw
+        // conversation trail as the fallback.
+        assert!(conversation_summaries(&std::collections::BTreeMap::new(), &contexts).is_empty());
     }
 }

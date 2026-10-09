@@ -14,6 +14,7 @@ pub mod provider;
 pub mod runtime;
 pub mod snapshot;
 pub mod store;
+mod text;
 pub mod tmux;
 pub mod tui;
 pub mod vector;

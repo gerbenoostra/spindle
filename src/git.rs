@@ -853,9 +853,19 @@ impl Repo {
                 times.created_at = Some(entry.at);
             }
             if entry.work {
-                times.worked_at = Some(times.worked_at.map_or(entry.at, |w| w.max(entry.at)));
+                let work = ReflogWork {
+                    at: entry.at,
+                    old_sha: entry.old,
+                    new_sha: entry.head,
+                    message: entry.message,
+                };
+                times.newest_work = Some(match times.newest_work {
+                    Some(w) => w.max(work),
+                    None => work,
+                });
             }
         }
+        times.worked_at = times.newest_work.as_ref().map(|w| w.at);
         times
     }
 }
@@ -886,6 +896,26 @@ pub struct ReflogTimes {
     pub created_at: Option<SystemTime>,
     /// The newest real work entry's own timestamp.
     pub worked_at: Option<SystemTime>,
+    /// The newest real work entry itself - time, old/new sha and raw
+    /// message as one tuple, so a reason and its moment can never come
+    /// from different lines. Ties on time resolve lexicographically on
+    /// `(old, new, message)`; identical entries collapse to one.
+    pub newest_work: Option<ReflogWork>,
+}
+
+/// One qualifying reflog work entry, selected whole: the moment, the
+/// sha pair it moved between and the message git wrote all come from the
+/// same line.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReflogWork {
+    /// The committer-clock epoch stamped on the line.
+    pub at: SystemTime,
+    /// The line's `old` sha: the tip before this entry.
+    pub old_sha: String,
+    /// The line's `new` sha: the tip after this entry.
+    pub new_sha: String,
+    /// The raw reflog message, unescaped; renderers escape it once.
+    pub message: String,
 }
 
 /// One reflog line: `<old> <new> <ident> <epoch> <tz>\t<msg>`.
@@ -898,8 +928,12 @@ struct ReflogEntry {
     work: bool,
     /// The committer-clock epoch stamped on the line.
     at: SystemTime,
+    /// The line's `old` sha: the tip before this entry.
+    old: String,
     /// The line's `new` sha: the tip after this entry.
     head: String,
+    /// Everything after the first tab - later tabs are the message's own.
+    message: String,
     /// `(old, new)` short names when the message is exactly
     /// `Branch: renamed refs/heads/<old> to refs/heads/<new>`.
     renamed: Option<(String, String)>,
@@ -920,7 +954,8 @@ impl ReflogEntry {
         // The epoch is the second token before the tab when read from the
         // right - robust against spaces inside the identity.
         let epoch: u64 = fields.nth_back(1)?.parse().ok()?;
-        let message = line.split('\t').nth(1).unwrap_or("");
+        // Split once: a message may itself contain tabs, which are its own.
+        let message = line.split_once('\t').map(|(_, m)| m).unwrap_or("");
         let creation = !old.is_empty() && old.bytes().all(|b| b == b'0');
         // A creation entry records the ref coming to be - `branch: Created
         // from`, `clone: from`, or the message-less line `git worktree add`
@@ -938,7 +973,9 @@ impl ReflogEntry {
             creation,
             work,
             at: UNIX_EPOCH + Duration::from_secs(epoch),
+            old: old.to_owned(),
             head: new.to_owned(),
+            message: message.to_owned(),
             renamed: parse_rename(message),
         })
     }
@@ -1917,6 +1954,150 @@ mod tests {
             times.worked_at,
             Some(UNIX_EPOCH + Duration::from_secs(1700000900)),
             "{times:?}"
+        );
+    }
+
+    #[test]
+    fn reflog_times_selects_the_newest_work_entry_wholesale() {
+        let temp = Temp::new();
+        let repo = Repo {
+            common_dir: temp.0.clone(),
+        };
+        let log = Path::new("logs/HEAD");
+        let log_dir = temp.0.join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let write = |body: &str| fs::write(log_dir.join("HEAD"), body).unwrap();
+        let t = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+
+        // Every qualifying operation carries its whole tuple: the time,
+        // the sha pair and the raw message all come from the same line.
+        for (i, message) in [
+            "commit: grow",
+            "commit (amend): grow more",
+            "reset: moving to HEAD~1",
+            "rebase (finish): onto main",
+            "merge: feature",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let epoch = 1_700_001_000 + i as u64;
+            write(&format!(
+                "aaaa{i} bbbb{i} A Name <a@b> {epoch} +0200\t{message}\n"
+            ));
+            let times = repo.reflog_times(log);
+            let work = times.newest_work.as_ref().expect("a work entry");
+            assert_eq!(work.at, t(epoch));
+            assert_eq!(work.old_sha, format!("aaaa{i}"));
+            assert_eq!(work.new_sha, format!("bbbb{i}"));
+            assert_eq!(work.message, message);
+            assert_eq!(times.worked_at, Some(work.at), "{times:?}");
+            assert_eq!(times.created_at, None, "{times:?}");
+        }
+
+        // The repository's first commit is both creation and work: the
+        // null-old line dates `created_at` and its tuple is the selected
+        // entry wholesale.
+        write("0000 ffff A Name <a@b> 1700000900 +0200\tcommit (initial): root\n");
+        let times = repo.reflog_times(log);
+        let work = times.newest_work.as_ref().expect("a work entry");
+        assert_eq!(work.at, t(1_700_000_900));
+        assert_eq!(work.old_sha, "0000");
+        assert_eq!(work.new_sha, "ffff");
+        assert_eq!(work.message, "commit (initial): root");
+        assert_eq!(times.created_at, Some(t(1_700_000_900)));
+        assert_eq!(times.worked_at, Some(work.at));
+
+        // The newest timestamp wins wherever it sits in the file: a stale
+        // line appended after it loses, and `worked_at` is the selected
+        // entry's own time.
+        write(
+            "aaaa 0001 A Name <a@b> 1700001000 +0200\tcommit: newer\n\
+             bbbb cccc A Name <a@b> 1700000500 +0200\tcommit: older\n",
+        );
+        let times = repo.reflog_times(log);
+        let work = times.newest_work.as_ref().expect("a work entry");
+        assert_eq!(work.at, t(1_700_001_000));
+        assert_eq!(work.message, "commit: newer");
+        assert_eq!(times.worked_at, Some(t(1_700_001_000)));
+
+        // A same-time tie resolves on the whole `(old, new, message)`
+        // tuple: each discriminator picks the lexicographically greater
+        // line, and the result is still one coherent entry.
+        write(
+            "aaaa bbbb A Name <a@b> 1700001000 +0200\tcommit: a\n\
+             cccc dddd A Name <a@b> 1700001000 +0200\tcommit: a\n",
+        );
+        let times = repo.reflog_times(log);
+        let work = times.newest_work.as_ref().expect("a work entry");
+        assert_eq!(work.at, t(1_700_001_000));
+        assert_eq!(
+            (work.old_sha.as_str(), work.new_sha.as_str()),
+            ("cccc", "dddd")
+        );
+        write(
+            "aaaa bbbb A Name <a@b> 1700001000 +0200\tcommit: a\n\
+             aaaa cccc A Name <a@b> 1700001000 +0200\tcommit: a\n",
+        );
+        assert_eq!(repo.reflog_times(log).newest_work.unwrap().new_sha, "cccc");
+        // Equal shas: the greater message decides.
+        write(
+            "aaaa bbbb A Name <a@b> 1700001000 +0200\tcommit: a\n\
+             aaaa bbbb A Name <a@b> 1700001000 +0200\tcommit: b\n",
+        );
+        assert_eq!(
+            repo.reflog_times(log).newest_work.unwrap().message,
+            "commit: b"
+        );
+        // Identical entries collapse: the same tuple twice is one entry.
+        write(
+            "aaaa bbbb A Name <a@b> 1700001000 +0200\tcommit: same\n\
+             aaaa bbbb A Name <a@b> 1700001000 +0200\tcommit: same\n",
+        );
+        let work = repo.reflog_times(log).newest_work.unwrap();
+        assert_eq!(work.new_sha, "bbbb");
+        assert_eq!(work.message, "commit: same");
+
+        // A work line with no tab at all carries an empty message.
+        write("aaaa bbbb A Name <a@b> 1700001000 +0200\n");
+        let work = repo.reflog_times(log).newest_work.unwrap();
+        assert_eq!(work.message, "");
+        assert_eq!(
+            (work.old_sha.as_str(), work.new_sha.as_str()),
+            ("aaaa", "bbbb")
+        );
+
+        // Tabs inside the message are the message's own: only the first
+        // tab splits header from text, and control bytes and Unicode pass
+        // through raw - escaping is the renderer's job, once.
+        write("aaaa bbbb A Name <a@b> 1700001000 +0200\tcommit: a\tb \u{7} 日本語\n");
+        let work = repo.reflog_times(log).newest_work.unwrap();
+        assert_eq!(work.message, "commit: a\tb \u{7} 日本語");
+
+        // Exclusions carry no metadata either: bookkeeping, a no-move
+        // entry and a non-initial creation all leave `newest_work` empty.
+        for body in [
+            "aaaa bbbb A Name <a@b> 1700001000 +0200\tcheckout: moving to b\n",
+            "aaaa bbbb A Name <a@b> 1700001000 +0200\tBranch: renamed refs/heads/x to refs/heads/y\n",
+            "aaaa aaaa A Name <a@b> 1700001000 +0200\treset: moving to HEAD\n",
+            "0000 aaaa A Name <a@b> 1700001000 +0200\tbranch: Created from main\n",
+        ] {
+            write(body);
+            let times = repo.reflog_times(log);
+            assert_eq!(times.newest_work, None, "{body}");
+            assert_eq!(times.worked_at, None, "{body}");
+        }
+        // The creation line still records `created_at` while proving no
+        // work.
+        let times = repo.reflog_times(log);
+        assert_eq!(times.created_at, Some(t(1_700_001_000)));
+
+        // Malformed lines and a missing log have no entry to select.
+        write("garbage\naaaa bbbb A Name <a@b> notanumber +0200\tcommit: x\n");
+        assert_eq!(repo.reflog_times(log).newest_work, None);
+        assert_eq!(
+            repo.reflog_times(Path::new("logs/MISSING")).newest_work,
+            None
         );
     }
 

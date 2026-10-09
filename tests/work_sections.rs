@@ -21,13 +21,16 @@ use agent_sessions::forge::{Forge, Pipeline, WorkItem};
 use agent_sessions::runtime::Runtime;
 use agent_sessions::snapshot::{Collector, Snapshot, WorkKind, WorkSection, to_json};
 use agent_sessions::store::{
-    ActivitySource, LifecycleInputs, NormEvent, Record, Store, WorkIdentity,
+    ActivityReference, ActivitySource, LifecycleInputs, NormEvent, ObservationSource, Record,
+    Store, WorkIdentity,
 };
 use agent_sessions::tui::{App, Key};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use support::fixture::{self, FixtureRepo, Landing};
 use support::tempdir::TempDir;
+use support::tmux::TmuxServer;
+use support::tmux_or_skip;
 
 const NEEDS_ID: &str = "11000000-1111-2222-3333-444444444444";
 const RESUME_ID: &str = "22000000-1111-2222-3333-444444444444";
@@ -65,6 +68,14 @@ fn now() -> u64 {
 
 fn collect(world: &World) -> Snapshot {
     collect_with(world, None, None)
+}
+
+/// As `collect`, over a runtime that sees the given tmux sockets.
+fn collect_on(world: &World, sockets: &[std::path::PathBuf]) -> Snapshot {
+    let runtime = Runtime::observe_over(sockets);
+    Collector::new(claude(&world.home))
+        .with_store(state(&world.home))
+        .collect(&runtime, None)
 }
 
 fn collect_with(world: &World, config: Option<Loaded>, forge: Option<Forge>) -> Snapshot {
@@ -1325,4 +1336,910 @@ fn a_dated_project_space_turn_backfills_source_activity() {
     assert!(!text.contains("activity: ?"), "{text}");
     assert!(text.contains("conversation:"), "{text}");
     assert!(text.contains("the task"), "{text}");
+}
+
+/// Turn `text` appended to conversation `id`'s transcript at `cwd`.
+fn append_turn(home: &TempDir, id: &str, cwd: &Path, text: &str) {
+    let transcript = home.join(format!(".claude/projects/t/{id}.jsonl"));
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .expect("the transcript");
+    use std::io::Write;
+    f.write_all(support::claude_turn(id, cwd, text).as_bytes())
+        .expect("the turn appends");
+}
+
+/// The one summary row `name`'s work row carries.
+fn only_summary<'a>(
+    snapshot: &'a Snapshot,
+    name: &str,
+) -> &'a agent_sessions::snapshot::ConversationSummary {
+    let row = work(snapshot, name);
+    assert_eq!(
+        row.conversation_summaries.len(),
+        1,
+        "{name}: {:?}",
+        row.conversation_summaries
+    );
+    &row.conversation_summaries[0]
+}
+
+#[test]
+fn conversation_summaries_compact_turns_through_the_pipeline() {
+    // A live agent on one branch's worktree: repeated transcript turns
+    // compact into one summary at the newest source time; moving the
+    // conversation leaves its captured context behind on the old row.
+    let home = TempDir::new("conversation-summaries");
+    let a = FixtureRepo::new("origin");
+    a.branch_with_commits("feat-one", 1, true);
+    let wt_one = a.add_worktree("one", Some("feat-one"));
+    a.branch_with_commits("feat-two", 1, true);
+    let wt_two = a.add_worktree("two", Some("feat-two"));
+    let id = "66000000-1111-2222-3333-444444444444";
+    transcript(&home, id, &wt_one);
+    let mut agent = support::live_claude(&home, id, "busy", &wt_one);
+    let world = World {
+        home,
+        a,
+        b: FixtureRepo::new("origin"),
+        agent: None,
+    };
+
+    let first = collect(&world);
+    let summary = only_summary(&first, "feat-one");
+    assert_eq!(
+        summary.key,
+        agent_sessions::store::conversation_key("claude", id)
+    );
+    assert_eq!(
+        summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        Some("the task")
+    );
+    let first_at = summary.occurred_at_ms;
+
+    // A repeated turn is still one row, at the newer source time, with
+    // the newer prompt captured - the per-turn reasons stay raw history
+    // underneath, never displayed per turn.
+    // `last_activity` carries second precision: a turn must land a
+    // whole second later to count as newer.
+    std::thread::sleep(Duration::from_millis(1_100));
+    append_turn(&world.home, id, &wt_one, "the follow-up");
+    let second = collect(&world);
+    let summary = only_summary(&second, "feat-one");
+    assert!(summary.occurred_at_ms > first_at, "{summary:?}");
+    assert_eq!(
+        summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        Some("the follow-up")
+    );
+    let row = work(&second, "feat-one");
+    assert!(
+        row.activities
+            .iter()
+            .filter(|e| e.source == ActivitySource::Conversation)
+            .count()
+            >= 2,
+        "raw history retained: {:?}",
+        row.activities
+    );
+
+    // The conversation moves to the other branch's worktree: its newest
+    // context lands on that record alone; the old record keeps the
+    // excerpt it captured - a prompt never leaks across rows.
+    agent.kill().expect("kill");
+    let _ = agent.wait();
+    let mut agent = support::live_claude(&world.home, id, "busy", &wt_two);
+    // `last_activity` carries second precision: a turn must land a
+    // whole second later to count as newer.
+    std::thread::sleep(Duration::from_millis(1_100));
+    append_turn(&world.home, id, &wt_two, "moved task");
+    let third = collect(&world);
+    assert_eq!(
+        only_summary(&third, "feat-two")
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        Some("moved task")
+    );
+    assert_eq!(
+        only_summary(&third, "feat-one")
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        Some("the follow-up"),
+        "the old row retains its own capture"
+    );
+
+    // Provider-absent: the transcript gone, the agent dead - the record's
+    // persisted summary still speaks, no current provider state reads in.
+    // A second quiet conversation keeps the repo itself in scope: a repo
+    // exists to the snapshot only while one resolves into it.
+    agent.kill().expect("kill");
+    let _ = agent.wait();
+    let keeper_id = "77000000-1111-2222-3333-444444444444";
+    transcript(&world.home, keeper_id, &world.a.main);
+    let mut keeper = support::live_claude(&world.home, keeper_id, "idle", &world.a.main);
+    fs::remove_file(world.home.join(format!(".claude/projects/t/{id}.jsonl")))
+        .expect("the transcript deletes");
+    fs::remove_file(
+        world
+            .home
+            .join(format!(".claude/sessions/{}.json", agent.id())),
+    )
+    .expect("the dead session file clears");
+    let fourth = collect(&world);
+    keeper.kill().expect("kill");
+    let _ = keeper.wait();
+    let summary = only_summary(&fourth, "feat-two");
+    assert_eq!(
+        summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        Some("moved task"),
+        "persisted fallback without the provider"
+    );
+    // The detail view renders the compacted row: one `last activity`
+    // line, no raw turn reasons.
+    let mut app = App::new(fourth);
+    app.key(Key::Char('2'));
+    let mut seen = String::new();
+    for _ in 0..12 {
+        let text = render(&app, 200, 40);
+        seen.push_str(&text);
+        if text.contains("Work - feat-two") {
+            assert!(text.contains("last activity"), "{text}");
+            assert!(text.contains("prompt: moved task"), "{text}");
+            assert!(!text.contains("moved task moved task"), "{text}");
+            break;
+        }
+        app.key(Key::Char('j'));
+    }
+    assert!(seen.contains("Work - feat-two"), "feat-two focused: {seen}");
+}
+
+/// Strip `session_context` from every record in `work.json`, keeping the
+/// cursors - the file a pre-context build would have written.
+fn strip_session_context(home: &TempDir) {
+    let path = state(home).join("work.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("work.json")).expect("json");
+    let data = doc["data"].as_object_mut().expect("data");
+    for key in ["branches", "paths"] {
+        for record in data[key].as_object_mut().expect(key).values_mut() {
+            record.as_object_mut().unwrap().remove("session_context");
+        }
+    }
+    fs::write(&path, serde_json::to_vec(&doc).unwrap()).expect("work.json writes");
+}
+
+#[test]
+fn cursor_only_records_compact_when_the_provider_is_absent() {
+    // A record holding cursors but no context - written before context
+    // existed - still compacts to one summary row once its provider is
+    // gone, without a new activity event or a moved `last_activity`.
+    let home = TempDir::new("cursor-only");
+    let a = FixtureRepo::new("origin");
+    a.branch_with_commits("feat-only", 1, true);
+    let wt = a.add_worktree("only", Some("feat-only"));
+    let id = "88000000-1111-2222-3333-444444444444";
+    transcript(&home, id, &wt);
+    let mut agent = support::live_claude(&home, id, "busy", &wt);
+    let world = World {
+        home,
+        a,
+        b: FixtureRepo::new("origin"),
+        agent: None,
+    };
+    let first = collect(&world);
+    let before = work(&first, "feat-only");
+    let before_at = before.conversation_summaries[0].occurred_at_ms;
+    let before_activities = before.activities.clone();
+    let before_last = before.last_activity;
+
+    // The provider goes silent and the file predates context.
+    agent.kill().expect("kill");
+    let _ = agent.wait();
+    fs::remove_file(world.home.join(format!(".claude/projects/t/{id}.jsonl")))
+        .expect("the transcript deletes");
+    fs::remove_dir_all(world.home.join(".claude/sessions")).expect("sessions clear");
+    strip_session_context(&world.home);
+    // A quiet conversation keeps the repo in scope.
+    let keeper_id = "99000000-1111-2222-3333-444444444444";
+    transcript(&world.home, keeper_id, &world.a.main);
+
+    let second = collect(&world);
+    let summary = only_summary(&second, "feat-only");
+    assert_eq!(
+        summary.key,
+        agent_sessions::store::conversation_key("claude", id)
+    );
+    assert_eq!(summary.occurred_at_ms, before_at);
+    assert!(
+        summary.context.is_none(),
+        "no context was ever captured: {summary:?}"
+    );
+    let after = work(&second, "feat-only");
+    assert_eq!(after.activities, before_activities, "no new activity");
+    assert_eq!(after.last_activity, before_last);
+
+    // Rendered: the id alone carries the row - no title, no prompt. The
+    // row sits in a cleanup section, collapsed under `all`, so scope to
+    // the repo first to expand it.
+    let mut app = App::new(second);
+    app.key(Key::Char('1'));
+    app.key(Key::Char('j'));
+    app.key(Key::Char('2'));
+    for _ in 0..12 {
+        let text = render(&app, 200, 40);
+        if text.contains("Work - feat-only") {
+            let line = text
+                .lines()
+                .find(|l| l.contains("last activity"))
+                .expect("the summary row renders: {text}");
+            assert!(line.contains("88000000"), "{text}");
+            assert!(!line.contains(" - "), "{text}");
+            return;
+        }
+        app.key(Key::Char('j'));
+    }
+    panic!("feat-only never focused");
+}
+
+#[test]
+fn gone_branch_and_detached_path_rows_keep_their_summaries() {
+    if !tmux_or_skip() {
+        return;
+    }
+    // A conversation per anchor, both captured; then both workspaces
+    // vanish under panes that still sit inside them - the gone rows keep
+    // the summaries their records captured, not the provider's present.
+    let home = TempDir::new("gone-summaries");
+    let tmux = TmuxServer::new();
+    let a = FixtureRepo::new("origin");
+    a.branch_with_commits("feat-gone", 1, true);
+    let wt = a.add_worktree("gone", Some("feat-gone"));
+    let det = a.add_worktree("det", None);
+    let gid = "aa110000-1111-2222-3333-444444444444";
+    let did = "bb220000-1111-2222-3333-444444444444";
+    let kid = "cc330000-1111-2222-3333-444444444444";
+    transcript(&home, gid, &wt);
+    transcript(&home, did, &det);
+    transcript(&home, kid, &a.main);
+    let mut agent_g = support::live_claude(&home, gid, "busy", &wt);
+    let mut agent_d = support::live_claude(&home, did, "busy", &det);
+    // Panes parked inside both workspaces: what retains the gone rows.
+    tmux.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "g",
+        "-x",
+        "100",
+        "-y",
+        "24",
+        "-c",
+        wt.to_str().unwrap(),
+        "sleep 300",
+    ]);
+    tmux.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "d",
+        "-x",
+        "100",
+        "-y",
+        "24",
+        "-c",
+        det.to_str().unwrap(),
+        "sleep 300",
+    ]);
+    let world = World {
+        home,
+        a,
+        b: FixtureRepo::new("origin"),
+        agent: None,
+    };
+    let sockets = [tmux.socket.clone()];
+    let first = collect_on(&world, &sockets);
+    let branch_row = work(&first, "feat-gone");
+    let branch_summary = only_summary(&first, "feat-gone").clone();
+    let det_row = first
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(det.as_path()))
+        .expect("the detached row");
+    let det_summary = det_row
+        .conversation_summaries
+        .iter()
+        .find(|s| s.key.contains(did))
+        .expect("the detached summary")
+        .clone();
+    let branch_last = branch_row.last_activity;
+    let det_last = det_row.last_activity;
+
+    // Both gone: worktrees removed, the branch deleted - while the panes
+    // and agents still sit inside. The agents die too, so nothing about
+    // the provider's present can substitute for the captured context.
+    agent_g.kill().expect("kill");
+    let _ = agent_g.wait();
+    agent_d.kill().expect("kill");
+    let _ = agent_d.wait();
+    world.a.git(
+        &world.a.main,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    world.a.git(
+        &world.a.main,
+        &["worktree", "remove", "--force", det.to_str().unwrap()],
+    );
+    world.a.git(&world.a.main, &["branch", "-D", "feat-gone"]);
+
+    let second = collect_on(&world, &sockets);
+    let gone_branch = second
+        .work
+        .iter()
+        .find(|w| w.name == "feat-gone" && w.gone.is_some())
+        .expect("the gone branch row");
+    let summary = gone_branch
+        .conversation_summaries
+        .iter()
+        .find(|s| s.key == branch_summary.key)
+        .expect("the retained summary");
+    assert_eq!(summary.occurred_at_ms, branch_summary.occurred_at_ms);
+    assert_eq!(
+        summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        branch_summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        "the gone row keeps the record's own capture: {summary:?}"
+    );
+    assert!(summary.context.is_some());
+    assert_eq!(gone_branch.last_activity, branch_last);
+
+    let gone_det = second
+        .work
+        .iter()
+        .find(|w| w.kind == WorkKind::Detached && w.gone.is_some())
+        .expect("the gone detached row");
+    let summary = gone_det
+        .conversation_summaries
+        .iter()
+        .find(|s| s.key == det_summary.key)
+        .expect("the retained detached summary");
+    assert_eq!(summary.occurred_at_ms, det_summary.occurred_at_ms);
+    assert_eq!(
+        summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref()),
+        det_summary
+            .context
+            .as_ref()
+            .and_then(|c| c.prompt_excerpt.as_deref())
+    );
+    assert_eq!(gone_det.last_activity, det_last);
+
+    // Rendered: the gone branch's row still shows the compacted summary.
+    // It sits in cleanup review, collapsed under `all` - scope to the
+    // repo to expand it.
+    let mut app = App::new(second);
+    app.key(Key::Char('1'));
+    app.key(Key::Char('j'));
+    app.key(Key::Char('2'));
+    for _ in 0..16 {
+        let text = render(&app, 200, 40);
+        if text.contains("Work - feat-gone") {
+            assert!(text.contains("last activity"), "{text}");
+            assert!(text.contains("aa110000"), "{text}");
+            return;
+        }
+        app.key(Key::Char('j'));
+    }
+    panic!("the gone feat-gone row never focused");
+}
+
+/// A real qualifying reflog operation reaches the detail pane: the
+/// activity reason names the selected entry - short new sha plus its raw
+/// message - at the entry's own time. Branch-only rows, a linked
+/// worktree's own HEAD attribution, and a stopped record's retained
+/// history all read the same contract.
+#[test]
+fn reflog_reasons_name_the_selected_entry_at_its_own_time() {
+    let home = TempDir::new("work-reflog-reasons");
+    let a = FixtureRepo::new("origin");
+
+    // Branch-only: the branch log's own commit entry is the work.
+    a.branch_with_commits("feat-solo", 1, false);
+    let solo_sha = a
+        .git(&a.main, &["rev-parse", "feat-solo"])
+        .trim()
+        .to_owned();
+
+    // A linked worktree: amending inside it lands in its own HEAD log
+    // and the branch log as identical tuples - one selected entry. The
+    // message carries Unicode, stored raw.
+    a.branch_with_commits("feat-linked", 1, false);
+    let wt = a.add_worktree("linked", Some("feat-linked"));
+    // A minute into the future on the committer clock: the reflog entry
+    // takes that date, so the amend is unambiguously the newest.
+    let amend_epoch = now() + 60;
+    let amend = fixture::command(Some(&wt), &["commit", "--amend", "-m", "amended 日本"])
+        .env("GIT_COMMITTER_DATE", format!("@{amend_epoch} +0000"))
+        .env("GIT_AUTHOR_DATE", format!("@{amend_epoch} +0000"))
+        .output()
+        .expect("the amend runs");
+    assert!(
+        amend.status.success(),
+        "amend failed: {}",
+        String::from_utf8_lossy(&amend.stderr)
+    );
+    let linked_sha = a.git(&wt, &["rev-parse", "HEAD"]).trim().to_owned();
+
+    // A merge in a second linked worktree: a real `merge` entry.
+    a.branch_with_commits("feat-tomerge", 1, false);
+    a.branch_with_commits("feat-merge", 1, false);
+    let wt_merge = a.add_worktree("merge", Some("feat-merge"));
+    let merge_epoch = now() + 120;
+    let merged_out = fixture::command(
+        Some(&wt_merge),
+        &["merge", "--no-ff", "-m", "merge msg", "feat-tomerge"],
+    )
+    .env("GIT_COMMITTER_DATE", format!("@{merge_epoch} +0000"))
+    .env("GIT_AUTHOR_DATE", format!("@{merge_epoch} +0000"))
+    .output()
+    .expect("the merge runs");
+    assert!(
+        merged_out.status.success(),
+        "merge failed: {}",
+        String::from_utf8_lossy(&merged_out.stderr)
+    );
+    let merge_sha = a.git(&wt_merge, &["rev-parse", "HEAD"]).trim().to_owned();
+
+    // A transcript rooted in the main checkout: what places the repo in
+    // the world at all.
+    transcript(&home, OTHER_ID, &a.main);
+
+    let world = World {
+        home,
+        a,
+        b: FixtureRepo::new("origin"),
+        agent: None,
+    };
+    let first = collect(&world);
+    assert!(first.complete, "{:?}", first.errors);
+
+    let reflog = |row: &agent_sessions::snapshot::WorkRow| {
+        row.activities
+            .iter()
+            .find(|e| e.source == ActivitySource::Reflog)
+            .cloned()
+            .unwrap_or_else(|| panic!("a reflog event on {}: {:?}", row.name, row.activities))
+    };
+    let solo = reflog(work(&first, "feat-solo"));
+    assert_eq!(
+        solo.reasons,
+        vec![format!("{} commit: feat-solo 0", &solo_sha[..7])]
+    );
+    // The event time is the selected entry's own committer clock, read
+    // back from the same log line the pass read - not the scan's - and
+    // `last_activity` agrees with it.
+    let solo_repo = agent_sessions::git::Repo::discover(&world.a.main)
+        .expect("the fixture repo discovers")
+        .expect("the main checkout is a repo");
+    let solo_times = solo_repo.reflog_times(Path::new("logs/refs/heads/feat-solo"));
+    let solo_at = solo_times.newest_work.expect("the solo work entry").at;
+    assert_eq!(
+        solo.occurred_at_ms,
+        agent_sessions::store::epoch_ms(solo_at),
+        "the event carries the selected line's own time: {solo:?}"
+    );
+    assert_eq!(
+        work(&first, "feat-solo").last_activity,
+        Some(solo.occurred_at_ms / 1000)
+    );
+
+    // The linked worktree's amend is attributed at its own entry - not
+    // to the main checkout's HEAD log, which never saw it.
+    let linked_row = first
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt.as_path()))
+        .expect("the linked worktree row");
+    let linked = reflog(linked_row);
+    assert_eq!(
+        linked.reasons,
+        vec![format!("{} commit (amend): amended 日本", &linked_sha[..7])]
+    );
+    // The pinned committer clock is the entry's own timestamp.
+    assert_eq!(linked.occurred_at_ms, amend_epoch * 1000);
+    assert_eq!(linked_row.last_activity, Some(amend_epoch));
+
+    let merge_row = first
+        .work
+        .iter()
+        .find(|w| w.worktree.as_deref() == Some(wt_merge.as_path()))
+        .expect("the merge worktree row");
+    let merged = reflog(merge_row);
+    assert!(
+        merged.reasons[0].starts_with(&format!("{} merge feat-tomerge:", &merge_sha[..7])),
+        "the merge entry: {:?}",
+        merged.reasons
+    );
+    assert_eq!(merged.occurred_at_ms, merge_epoch * 1000);
+    assert_eq!(merge_row.last_activity, Some(merge_epoch));
+
+    // The detail pane renders the reason escaped, at both widths.
+    let mut app = App::new(first).with_store(store(&world.home));
+    app.key(Key::Char('2'));
+    let index = 1 + app
+        .snapshot
+        .work
+        .iter()
+        .position(|w| w.name == "feat-linked")
+        .expect("the linked row in the detail list");
+    for _ in 0..index {
+        app.key(Key::Char('j'));
+    }
+    for width in [55, 200] {
+        let text = render(&app, width, 44);
+        assert!(text.contains("reflog:"), "{text}");
+        assert!(text.contains(&linked_sha[..7]), "{text}");
+        assert!(text.contains("amended 日"), "{text}");
+    }
+
+    // Stopped and gone: the worktree removed and the branch deleted, the
+    // record keeps the reason it captured while the work was live.
+    world.a.git(
+        &world.a.main,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    world.a.git(&world.a.main, &["branch", "-D", "feat-linked"]);
+    let second = collect(&world);
+    assert!(second.complete, "{:?}", second.errors);
+    let (work_state, errors) = store(&world.home).work();
+    assert!(errors.is_empty(), "{errors:?}");
+    let record = work_state
+        .branches
+        .values()
+        .find(|r| r.ref_name == "feat-linked")
+        .expect("the closed record stays");
+    assert!(record.ended_at.is_some(), "the record closed: {record:?}");
+    assert!(
+        record.activities.iter().any(|e| {
+            e.source == ActivitySource::Reflog
+                && e.reasons[0] == format!("{} commit (amend): amended 日本", &linked_sha[..7])
+        }),
+        "the record retains the captured reason: {:?}",
+        record.activities
+    );
+}
+
+/// A dirty working-tree transition stores its observation beside the
+/// activity the same transition emits - linked by source and occurrence,
+/// still dated at the scan - and the detail renders the evidence once,
+/// under `activity:`. The follow-up clean transition proves no remaining
+/// mtime, so its observation stays unlinked and visible. Real collection
+/// to detail, over both a branch and a detached-path record.
+#[test]
+fn a_covered_dirty_observation_is_stored_but_not_rendered_twice() {
+    let world = world();
+    let dirty_wt = world.a.dir.join("wt-dirty");
+    let detached_wt = world.a.dir.join("wt-detached");
+    // The first pass is a silent baseline for every record: the
+    // pre-seeded `dirty.txt` is already part of it.
+    collect(&world);
+
+    // Pin every changed file's mtime far in the past so the activity's
+    // occurrence provably differs from the pass's detection time.
+    let pin = UNIX_EPOCH + Duration::from_secs(1_000_000);
+    for path in [
+        dirty_wt.join("later.txt"),
+        dirty_wt.join("dirty.txt"),
+        detached_wt.join("loose.txt"),
+    ] {
+        fs::write(&path, "x").expect("write");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(pin)
+            .expect("mtime");
+    }
+    let mut second = collect(&world);
+    assert!(second.complete, "{:?}", second.errors);
+
+    let linked = ActivityReference {
+        source: ActivitySource::WorkingTree,
+        occurred_at_ms: 1_000_000_000,
+    };
+    let covered = |row: &agent_sessions::snapshot::WorkRow| {
+        let observation = row
+            .observations
+            .iter()
+            .find(|e| e.source == ObservationSource::WorkingTree)
+            .expect("the dirty transition observed");
+        assert!(
+            observation.observed_at_ms > 1_000_000_000,
+            "the observation dates at the scan, not the mtime: {observation:?}"
+        );
+        assert_eq!(observation.covered_by, Some(linked));
+        assert!(
+            observation.is_covered_by(&row.activities),
+            "the retained activity holds every reason: {:?} vs {:?}",
+            observation,
+            row.activities
+        );
+        observation.clone()
+    };
+    let branch = work(&second, "feat-dirty").clone();
+    let branch_obs = covered(&branch);
+    let detached = second
+        .work
+        .iter()
+        .find(|w| w.kind == WorkKind::Detached)
+        .expect("the detached row")
+        .clone();
+    let detached_obs = covered(&detached);
+    assert_eq!(
+        branch
+            .activities
+            .iter()
+            .find(|e| e.source == ActivitySource::WorkingTree)
+            .map(|e| e.occurred_at_ms),
+        Some(1_000_000_000),
+        "the activity is the pinned mtime: {:?}",
+        branch.activities
+    );
+
+    // The store holds the same raw history: the linked observation at
+    // its scan time, beside the activity it duplicates - suppression is
+    // display-only.
+    let (work_state, errors) = store(&world.home).work();
+    assert!(errors.is_empty(), "{errors:?}");
+    let record = work_state
+        .branches
+        .values()
+        .find(|r| r.ref_name == "feat-dirty")
+        .expect("the branch record");
+    assert!(record.observations.contains(&branch_obs));
+    let path_record = work_state
+        .paths
+        .iter()
+        .find(|(path, _)| path.contains("wt-detached"))
+        .map(|(_, record)| record)
+        .expect("the detached path record");
+    assert!(path_record.observations.contains(&detached_obs));
+
+    // Detail on the branch row: the proven reason appears once, under
+    // `activity:`, and the fully covered working-tree section is gone.
+    second.work = vec![branch.clone(), detached.clone()];
+    let mut app = App::new(second);
+    app.key(Key::Char('2'));
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        assert_eq!(
+            text.matches("untracked later.txt").count(),
+            1,
+            "the covered detection does not repeat under observations: {text}"
+        );
+        assert!(!text.contains("observations:"), "{text}");
+    }
+    // And the path row the same.
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        assert_eq!(text.matches("untracked loose.txt").count(), 1, "{text}");
+        assert!(!text.contains("observations:"), "{text}");
+    }
+
+    // The clean transition - every change gone - proves no remaining
+    // path's mtime: the next observation stays unlinked and visible.
+    fs::remove_file(dirty_wt.join("later.txt")).expect("remove");
+    fs::remove_file(dirty_wt.join("dirty.txt")).expect("remove");
+    fs::remove_file(detached_wt.join("loose.txt")).expect("remove");
+    let third = collect(&world);
+    let branch = work(&third, "feat-dirty").clone();
+    let trees: Vec<_> = branch
+        .observations
+        .iter()
+        .filter(|e| e.source == ObservationSource::WorkingTree)
+        .collect();
+    assert_eq!(trees.len(), 2, "{:?}", branch.observations);
+    let clean = trees[1];
+    assert!(clean.observed_at_ms > branch_obs.observed_at_ms);
+    assert_eq!(clean.covered_by, None);
+    assert!(!clean.is_covered_by(&branch.activities));
+
+    let mut third = third;
+    third.work = vec![branch.clone()];
+    let mut app = App::new(third);
+    app.key(Key::Char('2'));
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        // The linked detection stays hidden; the clean one renders.
+        assert!(text.contains("observations:"), "{text}");
+        assert_eq!(text.matches("untracked later.txt").count(), 1, "{text}");
+        // The raw history still holds both detections.
+        assert_eq!(app.snapshot.work[0].observations.len(), 2);
+    }
+}
+
+/// A transition whose only change is a tracked file's deletion proves no
+/// remaining changed-path mtime: the observation gets no link and stays
+/// visible, no activity is emitted, and the row's recency and section do
+/// not move. The follow-up restore is a clean transition - also
+/// unlinked. Real collection to detail, branch and detached-path
+/// records, both widths.
+#[test]
+fn a_deleted_only_transition_stays_visible_on_branch_and_path() {
+    let world = world();
+    let dirty_wt = world.a.dir.join("wt-dirty");
+    let detached_wt = world.a.dir.join("wt-detached");
+    // A resumable transcript keeps the detached row listed when clean -
+    // Cleanup-section rows collapse into a count and are unselectable.
+    transcript(
+        &world.home,
+        "66000000-1111-2222-3333-444444444444",
+        &detached_wt,
+    );
+    collect(&world);
+    // Drop the pre-seeded untracked file so the tracked-file deletion is
+    // the next dirty transition's only change.
+    fs::remove_file(dirty_wt.join("dirty.txt")).expect("remove");
+    let second = collect(&world);
+    let branch_before = work(&second, "feat-dirty").clone();
+    let detached_before = second
+        .work
+        .iter()
+        .find(|w| w.kind == WorkKind::Detached)
+        .expect("the detached row")
+        .clone();
+    // The return to clean is already an unlinked observation.
+    let clean = branch_before
+        .observations
+        .iter()
+        .find(|e| e.source == ObservationSource::WorkingTree)
+        .expect("the clean transition observed");
+    assert_eq!(clean.covered_by, None);
+
+    fs::remove_file(dirty_wt.join("feat-dirty-0.txt")).expect("rm tracked");
+    fs::remove_file(detached_wt.join("seed.txt")).expect("rm tracked");
+    let third = collect(&world);
+    assert!(third.complete, "{:?}", third.errors);
+
+    let branch = work(&third, "feat-dirty").clone();
+    let deleted_branch = branch
+        .observations
+        .iter()
+        .rfind(|e| e.source == ObservationSource::WorkingTree)
+        .expect("the deletion observed");
+    assert!(
+        deleted_branch
+            .reasons
+            .iter()
+            .any(|r| r.contains("deleted") && r.contains("feat-dirty-0.txt")),
+        "{deleted_branch:?}"
+    );
+    assert_eq!(deleted_branch.covered_by, None);
+    assert!(!deleted_branch.is_covered_by(&branch.activities));
+    // Observation-only transitions add no work: the activity history and
+    // the recency/classification derived from it are unchanged.
+    assert_eq!(branch.activities, branch_before.activities);
+    assert_eq!(branch.last_activity, branch_before.last_activity);
+    // The classification does follow the dirty flag - what it never
+    // follows is detection evidence.
+    assert_eq!(branch.section, WorkSection::FollowUp);
+
+    let detached = third
+        .work
+        .iter()
+        .find(|w| w.kind == WorkKind::Detached)
+        .expect("the detached row")
+        .clone();
+    let deleted_detached = detached
+        .observations
+        .iter()
+        .rfind(|e| e.source == ObservationSource::WorkingTree)
+        .expect("the deletion observed");
+    assert!(
+        deleted_detached
+            .reasons
+            .iter()
+            .any(|r| r.contains("deleted") && r.contains("seed.txt")),
+        "{deleted_detached:?}"
+    );
+    assert_eq!(deleted_detached.covered_by, None);
+    assert_eq!(detached.activities, detached_before.activities);
+    assert_eq!(detached.last_activity, detached_before.last_activity);
+    assert_eq!(detached.section, WorkSection::FollowUp);
+
+    // Both deletion reasons render under `observations:` at both widths.
+    let mut app_snapshot = third;
+    app_snapshot.work = vec![branch.clone(), detached.clone()];
+    let mut app = App::new(app_snapshot);
+    app.key(Key::Char('2'));
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        assert!(text.contains("observations:"), "{text}");
+        assert!(text.contains("feat-dirty-0.txt"), "{text}");
+        // Rendering moved nothing: the row's stored fields are as read.
+        assert_eq!(app.snapshot.work[0].last_activity, branch.last_activity);
+    }
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        assert!(text.contains("seed.txt"), "{text}");
+    }
+
+    // Restoring the tracked files is a clean transition on each record:
+    // unlinked, visible, and the earlier detections' scan times stay put.
+    world
+        .a
+        .git(&dirty_wt, &["checkout", "--", "feat-dirty-0.txt"]);
+    world.a.git(&detached_wt, &["checkout", "--", "seed.txt"]);
+    let fourth = collect(&world);
+    let branch = work(&fourth, "feat-dirty");
+    let trees: Vec<_> = branch
+        .observations
+        .iter()
+        .filter(|e| e.source == ObservationSource::WorkingTree)
+        .collect();
+    assert_eq!(trees.len(), 3, "{:?}", branch.observations);
+    assert!(
+        trees.iter().all(|e| e.covered_by.is_none()),
+        "no observation-only transition ever links: {trees:?}"
+    );
+    assert_eq!(trees[1].observed_at_ms, deleted_branch.observed_at_ms);
+    assert!(trees[2].observed_at_ms > trees[1].observed_at_ms);
+    assert_eq!(branch.activities, branch_before.activities);
+    assert_eq!(branch.last_activity, branch_before.last_activity);
+    assert_eq!(branch.section, branch_before.section);
+    let detached = fourth
+        .work
+        .iter()
+        .find(|w| w.kind == WorkKind::Detached)
+        .expect("the detached row")
+        .clone();
+    let trees: Vec<_> = detached
+        .observations
+        .iter()
+        .filter(|e| e.source == ObservationSource::WorkingTree)
+        .collect();
+    assert_eq!(trees.len(), 2, "{:?}", detached.observations);
+    assert!(trees.iter().all(|e| e.covered_by.is_none()));
+    assert_eq!(trees[0].observed_at_ms, deleted_detached.observed_at_ms);
+    assert_eq!(detached.last_activity, detached_before.last_activity);
+    assert_eq!(detached.section, detached_before.section);
+
+    // The path record's clean transition renders the same way. A clean
+    // detached row collapses into the `all`-scope Cleanup count, so the
+    // detail is reached under its repo's scope.
+    let mut app_snapshot = fourth;
+    app_snapshot.work = vec![detached.clone()];
+    let mut app = App::new(app_snapshot);
+    app.key(Key::Char('1'));
+    app.key(Key::Char('j'));
+    app.key(Key::Char('2'));
+    app.key(Key::Char('j'));
+    for width in [55, 200] {
+        let text = render(&app, width, 45);
+        assert!(text.contains("observations:"), "{text}");
+        assert!(text.contains("working tree clean"), "{text}");
+        assert!(text.contains("seed.txt"), "{text}");
+    }
 }

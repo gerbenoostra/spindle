@@ -10,13 +10,15 @@ use agent_sessions::forge::{Pipeline, WorkItem};
 use agent_sessions::provider::SourceError;
 use agent_sessions::runtime::{EvidenceSource, PaneSource, Provider};
 use agent_sessions::snapshot::{
-    AttachmentLiveness, AttachmentRow, CommitRow, ConversationRow, ConversationState, EvidenceRow,
-    IncarnationRow, LatchRow, PaneRow, ReferenceKind, ReferenceRow, RelatedRow, RelationStrength,
-    RepoCounts, RepoRow, SCHEMA_VERSION, Snapshot, Upstream, WorkKind, WorkRow, WorkSection,
+    AttachmentLiveness, AttachmentRow, CommitRow, ConversationRow, ConversationState,
+    ConversationSummary, EvidenceRow, IncarnationRow, LatchRow, PaneRow, ReferenceKind,
+    ReferenceRow, RelatedRow, RelationStrength, RepoCounts, RepoRow, SCHEMA_VERSION, Snapshot,
+    Upstream, WorkKind, WorkRow, WorkSection,
 };
 use agent_sessions::store::{
-    ActivityEvent, ActivitySource, Confidence, ContinuityEvidence, Exec, Mark, NormEvent,
-    ObservationEvent, ObservationSource, RejectedRecord, TouchProvenance,
+    ActivityEvent, ActivityReference, ActivitySource, Confidence, ContinuityEvidence, Exec, Mark,
+    NormEvent, ObservationEvent, ObservationSource, RejectedRecord, SessionContext,
+    TouchProvenance,
 };
 use agent_sessions::tui::{App, Key};
 use agent_sessions::verdict::{ActionVerdict, Verdict};
@@ -102,6 +104,7 @@ fn work() -> WorkRow {
         dirty: Some(true),
         broken: None,
         activities: Vec::new(),
+        conversation_summaries: Vec::new(),
         observations: Vec::new(),
         commits_ahead: Some(3),
         unpushed: Some(3),
@@ -307,6 +310,7 @@ fn activity_and_observation_histories_render_separately_and_cap_at_seven() {
     });
     snapshot.work[0].activities = activities;
     snapshot.work[0].observations = vec![ObservationEvent {
+        covered_by: None,
         source: ObservationSource::Lifecycle,
         observed_at_ms: (NOW - 90) * 1000,
         reasons: vec!["upstream: a -> b".to_owned(), "ahead: 1 -> 2".to_owned()],
@@ -345,7 +349,44 @@ fn activity_and_observation_histories_render_separately_and_cap_at_seven() {
         assert!(!text.contains("last change"), "{text}");
     }
     let text = render(&app, 200, 50);
+    // No cursor-backed summaries: the raw conversation trail stays - the
+    // legacy fallback a record without cursors renders.
     assert!(text.contains("8f423bbb update pane labels"), "{text}");
+    assert!(!text.contains("last activity"), "{text}");
+
+    // Two observation sources tied on their newest time order by name;
+    // within a source, events sort newest first.
+    let mut tied = fixture();
+    tied.work[0].observations = vec![
+        ObservationEvent {
+            covered_by: None,
+            source: ObservationSource::Forge,
+            observed_at_ms: (NOW - 60) * 1000,
+            reasons: vec!["forge old".to_owned()],
+        },
+        ObservationEvent {
+            covered_by: None,
+            source: ObservationSource::Forge,
+            observed_at_ms: (NOW - 30) * 1000,
+            reasons: vec!["forge new".to_owned()],
+        },
+        ObservationEvent {
+            covered_by: None,
+            source: ObservationSource::Lifecycle,
+            observed_at_ms: (NOW - 30) * 1000,
+            reasons: vec!["lifecycle tied".to_owned()],
+        },
+    ];
+    let mut tied = App::new(tied);
+    press(&mut tied, &[Key::Char('2'), Key::Char('j')]);
+    let text = render(&tied, 200, 40);
+    let forge = text.find("  forge:").expect("forge group");
+    let lifecycle = text.find("  lifecycle:").expect("lifecycle group");
+    assert!(forge < lifecycle, "tied groups order by name: {text}");
+    assert!(
+        text.find("forge new").unwrap() < text.find("forge old").unwrap(),
+        "events newest first: {text}"
+    );
 
     let mut quiet = App::new(fixture());
     press(&mut quiet, &[Key::Char('2'), Key::Char('j')]);
@@ -354,6 +395,230 @@ fn activity_and_observation_histories_render_separately_and_cap_at_seven() {
         !text.contains("observations:"),
         "a row with no observations renders no section: {text}"
     );
+}
+
+#[test]
+fn activity_and_observation_raw_groups_share_ordering_capping_and_escaping() {
+    let mut snapshot = fixture();
+    let row = &mut snapshot.work[0];
+    row.activities = vec![ActivityEvent {
+        source: ActivitySource::WorkingTree,
+        occurred_at_ms: (NOW - 60) * 1000,
+        reasons: vec!["modified\tREADME.md".to_owned()],
+    }];
+    for i in (0..8u64).rev() {
+        row.activities.push(ActivityEvent {
+            source: ActivitySource::Commit,
+            occurred_at_ms: (NOW - 60 - i * 60) * 1000,
+            reasons: vec![format!("commit{i}")],
+        });
+    }
+    row.observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 60,
+        &["moved\tworktree"],
+    )];
+    for i in (0..8u64).rev() {
+        row.observations.push(ObservationEvent {
+            covered_by: None,
+            source: ObservationSource::Forge,
+            observed_at_ms: (NOW - 60 - i * 60) * 1000,
+            reasons: vec![format!("forge{i}")],
+        });
+    }
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    let text = render(&app, 200, 60);
+    let activity_at = text.find("activity:").expect("activity section");
+    let observations_at = text.find("observations:").expect("observations section");
+    let activity = &text[activity_at..observations_at];
+    let observations = &text[observations_at..];
+    assert!(
+        activity.find("  commit:").unwrap() < activity.find("  working tree:").unwrap(),
+        "tied activity groups order by name: {activity}"
+    );
+    assert!(
+        observations.find("  forge:").unwrap() < observations.find("  lifecycle:").unwrap(),
+        "tied observation groups order by name: {observations}"
+    );
+    for section in [activity, observations] {
+        let first = if section.contains("commit0") {
+            "commit"
+        } else {
+            "forge"
+        };
+        assert!(
+            section.find(&format!("{first}0")).unwrap()
+                < section.find(&format!("{first}1")).unwrap(),
+            "events newest first inside the source: {section}"
+        );
+        assert!(
+            !section.contains(&format!("{first}7")),
+            "the eighth event is past the display cap: {section}"
+        );
+    }
+    assert!(activity.contains("modified\\tREADME.md"), "{activity}");
+    assert!(!activity.contains("modified\tREADME.md"), "{activity}");
+    assert!(observations.contains("moved\\tworktree"), "{observations}");
+    assert!(!observations.contains("moved\tworktree"), "{observations}");
+}
+
+#[test]
+fn a_covered_working_tree_observation_hides_behind_its_activity() {
+    let tree = |covered: Option<u64>, at: u64, reasons: &[&str]| ObservationEvent {
+        covered_by: covered.map(|at| ActivityReference {
+            source: ActivitySource::WorkingTree,
+            occurred_at_ms: at * 1000,
+        }),
+        source: ObservationSource::WorkingTree,
+        observed_at_ms: at * 1000,
+        reasons: reasons.iter().map(|r| r.to_string()).collect(),
+    };
+    let mut snapshot = fixture();
+    snapshot.work[0].activities = vec![ActivityEvent {
+        source: ActivitySource::WorkingTree,
+        occurred_at_ms: (NOW - 60) * 1000,
+        reasons: vec!["modified dup.rs".to_owned(), "untracked b.rs".to_owned()],
+    }];
+    snapshot.work[0].observations = vec![
+        // The proven duplicate: every reason sits in the linked,
+        // retained activity - it renders only under `activity:`.
+        tree(Some(NOW - 60), NOW - 50, &["modified dup.rs"]),
+        // Unlinked legacy and undated detections stay visible.
+        tree(None, NOW - 40, &["legacy dirty read"]),
+        tree(None, NOW - 30, &["deleted c.rs"]),
+        // A link naming the wrong source or a missing occurrence keeps
+        // the observation, and so does a pruned counterpart.
+        ObservationEvent {
+            covered_by: Some(ActivityReference {
+                source: ActivitySource::Commit,
+                occurred_at_ms: (NOW - 60) * 1000,
+            }),
+            source: ObservationSource::WorkingTree,
+            observed_at_ms: (NOW - 29) * 1000,
+            reasons: vec!["wrong source link".to_owned()],
+        },
+        tree(Some(NOW - 55), NOW - 28, &["stale link"]),
+        // A partial match: one reason the counterpart carries and one it
+        // never carried - the whole observation stays.
+        tree(Some(NOW - 60), NOW - 27, &["untracked b.rs", "ghost.rs"]),
+        // A linked Lifecycle event is never covered: only WorkingTree
+        // observations participate.
+        ObservationEvent {
+            covered_by: Some(ActivityReference {
+                source: ActivitySource::WorkingTree,
+                occurred_at_ms: (NOW - 60) * 1000,
+            }),
+            source: ObservationSource::Lifecycle,
+            observed_at_ms: (NOW - 26) * 1000,
+            reasons: vec!["dirty: clean -> dirty".to_owned()],
+        },
+    ];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        // The proof appears once, under `activity:` - the covered
+        // detection adds no second copy under `observations:`.
+        assert_eq!(text.matches("modified dup.rs").count(), 1, "{text}");
+        // The partial observation stays and re-shows the shared reason.
+        assert_eq!(text.matches("untracked b.rs").count(), 2, "{text}");
+        for kept in [
+            "legacy dirty read",
+            "deleted c.rs",
+            "wrong source link",
+            "stale link",
+            "ghost.rs",
+            "dirty: clean -> dirty",
+        ] {
+            assert!(text.contains(kept), "{text}");
+        }
+    }
+
+    // A row whose working-tree observations are all covered renders no
+    // `observations:` section, while the raw history still holds them.
+    let mut all = fixture();
+    all.work[0].activities = vec![ActivityEvent {
+        source: ActivitySource::WorkingTree,
+        occurred_at_ms: (NOW - 60) * 1000,
+        reasons: vec!["modified a.rs".to_owned()],
+    }];
+    all.work[0].observations = vec![tree(Some(NOW - 60), NOW - 50, &["modified a.rs"])];
+    let mut app = App::new(all);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        assert!(text.contains("modified a.rs"), "{text}");
+        assert!(
+            !text.contains("observations:"),
+            "the filtered section is empty: {text}"
+        );
+    }
+    assert_eq!(
+        app.snapshot.work[0].observations.len(),
+        1,
+        "the raw history is untouched by the display filter"
+    );
+
+    // The filter runs before the seven-per-source cap: seven newer
+    // covered events cannot push the older uncovered one out.
+    let mut capped = fixture();
+    capped.work[0].activities = vec![ActivityEvent {
+        source: ActivitySource::WorkingTree,
+        occurred_at_ms: (NOW - 60) * 1000,
+        reasons: vec!["modified a.rs".to_owned()],
+    }];
+    let mut observations = vec![tree(None, NOW - 100, &["older uncovered"])];
+    for i in 0..7u64 {
+        observations.push(tree(Some(NOW - 60), NOW - 90 + i, &["modified a.rs"]));
+    }
+    capped.work[0].observations = observations;
+    let mut app = App::new(capped);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        assert!(text.contains("older uncovered"), "{text}");
+        assert_eq!(text.matches("modified a.rs").count(), 1, "{text}");
+    }
+}
+
+#[test]
+fn reflog_activity_reasons_render_escaped_at_both_widths() {
+    let mut snapshot = fixture();
+    snapshot.work[0].activities = vec![
+        // The newest event's reason is the entry's short sha plus its raw
+        // message - controls and Unicode escape exactly once at render.
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 60) * 1000,
+            reasons: vec!["abc1234 commit: fix\tlabels\n日本\u{7}".to_owned()],
+        },
+        // A persisted generic trail from before reasons carried metadata
+        // keeps its fallback text.
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 120) * 1000,
+            reasons: vec!["reflog work".to_owned()],
+        },
+    ];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        assert!(text.contains("reflog:"), "{text}");
+        // At 55 the long reason wraps mid-escape; at 200 it reads whole.
+        // Wide glyphs pad to two cells, so the text checks fragments.
+        for fragment in ["abc1234 commit: fix\\tla", "\\n日", "\\u0007"] {
+            assert!(text.contains(fragment), "{text}");
+        }
+        assert!(text.contains("reflog work"), "{text}");
+        assert!(
+            text.find("abc1234").unwrap() < text.find("reflog work").unwrap(),
+            "newest event first: {text}"
+        );
+        // Nothing raw leaked into the cells.
+        assert!(!text.contains('\t') && !text.contains('\u{7}'), "{text}");
+    }
 }
 
 #[test]
@@ -1086,5 +1351,632 @@ fn a_rejected_journal_record_reaches_the_snapshot_evidence() {
             .contains("below the high-water"),
         "{:?}",
         conv.evidence.rejected
+    );
+}
+
+/// A conversation summary as the store projects it onto the row.
+fn summary(
+    key: &str,
+    at_ms: u64,
+    title: Option<&str>,
+    prompt: Option<&str>,
+) -> ConversationSummary {
+    ConversationSummary {
+        key: key.to_owned(),
+        occurred_at_ms: at_ms,
+        context: (title.is_some() || prompt.is_some()).then(|| SessionContext {
+            title: title.map(str::to_owned),
+            prompt_excerpt: prompt.map(str::to_owned),
+        }),
+    }
+}
+
+#[test]
+fn conversation_summaries_compact_turns_into_one_row_per_conversation() {
+    let mut snapshot = fixture();
+    let row = &mut snapshot.work[0];
+    // The raw history keeps every turn; the compacted group replaces it.
+    row.activities = vec![
+        ActivityEvent {
+            source: ActivitySource::Conversation,
+            occurred_at_ms: (NOW - 120) * 1000,
+            reasons: vec!["8f423bbb update pane labels".to_owned()],
+        },
+        ActivityEvent {
+            source: ActivitySource::Conversation,
+            occurred_at_ms: (NOW - 60) * 1000,
+            reasons: vec![
+                "8f423bbb update pane labels".to_owned(),
+                "aaaa1111 first".to_owned(),
+            ],
+        },
+        ActivityEvent {
+            source: ActivitySource::WorkingTree,
+            occurred_at_ms: (NOW - 30) * 1000,
+            reasons: vec!["modified main.rs".to_owned()],
+        },
+    ];
+    // Two conversations at one timestamp keep two summaries in stable
+    // full-key order - the provider-qualified keys with the same
+    // eight-character session prefix stay distinct.
+    row.conversation_summaries = vec![
+        summary(
+            "claude\u{0}aaaa1111-2222",
+            (NOW - 60) * 1000,
+            None,
+            Some("fix the login form"),
+        ),
+        summary(
+            "other\u{0}aaaa1111-9999",
+            (NOW - 60) * 1000,
+            Some("a titled one"),
+            None,
+        ),
+        summary("claude\u{0}8f423bbb-3333", (NOW - 120) * 1000, None, None),
+    ];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        assert!(text.contains("  conversation:"), "{text}");
+        // One row per conversation, newest occurrence first then key:
+        // `claude\0aaaa...` sorts before `other\0aaaa...` at equal time.
+        // Wrapping may split a row's id from its detail at 55 columns, so
+        // the order check walks `last activity` occurrences in the text.
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("last activity"))
+            .collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].contains("60s aaaa1111"), "{text}");
+        assert!(lines[1].contains("60s aaaa1111"), "{text}");
+        assert!(lines[2].contains("2m 8f423bbb"), "{text}");
+        let prompt_at = text.find("prompt: fix the login form").expect("prompt");
+        let title_at = text.find("a titled one").expect("title");
+        assert!(prompt_at < title_at, "full-key order at equal time: {text}");
+        assert!(
+            !lines[2].contains(" - "),
+            "id alone where the record captured no context: {text}"
+        );
+        // The raw turn reasons compacted away from the activity section
+        // (the conversation list's own title column still shows it), and
+        // the working-tree source's own group stays - newest first:
+        // working tree (30s) beats conversation (60s).
+        let activity = &text[text.find("activity:").unwrap()..text.find("commits not on").unwrap()];
+        assert!(!activity.contains("update pane labels"), "{text}");
+        assert!(text.contains("modified main.rs"), "{text}");
+        assert!(
+            text.find("  working tree:").unwrap() < text.find("  conversation:").unwrap(),
+            "source groups order by their newest event: {text}"
+        );
+        // Wrapped cells never carry a terminal control.
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+    }
+}
+
+#[test]
+fn conversation_summaries_cap_at_seven_and_escape_context() {
+    let mut snapshot = fixture();
+    let row = &mut snapshot.work[0];
+    // Eight conversations compacted from twice as many raw events: the
+    // seven newest keys show; the eighth - oldest - does not.
+    let mut activities = Vec::new();
+    row.conversation_summaries = (0..8u64)
+        .map(|i| {
+            // The eight-char short id distinguishes every key.
+            let key = format!("claude\u{0}s{i:07}-xxxx");
+            for turn in 0..2 {
+                activities.push(ActivityEvent {
+                    source: ActivitySource::Conversation,
+                    occurred_at_ms: (NOW - 1000 + i * 10 + turn) * 1000,
+                    reasons: vec![format!("s{i:07} turn{turn}")],
+                });
+            }
+            // The oldest row's prompt carries escapes; it compacts out
+            // with the row, so a prompt with controls must show on a
+            // surviving row instead.
+            let prompt = (i == 7).then(|| "tab\there\nand \u{7}bell".to_owned());
+            summary(
+                &key,
+                (NOW - 1000 + i * 10 + 1) * 1000,
+                None,
+                prompt.as_deref(),
+            )
+        })
+        .collect();
+    row.activities = activities;
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("last activity"))
+            .collect();
+        assert_eq!(lines.len(), 7, "{text}");
+        assert!(text.contains("s0000007"), "{text}");
+        assert!(
+            !text.contains("s0000000"),
+            "the eighth compacts out: {text}"
+        );
+        assert!(!text.contains("s0000000 turn"), "{text}");
+        assert!(!text.contains("turn1"), "{text}");
+    }
+    // The control characters in the stored excerpt render escaped,
+    // never as terminal input - asserted unwrapped on the wide frame.
+    let text = render(&app, 200, 60);
+    assert!(
+        text.contains("prompt: tab\\there\\nand \\u0007bell"),
+        "{text}"
+    );
+    assert!(!text.contains('\t') && !text.contains('\u{7}'), "{text}");
+}
+
+#[test]
+fn a_unicode_control_prompt_renders_bounded_and_escaped() {
+    // The excerpt the store persists is raw and cell-bounded; the detail
+    // renders it escaped once - no terminal control survives, at either
+    // width.
+    let temp = support::tempdir::TempDir::new("unicode-excerpt");
+    let store = agent_sessions::store::Store::open(temp.path().to_path_buf());
+    let obs = |name: &str| agent_sessions::store::ObservedRef {
+        name: name.to_owned(),
+        head: None,
+        rewritten: false,
+        creation: None,
+        renamed_from: None,
+        commit: None,
+        activities: Vec::new(),
+        inputs: agent_sessions::store::LifecycleInputs::default(),
+    };
+    store
+        .sync_repo("/r/.git", &[obs("feat")], 1_000)
+        .expect("sync");
+    let id = store
+        .load()
+        .work
+        .branch("/r/.git", "feat")
+        .expect("the record")
+        .id
+        .clone();
+    // CJK double-width, a combining mark, raw tab/newline/escape and a
+    // tail long enough to force truncation past the cell bound.
+    let prompt = format!(
+        "日本語のe\u{301}xcerpt\ttab\nnewline\u{1b}[0m {}",
+        "長い尾部".repeat(40)
+    );
+    store
+        .sync_session_updates(&[agent_sessions::store::SessionUpdate {
+            identity: agent_sessions::store::UpdateIdentity::Branch(id.clone()),
+            conversation: agent_sessions::store::conversation_key("claude", "u0n1c0de-zz"),
+            at_ms: 5_000,
+            reason: "turn".to_owned(),
+            context: SessionContext {
+                title: None,
+                prompt_excerpt: Some(prompt),
+            },
+        }])
+        .expect("update");
+    let record = store
+        .load()
+        .work
+        .branches
+        .get(&id)
+        .expect("the record")
+        .clone();
+    let excerpt = record.session_context
+        [&agent_sessions::store::conversation_key("claude", "u0n1c0de-zz")]
+        .prompt_excerpt
+        .clone()
+        .expect("the bounded excerpt");
+    // Raw storage, bounded on escape: it keeps control bytes verbatim but
+    // never renders past 120 cells once escaped.
+    assert!(excerpt.contains('\t') && excerpt.contains('\u{1b}'));
+    assert!(excerpt.ends_with('…'));
+
+    let mut snapshot = fixture();
+    snapshot.work[0].conversation_summaries = vec![summary(
+        "claude\u{0}u0n1c0de-zz",
+        (NOW - 60) * 1000,
+        None,
+        Some(&excerpt),
+    )];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 50);
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'), "{text}");
+        // Wrapping splits the row mid-string; the detail pane's cells,
+        // rejoined past the pane borders, restore each logical line.
+        let detail: String = text
+            .lines()
+            .filter_map(|l| l.rsplit('│').nth(1).map(str::to_owned))
+            .map(|s| s.trim_end().to_owned())
+            .collect();
+        // The escaped controls and double-width text print literally -
+        // buffer cells pad each wide glyph with a space, so the needles
+        // are the fragments padding cannot split.
+        assert!(detail.contains("prompt: 日"), "{text}");
+        assert!(detail.contains("xcerpt"), "{text}");
+        assert!(detail.contains("\\ttab"), "{text}");
+        assert!(detail.contains("\\nnewline"), "{text}");
+        assert!(detail.contains("\\u001b"), "{text}");
+        assert!(detail.contains("…"), "{text}");
+    }
+}
+
+fn obs(source: ObservationSource, at: u64, reasons: &[&str]) -> ObservationEvent {
+    ObservationEvent {
+        covered_by: None,
+        source,
+        observed_at_ms: at * 1000,
+        reasons: reasons.iter().map(|r| r.to_string()).collect(),
+    }
+}
+
+#[test]
+fn lifecycle_counts_render_under_an_observed_git_state_subgroup() {
+    let mut snapshot = fixture();
+    let activities = vec![
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 300) * 1000,
+            reasons: vec!["aaa1111 commit: earlier".to_owned()],
+        },
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 200) * 1000,
+            reasons: vec!["bbb2222 commit: later".to_owned()],
+        },
+        ActivityEvent {
+            source: ActivitySource::Commit,
+            occurred_at_ms: (NOW - 120) * 1000,
+            reasons: vec!["bbb2222 later".to_owned()],
+        },
+    ];
+    let observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 90,
+        &["upstream: a -> b", "ahead: 1 -> 2", "unpushed: 0 -> 1"],
+    )];
+    snapshot.work[0].activities = activities.clone();
+    snapshot.work[0].observations = observations.clone();
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        assert!(text.contains("activity: 2m"), "{text}");
+        let subgroup = text
+            .find("  git state (observed):")
+            .expect("the git-state subgroup: {text}");
+        assert!(text.find("  reflog:").unwrap() < subgroup, "{text}");
+        assert!(text.find("  commit:").unwrap() < subgroup, "{text}");
+        let observations_at = text.find("observations:").expect("observations");
+        assert!(subgroup < observations_at, "{text}");
+        let git = &text[subgroup..observations_at];
+        assert!(git.contains("observed"), "{text}");
+        let rest = &text[observations_at..];
+        assert!(rest.contains("upstream: a -> b"), "{text}");
+        assert!(!rest.contains("ahead: 1 -> 2"), "{text}");
+        if width == 200 {
+            assert_eq!(text.matches("ahead: 1 -> 2").count(), 1, "{text}");
+            assert_eq!(text.matches("unpushed: 0 -> 1").count(), 1, "{text}");
+            assert!(git.contains("observed 1m ahead: 1 -> 2"), "{text}");
+            assert!(git.contains("observed 1m unpushed: 0 -> 1"), "{text}");
+            assert!(text.contains("5m aaa1111 commit: earlier"), "{text}");
+            assert!(text.contains("3m bbb2222 commit: later"), "{text}");
+        }
+    }
+    assert_eq!(app.snapshot.work[0].activities, activities);
+    assert_eq!(app.snapshot.work[0].observations, observations);
+}
+
+#[test]
+fn observed_counts_alone_never_count_as_activity() {
+    let mut snapshot = fixture();
+    snapshot.work[0].activities = Vec::new();
+    snapshot.work[0].last_activity = None;
+    snapshot.work[0].observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 30,
+        &["ahead: 0 -> 2"],
+    )];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        assert!(text.contains("activity: ?"), "{text}");
+        let subgroup = text
+            .find("  git state (observed):")
+            .expect("the git-state subgroup");
+        let end = text.find("commits not on").unwrap_or(text.len());
+        let detail: Vec<&str> = text[subgroup..end]
+            .lines()
+            .filter(|l| l.contains("ahead: 0 -> 2"))
+            .collect();
+        assert!(!detail.is_empty(), "{text}");
+        assert!(
+            detail.iter().all(|l| l.contains("observed 30s")),
+            "every line is scan-dated: {text}"
+        );
+        assert!(
+            !text.contains("observations:"),
+            "the count left nothing behind: {text}"
+        );
+    }
+}
+
+#[test]
+fn unknown_and_other_source_count_like_reasons_stay_observations() {
+    let mut snapshot = fixture();
+    snapshot.work[0].observations = vec![
+        obs(
+            ObservationSource::Lifecycle,
+            NOW - 60,
+            &[
+                "ahead:1 -> 2",
+                "Ahead: 2 -> 3",
+                "ahead count: 4",
+                "landed: no -> yes",
+            ],
+        ),
+        obs(ObservationSource::Forge, NOW - 50, &["ahead: 9 -> 9"]),
+        obs(
+            ObservationSource::WorkingTree,
+            NOW - 40,
+            &["unpushed: 0 -> 1"],
+        ),
+    ];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        assert!(
+            !text.contains("git state"),
+            "no count-shaped reason matched exactly: {text}"
+        );
+        let observations_at = text.find("observations:").expect("observations");
+        for kept in [
+            "ahead:1 -> 2",
+            "Ahead: 2 -> 3",
+            "ahead count: 4",
+            "landed: no -> yes",
+            "ahead: 9 -> 9",
+            "unpushed: 0 -> 1",
+        ] {
+            assert!(text[observations_at..].contains(kept), "{text}");
+        }
+    }
+}
+
+#[test]
+fn a_remote_only_count_change_leaves_source_activity_unchanged() {
+    let mut snapshot = fixture();
+    let activities = vec![ActivityEvent {
+        source: ActivitySource::Reflog,
+        occurred_at_ms: (NOW - 5400) * 1000,
+        reasons: vec!["ccc3333 commit: earlier work".to_owned()],
+    }];
+    let observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 5,
+        &["behind: 0 -> 3"],
+    )];
+    snapshot.work[0].activities = activities.clone();
+    snapshot.work[0].observations = observations.clone();
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        assert!(text.contains("activity: 1h"), "{text}");
+        let subgroup = text
+            .find("  git state (observed):")
+            .expect("the git-state subgroup");
+        assert!(text.find("  reflog:").unwrap() < subgroup, "{text}");
+        let end = text.find("commits not on").unwrap_or(text.len());
+        let git = &text[subgroup..end];
+        assert!(git.contains("observed 5s"), "{text}");
+        assert!(git.contains("behind: 0"), "{text}");
+        assert!(text.contains("ccc3333"), "{text}");
+        assert!(
+            !text.contains("observations:"),
+            "nothing else was observed: {text}"
+        );
+    }
+    let text = render(&app, 200, 60);
+    assert!(text.contains("1h ccc3333 commit: earlier work"), "{text}");
+    let subgroup = text.find("  git state (observed):").unwrap();
+    let end = text.find("commits not on").unwrap();
+    assert!(
+        text[subgroup..end].contains("observed 5s behind: 0 -> 3"),
+        "{text}"
+    );
+    assert_eq!(app.snapshot.work[0].activities, activities);
+    assert_eq!(app.snapshot.work[0].observations, observations);
+}
+
+#[test]
+fn git_state_sorts_by_scan_time_and_caps_after_partitioning() {
+    let mut snapshot = fixture();
+    snapshot.work[0].activities = vec![
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 7200) * 1000,
+            reasons: vec!["aaa1111 commit: old".to_owned()],
+        },
+        ActivityEvent {
+            source: ActivitySource::Reflog,
+            occurred_at_ms: (NOW - 5400) * 1000,
+            reasons: vec!["bbb2222 commit: mid".to_owned()],
+        },
+    ];
+    let mut observations: Vec<ObservationEvent> = (0..8u64)
+        .map(|i| {
+            let reasons = if i == 7 {
+                vec![
+                    "ahead: 7 -> 8".to_owned(),
+                    "behind: 0 -> 5".to_owned(),
+                    "unpushed: 6 -> 7".to_owned(),
+                ]
+            } else {
+                vec![format!("ahead: {i} -> {}", i + 1)]
+            };
+            ObservationEvent {
+                covered_by: None,
+                source: ObservationSource::Lifecycle,
+                observed_at_ms: (NOW - 800 + i * 10) * 1000,
+                reasons,
+            }
+        })
+        .collect();
+    observations.push(obs(
+        ObservationSource::Lifecycle,
+        NOW - 5,
+        &["landed: no -> ancestor"],
+    ));
+    snapshot.work[0].observations = observations;
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 70);
+        assert!(text.contains("activity: 1h"), "{text}");
+        let subgroup = text.find("  git state (observed):").expect("subgroup");
+        let observations_at = text.find("observations:").expect("observations");
+        assert!(subgroup < observations_at, "{text}");
+        assert!(text.find("  reflog:").unwrap() < subgroup, "{text}");
+        let git = &text[subgroup..observations_at];
+        assert!(!git.contains("ahead: 0 -> 1"), "{text}");
+        assert!(!git.contains("landed"), "{text}");
+        assert!(text.contains("landed: no -> ancestor"), "{text}");
+        if width == 200 {
+            assert!(text.contains("2h aaa1111 commit: old"), "{text}");
+            assert!(text.contains("1h bbb2222 commit: mid"), "{text}");
+            assert_eq!(git.matches("observed ").count(), 9, "{text}");
+            assert!(git.contains("observed 12m ahead: 7 -> 8"), "{text}");
+            assert!(git.contains("behind: 0 -> 5"), "{text}");
+            assert!(git.contains("unpushed: 6 -> 7"), "{text}");
+            assert!(git.contains("observed 13m ahead: 1 -> 2"), "{text}");
+            for i in 1..7u64 {
+                assert!(git.contains(&format!("ahead: {i} -> {}", i + 1)), "{text}");
+            }
+            assert!(
+                git.find("ahead: 7 -> 8").unwrap() < git.find("ahead: 1 -> 2").unwrap(),
+                "newest observed first: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn git_state_ties_and_reasons_render_deterministically() {
+    let render_order = |first: &[&str], second: &[&str]| {
+        let mut snapshot = fixture();
+        snapshot.work[0].observations = vec![
+            obs(ObservationSource::Lifecycle, NOW - 60, first),
+            obs(ObservationSource::Lifecycle, NOW - 60, second),
+        ];
+        let mut app = App::new(snapshot);
+        press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+        let text = render(&app, 200, 60);
+        let subgroup = text.find("  git state (observed):").expect("subgroup");
+        let end = text.find("commits not on").unwrap_or(text.len());
+        text[subgroup..end]
+            .lines()
+            .filter(|l| l.contains("observed "))
+            .map(|l| l.trim().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let forward = render_order(&["behind: 0 -> 1"], &["ahead: 2 -> 3"]);
+    let reversed = render_order(&["ahead: 2 -> 3"], &["behind: 0 -> 1"]);
+    assert_eq!(forward, reversed, "{forward:?} vs {reversed:?}");
+    assert!(
+        forward[0].contains("ahead: 2 -> 3"),
+        "the smaller reason list wins the tie: {forward:?}"
+    );
+    let mixed = render_order(&["unpushed: 1 -> 2", "ahead: 3 -> 4"], &["behind: 0 -> 1"]);
+    let ahead = mixed
+        .iter()
+        .position(|l| l.contains("ahead: 3 -> 4"))
+        .unwrap();
+    let unpushed = mixed
+        .iter()
+        .position(|l| l.contains("unpushed: 1 -> 2"))
+        .unwrap();
+    assert!(ahead < unpushed, "{mixed:?}");
+}
+
+#[test]
+fn git_state_reasons_escape_and_wrap_and_leave_raw_history() {
+    let mut snapshot = fixture();
+    let raw = "ahead: 0 -> 1 日本\ttab\u{7}".to_owned();
+    let long = format!("unpushed: 0 -> 1 {}", "tail".repeat(30));
+    snapshot.work[0].observations =
+        vec![obs(ObservationSource::Lifecycle, NOW - 60, &[&raw, &long])];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    for width in [55, 200] {
+        let text = render(&app, width, 60);
+        assert!(text.contains("git state (observed):"), "{text}");
+        assert!(!text.contains('\t') && !text.contains('\u{7}'), "{text}");
+        assert!(text.contains("unpushed: 0 ->"), "{text}");
+    }
+    let text = render(&app, 200, 60);
+    assert!(text.contains("\\ttab\\u0007"), "{text}");
+    assert!(text.contains("unpushed: 0 -> 1"), "{text}");
+    assert_eq!(
+        app.snapshot.work[0].observations[0].reasons,
+        vec![raw, long]
+    );
+}
+
+#[test]
+fn observed_counts_do_not_defeat_the_age_filter() {
+    let mut snapshot = fixture();
+    let mut unknown = work();
+    unknown.name = "feat/unknown".to_owned();
+    unknown.identity = Some("i222".to_owned());
+    unknown.incarnation = Some(incarnation("i222", "feat/unknown", 1));
+    unknown.last_activity = None;
+    unknown.observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 5,
+        &["ahead: 0 -> 1"],
+    )];
+    let mut stale = work();
+    stale.name = "feat/stale".to_owned();
+    stale.identity = Some("i333".to_owned());
+    stale.incarnation = Some(incarnation("i333", "feat/stale", 1));
+    stale.last_activity = Some(NOW - 100_000);
+    stale.observations = vec![obs(
+        ObservationSource::Lifecycle,
+        NOW - 5,
+        &["behind: 0 -> 3"],
+    )];
+    snapshot.work.push(unknown);
+    snapshot.work.push(stale);
+    let mut app = App::new(snapshot);
+    press(
+        &mut app,
+        &[
+            Key::Char('2'),
+            Key::Char('/'),
+            Key::Char('a'),
+            Key::Char('g'),
+            Key::Char('e'),
+            Key::Char(':'),
+            Key::Char('1'),
+            Key::Char('h'),
+            Key::Enter,
+        ],
+    );
+    let text = render(&app, 200, 30);
+    assert!(text.contains("feat/login"), "{text}");
+    assert!(
+        !text.contains("feat/unknown"),
+        "an unknown age fails closed, observed counts notwithstanding: {text}"
+    );
+    assert!(
+        !text.contains("feat/stale"),
+        "a scan-time count never refreshes last_activity: {text}"
     );
 }

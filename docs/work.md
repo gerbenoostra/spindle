@@ -49,6 +49,30 @@ The `[4]` detail pane follows the focused row. `e` shows the evidence behind
 a claim - which source won and what was outranked, `?` where nothing proved
 it. The full vocabulary is in [attention](attention.md).
 
+Under **Activity**, each conversation the row's record has observed gets one
+row - `last activity` at its newest source-backed occurrence - rather than one
+line per turn. The row shows a short id plus the latest-known submitted prompt,
+kept as a bounded excerpt; the excerpt is context, not a claim that the
+activity dates that prompt. Where no prompt was captured the provider title
+stands in, then the bare id. At most seven conversations show, newest first,
+after the per-turn events compact; a record without conversation cursors keeps
+its raw per-turn trail, and the other sources' raw histories are unchanged.
+Context is captured per work row, so a later prompt after moving to other work
+does not overwrite the earlier row's captured context.
+
+Directly under the activity groups, a `git state (observed)` subgroup lists
+the delivery-count transitions a pass observed: `ahead:`, `behind:` and
+`unpushed:` readings, each dated `observed <age>` at the time the collector
+saw the change. That timestamp is a detection, not work - a remote push or a
+base move shifts the counts without any local reflog entry, so the subgroup
+is never paired with one and `activity:` still names only source-backed
+occurrences (`?` when none exist). Only lifecycle reasons with the exact
+`ahead: `, `behind: ` or `unpushed: ` prefix move there; every other
+observation reason stays under `observations:`, an event left with no other
+reasons leaves no empty group, and the subgroup itself is omitted when no
+counts were observed. At most seven count events show, newest scan first
+with ties ordered by their reason list.
+
 ## Navigation
 
 - `enter` on a live conversation selects the bound socket-qualified pane the
@@ -81,6 +105,11 @@ it. The full vocabulary is in [attention](attention.md).
 - `o` trusts only the URL the collected row recorded - because a local
   refresh cannot replace missing forge evidence; not re-deriving or guessing
   a URL at keypress time.
+- Each conversation gets one summary row keyed by its full
+  provider-qualified key - because labels and short ids collide and repeated
+  labels obscure which conversation a row names; not label or short-id
+  deduplication (distinct conversations would merge) and not per-turn
+  display (the noise the summary exists to remove).
 
 The architecture and failure semantics live in
 [work-lifecycle](architecture/work-lifecycle.md) and
