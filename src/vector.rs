@@ -1273,9 +1273,27 @@ mod tests {
         assert_eq!(worktree_head_log(false, None), None);
     }
 
+    /// A `Repo` over a temporary common dir, removed on drop so a
+    /// panicking test cannot leave its fixture behind.
+    struct TempRepo(Repo);
+
+    impl std::ops::Deref for TempRepo {
+        type Target = Repo;
+
+        fn deref(&self) -> &Repo {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0.common_dir);
+        }
+    }
+
     /// A `Repo` over a fabricated common dir whose reflog files alone
     /// exist: `logs` maps each relative log path to its contents.
-    fn reflog_repo(logs: &[(&str, &str)]) -> Repo {
+    fn reflog_repo(logs: &[(&str, &str)]) -> TempRepo {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "agent-sessions-reflog-{}-{}",
@@ -1283,12 +1301,26 @@ mod tests {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        // Wrapped before the fixture writes: a panic mid-write still
+        // drops the dir.
+        let repo = TempRepo(Repo { common_dir: dir });
         for (rel, body) in logs {
-            let path = dir.join(rel);
+            let path = repo.common_dir.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, body).unwrap();
         }
-        Repo { common_dir: dir }
+        repo
+    }
+
+    #[test]
+    fn a_reflog_repo_drops_its_common_dir() {
+        let dir = {
+            let repo = reflog_repo(&[("logs/HEAD", "aaaa bbbb A <a@b> 1 +0000\tcommit: x\n")]);
+            let dir = repo.common_dir().to_owned();
+            assert!(dir.exists(), "the fixture is live inside the scope");
+            dir
+        };
+        assert!(!dir.exists(), "the drop removed {dir:?}");
     }
 
     /// A worktree anchor over `head`, `main` marking the repository's own
