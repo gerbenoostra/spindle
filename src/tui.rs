@@ -13,6 +13,7 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
@@ -2731,18 +2732,14 @@ pub fn run(
     crossterm::execute!(stdout, EnterAlternateScreen)?; // coverage: off - `?` needs a broken terminal
     let backend = ratatui::backend::CrosstermBackend::new(stdout); // coverage: off - same
     let mut terminal = Terminal::new(backend)?; // coverage: off - `?` needs a broken terminal
-    // One pending snapshot at most: the worker computes the next pass only
-    // once the loop has taken the previous one, so a slow collect can delay
-    // the next swap but never a redraw or a key press.
+    // One pending snapshot at most, newest wins: the worker never waits
+    // on the loop, so a slow draw never delays a collect pass - the slot
+    // simply keeps the latest until `feed` takes it.
     let pace = Duration::from_secs(1); // coverage: off - the worker only runs under a real terminal
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Snapshot>(1); // coverage: off - same
+    let (tx, rx) = snapshot_channel(); // coverage: off - same
     std::thread::spawn(move || collect_worker(tx, refresh, pace)); // coverage: off - same
 
-    let feed = move || match rx.try_recv() {
-        Ok(snapshot) => Feed::Snapshot(snapshot), // coverage: off - `run` itself needs a real terminal
-        Err(std::sync::mpsc::TryRecvError::Empty) => Feed::Idle, // coverage: off - the unexecuted instantiation's arm edge
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => Feed::Dead, // coverage: off - needs the worker to die while the loop runs
-    }; // coverage: off - the unexecuted instantiation's region edge
+    let feed = move || rx.feed(); // coverage: off - `run` itself needs a real terminal
     let result = run_loop(
         &mut terminal,
         &mut app,
@@ -2813,22 +2810,121 @@ fn restore_terminal() -> io::Result<()> { // coverage: off - a resume needs a re
     enable_raw_mode()?; // coverage: off - `?` needs a broken terminal
     crossterm::execute!(io::stdout(), EnterAlternateScreen) // coverage: off - same
 } // coverage: off - same
+/// The collector's slot: one pending snapshot, newest wins, both ends
+/// flagging their exit so the survivor never waits on a ghost. Publishing
+/// displaces a pending snapshot whose teardown runs after the lock drops;
+/// taking the pending wins even over a dead producer, so the last pass is
+/// never lost to a race with exit.
+struct SnapshotSlot {
+    /// The newest published snapshot the loop has not taken yet.
+    pending: Option<Snapshot>,
+    producer_live: bool,
+    consumer_live: bool,
+}
+
+/// The worker's end of the slot. `publish` never waits on the UI: it
+/// swaps the pending snapshot for the newest under a short lock, so one
+/// collect pass can never queue behind an undrawn frame.
+struct SnapshotSender {
+    slot: Arc<Mutex<SnapshotSlot>>,
+}
+
+impl SnapshotSender {
+    /// Hand `snapshot` to the loop, replacing whatever is pending.
+    /// `false` once the loop is gone - the worker's publish verdict and
+    /// its stop signal.
+    fn publish(&self, snapshot: Snapshot) -> bool {
+        let displaced = {
+            let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+            if !slot.consumer_live {
+                return false;
+            }
+            slot.pending.replace(snapshot)
+        };
+        drop(displaced);
+        true
+    }
+
+    /// Whether the loop still takes snapshots. A pass that published
+    /// nothing gets no `publish` verdict, so the worker asks directly
+    /// before resting - a gone loop ends a clean pass too.
+    fn connected(&self) -> bool {
+        self.slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .consumer_live
+    }
+}
+
+impl Drop for SnapshotSender {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        slot.producer_live = false;
+    }
+}
+
+/// The loop's end of the slot. `feed` takes the pending snapshot - even
+/// after the producer died - before reporting `Idle` or `Dead`.
+struct SnapshotReceiver {
+    slot: Arc<Mutex<SnapshotSlot>>,
+}
+
+impl SnapshotReceiver {
+    /// The newest pending snapshot; `Idle` while the worker still lives,
+    /// `Dead` once it is gone and nothing is pending.
+    fn feed(&self) -> Feed {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.pending.take() {
+            Some(snapshot) => Feed::Snapshot(snapshot),
+            None if slot.producer_live => Feed::Idle,
+            None => Feed::Dead,
+        }
+    }
+}
+
+impl Drop for SnapshotReceiver {
+    fn drop(&mut self) {
+        let pending = {
+            let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+            slot.consumer_live = false;
+            slot.pending.take()
+        };
+        drop(pending);
+    }
+}
+
+/// The one-slot pair: single producer, single consumer, so neither handle
+/// clones.
+fn snapshot_channel() -> (SnapshotSender, SnapshotReceiver) {
+    let slot = Arc::new(Mutex::new(SnapshotSlot {
+        pending: None,
+        producer_live: true,
+        consumer_live: true,
+    }));
+    (
+        SnapshotSender { slot: slot.clone() },
+        SnapshotReceiver { slot },
+    )
+}
+
 /// The collector's own loop, on its own thread: one staged pass streams
-/// its snapshots through `publish`, each handed over once the previous one
-/// was taken (the bounded channel paces the worker), then `interval` of
-/// rest and the next pass. A dropped receiver ends the worker.
+/// its snapshots through `publish`, each swapped into the slot without
+/// waiting for the loop to draw (newest wins; the loop polls on its own
+/// tick), then `interval` of rest and the next pass. A dropped receiver
+/// ends the worker - by a `publish` verdict, or by the `connected` check
+/// on a pass that published nothing.
 fn collect_worker(
-    tx: std::sync::mpsc::SyncSender<Snapshot>,
+    tx: SnapshotSender,
     mut refresh: impl FnMut(&mut dyn FnMut(Snapshot) -> bool),
     interval: Duration,
 ) {
     loop {
         let mut alive = true;
         refresh(&mut |snapshot| {
-            alive = tx.send(snapshot).is_ok();
+            alive = tx.publish(snapshot);
             alive
         });
-        if !alive {
+        if !alive || !tx.connected() {
             return;
         }
         std::thread::sleep(interval);
@@ -4700,28 +4796,161 @@ mod tests {
         assert!(!SPINNER.iter().any(|f| footer.contains(f)), "{footer}");
     }
 
+    /// The newest pending snapshot, `n`-stamped.
+    fn stamped(n: u64) -> Snapshot {
+        let mut s = fixture();
+        s.observed_at = n;
+        s
+    }
+
+    #[test]
+    fn the_slot_keeps_only_the_newest_pending_snapshot() {
+        let (tx, rx) = snapshot_channel();
+        tx.publish(stamped(1));
+        tx.publish(stamped(2));
+        tx.publish(stamped(3));
+        match rx.feed() {
+            Feed::Snapshot(s) => assert_eq!(s.observed_at, 3, "newest wins"),
+            _ => panic!("a pending snapshot must feed"), // coverage: off - the match's failure arm
+        }
+        assert!(matches!(rx.feed(), Feed::Idle), "the slot drains to Idle"); // coverage: off - the assert's panic edge
+    }
+
+    #[test]
+    fn a_dropped_receiver_fails_the_next_publish() {
+        let (tx, rx) = snapshot_channel();
+        drop(rx);
+        assert!(!tx.publish(stamped(1)));
+    }
+
+    /// The worker ends when the loop's receiver drops - even mid-pass -
+    /// and a pass that published nothing still notices through
+    /// `connected` rather than looping forever.
     #[test]
     fn the_worker_produces_until_the_receiver_drops() {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Snapshot>(1);
-        let mut calls = 0u64;
+        let (tx, rx) = snapshot_channel();
+        let (passes_tx, passes_rx) = std::sync::mpsc::channel::<u64>();
         let worker = std::thread::spawn(move || {
+            let mut calls = 0u64;
             collect_worker(
                 tx,
                 move |publish| {
                     calls += 1;
-                    let mut s = fixture();
-                    s.observed_at = calls;
-                    publish(s);
+                    let _ = passes_tx.send(calls);
+                    publish(stamped(calls));
                 },
                 Duration::ZERO,
             )
         });
-        // One pass after another lands on the channel; dropping the
-        // receiver ends the worker instead of leaving it parked.
-        assert_eq!(rx.recv().unwrap().observed_at, 1);
-        assert_eq!(rx.recv().unwrap().observed_at, 2);
+        // The worker publishes every pass; the receiver takes only the
+        // newest. Barrier on the pass counter, not on a race with the
+        // slot.
+        assert_eq!(passes_rx.recv().unwrap(), 1);
         drop(rx);
         worker.join().unwrap();
+        // A pass whose publishes were never consumed still terminates.
+        let (tx, rx) = snapshot_channel();
+        let worker = std::thread::spawn(move || collect_worker(tx, |_publish| {}, Duration::ZERO));
+        drop(rx);
+        worker.join().unwrap();
+    }
+
+    /// A staged burst with no reader: every publish lands on the slot
+    /// (the worker never waits on the UI), and the newest snapshot is
+    /// what the loop eventually draws.
+    #[test]
+    fn a_burst_of_publishes_leaves_the_newest() {
+        let (tx, rx) = snapshot_channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<u64>();
+        let worker = std::thread::spawn(move || {
+            collect_worker(
+                tx,
+                move |publish| {
+                    for n in 1..=3 {
+                        publish(stamped(n));
+                    }
+                    let _ = done_tx.send(0);
+                },
+                // The slot holds the burst until the test inspects it at
+                // the barrier; the rest interval just keeps the worker
+                // looping cheaply until the receiver drops.
+                Duration::from_millis(10),
+            )
+        });
+        // recv_timeout is only a deadlock guard; the barrier is the pass's
+        // own done signal, so the assertion never guesses at timing.
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the pass finished without a reader");
+        match rx.feed() {
+            Feed::Snapshot(s) => assert_eq!(s.observed_at, 3),
+            _ => panic!("the burst's newest must be pending"), // coverage: off - the match's failure arm
+        }
+        drop(rx);
+        worker.join().unwrap();
+    }
+
+    /// Producer lifecycle through the slot: a pending complete snapshot
+    /// still feeds after the sender drops, then `Dead`; an empty slot
+    /// with a dead producer reports `Dead` outright.
+    #[test]
+    fn producer_exit_keeps_the_pending_snapshot() {
+        let (tx, rx) = snapshot_channel();
+        let mut complete = stamped(9);
+        complete.complete = true;
+        tx.publish(complete);
+        drop(tx);
+        match rx.feed() {
+            Feed::Snapshot(s) => assert!(s.complete, "the pending snapshot survives"),
+            _ => panic!("a pending snapshot outlives its producer"), // coverage: off - the match's failure arm
+        }
+        assert!(matches!(rx.feed(), Feed::Dead)); // coverage: off - the assert's panic edge
+
+        let (tx, rx) = snapshot_channel();
+        drop(tx);
+        assert!(matches!(rx.feed(), Feed::Dead)); // coverage: off - the assert's panic edge
+    }
+
+    /// A complete snapshot displacing an incomplete one keeps the loop's
+    /// final answer: the pending slot replaces, never queues.
+    #[test]
+    fn a_complete_snapshot_displaces_an_incomplete_one() {
+        let (tx, rx) = snapshot_channel();
+        tx.publish(stamped(1));
+        let mut complete = stamped(2);
+        complete.complete = true;
+        tx.publish(complete);
+        match rx.feed() {
+            Feed::Snapshot(s) => {
+                assert!(s.complete);
+                assert_eq!(s.observed_at, 2);
+            }
+            _ => panic!("the complete snapshot must be pending"), // coverage: off - the match's failure arm
+        }
+        assert!(matches!(rx.feed(), Feed::Idle)); // coverage: off - the assert's panic edge
+    }
+
+    /// A panic while the slot is locked poisons the mutex: both ends
+    /// recover through `into_inner` - no data is ever handed out under
+    /// the lock, so a poisoned slot is still safe to use.
+    #[test]
+    fn a_poisoned_slot_recovers_instead_of_propagating() {
+        let (tx, rx) = snapshot_channel();
+        let slot = tx.slot.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = slot.lock().unwrap(); // coverage: off - the panic edge is the point of the test
+            panic!("poison"); // coverage: off - unwinds by construction
+        }));
+        assert!(tx.slot.lock().is_err());
+        assert!(tx.publish(stamped(1)));
+        assert!(tx.connected());
+        match rx.feed() {
+            Feed::Snapshot(s) => assert_eq!(s.observed_at, 1),
+            _ => panic!("a poisoned slot still feeds"), // coverage: off - the match's failure arm
+        }
+        drop(tx);
+        assert!(matches!(rx.feed(), Feed::Dead)); // coverage: off - the assert's panic edge
+        drop(rx);
     }
 
     #[test]
