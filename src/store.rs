@@ -3083,6 +3083,9 @@ mod tests {
                 .is_err()
             );
             assert_eq!(attempts.get(), 1, "{kind:?} must not retry");
+            // The fallback succeeds if called again, without retrying
+            // through the helper.
+            assert_eq!(once().unwrap(), 7);
         }
     }
 
