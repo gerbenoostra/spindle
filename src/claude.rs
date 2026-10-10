@@ -125,7 +125,8 @@ pub struct BranchMark {
 }
 
 /// One scan's output: the merged conversations plus the failures the
-/// evidence view keeps; rejected non-transcripts are dropped silently.
+/// evidence view keeps. Rejected paths carry no actionable evidence and
+/// are not retained.
 #[derive(Debug, Default)]
 pub struct Inventory {
     pub conversations: Vec<Conversation>,
