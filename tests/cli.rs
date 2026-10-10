@@ -178,7 +178,8 @@ fn list_json_prints_the_complete_snapshot() {
     assert!(out.status.success(), "{}", stderr_of(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
-    assert_eq!(json["schema_version"], 2, "{stdout}");
+    assert_eq!(json["schema_version"], 3, "{stdout}");
+    assert!(json.get("skipped").is_none(), "{stdout}");
     // The staged pipeline ran to completion: `list --json` prints only the
     // final snapshot.
     assert_eq!(json["complete"], true, "{stdout}");

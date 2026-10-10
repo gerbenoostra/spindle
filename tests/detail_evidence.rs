@@ -233,7 +233,6 @@ fn fixture() -> Snapshot {
         work: vec![work()],
         conversations: vec![conversation("8f423bbb", Some("update pane labels"))],
         errors: vec![],
-        skipped: vec![],
         stale_sockets: 0,
     }
 }
@@ -953,7 +952,6 @@ fn the_evidence_overlay_shows_claims_latches_marks_and_rejects() {
         source: "git".to_owned(),
         detail: "rev-list failed".to_owned(),
     }];
-    snapshot.skipped = vec!["not-a-uuid.jsonl".to_owned()];
     snapshot.stale_sockets = 3;
     let mut app = App::new(snapshot);
     press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char('e')]);
@@ -972,10 +970,14 @@ fn the_evidence_overlay_shows_claims_latches_marks_and_rejects() {
         assert!(text.contains("rejected / stale:"), "{text}");
         assert!(text.contains("PreToolUse"), "{text}");
         assert!(text.contains("no mapped event"), "{text}");
-        assert!(text.contains("collector:"), "{text}");
+        let pane: String = text.lines().filter_map(|l| l.rsplit('│').nth(1)).collect();
+        let squashed: String = pane.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squashed.contains("collector:1errors·3stalesockets"),
+            "{text}"
+        );
         assert!(text.contains("rev-list failed"), "{text}");
-        assert!(text.contains("not-a-uuid.jsonl"), "{text}");
-        assert!(text.contains("3 stale sockets"), "{text}");
+        assert!(!text.contains("skipped"), "{text}");
     }
     let text = render(&app, 200, 50);
     assert!(text.contains("journal 7 · producer 12"), "{text}");

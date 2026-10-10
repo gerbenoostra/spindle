@@ -110,6 +110,9 @@ with ties ordered by their reason list.
   labels obscure which conversation a row names; not label or short-id
   deduplication (distinct conversations would merge) and not per-turn
   display (the noise the summary exists to remove).
+- Rejected transcript paths are neither retained nor exposed - because they
+  provide no actionable evidence and add noise; not hiding them only in the
+  evidence pane (that leaves unused data in the JSON contract).
 
 The architecture and failure semantics live in
 [work-lifecycle](architecture/work-lifecycle.md) and

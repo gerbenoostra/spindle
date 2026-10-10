@@ -1210,7 +1210,7 @@ impl App {
 
     /// The evidence body for the selected row: a conversation's claims,
     /// latches, marks and rejected records, or an incarnation's
-    /// continuity evidence - then the collector's errors and skips.
+    /// continuity evidence - then the collector's errors.
     fn evidence_lines(&self, view: &View<'_>, width: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         match self.detail_target(view) {
@@ -1230,18 +1230,14 @@ impl App {
         push_head(
             &mut out,
             format!(
-                "collector: {} errors · {} skipped · {} stale sockets",
+                "collector: {} errors · {} stale sockets",
                 s.errors.len(),
-                s.skipped.len(),
                 s.stale_sockets
             ),
             width,
         );
         for e in &s.errors {
             push_text(&mut out, format!("  {}: {}", e.source, e.detail), width);
-        }
-        for skip in &s.skipped {
-            push_text(&mut out, format!("  skipped: {skip}"), width);
         }
         out
     }
@@ -3346,7 +3342,6 @@ mod tests {
                 },
             ],
             errors: vec![],
-            skipped: vec![],
             stale_sockets: 0, // coverage: off - the unexecuted instantiation's region edge
         }
     }
