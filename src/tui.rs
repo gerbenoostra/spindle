@@ -1825,10 +1825,14 @@ impl App {
     /// While the snapshot is incomplete a spinner leads - collection is in
     /// flight - and a dead collector replaces the line entirely.
     fn footer(&self, f: &mut Frame<'_>, area: Rect) {
-        let text = if self.collector_dead {
-            "collector stopped - last snapshot | q quit".to_owned()
+        let dim = Style::default().fg(Color::DarkGray);
+        let line = if self.collector_dead {
+            Line::from(Span::styled(
+                "collector stopped - last snapshot | q quit",
+                dim,
+            ))
         } else if let Some(notice) = &self.notice {
-            notice.clone()
+            Line::from(Span::styled(notice.clone(), dim))
         } else {
             let spinner = self.spinner(area.width);
             let hints = if self.editing.is_some() {
@@ -1857,12 +1861,11 @@ impl App {
                 };
                 format!("{hints} | ? keys | q quit")
             };
-            format!("{spinner}{hints}")
+            // The spinner leads in the default foreground so it reads as live
+            // activity; the hints behind it stay dim.
+            Line::from(vec![Span::raw(spinner), Span::styled(hints, dim)])
         };
-        f.render_widget(
-            Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray))),
-            area,
-        );
+        f.render_widget(Paragraph::new(line), area);
     }
 
     /// The collection-in-flight glyph for the footer, cycling one frame per
