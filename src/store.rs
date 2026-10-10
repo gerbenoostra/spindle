@@ -3009,6 +3009,83 @@ mod tests {
         r
     }
 
+    /// Retry one append's documented busy verdict in the test only. The
+    /// production `Lock` is a bounded, non-fair waiter: `WouldBlock`
+    /// simply means the 2s poll expired before this writer's turn. A
+    /// writer that needs its append to land - which is what this test
+    /// proves about *successful* writes, not lock fairness - retries it;
+    /// raising `LOCK_WAIT` to make the race vanish would change the
+    /// documented contract for every caller to fix one test.
+    fn append_with_busy_retry(
+        deadline: std::time::Instant,
+        append: &mut dyn FnMut() -> io::Result<u64>,
+    ) -> u64 {
+        loop {
+            match append() {
+                Ok(seq) => return seq,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(e) => panic!("append: {e}"),
+            }
+        }
+    }
+
+    /// The helper retries `WouldBlock` to success, gives up past the
+    /// deadline, and never retries a non-busy error - each arm driven
+    /// deterministically by a mock append.
+    #[test]
+    fn append_with_busy_retry_retries_only_busy() {
+        let attempts = std::cell::Cell::new(0);
+        let mut append = || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"))
+            } else {
+                Ok(7)
+            }
+        };
+        assert_eq!(
+            append_with_busy_retry(
+                std::time::Instant::now() + Duration::from_secs(30),
+                &mut append
+            ),
+            7
+        );
+        assert_eq!(attempts.get(), 2);
+
+        // Busy past the deadline gives up; a non-busy error is reported
+        // and never retried, however far the deadline sits. Each mock
+        // fails once then succeeds, so a wrongly-taken retry would return
+        // `Ok` - the panic assertion fails deterministically instead of
+        // passing on a hidden retry or hanging on an ignored deadline.
+        for (kind, wait) in [
+            (io::ErrorKind::WouldBlock, Duration::ZERO),
+            (io::ErrorKind::Other, Duration::from_secs(30)),
+        ] {
+            let attempts = std::cell::Cell::new(0);
+            let mut once = || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(io::Error::new(kind, "once"))
+                } else {
+                    Ok(7)
+                }
+            };
+            let deadline = std::time::Instant::now() + wait;
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    append_with_busy_retry(deadline, &mut once)
+                }))
+                .is_err()
+            );
+            assert_eq!(attempts.get(), 1, "{kind:?} must not retry");
+        }
+    }
+
     #[test]
     fn concurrent_writers_get_unique_monotonic_sequences() {
         let temp = TempStore::new();
@@ -3019,9 +3096,13 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 (0..8)
                     .map(|_| {
-                        store
-                            .append(record("claude", &format!("s{i}"), "Stop", NormEvent::End))
-                            .expect("append")
+                        let mut append = || {
+                            store.append(record("claude", &format!("s{i}"), "Stop", NormEvent::End))
+                        };
+                        append_with_busy_retry(
+                            std::time::Instant::now() + Duration::from_secs(30),
+                            &mut append,
+                        )
                     })
                     .collect::<Vec<u64>>()
             }));
@@ -3030,6 +3111,9 @@ mod tests {
             .into_iter()
             .flat_map(|h| h.join().expect("writer joins"))
             .collect();
+        // 8 writers x 8 appends serialize into every sequence exactly
+        // once: the lock pins *that* successes interleave correctly, not
+        // that a given waiter wins inside LOCK_WAIT.
         seqs.sort_unstable();
         assert_eq!(seqs, (1..=64).collect::<Vec<_>>());
         let loaded = store.load();
