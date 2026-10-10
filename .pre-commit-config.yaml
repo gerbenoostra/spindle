@@ -52,10 +52,10 @@ repos:
 
       # A commit-msg hook gets the message file as its only filename; pygrep
       # fails when the pattern matches. Covers co-authoring by an agent or any
-      # bot, "Generated with/by" an agent or a linked tool name, and Cursor's
-      # "Made-with:" trailer.
+      # bot, "Generated with/by" an agent name (bracketed or not), and
+      # Cursor's "Made-with:" trailer.
       - id: no-agent-attribution
         name: No agent attribution in commit message
         language: pygrep
-        entry: '(?i)(co-authored-by:.*(devin|claude|anthropic|copilot|cursor|gemini|jules|aider|codex|codeium|windsurf|cognition|openai|\[bot\])|generated (with|by) (\[|claude|devin|copilot|cursor|gemini|jules|aider|codex)|made-with: (cursor|devin|claude))'
+        entry: '(?i)(co-authored-by:.*(devin|claude|anthropic|copilot|cursor|gemini|jules|aider|codex|codeium|windsurf|cognition|openai|\[bot\])|generated (with|by)[^\]]*(devin|claude|anthropic|copilot|cursor|gemini|jules|aider|codex|codeium|windsurf|cognition|openai)|made-with: (cursor|devin|claude))'
         stages: [commit-msg]
