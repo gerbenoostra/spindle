@@ -777,6 +777,80 @@ fn a_staged_pass_streams_inventory_local_git_remote_then_completes() {
     );
 }
 
+/// A warm collector over identical evidence publishes only its forced
+/// boundaries: stage 1 and the complete final. Nothing in between
+/// republishes - identical merges, remote answers and forge statuses are
+/// not new information.
+#[test]
+fn an_unchanged_second_pass_publishes_only_its_boundaries() {
+    // Deliberately minimal and static: two plain repos and one transcript
+    // each, no live agent, no tmux, no oddball git shapes - the second
+    // pass's evidence is identical by construction, so the quiet-pass
+    // assertion can never flake on fixture timing.
+    let repo = FixtureRepo::new("origin");
+    let repo2 = FixtureRepo::new("origin");
+    let home = TempDir::new("claude-store");
+    transcript(
+        &home,
+        "-quiet-a",
+        "11111111-2222-3333-4444-555555555555",
+        repo.main.as_path(),
+        &[("user", "first repo")],
+    );
+    transcript(
+        &home,
+        "-quiet-b",
+        "66666666-7777-8888-9999-000000000000",
+        repo2.main.as_path(),
+        &[("user", "second repo")],
+    );
+    let mut collector = Collector::new(home.join(".claude")).with_workers(1);
+    let runtime = Runtime::observe_over(&[]);
+
+    // The first pass still streams every stage progressively.
+    let mut first = Vec::new();
+    collector.collect_staged(&runtime, None, &mut |s| {
+        first.push(s);
+        true
+    });
+    assert!(
+        first.len() >= 3,
+        "the first pass lands rows progressively: {}",
+        first.len()
+    );
+    assert!(!first.first().unwrap().complete);
+    assert!(first.last().unwrap().complete);
+    let last = first.last().unwrap();
+    assert_eq!(last.work.len(), 2);
+    assert_eq!(last.conversations.len(), 2);
+    let repos: Vec<String> = last.work.iter().map(|w| w.repo.clone()).collect();
+
+    // The second, unchanged pass publishes exactly stage 1 (incomplete)
+    // and the forced final (complete), with every row still present.
+    let mut second = Vec::new();
+    collector.collect_staged(&runtime, None, &mut |s| {
+        second.push(s);
+        true
+    });
+    assert_eq!(
+        second.len(),
+        2,
+        "an unchanged pass republishes nothing between its boundaries"
+    );
+    assert!(!second[0].complete && second[1].complete);
+    assert_eq!(second[1].work.len(), 2);
+    assert_eq!(second[1].conversations.len(), 2);
+    assert_eq!(
+        second[1]
+            .work
+            .iter()
+            .map(|w| w.repo.clone())
+            .collect::<Vec<_>>(),
+        repos,
+        "both repos are still there"
+    );
+}
+
 #[test]
 fn a_publish_that_returns_false_stops_the_pass() {
     if !tmux_or_skip() {
@@ -849,4 +923,89 @@ fn a_second_pass_carries_remote_fields_until_they_are_replaced() {
     for key in ["repos", "work", "conversations"] {
         assert_eq!(last_a[key], last_b[key], "{key} diverged across passes");
     }
+}
+
+/// A refused publish must stay refused: once the consumer cancels, no
+/// later stage may revive the pass - not even a clean emit's "still
+/// alive" verdict. The first repo's local evidence changed while the
+/// second did not: before the fix, the unchanged repo's merge left the
+/// collector clean, its emit skipped the callback, `alive` recovered to
+/// `true`, and the canceled pass ran to the complete final publish.
+#[test]
+fn an_unchanged_repo_does_not_revive_a_canceled_pass() {
+    let first_repo = FixtureRepo::new("origin");
+    let second_repo = FixtureRepo::new("origin");
+    let home = TempDir::new("cancel-quiet");
+    transcript(
+        &home,
+        "-first",
+        "11111111-2222-3333-4444-555555555555",
+        &first_repo.main,
+        &[("user", "first"), ("assistant", "newest")],
+    );
+    transcript(
+        &home,
+        "-second",
+        "66666666-7777-8888-9999-000000000000",
+        &second_repo.main,
+        &[("user", "second")],
+    );
+    let mut collector = Collector::new(home.join(".claude")).with_workers(1);
+    let runtime = Runtime::observe_over(&[]);
+    let warm = collector.collect(&runtime, None);
+    assert_eq!(warm.repos.len(), 2);
+
+    fs::write(first_repo.main.join("seed.txt"), "changed").unwrap();
+    let mut delivered = Vec::new();
+    collector.collect_staged(&runtime, None, &mut |snapshot| {
+        delivered.push(snapshot.complete);
+        delivered.len() < 2
+    });
+    assert_eq!(
+        delivered,
+        vec![false, false],
+        "refusal of the changed repo must not be undone by the unchanged one"
+    );
+}
+
+/// The mirror image: BOTH repos dirty, the second repo's change landing
+/// only after the refusal. A canceled pass must not even invoke the
+/// callback again - the fanout callback drains already-running jobs
+/// without merging or publishing.
+#[test]
+fn a_later_changed_repo_does_not_revive_a_canceled_pass() {
+    let first_repo = FixtureRepo::new("origin");
+    let second_repo = FixtureRepo::new("origin");
+    let home = TempDir::new("cancel-later");
+    transcript(
+        &home,
+        "-first",
+        "11111111-2222-3333-4444-555555555555",
+        &first_repo.main,
+        &[("user", "first"), ("assistant", "newest")],
+    );
+    transcript(
+        &home,
+        "-second",
+        "66666666-7777-8888-9999-000000000000",
+        &second_repo.main,
+        &[("user", "second")],
+    );
+    let mut collector = Collector::new(home.join(".claude")).with_workers(1);
+    let runtime = Runtime::observe_over(&[]);
+    let warm = collector.collect(&runtime, None);
+    assert_eq!(warm.repos.len(), 2);
+
+    fs::write(first_repo.main.join("seed.txt"), "changed").unwrap();
+    fs::write(second_repo.main.join("seed.txt"), "changed").unwrap();
+    let mut delivered = Vec::new();
+    collector.collect_staged(&runtime, None, &mut |snapshot| {
+        delivered.push(snapshot.complete);
+        delivered.len() < 2
+    });
+    assert_eq!(
+        delivered,
+        vec![false, false],
+        "the changed repo draining after the refusal must not republish: {delivered:?}"
+    );
 }

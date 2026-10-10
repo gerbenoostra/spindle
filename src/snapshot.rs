@@ -797,6 +797,12 @@ pub struct Collector {
     /// The last-published view: every field keeps its last value until the
     /// stage that owns it lands a replacement.
     model: Model,
+    /// Whether anything visible moved since the last publish: an emit
+    /// with it clear rebuilds the identical snapshot, so it returns true
+    /// without rederiving a row or calling `publish`. Stage 1 and the
+    /// final stage force it; every later mutation sets it only on an
+    /// actual change.
+    dirty: bool,
     /// Pool width for per-repository and per-remote fan-out.
     workers: usize,
 }
@@ -854,7 +860,7 @@ impl Collector {
         let forgotten_after = config::DEFAULT_FORGOTTEN_AFTER;
         let model = Model::default(); // coverage: off - the unexecuted instantiation's region edge
         let workers = fanout::WORKERS; // coverage: off - same
-        Collector { claude, remotes, forge, forge_cache, forgotten_after, warnings: Vec::new(), store: None, idles: HashMap::new(), undated: HashMap::new(), model, workers }
+        Collector { claude, remotes, forge, forge_cache, forgotten_after, warnings: Vec::new(), store: None, idles: HashMap::new(), undated: HashMap::new(), model, dirty: false, workers }
     }
 
     /// Read (and acknowledge through) the store at `dir` - the journal of
@@ -929,6 +935,10 @@ impl Collector {
         // any Git subprocess runs. The store loads here too - the journal
         // and authored records are stage-1 evidence.
         let observed_at = runtime.observed_at;
+        // The pass's canonical binding cache: pane cwds freeze now, root
+        // spellings resolve lazily so an anchor discovered mid-pass still
+        // binds. Dropped when the pass ends; the next pass rebuilds it.
+        let bindings = tmux::BindingCache::new(&runtime.panes);
         let inventory = self.claude.scan();
         self.model.errors = inventory.errors;
         // Stamp before loading: a write racing the load then shows as a
@@ -1084,7 +1094,10 @@ impl Collector {
             ));
         }
         self.model.conversations = conversations;
-        if !self.emit(runtime, own_pane, publish) {
+        // Stage 1 always publishes: it is the first view of the pass, and
+        // nothing it lands is compared - the whole stage is new evidence.
+        self.dirty = true;
+        if !self.emit(runtime, own_pane, &bindings, publish) {
             return;
         }
 
@@ -1121,9 +1134,12 @@ impl Collector {
                 }
                 None => (None, None, None),
             };
-            conv.repo = repo;
-            conv.worktree = worktree;
-            conv.branch = branch;
+            if conv.repo != repo || conv.worktree != worktree || conv.branch != branch {
+                conv.repo = repo;
+                conv.worktree = worktree;
+                conv.branch = branch;
+                self.dirty = true;
+            }
         }
 
         // Non-git project spaces become rows on their own pseudo-repo -
@@ -1135,15 +1151,17 @@ impl Collector {
                     continue;
                 }
                 let id = path.display().to_string();
-                self.model
-                    .repos
-                    .entry(id.clone())
-                    .or_insert_with(|| RepoModel {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    self.model.repos.entry(id.clone())
+                {
+                    entry.insert(RepoModel {
                         repo: None,
                         name: display_name(path),
                         path: path.clone(),
                         data: RepoData::Space(Box::new(space_row(&id, path))),
                     });
+                    self.dirty = true;
+                }
             }
         }
 
@@ -1156,8 +1174,12 @@ impl Collector {
             .cloned()
             .chain(spaces.iter().map(|p| p.display().to_string()))
             .collect();
+        let before = self.model.repos.len();
         self.model.repos.retain(|id, _| keep.contains(id));
-        if !self.emit(runtime, own_pane, publish) {
+        if self.model.repos.len() != before {
+            self.dirty = true;
+        }
+        if !self.emit(runtime, own_pane, &bindings, publish) {
             return;
         }
 
@@ -1174,17 +1196,34 @@ impl Collector {
                         common_dir: PathBuf::from(repo_id),
                     };
                     vector::collect_local_repo(&repo, |anchor| {
-                        runtime_facts(runtime, conversations, running, placements, anchor, repo_id)
+                        runtime_facts(
+                            runtime,
+                            conversations,
+                            running,
+                            placements,
+                            anchor,
+                            repo_id,
+                            &bindings,
+                        )
                     })
                     .map_err(|e| anchor_error(repo_id, e)) // coverage: off - needs a repo whose worktree read fails mid-pass
                 },
                 |i, result| {
+                    // Cancellation is sticky: a refused publish ends the
+                    // pass, so a drained job whose callback arrives after
+                    // the refusal is discarded rather than merged or
+                    // published - `emit`'s own "still alive" verdict (a
+                    // clean emit returns `true`) must never resurrect the
+                    // pass.
+                    if !alive {
+                        return;
+                    }
                     let repo_id = &order[i];
                     match result {
                         Ok(local) => self.merge_repo(repo_id, local),
                         Err(error) => self.fail_repo(repo_id, error), // coverage: off - needs a repo's worktree list to fail after its cwd resolved, mid-pass
                     }
-                    alive = self.emit(runtime, own_pane, publish);
+                    alive = self.emit(runtime, own_pane, &bindings, publish);
                 },
             );
             if !alive {
@@ -1196,11 +1235,12 @@ impl Collector {
             &inventory.conversations,
             &running,
             &mut placements,
+            &bindings,
         );
         if local_only {
             // The action re-resolve ends where the network begins: no
             // remote or forge ask belongs on a keypress's path.
-            let _ = self.emit(runtime, own_pane, publish);
+            let _ = self.emit(runtime, own_pane, &bindings, publish);
             return;
         }
         // Stage 3 - remote evidence, one `ls-remote --symref` per repo and
@@ -1265,7 +1305,7 @@ impl Collector {
                 continue; // coverage: off - fan_out delivers every index
             };
             self.apply_to_repo(repo_id, applied);
-            if !self.emit(runtime, own_pane, publish) {
+            if !self.emit(runtime, own_pane, &bindings, publish) {
                 return;
             }
         }
@@ -1281,8 +1321,12 @@ impl Collector {
         if let Some(store) = self.store.clone() {
             self.sync_work(&store, now_ms);
         }
+        // The final publish is unconditional: it reports `complete`, and
+        // the sync's authored writes must surface even where no stage
+        // flagged them.
         self.model.complete = true;
-        self.emit(runtime, own_pane, publish);
+        self.dirty = true;
+        self.emit(runtime, own_pane, &bindings, publish);
     }
 
     /// The forge fan-out: enumerate every branch anchor's `(remote_url,
@@ -1338,8 +1382,11 @@ impl Collector {
             else {
                 continue; // coverage: off - the model cannot change underneath one pass
             };
-            if let Some(work) = local.anchors.get_mut(i) {
+            if let Some(work) = local.anchors.get_mut(i)
+                && work.state.forge != status
+            {
                 work.state.forge = status;
+                self.dirty = true;
             } // coverage: off - the get-miss edge is unreachable: `i` indexes this same vec
         }
         for model in self.model.repos.values_mut() {
@@ -1352,8 +1399,11 @@ impl Collector {
                 else {
                     continue;
                 };
-                if let Some(status) = self.forge_cache.peek(url, branch) {
+                if let Some(status) = self.forge_cache.peek(url, branch)
+                    && work.state.forge != *status
+                {
                     work.state.forge = status.clone();
+                    self.dirty = true;
                 }
             }
         }
@@ -1417,7 +1467,10 @@ impl Collector {
                     let previous = self.model.ref_observed.get(repo_id).copied();
                     match store.sync_repo_after(repo_id, &refs, observed_ms, previous) {
                         Ok(()) => observed.push(repo_id.clone()),
-                        Err(e) => self.model.errors.push(work_state_error(repo_id, e)),
+                        Err(e) => {
+                            self.model.errors.push(work_state_error(repo_id, e));
+                            self.dirty = true;
+                        }
                     }
                     for w in &local.anchors {
                         if let Anchor::Worktree {
@@ -1434,6 +1487,7 @@ impl Collector {
                             )
                         {
                             self.model.errors.push(work_state_error(repo_id, e));
+                            self.dirty = true;
                         }
                     }
                 }
@@ -1449,16 +1503,20 @@ impl Collector {
                         )
                     {
                         self.model.errors.push(work_state_error(repo_id, e));
+                        self.dirty = true;
                     }
                 }
             }
         }
         for repo_id in observed {
-            self.model.ref_observed.insert(repo_id, observed_ms);
+            if self.model.ref_observed.insert(repo_id, observed_ms) != Some(observed_ms) {
+                self.dirty = true;
+            }
         }
         // Repo reconciliation first: placements name the active
         // incarnation ids the sync just settled.
         let mut errors = self.refresh_work();
+        self.dirty |= !errors.is_empty();
         self.model.errors.append(&mut errors);
         let mut placements = Vec::new();
         let mut dated = Vec::new();
@@ -1496,8 +1554,10 @@ impl Collector {
                 source: "work.json".to_owned(),
                 detail: format!("touches: {e}"),
             });
+            self.dirty = true;
         }
         let mut errors = self.refresh_work();
+        self.dirty |= !errors.is_empty();
         self.model.errors.append(&mut errors);
         let mut bound: HashMap<String, store::UpdateIdentity> = HashMap::new();
         for touch in &self.model.work.touches {
@@ -1541,11 +1601,20 @@ impl Collector {
         }
         match store.sync_session_updates(&updates) {
             Ok(()) => {}
-            Err(e) => self.model.errors.push(work_state_error("sessions", e)), // coverage: off - a refused write needs a filesystem fault
+            Err(e) => self.fail_write(e), // coverage: off - a refused write needs a filesystem fault
         }
         let mut errors = self.refresh_work();
+        self.dirty |= !errors.is_empty();
         self.model.errors.append(&mut errors);
     }
+
+    /// A refused session-update write: report it like the other sync
+    /// faults and mark the pass dirty.
+    #[rustfmt::skip] // the fault-only regions keep their markers on their own lines
+    fn fail_write(&mut self, e: std::io::Error) { // coverage: off - reached only from the refused-write arm
+        self.model.errors.push(work_state_error("sessions", e)); // coverage: off - same
+        self.dirty = true; // coverage: off - same
+    } // coverage: off - same
 
     /// Re-read `work.json` into the model when its stamp moved since the
     /// last read - the pass's own sync or a `p` from the TUI - and return
@@ -1559,6 +1628,9 @@ impl Collector {
             return Vec::new();
         }
         let (work, errors) = store.work();
+        if work != self.model.work {
+            self.dirty = true;
+        }
         self.model.work = work;
         self.model.work_stamp = stamp;
         errors
@@ -1597,13 +1669,25 @@ impl Collector {
         &mut self,
         runtime: &Runtime,
         own_pane: Option<&PaneRef>,
+        bindings: &tmux::BindingCache,
         publish: &mut dyn FnMut(Snapshot) -> bool,
     ) -> bool {
-        let now = epoch(runtime.observed_at);
         // Authored state as the store holds it now, not as stage 1 loaded
         // it: a `p` that lands mid-pass must hold in every later stage.
-        // Stage 1 and the sync already report the file's read errors.
-        let _ = self.refresh_work();
+        // This refresh runs before the dirty gate precisely so a mid-pass
+        // write - or a newly unreadable file - still publishes. Its read
+        // errors append here like the other refresh sites; an unchanged
+        // stamp means no re-read, so they can never duplicate.
+        let mut errors = self.refresh_work();
+        self.dirty |= !errors.is_empty();
+        self.model.errors.append(&mut errors);
+        // Nothing visible moved since the last publish: the rebuild below
+        // would emit the identical snapshot, so skip it without cancelling
+        // the pass.
+        if !self.dirty {
+            return true;
+        }
+        let now = epoch(runtime.observed_at);
         let authored = &self.model.work;
         // Touches re-derive per publish like the Work identities: stage 1
         // may show last pass's persisted intervals, the publish after the
@@ -1636,7 +1720,7 @@ impl Collector {
                     for anchor in &local.anchors {
                         let mut row =
                             work_row(id, &model.name, &anchor.state, anchor.ref_head(), authored);
-                        row.panes = anchor_panes(&anchor.state.anchor, &runtime.panes);
+                        row.panes = anchor_panes(&anchor.state.anchor, &runtime.panes, bindings);
                         work.push(row);
                     }
                 }
@@ -1654,7 +1738,13 @@ impl Collector {
             .iter()
             .filter_map(|w| w.worktree.as_ref().map(|p| p.display().to_string()))
             .collect();
-        work.extend(gone_rows(&self.model, authored, runtime, &live_paths));
+        work.extend(gone_rows(
+            &self.model,
+            authored,
+            runtime,
+            &live_paths,
+            bindings,
+        ));
         // A branch row's session counts are its incarnation's, not its
         // location's: runtime facts count every conversation under the
         // worktree or repo, but the row claims only the exact touches to
@@ -1731,7 +1821,7 @@ impl Collector {
         sort_repos(&mut repos);
         let mut conversations = self.model.conversations.clone();
         sort_conversations(&mut conversations, runtime.observed_at);
-        publish(Snapshot {
+        let alive = publish(Snapshot {
             schema_version: SCHEMA_VERSION,
             observed_at: epoch(runtime.observed_at),
             own_pane: own_pane.map(|p| p.pane.as_str().to_owned()),
@@ -1741,7 +1831,10 @@ impl Collector {
             conversations,
             errors: self.model.errors.clone(),
             stale_sockets: self.model.stale_sockets,
-        })
+        });
+        // Published: the next emit rebuilds only on a new visible change.
+        self.dirty = false;
+        alive
     }
 
     /// Every ask's last-known listing: fetched this pass, or still fresh
@@ -1764,13 +1857,13 @@ impl Collector {
     fn apply_to_repo(&mut self, repo_id: &str, applied: Vec<vector::RemoteApplied>) {
         let Some(RepoModel { data: RepoData::Git(local), .. }) = self.model.repos.get_mut(repo_id) else { return }; // coverage: off - the model cannot change underneath one pass
         for (work, a) in local.anchors.iter_mut().zip(applied) {
-            work.apply(a);
+            self.dirty |= work.apply(a);
         }
     }
 
     /// A repo whose local read failed keeps its error and drops its row.
     #[rustfmt::skip]
-    fn fail_repo(&mut self, repo_id: &str, error: SourceError) { self.model.errors.push(error); self.model.repos.remove(repo_id); } // coverage: off - the caller's arm needs a gitdir to vanish mid-pass
+    fn fail_repo(&mut self, repo_id: &str, error: SourceError) { self.model.errors.push(error); self.dirty = true; self.model.repos.remove(repo_id); } // coverage: off - the caller's arm needs a gitdir to vanish mid-pass
 
     fn reconcile_worktree_spaces(
         &mut self,
@@ -1778,6 +1871,7 @@ impl Collector {
         conversations: &[Conversation],
         running: &[bool],
         placements: &mut [Option<CwdPlacement>],
+        bindings: &tmux::BindingCache,
     ) {
         let mut claimed: Vec<(PathBuf, String, Option<String>)> = Vec::new();
         for (repo_id, model) in &self.model.repos {
@@ -1798,12 +1892,16 @@ impl Collector {
         if claimed.is_empty() {
             return;
         }
+        let before = self.model.repos.len();
         self.model.repos.retain(|_, model| match &model.data {
             RepoData::Space(_) => !claimed
                 .iter()
                 .any(|(path, ..)| inside_path(&model.path, path)),
             RepoData::Git(_) => true,
         });
+        if self.model.repos.len() != before {
+            self.dirty = true;
+        }
         let mut touched: HashSet<String> = HashSet::new();
         for (conv, place) in self
             .model
@@ -1829,6 +1927,7 @@ impl Collector {
             conv.repo = Some(repo_id.clone());
             conv.worktree = Some(root.clone());
             conv.branch = branch.clone();
+            self.dirty = true;
             touched.insert(repo_id.clone());
         }
         if touched.is_empty() {
@@ -1857,11 +1956,20 @@ impl Collector {
                     placements,
                     &work.state.anchor,
                     repo_id,
+                    bindings,
                 );
-                work.state.vector.windows = facts.windows;
-                work.state.vector.live_pids = facts.live_pids;
-                work.state.vector.live_agent_sessions = facts.live_agent_sessions;
-                work.state.vector.past_agent_sessions = facts.past_agent_sessions;
+                let vector = &mut work.state.vector;
+                if vector.windows != facts.windows
+                    || vector.live_pids != facts.live_pids
+                    || vector.live_agent_sessions != facts.live_agent_sessions
+                    || vector.past_agent_sessions != facts.past_agent_sessions
+                {
+                    vector.windows = facts.windows;
+                    vector.live_pids = facts.live_pids;
+                    vector.live_agent_sessions = facts.live_agent_sessions;
+                    vector.past_agent_sessions = facts.past_agent_sessions;
+                    self.dirty = true;
+                }
             }
         }
     }
@@ -1890,6 +1998,30 @@ impl Collector {
             }
         }
         let (name, path) = repo_display(local.anchors.iter().map(|w| &w.state.anchor), &repo);
+        // Whether anything visible moved: repo identity, the remote name
+        // set and every anchor's full WorkState plus its proven tip. The
+        // fresh local replaces the model regardless - stage 3 and the
+        // sync consume its private probe metadata either way.
+        let changed = match self.model.repos.get(repo_id) {
+            Some(RepoModel {
+                name: old_name,
+                path: old_path,
+                data: RepoData::Git(old),
+                ..
+            }) => {
+                *old_name != name
+                    || *old_path != path
+                    || old.remote_names() != local.remote_names()
+                    || old.anchors.len() != local.anchors.len()
+                    || old
+                        .anchors
+                        .iter()
+                        .zip(local.anchors.iter())
+                        .any(|(o, w)| o.state != w.state || o.ref_head() != w.ref_head())
+            }
+            _ => true,
+        };
+        self.dirty |= changed;
         self.model.repos.insert(
             repo_id.to_owned(),
             RepoModel {
@@ -2044,6 +2176,7 @@ fn runtime_facts(
     placements: &[Option<CwdPlacement>],
     anchor: &Anchor,
     repo_id: &str,
+    bindings: &tmux::BindingCache,
 ) -> RuntimeFacts {
     let (path, admin_id) = match anchor {
         Anchor::Worktree { path, admin_id, .. } => (Some(path.as_path()), admin_id.as_deref()),
@@ -2056,13 +2189,13 @@ fn runtime_facts(
         past_agent_sessions: 0,
     };
     if let Some(path) = path {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned()); // coverage: off - a reported path canonicalizes
-        facts.windows.total = runtime.panes.windows_bound(admin_id, path);
+        let canonical = bindings.root(path);
+        facts.windows.total = bindings.windows_bound(&runtime.panes, admin_id, path);
         // Orphaned windows are bound by derived evidence alone: a window
         // carrying no stored worktree edge whose pane cwds land inside.
         let mut orphaned = std::collections::HashSet::new();
         for pane in &runtime.panes.panes {
-            if pane.wt_adminid.is_none() && pane.binds_worktree(admin_id, path) {
+            if pane.wt_adminid.is_none() && bindings.binds_at(pane, admin_id, &canonical) {
                 orphaned.insert((&pane.socket, &pane.window));
             }
         }
@@ -2610,14 +2743,21 @@ fn apply_path_record(row: &mut WorkRow, authored: &store::Work) {
 
 /// The panes bound to an anchor's worktree - a branch-only anchor binds
 /// nothing by path.
-fn anchor_panes(anchor: &Anchor, panes: &tmux::PaneInventory) -> Vec<PaneRow> {
+fn anchor_panes(
+    anchor: &Anchor,
+    panes: &tmux::PaneInventory,
+    bindings: &tmux::BindingCache,
+) -> Vec<PaneRow> {
     let Anchor::Worktree { path, admin_id, .. } = anchor else {
         return Vec::new();
     };
+    // The anchor's root resolves once; each pane then compares its frozen
+    // cwd spelling purely, canonicalizing nothing per pane.
+    let root = bindings.root(path);
     panes
         .panes
         .iter()
-        .filter(|p| p.binds_worktree(admin_id.as_deref(), path))
+        .filter(|p| bindings.binds_at(p, admin_id.as_deref(), &root))
         .map(|p| PaneRow {
             handle: format!("{}:{}.{}", p.session_name, p.window, p.id),
             command: p.command.clone(),
@@ -2771,6 +2911,7 @@ fn gone_rows(
     authored: &store::Work,
     runtime: &Runtime,
     live_paths: &HashSet<String>,
+    bindings: &tmux::BindingCache,
 ) -> Vec<WorkRow> {
     let mut rows = Vec::new();
     let numbers = incarnation_numbers(authored);
@@ -2806,6 +2947,7 @@ fn gone_rows(
             record.inputs.admin_id.as_deref(),
             &path,
             &model.conversations,
+            bindings,
         );
         if refs.is_empty() {
             continue;
@@ -2850,7 +2992,7 @@ fn gone_rows(
             continue;
         }
         let path = PathBuf::from(path_str);
-        let refs = references(&runtime.panes, None, &path, &model.conversations);
+        let refs = references(&runtime.panes, None, &path, &model.conversations, bindings);
         if refs.is_empty() {
             continue;
         }
@@ -2891,12 +3033,16 @@ fn references(
     admin_id: Option<&str>,
     path: &Path,
     conversations: &[ConversationRow],
+    bindings: &tmux::BindingCache,
 ) -> Vec<ReferenceRow> {
     let mut refs = Vec::new();
     let mut windows = std::collections::BTreeSet::new();
     let mut sessions = std::collections::BTreeSet::new();
+    // The gone path resolves once per pass like a live root: a vanished
+    // directory falls back to its literal spelling, same as uncached.
+    let root = bindings.root(path);
     for pane in &panes.panes {
-        if !pane.binds_worktree(admin_id, path) {
+        if !bindings.binds_at(pane, admin_id, &root) {
             continue;
         }
         refs.push(ReferenceRow {
@@ -2923,8 +3069,13 @@ fn references(
         label: session,
     }));
     for c in conversations.iter().filter(|c| c.running()) {
-        let inside = c.cwd.as_deref().is_some_and(|cwd| inside_path(cwd, path))
-            || c.worktree.as_deref().is_some_and(|w| inside_path(w, path));
+        let inside = c
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| inside_resolved(cwd, &root))
+            || c.worktree
+                .as_deref()
+                .is_some_and(|w| inside_resolved(w, &root));
         if !inside {
             continue;
         }
@@ -2949,6 +3100,13 @@ fn inside_path(cwd: &Path, root: &Path) -> bool {
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
     let root = root.canonicalize().unwrap_or_else(|_| root.to_owned());
     cwd.starts_with(&root)
+}
+
+/// `inside_path` against a `root` the binding cache already resolved: only
+/// the conversation's side still needs canonicalizing.
+fn inside_resolved(cwd: &Path, root: &Path) -> bool {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
+    cwd.starts_with(root)
 }
 
 /// The reference counts a gone row's summary names.
@@ -5307,7 +5465,13 @@ mod tests {
             vec![pane, pane2, pane3, stray],
         );
         let live_paths = HashSet::new();
-        let rows = gone_rows(&model, &work, &live_rt, &live_paths);
+        let rows = gone_rows(
+            &model,
+            &work,
+            &live_rt,
+            &live_paths,
+            &tmux::BindingCache::new(&live_rt.panes),
+        );
         assert_eq!(rows.len(), 3, "{rows:?}");
         let space_row = rows
             .iter()
@@ -5340,11 +5504,29 @@ mod tests {
         // but lists nowhere.
         let quiet = runtime(vec![], vec![]);
         let model = Model::default();
-        assert!(gone_rows(&model, &work, &quiet, &live_paths).is_empty());
+        assert!(
+            gone_rows(
+                &model,
+                &work,
+                &quiet,
+                &live_paths,
+                &tmux::BindingCache::new(&quiet.panes)
+            )
+            .is_empty()
+        );
         // The same workspace live under a new anchor: the closed record
         // does not resurrect as gone.
         let live_paths: HashSet<String> = [missing.clone()].into_iter().collect();
-        assert!(gone_rows(&model, &work, &quiet, &live_paths).is_empty());
+        assert!(
+            gone_rows(
+                &model,
+                &work,
+                &quiet,
+                &live_paths,
+                &tmux::BindingCache::new(&quiet.panes)
+            )
+            .is_empty()
+        );
         // A vanished project space follows the same rule.
         let space =
             std::env::temp_dir().join(format!("agent-sessions-gone-{}-b", std::process::id()));
@@ -5386,7 +5568,13 @@ mod tests {
             conversations: vec![c, c2],
             ..Default::default()
         };
-        let rows = gone_rows(&model, &paths, &quiet, &live_paths);
+        let rows = gone_rows(
+            &model,
+            &paths,
+            &quiet,
+            &live_paths,
+            &tmux::BindingCache::new(&quiet.panes),
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind, WorkKind::Detached);
         assert_eq!(rows[0].gone.as_deref(), Some("worktree gone"));
@@ -5448,7 +5636,13 @@ mod tests {
             conversations: vec![agent],
             ..Default::default()
         };
-        let rows = gone_rows(&model, &work, &rt, &HashSet::new());
+        let rows = gone_rows(
+            &model,
+            &work,
+            &rt,
+            &HashSet::new(),
+            &tmux::BindingCache::new(&rt.panes),
+        );
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].identity.as_deref(), Some("i2"));
         assert_eq!(
@@ -5764,5 +5958,467 @@ mod tests {
         // An empty cursor map projects nothing - the row keeps its raw
         // conversation trail as the fallback.
         assert!(conversation_summaries(&std::collections::BTreeMap::new(), &contexts).is_empty());
+    }
+    /// A collector over a nonexistent claude root: emit-level tests never
+    /// scan it.
+    fn emit_collector() -> Collector {
+        Collector::new(PathBuf::from("/definitely/no/claude"))
+    }
+
+    /// A unique scratch dir per test, cleaned by hand on drop.
+    struct ScratchDir(PathBuf);
+    impl ScratchDir {
+        fn new(name: &str) -> ScratchDir {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            loop {
+                let dir = std::env::temp_dir().join(format!(
+                    "agent-sessions-{name}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                match fs::create_dir(&dir) {
+                    Ok(()) => return ScratchDir(dir),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue, // coverage: off - needs a name collision with a live sibling test
+                    Err(e) => panic!("create_dir {}: {e}", dir.display()), // coverage: off - needs an unwritable temp root
+                }
+            }
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `git` with a hermetic identity and config, asserting success.
+    fn fixture_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "init.defaultBranch=main"])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr) // coverage: off - the assert's panic edge
+        );
+    }
+
+    /// A clone at `dir/main` with one commit pushed to a bare `origin`.
+    fn git_fixture(dir: &Path) -> git::Repo {
+        fs::create_dir_all(dir).unwrap();
+        fixture_git(dir, &["init", "--bare", "-b", "main", "remote.git"]);
+        fixture_git(dir, &["init", "-b", "main", "main"]);
+        let main = dir.join("main");
+        fixture_git(&main, &["remote", "add", "origin", "../remote.git"]);
+        fs::write(main.join("f"), "x").unwrap();
+        fixture_git(&main, &["add", "f"]);
+        fixture_git(&main, &["commit", "-m", "seed"]);
+        fixture_git(&main, &["push", "-u", "origin", "main"]);
+        fixture_git(&main, &["remote", "set-head", "origin", "-a"]);
+        git::Repo::discover(&main)
+            .expect("discover")
+            .expect("the clone is a repo")
+    }
+
+    /// The repo id the model keys it under.
+    fn repo_id(repo: &git::Repo) -> String {
+        repo.common_dir().display().to_string()
+    }
+
+    #[test]
+    fn a_clean_emit_returns_true_without_publishing() {
+        let mut collector = emit_collector();
+        let runtime = runtime(Vec::new(), Vec::new());
+        let bindings = tmux::BindingCache::new(&runtime.panes);
+        let mut calls = 0;
+        let mut never = |_: Snapshot| -> bool { panic!("a clean emit must not publish") }; // coverage: off - runs only if the gate wrongly publishes
+        // Clean model: the emit proves the pass alive without rebuilding
+        // or invoking the callback.
+        assert!(collector.emit(&runtime, None, &bindings, &mut never));
+        assert_eq!(calls, 0);
+
+        // Dirty publishes exactly once and clears the flag - the next
+        // identical emit skips again.
+        collector.dirty = true;
+        assert!(collector.emit(&runtime, None, &bindings, &mut |_| {
+            calls += 1;
+            true
+        }));
+        assert_eq!(calls, 1);
+        assert!(!collector.dirty);
+        assert!(collector.emit(&runtime, None, &bindings, &mut never));
+        assert_eq!(calls, 1);
+    }
+
+    /// The staged pass's forced boundaries still hold under the gate:
+    /// stage 1 publishes unconditionally, the final publish reports
+    /// `complete`.
+    #[test]
+    fn stage_boundaries_publish_even_when_nothing_moved() {
+        let mut collector = emit_collector();
+        let runtime = runtime(Vec::new(), Vec::new());
+        let mut published = Vec::new();
+        collector.collect_staged(&runtime, None, &mut |snapshot| {
+            published.push(snapshot);
+            true
+        });
+        assert_eq!(published.len(), 2, "{published:?}");
+        assert!(!published[0].complete);
+        assert!(published[1].complete);
+    }
+
+    /// An identical merge and remote apply leave the pass clean; a moved
+    /// remote answer marks it dirty. Uses a real fixture repo because the
+    /// comparison runs over collected local state, which only Git can
+    /// produce.
+    #[test]
+    fn identical_merge_and_apply_publish_nothing() {
+        let dir = ScratchDir::new("emit-merge");
+        let repo = git_fixture(&dir.0);
+        let id = repo_id(&repo);
+        let mut collector = emit_collector();
+
+        // First merge lands a new repo: dirty.
+        let local = vector::collect_local_repo(&repo, |_| Default::default()).unwrap();
+        collector.merge_repo(&id, local);
+        assert!(collector.dirty);
+
+        // Repeating the identical local read changes nothing visible.
+        collector.dirty = false;
+        let local = vector::collect_local_repo(&repo, |_| Default::default()).unwrap();
+        collector.merge_repo(&id, local);
+        assert!(!collector.dirty, "an identical merge must not republish");
+
+        // Stage 3: the remote answer applies once, then repeats clean.
+        let local = vector::collect_local_repo(&repo, |_| Default::default()).unwrap();
+        let applied = vector::apply_remote(&repo, &local, |r, name| r.remote_listing(name));
+        collector.apply_to_repo(&id, applied);
+        assert!(collector.dirty, "landing the remote answer republishes");
+        collector.dirty = false;
+        let applied = vector::apply_remote(&repo, &local, |r, name| r.remote_listing(name));
+        collector.apply_to_repo(&id, applied);
+        assert!(
+            !collector.dirty,
+            "an identical remote answer must not republish"
+        );
+
+        // A moved answer republishes.
+        let mut applied = vector::apply_remote(&repo, &local, |r, name| r.remote_listing(name));
+        applied[0].commits_ahead = Evidence::Unknown("probe changed".to_owned());
+        collector.apply_to_repo(&id, applied);
+        assert!(collector.dirty);
+    }
+
+    /// A repo dropped mid-pass - its local read failed - is a visible
+    /// removal: the error and the missing row publish.
+    #[test]
+    fn a_repo_dropped_mid_pass_republishes() {
+        let dir = ScratchDir::new("emit-fail");
+        let repo = git_fixture(&dir.0);
+        let id = repo_id(&repo);
+        let mut collector = emit_collector();
+        let local = vector::collect_local_repo(&repo, |_| Default::default()).unwrap();
+        collector.merge_repo(&id, local);
+        collector.dirty = false;
+        collector.fail_repo(
+            &id,
+            SourceError {
+                source: "git".to_owned(),
+                detail: "worktree list failed".to_owned(),
+            },
+        );
+        assert!(collector.dirty, "a dropped repo republishes");
+        assert!(!collector.model.repos.contains_key(&id));
+    }
+
+    /// New and removed anchors, a moved tip and a dirty worktree each mark
+    /// the merge dirty; the identical state does not.
+    #[test]
+    fn merge_changes_publish_and_identical_ones_do_not() {
+        let dir = ScratchDir::new("emit-anchor");
+        let repo = git_fixture(&dir.0);
+        let id = repo_id(&repo);
+        let main = dir.0.join("main");
+        let mut collector = emit_collector();
+        let collect =
+            |repo: &git::Repo| vector::collect_local_repo(repo, |_| Default::default()).unwrap();
+        collector.merge_repo(&id, collect(&repo));
+
+        // A new branch is a new anchor.
+        collector.dirty = false;
+        fixture_git(&main, &["branch", "new-branch"]);
+        collector.merge_repo(&id, collect(&repo));
+        assert!(collector.dirty, "a new anchor republishes");
+
+        // Removing it again is an anchor removal.
+        collector.dirty = false;
+        fixture_git(&main, &["branch", "-D", "new-branch"]);
+        collector.merge_repo(&id, collect(&repo));
+        assert!(collector.dirty, "a removed anchor republishes");
+
+        // A moved HEAD is a different tip and vector.
+        collector.dirty = false;
+        fs::write(main.join("f"), "y").unwrap();
+        fixture_git(&main, &["add", "f"]);
+        fixture_git(&main, &["commit", "-m", "move"]);
+        collector.merge_repo(&id, collect(&repo));
+        assert!(collector.dirty, "a moved HEAD republishes");
+
+        // An uncommitted change is local worktree evidence.
+        collector.dirty = false;
+        fs::write(main.join("f"), "dirty").unwrap();
+        collector.merge_repo(&id, collect(&repo));
+        assert!(collector.dirty, "a dirty worktree republishes");
+
+        // Restoring the file still differs - its fingerprint carries the
+        // newest mtime, which the write legitimately moved. Only after
+        // that evidence lands does the identical state repeat clean.
+        collector.dirty = false;
+        fixture_git(&main, &["checkout", "--", "f"]);
+        collector.merge_repo(&id, collect(&repo));
+        assert!(collector.dirty);
+        collector.dirty = false;
+        collector.merge_repo(&id, collect(&repo));
+        assert!(!collector.dirty);
+    }
+
+    /// Stage 4's forge overlay: an equal status does not republish, a
+    /// changed one does.
+    #[test]
+    fn an_equal_forge_status_does_not_republish() {
+        let dir = ScratchDir::new("emit-forge");
+        let repo = git_fixture(&dir.0);
+        let id = repo_id(&repo);
+        let main = dir.0.join("main");
+        // A forge-parseable remote URL: collect_forge asks (or settles)
+        // only anchors carrying one.
+        fixture_git(
+            &main,
+            &["remote", "set-url", "origin", "https://github.com/a/b.git"],
+        );
+        let mut collector = emit_collector();
+        // A forge handle that always fails: the point is equal-vs-moved
+        // status application, not the answer itself.
+        collector = collector.with_forge(crate::forge::Forge::with_path(
+            "/definitely/no/forges".into(),
+        ));
+        let local = vector::collect_local_repo(&repo, |_| Default::default()).unwrap();
+        collector.merge_repo(&id, local);
+        collector.dirty = false;
+        collector.collect_forge();
+        assert!(collector.dirty, "landing forge answers republishes");
+        collector.dirty = false;
+        collector.collect_forge();
+        assert!(
+            !collector.dirty,
+            "the same cached answer must not republish"
+        );
+    }
+
+    /// A rewritten `work.json` with different records republishes; the
+    /// identical bytes under a fresh stamp do not - refresh compares the
+    /// loaded Work, not the file.
+    #[test]
+    fn work_change_publishes_but_stamp_only_rewrite_does_not() {
+        let dir = ScratchDir::new("emit-work");
+        let store = Store::open(dir.0.clone());
+        let mut collector = emit_collector().with_store(dir.0.clone());
+        let runtime = runtime(Vec::new(), Vec::new());
+        let bindings = tmux::BindingCache::new(&runtime.panes);
+        let calls = std::cell::Cell::new(0);
+        let mut publish = |_: Snapshot| {
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        // No work file yet: nothing to refresh, clean emit skips.
+        assert!(collector.emit(&runtime, None, &bindings, &mut publish));
+        assert_eq!(calls.get(), 0);
+
+        // A record landing in work.json is a visible change.
+        store
+            .sync_path(
+                "/space",
+                "/space",
+                &store::LifecycleInputs::default(),
+                &[],
+                1_000,
+            )
+            .unwrap();
+        assert!(collector.emit(&runtime, None, &bindings, &mut publish));
+        assert_eq!(calls.get(), 1);
+
+        // The identical payload under a new stamp parses equal: no
+        // republish. The rewrite is an atomic rename onto a fresh inode,
+        // so the stamp provably moved and the gate re-parsed the file.
+        let work_file = dir.0.join("work.json");
+        let before = store.work_stamp();
+        let bytes = fs::read(&work_file).unwrap();
+        let tmp = dir.0.join("work.json.tmp");
+        fs::write(&tmp, &bytes).unwrap();
+        fs::rename(&tmp, &work_file).unwrap();
+        assert_ne!(
+            store.work_stamp(),
+            before,
+            "the rewrite must move the stamp"
+        );
+        assert!(collector.emit(&runtime, None, &bindings, &mut publish));
+        assert_eq!(calls.get(), 1, "a stamp-only rewrite must not republish");
+
+        // A real change - a second path record - republishes.
+        store
+            .sync_path(
+                "/space2",
+                "/space2",
+                &store::LifecycleInputs::default(),
+                &[],
+                2_000,
+            )
+            .unwrap();
+        assert!(collector.emit(&runtime, None, &bindings, &mut publish));
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// A `p` landing mid-pass: the parked flip on an existing branch
+    /// record rewrites work.json, and the next emit publishes it.
+    #[test]
+    fn a_mid_pass_parked_flag_republishes() {
+        let dir = ScratchDir::new("emit-parked");
+        let store = Store::open(dir.0.clone());
+        let mut collector = emit_collector().with_store(dir.0.clone());
+        let runtime = runtime(Vec::new(), Vec::new());
+        let bindings = tmux::BindingCache::new(&runtime.panes);
+        let calls = std::cell::Cell::new(0);
+        let mut publish = |_: Snapshot| {
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        // An authored branch record exists.
+        store
+            .sync_repo_after(
+                "/r/.git",
+                &[store::ObservedRef {
+                    name: "feat".to_owned(),
+                    head: None,
+                    rewritten: false,
+                    creation: None,
+                    renamed_from: None,
+                    commit: None,
+                    activities: Vec::new(),
+                    inputs: store::LifecycleInputs::default(),
+                }],
+                1_000,
+                None,
+            )
+            .unwrap();
+        assert!(collector.emit(&runtime, None, &bindings, &mut publish));
+        assert_eq!(calls.get(), 1);
+        let record_id = collector
+            .model
+            .work
+            .branch("/r/.git", "feat")
+            .expect("the record")
+            .id
+            .clone();
+
+        // Toggling `parked` on it mid-pass republishes.
+        assert!(
+            store
+                .toggle_parked(&store::WorkIdentity::Branch(record_id))
+                .unwrap()
+        );
+        assert!(collector.emit(&runtime, None, &bindings, &mut publish));
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// A malformed `work.json` is read evidence too: the pass reports the
+    /// error and publishes it rather than hiding it behind the gate.
+    #[test]
+    fn a_malformed_work_file_republishes_its_error() {
+        let dir = ScratchDir::new("emit-badwork");
+        let mut collector = emit_collector().with_store(dir.0.clone());
+        let runtime = runtime(Vec::new(), Vec::new());
+        // First pass writes work.json through the sync.
+        collector.collect(&runtime, None);
+        fs::write(dir.0.join("work.json"), b"garbage").unwrap();
+        let snapshot = collector.collect(&runtime, None);
+        assert!(
+            snapshot.errors.iter().any(|e| e.source == "work.json"),
+            "{:?}",
+            snapshot.errors
+        );
+    }
+
+    /// The same corruption behind a clean model: `emit`'s refresh reads
+    /// the fault, the error itself is the visible change, and the gate
+    /// publishes it even though the loaded Work equals the default.
+    #[test]
+    fn a_malformed_work_file_publishes_through_a_clean_emit() {
+        let dir = ScratchDir::new("emit-badwork-gate");
+        let mut collector = emit_collector().with_store(dir.0.clone());
+        let runtime = runtime(Vec::new(), Vec::new());
+        let bindings = tmux::BindingCache::new(&runtime.panes);
+        fs::write(dir.0.join("work.json"), b"garbage").unwrap();
+        let mut published = None;
+        collector.emit(&runtime, None, &bindings, &mut |s| {
+            published = Some(s);
+            true
+        });
+        let snapshot = published.expect("the read error is a visible change");
+        assert!(
+            snapshot.errors.iter().any(|e| e.source == "work.json"),
+            "{:?}",
+            snapshot.errors
+        );
+    }
+
+    /// A local-only pass publishes what the worktree-space reconcile
+    /// changed: the clean emit at its end must not swallow the dirty the
+    /// reconcile set.
+    #[test]
+    fn collect_local_publishes_reconcile_changes() {
+        let dir = ScratchDir::new("emit-local");
+        let repo = git_fixture(&dir.0);
+        let id = repo_id(&repo);
+        let main = dir.0.join("main");
+        let mut collector = emit_collector();
+        let local = vector::collect_local_repo(&repo, |_| Default::default()).unwrap();
+        collector.merge_repo(&id, local);
+        collector.dirty = false;
+
+        // A conversation placed in a project space that sits inside the
+        // repo's worktree: reconcile upgrades it to a checkout placement.
+        let mut conv = live_row("cccccccc-1", 42);
+        conv.repo = Some(main.display().to_string());
+        conv.worktree = None;
+        conv.branch = None;
+        collector.model.conversations = vec![conv];
+        let mut placements = vec![Some(CwdPlacement::ProjectSpace { path: main.clone() })];
+        let conversations: Vec<Conversation> = Vec::new();
+        let runtime = runtime(Vec::new(), Vec::new());
+        let bindings = tmux::BindingCache::new(&runtime.panes);
+        collector.reconcile_worktree_spaces(
+            &runtime,
+            &conversations,
+            &[],
+            &mut placements,
+            &bindings,
+        );
+        assert!(collector.dirty, "a placement upgrade is a visible change");
+        assert!(matches!(placements[0], Some(CwdPlacement::Checkout { .. }))); // coverage: off - the assert's panic edge
+        // The emit a collect_local pass ends on publishes the change.
+        let mut calls = 0;
+        assert!(collector.emit(&runtime, None, &bindings, &mut |_| {
+            calls += 1;
+            true
+        }));
+        assert_eq!(calls, 1);
     }
 }
