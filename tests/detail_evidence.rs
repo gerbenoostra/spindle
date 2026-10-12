@@ -654,6 +654,24 @@ fn work_detail_renders_question_marks_for_unproven_fields() {
 }
 
 #[test]
+fn work_detail_marks_a_same_named_remote_ref_as_not_tracked() {
+    // Pushed without `-u`: the remote carries the branch, no upstream is
+    // configured - the fallback's remote ref renders, but as not tracked.
+    let mut row = work();
+    row.upstream = Upstream::Untracked;
+    row.upstream_detail = Some("origin/feat/login".to_owned());
+    let mut snapshot = fixture();
+    snapshot.work = vec![row];
+    let mut app = App::new(snapshot);
+    press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+    let text = render(&app, 200, 40);
+    assert!(
+        text.contains("remote: origin/feat/login · not tracked · unpushed 3"),
+        "{text}"
+    );
+}
+
+#[test]
 fn work_detail_lists_the_commits_not_on_the_base() {
     let mut row = work();
     // Three ahead, two listed: the cap names the rest.

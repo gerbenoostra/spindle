@@ -182,15 +182,21 @@ impl WorkKind {
     }
 }
 
-/// `WorkRow.upstream`: what the branch's configured upstream proved.
+/// `WorkRow.upstream`: what the upstream evidence proved - the configured
+/// upstream, or the same-named remote ref a `push` without `-u` left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Upstream {
     /// The upstream ref exists on the remote.
     Tracked,
-    /// No upstream configured.
+    /// No upstream configured, and no remote evidence says the remote
+    /// ever carried the branch.
     NeverPushed,
-    /// Configured, and the remote provably no longer carries it.
+    /// No upstream configured, but a remote provably carries a same-named
+    /// branch.
+    Untracked,
+    /// The remote provably no longer carries the ref it once had - a
+    /// configured upstream, or one a tracking ref or the record remembers.
     RemoteGone,
     /// No branch to track (detached HEAD, project space).
     NotApplicable,
@@ -204,6 +210,7 @@ impl Upstream {
         match self {
             Upstream::Tracked => "tracked",
             Upstream::NeverPushed => "never_pushed",
+            Upstream::Untracked => "untracked",
             Upstream::RemoteGone => "remote_gone",
             Upstream::NotApplicable => "not_applicable",
             Upstream::Unknown => "unknown",
@@ -1165,6 +1172,11 @@ impl Collector {
             let conversations = &inventory.conversations;
             let running = &running;
             let placements = &placements;
+            // The persisted upstream readings, `repo` -> `branch` ->
+            // reading: the record's last-proven remote is the fallback's
+            // longitudinal half - what a pruned tracking ref can no
+            // longer say.
+            let priors = prior_upstreams(&self.model.work);
             let mut alive = true;
             fanout::fan_out(
                 &order,
@@ -1173,9 +1185,27 @@ impl Collector {
                     let repo = git::Repo {
                         common_dir: PathBuf::from(repo_id),
                     };
-                    vector::collect_local_repo(&repo, |anchor| {
-                        runtime_facts(runtime, conversations, running, placements, anchor, repo_id)
-                    })
+                    vector::collect_local_repo(
+                        &repo,
+                        |anchor| {
+                            runtime_facts(
+                                runtime,
+                                conversations,
+                                running,
+                                placements,
+                                anchor,
+                                repo_id,
+                            )
+                        },
+                        |anchor| {
+                            anchor.branch().and_then(|name| {
+                                priors
+                                    .get(repo_id.as_str())
+                                    .and_then(|p| p.get(name))
+                                    .cloned()
+                            })
+                        },
+                    )
                     .map_err(|e| anchor_error(repo_id, e)) // coverage: off - needs a repo whose worktree read fails mid-pass
                 },
                 |i, result| {
@@ -2250,19 +2280,52 @@ fn work_row(
 }
 
 /// The row's upstream reading and its detail: `remote/merge_ref` for a
-/// configured upstream, the reason for an unknown one.
+/// configured or fallback upstream, the reason for an unknown one.
 fn upstream_of(state: &UpstreamState) -> (Upstream, Option<String>) {
     match state {
         UpstreamState::NeverPushed => (Upstream::NeverPushed, None),
         UpstreamState::Tracked { remote, merge_ref } => {
-            (Upstream::Tracked, Some(format!("{remote}/{merge_ref}")))
+            (Upstream::Tracked, Some(upstream_label(remote, merge_ref)))
         }
-        UpstreamState::RemoteGone { remote, merge_ref } => {
-            (Upstream::RemoteGone, Some(format!("{remote}/{merge_ref}")))
+        UpstreamState::Untracked { remote, merge_ref } => {
+            (Upstream::Untracked, Some(upstream_label(remote, merge_ref)))
         }
+        UpstreamState::RemoteGone { remote, merge_ref } => (
+            Upstream::RemoteGone,
+            Some(upstream_label(remote, merge_ref)),
+        ),
         UpstreamState::Unknown(reason) => (Upstream::Unknown, Some(reason.clone())),
         UpstreamState::NotApplicable => (Upstream::NotApplicable, None),
     }
+}
+
+/// `origin/fix/login`: the merge ref's `refs/heads/` prefix is evidence
+/// plumbing, not part of the name a user would write.
+fn upstream_label(remote: &str, merge_ref: &str) -> String {
+    let short = merge_ref.strip_prefix("refs/heads/").unwrap_or(merge_ref);
+    format!("{remote}/{short}")
+}
+
+/// Every active incarnation's last-proven upstream reading, keyed by repo
+/// then branch: what `collect_local_repo` consults when the pass's own
+/// remote evidence is gone. Closed records answer nothing - their
+/// history belongs to a ref that is gone.
+fn prior_upstreams(work: &store::Work) -> HashMap<String, HashMap<String, String>> {
+    let mut priors: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for (key, id) in &work.active_branches {
+        if let Some((repo, name)) = key.split_once('\0')
+            && let Some(upstream) = work
+                .branches
+                .get(id)
+                .and_then(|r| r.inputs.upstream.as_ref())
+        {
+            priors
+                .entry(repo.to_owned())
+                .or_default()
+                .insert(name.to_owned(), upstream.clone());
+        }
+    }
+    priors
 }
 
 /// The row's proven landed verdict, `None` while unproven.
@@ -3234,7 +3297,7 @@ fn work_facts(row: &WorkRow) -> Vec<String> {
         Upstream::NeverPushed => parts.push("no remote".to_owned()),
         Upstream::RemoteGone => parts.push("remote gone".to_owned()),
         Upstream::Unknown => parts.push("?".to_owned()),
-        Upstream::Tracked | Upstream::NotApplicable => {}
+        Upstream::Tracked | Upstream::Untracked | Upstream::NotApplicable => {}
     }
     match row.commits_ahead {
         Some(n) if n > 0 => parts.push(format!("↑{n}")),
@@ -4723,6 +4786,7 @@ mod tests {
         for upstream in [
             Upstream::Tracked,
             Upstream::NeverPushed,
+            Upstream::Untracked,
             Upstream::RemoteGone,
             Upstream::NotApplicable,
             Upstream::Unknown,
@@ -4751,6 +4815,7 @@ mod tests {
         for (value, want) in [
             (wire(&Upstream::Tracked), "tracked"),
             (wire(&Upstream::NeverPushed), "never_pushed"),
+            (wire(&Upstream::Untracked), "untracked"),
             (wire(&Upstream::RemoteGone), "remote_gone"),
             (wire(&Upstream::NotApplicable), "not_applicable"),
             (wire(&Upstream::Unknown), "unknown"),

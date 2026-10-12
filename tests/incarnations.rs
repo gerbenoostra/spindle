@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_sessions::runtime::Runtime;
-use agent_sessions::snapshot::{Collector, Snapshot, WorkKind, WorkRow, to_json};
+use agent_sessions::snapshot::{Collector, Snapshot, Upstream, WorkKind, WorkRow, to_json};
 use agent_sessions::store::{
     ActivitySource, BranchRecord, Confidence, ContinuityEvidence, DatedTouch, LifecycleInputs,
     ObservationSource, ObservedRef, RefCreationEvidence, SessionContext, SessionUpdate, Store,
@@ -430,6 +430,46 @@ fn a_force_pushed_tip_is_continuous_not_a_new_incarnation() {
     let later = record(&world, "feat").unwrap();
     assert_eq!(later.id, before.id);
     assert_eq!(later.continuity_evidence, ContinuityEvidence::ForcePush);
+}
+
+#[test]
+fn a_pruned_remote_branch_still_reads_remote_gone_from_the_record() {
+    let world = world();
+    // Pushed without `-u`: the first pass proves and records
+    // `untracked origin/feat-untracked`.
+    world.repo.branch_with_commits("feat-untracked", 1, false);
+    git(&world.repo, &["push", "origin", "feat-untracked"]);
+    let snapshot = collect(&world);
+    assert_eq!(
+        work(&snapshot, "feat-untracked").upstream,
+        Upstream::Untracked
+    );
+
+    // Delete-on-merge on the remote, prune the tracking ref: every live
+    // piece of evidence is gone - only the record remembers.
+    world.repo.git(
+        world.repo.remote.as_path(),
+        &["branch", "-D", "feat-untracked"],
+    );
+    git(
+        &world.repo,
+        &["update-ref", "-d", "refs/remotes/origin/feat-untracked"],
+    );
+    let snapshot = collect(&world);
+    let gone = work(&snapshot, "feat-untracked");
+    assert_eq!(gone.upstream, Upstream::RemoteGone);
+    assert_eq!(
+        gone.upstream_detail.as_deref(),
+        Some("origin/feat-untracked")
+    );
+
+    // And it stays gone on the next pass: the recorded reading is stable,
+    // not a one-pass echo of the transition.
+    let snapshot = collect(&world);
+    assert_eq!(
+        work(&snapshot, "feat-untracked").upstream,
+        Upstream::RemoteGone
+    );
 }
 
 #[test]

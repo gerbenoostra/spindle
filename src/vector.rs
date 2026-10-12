@@ -104,11 +104,19 @@ pub struct RuntimeFacts {
 /// a remote that cannot be reached is `Unknown`, not gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamState {
-    /// No `branch.<name>.remote`/`.merge` configured.
+    /// No `branch.<name>.remote`/`.merge` configured, and no remote
+    /// provably carries a same-named branch either.
     NeverPushed,
     /// Configured, and the remote still advertises the merge ref.
     Tracked { remote: String, merge_ref: String },
-    /// Configured, and `ls-remote` proves the remote no longer has it.
+    /// No upstream configured, but a remote provably carries a same-named
+    /// branch: what a `push` without `-u` leaves behind. The proof is the
+    /// remote's advertised `refs/heads/<branch>`; when the remote cannot
+    /// be asked, the local `refs/remotes/<remote>/<branch>` it wrote.
+    Untracked { remote: String, merge_ref: String },
+    /// `ls-remote` proves the remote no longer carries the merge ref it
+    /// once had - a configured upstream, or the unconfigured same-named
+    /// branch its surviving tracking ref remembers.
     RemoteGone { remote: String, merge_ref: String },
     /// Configured partially or the remote could not be asked.
     Unknown(String),
@@ -297,8 +305,15 @@ struct AnchorLocal {
     /// `branch.<name>.remote`/`.merge` - from the `for-each-ref` batch when
     /// available, the `config` probes otherwise. `None` on a detached head.
     config: Option<Result<UpstreamConfig, git::Error>>,
-    /// The upstream remote's URL or a forge-parseable remote name.
-    remote_url: Option<String>,
+    /// Remotes whose `refs/remotes/<r>/<branch>` resolves: the local half
+    /// of the no-upstream fallback, kept sorted as `git remote` printed it.
+    /// Empty unless the branch has no upstream configured.
+    untracked_remotes: Vec<String>,
+    /// The persisted record's last-proven upstream reading
+    /// (`"untracked origin/feat"`), when the branch's record had one: the
+    /// longitudinal half of the fallback, covering what a pruned tracking
+    /// ref no longer can.
+    prior_upstream: Option<String>,
     /// The anchor tip's ref spec (`refs/heads/<name>` or a detached sha);
     /// `None` for an unborn HEAD.
     head: Option<String>,
@@ -360,6 +375,7 @@ impl AnchorWork {
 
     /// Patch the remote-owned fields from a finished [`apply_remote`].
     pub fn apply(&mut self, applied: RemoteApplied) {
+        self.state.remote_url = applied.remote_url;
         self.state.base = applied.base;
         self.state.vector.upstream_state = applied.upstream_state;
         self.state.vector.commits_ahead_of_base = applied.commits_ahead;
@@ -374,6 +390,8 @@ impl AnchorWork {
 #[derive(Debug)]
 pub struct RemoteApplied {
     pub upstream_state: UpstreamState,
+    /// The configured or fallback remote's URL - the forge's routing key.
+    pub remote_url: Option<String>,
     pub base: Evidence<Base>,
     pub commits_ahead: Evidence<u64>,
     pub commits_behind: Evidence<u64>,
@@ -385,8 +403,9 @@ pub struct RemoteApplied {
 /// One repository's local collection: every anchor and the repo-level
 /// evidence the remote stage re-uses.
 pub struct RepoLocal {
-    /// `git remote`, kept as the result: base resolution fails closed on
-    /// the error exactly like the per-anchor path.
+    /// `git remote`, kept as the result: base resolution and the
+    /// untracked-ref fallback fail closed on the error exactly like the
+    /// per-anchor path.
     remotes: Result<Vec<String>, git::Error>,
     /// Remote name -> `refs/remotes/<r>/HEAD` target, covering every remote
     /// the anchors can ask for. A missing key is "no such symref".
@@ -413,6 +432,7 @@ impl RepoLocal {
 pub fn collect_local_repo(
     repo: &Repo,
     runtime_of: impl Fn(&Anchor) -> RuntimeFacts,
+    prior_upstream: impl Fn(&Anchor) -> Option<String>,
 ) -> Result<RepoLocal, git::Error> {
     // The batch is best-effort: an older git rejects the atom format and
     // every batched fact falls back to its per-branch probe - except the
@@ -458,14 +478,23 @@ pub fn collect_local_repo(
         None => unchecked_branch_anchors(repo, &checked_out, &mut anchors)?, // coverage: off - the `?` arm needs a git too old for the atoms
     }
 
+    let remotes = repo.remotes();
     let works: Vec<AnchorWork> = anchors
         .into_iter()
         .map(|anchor| {
             let runtime = runtime_of(&anchor);
-            anchor_work(repo, anchor, facts.as_ref(), tips.as_ref(), runtime)
+            let prior = prior_upstream(&anchor);
+            anchor_work(
+                repo,
+                anchor,
+                facts.as_ref(),
+                tips.as_ref(),
+                runtime,
+                &remotes,
+                prior,
+            )
         })
         .collect();
-    let remotes = repo.remotes();
     let asks = remote_asks(&works, &remotes);
     let local_heads = local_heads(repo, &asks, facts.as_ref());
     Ok(RepoLocal {
@@ -492,6 +521,16 @@ fn remote_asks(works: &[AnchorWork], remotes: &Result<Vec<String>, git::Error>) 
     let mut asks = std::collections::BTreeSet::new();
     for work in works {
         if let Some(remote) = work.ask(remotes) {
+            asks.insert(remote);
+        }
+        // A record's remote is worth asking where it decides: the branch
+        // has no tracking ref to settle the fallback locally. `.` is the
+        // repository itself, never a remote answer.
+        if work.local.untracked_remotes.is_empty()
+            && matches!(&work.local.config, Some(Ok(UpstreamConfig::None)))
+            && let Some((remote, _)) = prior_remote_ref(work.local.prior_upstream.as_deref())
+            && remote != "."
+        {
             asks.insert(remote);
         }
     }
@@ -525,6 +564,8 @@ fn anchor_work(
     facts: Option<&git::RefFacts>,
     tips: Option<&HashMap<String, String>>,
     runtime: RuntimeFacts,
+    remotes: &Result<Vec<String>, git::Error>,
+    prior_upstream: Option<String>,
 ) -> AnchorWork {
     let branch = anchor.branch();
     let fact = branch.and_then(|b| facts.and_then(|f| f.branches.get(b)));
@@ -555,7 +596,22 @@ fn anchor_work(
     let (reflog_entry, commit_activity) = git_activity(repo, &anchor, fact);
     let reflog_activity = reflog_entry.as_ref().map(|w| w.at);
     let local = AnchorLocal {
-        remote_url: remote_url(repo, &config),
+        // A branch with no configured upstream falls back to the remotes
+        // a same-named remote-tracking ref proves - the local evidence a
+        // `push` without `-u` leaves. A `.` remote is the repository
+        // itself and carries no remote-tracking ref.
+        untracked_remotes: match (branch, remotes) {
+            (Some(branch), Ok(remotes)) if matches!(&config, Some(Ok(UpstreamConfig::None))) => {
+                remotes
+                    .iter()
+                    .filter(|remote| remote.as_str() != ".")
+                    .filter(|remote| remote_carries_branch(repo, remote, branch, facts))
+                    .cloned()
+                    .collect()
+            }
+            _ => Vec::new(),
+        },
+        prior_upstream,
         config,
         head: head_spec(&anchor),
         track: fact.and_then(|f| f.track),
@@ -586,7 +642,7 @@ fn anchor_work(
     let state = WorkState {
         repo: repo.clone(),
         anchor: anchor.clone(),
-        remote_url: local.remote_url.clone(),
+        remote_url: None,
         base: Evidence::Unknown(PENDING.to_owned()),
         forge: ForgeStatus {
             item: WorkItem::Unknown,
@@ -684,16 +740,33 @@ fn upstream_config(
     }
 } // coverage: off - the unexecuted instantiation's exit edge
 
-/// The configured remote names itself even when it cannot be reached, so it
-/// still feeds base resolution and forge routing. The URL is the remote's
-/// configured `remote.<name>.url`, or the name itself when it parses as a
-/// forge remote (`branch.<name>.remote` may carry the URL directly).
-fn remote_url(repo: &Repo, config: &Option<Result<UpstreamConfig, git::Error>>) -> Option<String> {
-    let remote = configured_remote(config)?;
+/// The named remote's URL - the configured remote names itself even when
+/// it cannot be reached, so it still feeds base resolution and forge
+/// routing. The URL is `remote.<name>.url`, or the name itself when it
+/// parses as a forge remote (`branch.<name>.remote` may carry the URL
+/// directly).
+fn remote_url(repo: &Repo, remote: &str) -> Option<String> {
     repo.remote_url(remote)
         .ok()
         .flatten()
         .or_else(|| forge::parse_remote(remote).map(|_| remote.to_owned()))
+}
+
+/// Whether `refs/remotes/<remote>/<branch>` resolves locally: the batch's
+/// remote ref listing when present, a `rev-parse` probe otherwise.
+fn remote_carries_branch(
+    repo: &Repo,
+    remote: &str,
+    branch: &str,
+    facts: Option<&git::RefFacts>,
+) -> bool {
+    match facts {
+        Some(facts) => facts
+            .remote_refs
+            .get(remote)
+            .is_some_and(|names| names.contains(branch)),
+        None => repo.has_ref(&format!("refs/remotes/{remote}/{branch}")), // coverage: off - needs a git too old for the atoms
+    }
 }
 
 /// The remote a `Full` upstream names; any other shape has none.
@@ -733,9 +806,14 @@ pub fn apply_remote(
         .anchors
         .iter()
         .map(|work| {
-            let upstream = upstream_state_of(&work.local.config, |remote| {
-                remote_refs(&listing_of(repo, remote))
-            });
+            let upstream = upstream_state_of(
+                &work.local.config,
+                work.state.anchor.branch(),
+                &work.local.untracked_remotes,
+                work.local.prior_upstream.as_deref(),
+                &local.remotes,
+                |remote| remote_refs(&listing_of(repo, remote)),
+            );
             let base = resolve_base(
                 repo,
                 configured_remote(&work.local.config),
@@ -798,8 +876,20 @@ pub fn apply_remote(
                     (commits, behind, listed, landed, unpushed)
                 }
             };
+            // The forge routes on whichever remote the upstream reading
+            // proved: the configured one, or the fallback remote a
+            // same-named remote branch was found on.
+            let remote_url = configured_remote(&work.local.config)
+                .map(str::to_owned)
+                .or_else(|| match &upstream {
+                    UpstreamState::Untracked { remote, .. }
+                    | UpstreamState::RemoteGone { remote, .. } => Some(remote.clone()),
+                    _ => None,
+                })
+                .and_then(|remote| remote_url(repo, &remote));
             RemoteApplied {
                 upstream_state: upstream,
+                remote_url,
                 base,
                 commits_ahead,
                 commits_behind,
@@ -826,8 +916,14 @@ fn worktree_head_log(main: bool, admin_id: Option<&str>) -> Option<PathBuf> {
 /// A read-only `ls-remote` decides whether the remote still advertises the
 /// configured merge ref. An unreachable remote is `Unknown`, not `remote_gone`:
 /// gone is only claimed when the remote answered and did not have the ref.
+/// Without a configured upstream the question becomes whether a remote
+/// provably carries a same-named branch instead.
 fn upstream_state_of(
     config: &Option<Result<UpstreamConfig, git::Error>>,
+    branch: Option<&str>,
+    untracked_remotes: &[String],
+    prior_upstream: Option<&str>,
+    remotes: &Result<Vec<String>, git::Error>,
     mut refs_of: impl FnMut(&str) -> Evidence<std::sync::Arc<Vec<String>>>,
 ) -> UpstreamState {
     let Some(config) = config else {
@@ -835,7 +931,16 @@ fn upstream_state_of(
     };
     match config {
         Err(e) => UpstreamState::Unknown(format!("upstream config: {e}")),
-        Ok(UpstreamConfig::None) => UpstreamState::NeverPushed,
+        Ok(UpstreamConfig::None) => match branch {
+            Some(branch) => untracked_upstream(
+                branch,
+                untracked_remotes,
+                prior_upstream,
+                remotes,
+                &mut refs_of,
+            ),
+            None => UpstreamState::NeverPushed, // coverage: off - an upstream config exists only for a branch
+        },
         Ok(UpstreamConfig::Partial) => {
             UpstreamState::Unknown("incomplete upstream config".to_owned())
         }
@@ -853,6 +958,104 @@ fn upstream_state_of(
             }
         }
     }
+}
+
+/// The no-upstream fallback: a remote provably carrying `refs/heads/<branch>`
+/// is `untracked` - the `push` without `-u` shape - `never_pushed` only
+/// holds when nothing proves the remote ever had it, and a remote answering
+/// that it lacks a ref local evidence remembers is `remote_gone`, the
+/// delete-on-merge shape. The repository's lone remote is already asked for
+/// the base, so its listing decides; the local tracking ref stands in when
+/// it cannot answer; several remotes are never probed for this, so only one
+/// local match can name a remote.
+fn untracked_upstream(
+    branch: &str,
+    untracked_remotes: &[String],
+    prior_upstream: Option<&str>,
+    remotes: &Result<Vec<String>, git::Error>,
+    refs_of: &mut impl FnMut(&str) -> Evidence<std::sync::Arc<Vec<String>>>,
+) -> UpstreamState {
+    let remotes = match remotes {
+        Ok(remotes) => remotes,
+        Err(e) => return UpstreamState::Unknown(format!("remote list: {e}")), // coverage: off - the remote list fails only where the config probes already did
+    };
+    let merge_ref = format!("refs/heads/{branch}");
+    let untracked = |remote: &str| UpstreamState::Untracked {
+        remote: remote.to_owned(),
+        merge_ref: merge_ref.clone(),
+    };
+    match remotes.as_slice() {
+        // A `.` remote is the repository itself: `ls-remote .` would
+        // trivially advertise the branch, but it is no remote answer.
+        [remote] if remote != "." => {
+            match refs_of(remote).map(|refs| refs.iter().any(|r| r == &merge_ref)) {
+                Evidence::Known(true) => untracked(remote),
+                // The remote answered and lacks the branch its surviving
+                // tracking ref remembers: gone - the delete-on-merge
+                // shape - not never-pushed.
+                Evidence::Known(false) if untracked_remotes.contains(remote) => {
+                    UpstreamState::RemoteGone {
+                        remote: remote.clone(),
+                        merge_ref,
+                    }
+                }
+                Evidence::Known(false) => prior_upstream_state(prior_upstream, refs_of)
+                    .unwrap_or(UpstreamState::NeverPushed),
+                // The remote cannot be asked; the tracking ref a push wrote
+                // stands alone, like the base's local remote HEAD does.
+                Evidence::Unknown(_) if untracked_remotes.contains(remote) => untracked(remote),
+                Evidence::Unknown(_) => prior_upstream_state(prior_upstream, refs_of)
+                    .unwrap_or(UpstreamState::NeverPushed),
+            }
+        }
+        _ => match untracked_remotes {
+            [remote] => untracked(remote),
+            [] => {
+                prior_upstream_state(prior_upstream, refs_of).unwrap_or(UpstreamState::NeverPushed)
+            }
+            many => match prior_remote_ref(prior_upstream) {
+                // Several remotes carry the tracking ref; the record names
+                // the one the push went to.
+                Some((remote, _)) if many.iter().any(|r| r == &remote) => untracked(&remote),
+                _ => UpstreamState::Unknown(format!(
+                    "same-named remote-tracking ref on {}: ambiguous remote",
+                    many.join(", ")
+                )),
+            },
+        },
+    }
+}
+
+/// The persisted record's say on the remote it once named, decided by that
+/// remote's own listing: the recorded ref advertised is `untracked`, proven
+/// absent is `remote_gone`, unanswerable is `unknown` so the record outlives
+/// the pass that could not recheck it. `None` when the record carried no
+/// remote detail, so `never_pushed` is still a possible answer.
+fn prior_upstream_state(
+    prior_upstream: Option<&str>,
+    refs_of: &mut impl FnMut(&str) -> Evidence<std::sync::Arc<Vec<String>>>,
+) -> Option<UpstreamState> {
+    let (remote, merge_ref) = prior_remote_ref(prior_upstream)?;
+    Some(
+        match refs_of(&remote).map(|refs| refs.contains(&merge_ref)) {
+            Evidence::Known(true) => UpstreamState::Untracked { remote, merge_ref },
+            Evidence::Known(false) => UpstreamState::RemoteGone { remote, merge_ref },
+            Evidence::Unknown(e) => UpstreamState::Unknown(e),
+        },
+    )
+}
+
+/// The `<remote>/<merge>` a persisted upstream reading carried:
+/// `"untracked origin/feat"` is `("origin", "refs/heads/feat")`. The
+/// reading's state word is skipped - the remote detail it kept is the
+/// evidence. A `refs/heads/` prefix the older spelling kept in the merge
+/// name is stripped. A remote name containing `/` misparses: the named
+/// remote then probes as unreachable, which fails closed to `unknown`.
+fn prior_remote_ref(prior: Option<&str>) -> Option<(String, String)> {
+    let detail = prior?.split_once(' ')?.1;
+    let (remote, merge) = detail.split_once('/')?;
+    let merge = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+    Some((remote.to_owned(), format!("refs/heads/{merge}")))
 }
 
 /// The remote's advertised ref listing: `refs` is an `Arc` share, so
@@ -1055,9 +1258,16 @@ fn landed(
     })
 }
 
-/// Commits the configured upstream does not have. A branch that was never
-/// pushed - or a detached HEAD - has no upstream at all, so every commit
-/// past the base is unpushed by definition. The batch's `upstream:track`
+fn remote_tracking_ref(remote: &str, merge_ref: &str) -> String {
+    format!(
+        "refs/remotes/{remote}/{}",
+        merge_ref.strip_prefix("refs/heads/").unwrap_or(merge_ref)
+    )
+}
+
+/// Commits the configured - or fallback - upstream does not have. A branch
+/// that was never pushed - or a detached HEAD - has no upstream at all, so
+/// every commit past the base is unpushed by definition. The batch's `upstream:track`
 /// ahead count answers it directly when present; `@{u}` resolves through
 /// the refspec otherwise, which is why it handles a merge ref naming a
 /// different remote branch and fails closed when the tracking ref is gone.
@@ -1070,13 +1280,37 @@ fn unpushed_commits(
 ) -> Evidence<u64> {
     match (upstream, branch) {
         (UpstreamState::NeverPushed | UpstreamState::NotApplicable, _) => commits_ahead.clone(),
+        // An untracked branch has no `@{u}` to resolve; the remote-tracking
+        // ref the fallback proved is what it diverges from.
+        (UpstreamState::Untracked { remote, merge_ref }, Some(branch)) => {
+            let tracking = remote_tracking_ref(remote, merge_ref);
+            match repo.rev_list_count(&tracking, &format!("refs/heads/{branch}")) {
+                Ok(count) => Evidence::Known(count),
+                Err(e) => Evidence::Unknown(format!("unpushed count via {tracking}: {e}")),
+            }
+        }
         (_, Some(branch)) => match track {
             Some(Track::Counts { ahead, .. }) => Evidence::Known(ahead),
             _ => {
                 let upstream_ref = format!("{branch}@{{u}}");
                 match repo.rev_list_count(&upstream_ref, &format!("refs/heads/{branch}")) {
                     Ok(count) => Evidence::Known(count),
-                    Err(e) => Evidence::Unknown(format!("unpushed count via @{{u}}: {e}")),
+                    Err(e) => match upstream {
+                        // `@{u}` needs upstream config; a remote-gone
+                        // branch without it still has the surviving
+                        // tracking ref to count against.
+                        UpstreamState::RemoteGone { remote, merge_ref } => {
+                            let tracking = remote_tracking_ref(remote, merge_ref);
+                            match repo.rev_list_count(&tracking, &format!("refs/heads/{branch}")) {
+                                Ok(count) => Evidence::Known(count),
+                                // Nothing to count against left: commits
+                                // past the base bound the loss - the
+                                // never_pushed definition.
+                                Err(_) => commits_ahead.clone(),
+                            }
+                        }
+                        _ => Evidence::Unknown(format!("unpushed count via @{{u}}: {e}")),
+                    },
                 }
             }
         },
@@ -1125,7 +1359,8 @@ fn probe_repo_local(
     remotes: Result<Vec<String>, git::Error>,
 ) -> RepoLocal {
     let tips = repo.branch_tips().unwrap_or_default();
-    let work = anchor_work(repo, anchor, None, Some(&tips), runtime);
+    // The per-branch path has no persisted record to consult.
+    let work = anchor_work(repo, anchor, None, Some(&tips), runtime, &remotes, None);
     let asks = remote_asks(std::slice::from_ref(&work), &remotes);
     let local_heads = local_heads(repo, &asks, None);
     RepoLocal {
@@ -1258,6 +1493,30 @@ mod tests {
             "{:?}",
             removal.reasons
         );
+    }
+
+    #[test]
+    fn a_persisted_upstream_reading_names_a_remote_and_merge_ref() {
+        assert_eq!(
+            prior_remote_ref(Some("untracked origin/fix/tui-idle-cpu")),
+            Some((
+                "origin".to_owned(),
+                "refs/heads/fix/tui-idle-cpu".to_owned()
+            ))
+        );
+        assert_eq!(
+            prior_remote_ref(Some("remote_gone upstream/feat")),
+            Some(("upstream".to_owned(), "refs/heads/feat".to_owned()))
+        );
+        // The older spelling's `refs/heads/` prefix in the merge name.
+        assert_eq!(
+            prior_remote_ref(Some("tracked origin/refs/heads/release")),
+            Some(("origin".to_owned(), "refs/heads/release".to_owned()))
+        );
+        // Readings that name no remote carry no evidence.
+        assert_eq!(prior_remote_ref(None), None);
+        assert_eq!(prior_remote_ref(Some("never_pushed")), None);
+        assert_eq!(prior_remote_ref(Some("untracked origin")), None);
     }
 
     #[test]
@@ -1556,7 +1815,7 @@ mod tests {
         assert!(anchors(&repo).unwrap().is_empty());
         // The staged local read agrees: no checkouts, no asks, nothing for
         // the remote stage to apply.
-        let local = collect_local_repo(&repo, |_| RuntimeFacts::default()).unwrap(); // coverage: off - the panic edge is a failed assertion
+        let local = collect_local_repo(&repo, |_| RuntimeFacts::default(), |_| None).unwrap(); // coverage: off - the panic edge is a failed assertion
         assert!(local.anchors.is_empty() && local.asks.is_empty());
         let applied = apply_remote(&repo, &local, |_, _| panic!("no anchors")); // coverage: off - proves the listing callback never runs
         assert!(applied.is_empty());
@@ -1574,7 +1833,7 @@ mod tests {
         let file = dir.join("not-a-repo");
         std::fs::write(&file, "x").unwrap();
         let repo = Repo { common_dir: file };
-        let result = collect_local_repo(&repo, |_| RuntimeFacts::default()); // coverage: off - the unexecuted instantiation's region edge
+        let result = collect_local_repo(&repo, |_| RuntimeFacts::default(), |_| None); // coverage: off - the unexecuted instantiation's region edge
         let err = match result {
             Ok(_) => panic!("a broken repo cannot collect"), // coverage: off - the panic edge is a failed assertion
             Err(e) => e,

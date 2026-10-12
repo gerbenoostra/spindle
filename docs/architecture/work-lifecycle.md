@@ -151,3 +151,53 @@ rather than "noticed 30 days ago".
   recreated roots must not be rebound). tmux reads the cwd verbatim from
   `/proc/<pid>/cwd` on Linux, where the kernel appends the suffix:
   [osdep-linux.c](https://github.com/tmux/tmux/blob/master/osdep-linux.c).
+
+## Remote-state classification
+
+A branch's `upstream_state` answers "does a remote carry this branch, did it
+ever, and can that be proven this pass?" - never "is an upstream configured?".
+The collector stays read-only: no fetch, no prune, no config write.
+
+- A same-named remote ref without upstream config is `untracked`, not `tracked` -
+  because the classifier must be honest about missing upstream config, which
+  affects what `unpushed` can count and what `git` commands would apply; not
+  reusing `tracked` (it would claim divergence data `@{u}` cannot produce).
+- `remote_gone` is claimed only when `ls-remote` answers `Known(lacks)` - because
+  deletion must be proven by the remote, not inferred from absent local evidence;
+  not treating unreachable as gone (a network failure is not a deletion).
+- With a persisted record but an unreachable remote and no tracking ref, report
+  `unknown` rather than `never_pushed` - because `unknown` leaves the record's
+  proven reading in place while `never_pushed` overwrites and destroys it; not
+  answering `remote_gone` (deletion is unproven).
+- With no evidence at all, report `never_pushed` - preserving the pre-fallback
+  default; not `unknown` (it would mark every local-only branch `?` whenever
+  offline).
+- When `remote_gone` has no counting ref left, `unpushed` bounds by commits past
+  the proven base - because past-base commits are the conservative answer to
+  "not provably on any remote"; not `unknown` (a merged-then-pruned branch would
+  block cleanup forever).
+- When `untracked` rests only on an advertised ref with no local tracking ref,
+  `unpushed` is `?` - because the remote's tip is unknowable locally; not bounding
+  by the base (the remote demonstrably holds some of the commits, so a
+  fabricated count misleads more than `?`).
+- The record's remote is asked as a remote ask only when it is the only evidence
+  left - because the probe is bounded to that one remote; not probing every
+  configured remote (unbounded asks) and not skipping the probe (the record could
+  never be rechecked).
+- Several remotes carrying a same-named tracking ref stay `unknown` unless the
+  record names one - because picking a remote without evidence is a guess; not
+  first-remote-wins ordering (alphabetical is not semantic).
+- The persisted record is consulted only for `UpstreamConfig::None` - because a
+  configured upstream's state already follows the stronger configured path; not
+  letting the record override config (a stale record would contradict live config
+  evidence).
+- Old `refs/heads/` prefixes in persisted upstream details are stripped at parse
+  - because one binary's records must feed the next; not requiring the current
+  spelling (old records would misfire as `remote_gone` via a vacuous ref check).
+- The additive `untracked` wire value ships under the existing `schema_version` -
+  because additive values are the snapshot's declared compatibility rule; not
+  bumping (a version bump for an additive enum value resets persisted history
+  for no consumer gain).
+- Compact-row tails get no `not tracked` marker - because the requested surface
+  was the details pane only; not adding one speculatively (the tail stays a risk
+  summary, not a config linter).
