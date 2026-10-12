@@ -1273,10 +1273,13 @@ fn unpushed_commits(
 ) -> Evidence<u64> {
     match (upstream, branch) {
         (UpstreamState::NeverPushed | UpstreamState::NotApplicable, _) => commits_ahead.clone(),
-        // An untracked branch has no `@{u}` to resolve; the same-named
-        // remote-tracking ref the fallback proved is what it diverges from.
-        (UpstreamState::Untracked { remote, .. }, Some(branch)) => {
-            let tracking = format!("refs/remotes/{remote}/{branch}");
+        // An untracked branch has no `@{u}` to resolve; the remote-tracking
+        // ref the fallback proved is what it diverges from.
+        (UpstreamState::Untracked { remote, merge_ref }, Some(branch)) => {
+            let tracking = format!(
+                "refs/remotes/{remote}/{}",
+                merge_ref.strip_prefix("refs/heads/").unwrap_or(merge_ref)
+            );
             match repo.rev_list_count(&tracking, &format!("refs/heads/{branch}")) {
                 Ok(count) => Evidence::Known(count),
                 Err(e) => Evidence::Unknown(format!("unpushed count via {tracking}: {e}")),

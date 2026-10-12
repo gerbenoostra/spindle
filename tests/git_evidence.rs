@@ -1162,6 +1162,14 @@ fn a_recorded_upstream_still_decides_remote_state_without_a_tracking_ref() {
     // counterpart: untracked, not never_pushed.
     f.branch_with_commits("kept", 1, false);
     f.git(&f.remote, &["branch", "feat-kept", "main"]);
+    f.git(
+        &f.main,
+        &[
+            "update-ref",
+            "refs/remotes/origin/feat-kept",
+            "refs/heads/main",
+        ],
+    );
     // A record naming a remote that cannot be asked leaves `unknown`: the
     // reading survives the pass instead of being overwritten.
     f.branch_with_commits("elsewhere", 1, false);
@@ -1207,6 +1215,16 @@ fn a_recorded_upstream_still_decides_remote_state_without_a_tracking_ref() {
             remote: "origin".to_owned(),
             merge_ref: "refs/heads/feat-kept".to_owned()
         }
+    );
+    assert_eq!(
+        anchors
+            .iter()
+            .find(|w| w.state.anchor.branch() == Some("kept"))
+            .unwrap()
+            .state
+            .vector
+            .unpushed_commits,
+        Evidence::Known(1)
     );
     assert!(matches!(
         upstream(&anchors, "elsewhere"),
