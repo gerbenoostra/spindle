@@ -4769,6 +4769,14 @@ mod tests {
         // At 200 columns the glyph is spelled out as `collecting`.
         let wide = render_to(&app, 200, 24);
         assert!(bottom_line(&wide).contains("collecting"), "{wide:?}");
+
+        // The glyph keeps the default foreground so it reads as live
+        // activity; the hints behind it stay dim.
+        let mut terminal = Terminal::new(TestBackend::new(55, 10)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 9)].fg, Color::Reset);
+        assert_eq!(buffer[(2, 9)].fg, Color::DarkGray);
     }
 
     #[test]
