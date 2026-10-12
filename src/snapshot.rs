@@ -4815,6 +4815,7 @@ mod tests {
         for (value, want) in [
             (wire(&Upstream::Tracked), "tracked"),
             (wire(&Upstream::NeverPushed), "never_pushed"),
+            (wire(&Upstream::Untracked), "untracked"),
             (wire(&Upstream::RemoteGone), "remote_gone"),
             (wire(&Upstream::NotApplicable), "not_applicable"),
             (wire(&Upstream::Unknown), "unknown"),
