@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.0](https://github.com/gerbenoostra/spindle/compare/v0.1.0...v0.2.0) (2026-10-12)
+
+
+### Features
+
+* clarify Work detail activity summaries and provenance ([#18](https://github.com/gerbenoostra/spindle/issues/18)) ([1903781](https://github.com/gerbenoostra/spindle/commit/1903781849fa55ebb817d06d320e44288ca879e3))
+* remote state evidence beyond configured upstream ([#22](https://github.com/gerbenoostra/spindle/issues/22)) ([b119b70](https://github.com/gerbenoostra/spindle/commit/b119b70284ac5110a2898778cb772530f255bfd1))
+
+
+### Bug Fixes
+
+* remove skipped transcript rows from evidence ([#20](https://github.com/gerbenoostra/spindle/issues/20)) ([e2ed603](https://github.com/gerbenoostra/spindle/commit/e2ed603159b89ac3c920dcd1c91d999e9ca2d5a5))
+
+
+### Performance Improvements
+
+* reduce idle dashboard collection work ([#21](https://github.com/gerbenoostra/spindle/issues/21)) ([60618e2](https://github.com/gerbenoostra/spindle/commit/60618e2a96370f7ef5a7e8eb1c1c21d3faa8b670))
+
 ## [0.1.0](https://github.com/gerbenoostra/spindle/compare/v0.0.2...v0.1.0) (2026-10-08)
 
 
