@@ -1258,6 +1258,13 @@ fn landed(
     })
 }
 
+fn remote_tracking_ref(remote: &str, merge_ref: &str) -> String {
+    format!(
+        "refs/remotes/{remote}/{}",
+        merge_ref.strip_prefix("refs/heads/").unwrap_or(merge_ref)
+    )
+}
+
 /// Commits the configured - or fallback - upstream does not have. A branch
 /// that was never pushed - or a detached HEAD - has no upstream at all, so
 /// every commit past the base is unpushed by definition. The batch's `upstream:track`
@@ -1276,10 +1283,7 @@ fn unpushed_commits(
         // An untracked branch has no `@{u}` to resolve; the remote-tracking
         // ref the fallback proved is what it diverges from.
         (UpstreamState::Untracked { remote, merge_ref }, Some(branch)) => {
-            let tracking = format!(
-                "refs/remotes/{remote}/{}",
-                merge_ref.strip_prefix("refs/heads/").unwrap_or(merge_ref)
-            );
+            let tracking = remote_tracking_ref(remote, merge_ref);
             match repo.rev_list_count(&tracking, &format!("refs/heads/{branch}")) {
                 Ok(count) => Evidence::Known(count),
                 Err(e) => Evidence::Unknown(format!("unpushed count via {tracking}: {e}")),
@@ -1296,10 +1300,7 @@ fn unpushed_commits(
                         // branch without it still has the surviving
                         // tracking ref to count against.
                         UpstreamState::RemoteGone { remote, merge_ref } => {
-                            let tracking = format!(
-                                "refs/remotes/{remote}/{}",
-                                merge_ref.strip_prefix("refs/heads/").unwrap_or(merge_ref)
-                            );
+                            let tracking = remote_tracking_ref(remote, merge_ref);
                             match repo.rev_list_count(&tracking, &format!("refs/heads/{branch}")) {
                                 Ok(count) => Evidence::Known(count),
                                 // Nothing to count against left: commits
