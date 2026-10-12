@@ -96,6 +96,30 @@ fn standard() -> FixtureRepo {
     f.branch_with_commits("local", 1, false);
     f.add_worktree("local", Some("local"));
 
+    // Pushed without `-u`: the remote carries the branch but no upstream
+    // is configured - the same-named remote ref is the untracked fallback.
+    f.branch_with_commits("untracked", 1, false);
+    f.git(&f.main, &["push", "origin", "untracked"]);
+    f.add_worktree("untracked", Some("untracked"));
+
+    // The same push without `-u`, then deleted on the remote: the
+    // surviving tracking ref proves it once had the branch, so the
+    // remote's own answer reads remote_gone - the delete-on-merge shape.
+    f.branch_with_commits("untracked-gone", 1, false);
+    f.git(&f.main, &["push", "origin", "untracked-gone"]);
+    f.git(&f.remote, &["branch", "-D", "untracked-gone"]);
+    f.add_worktree("untracked-gone", Some("untracked-gone"));
+
+    // Remote-gone with the tracking ref pruned too: `@{u}` and the
+    // fallback ref both fail, so commits past the base bound the loss.
+    f.branch_with_commits("gone-pruned", 1, true);
+    f.git(&f.remote, &["branch", "-D", "gone-pruned"]);
+    f.git(
+        &f.main,
+        &["update-ref", "-d", "refs/remotes/origin/gone-pruned"],
+    );
+    f.add_worktree("gone-pruned", Some("gone-pruned"));
+
     // A branch that tracks a different remote ref than its own name.
     f.branch_with_commits("release", 1, true);
     f.git(
@@ -421,6 +445,58 @@ fn the_fixture_table() {
         ),
     );
 
+    // The untracked fallback: the remote carries the branch, so unpushed
+    // counts against the remote-tracking ref - nothing is unpushed.
+    expect(
+        &states,
+        "wt:untracked@wt-untracked",
+        (
+            Verdict::Review,
+            &[
+                "1 commit ahead of origin/main and not landed",
+                "removal keeps branch untracked and its commits",
+            ],
+        ),
+        (
+            Verdict::Review,
+            &[
+                "requires `git branch -D`",
+                "not landed on origin/main",
+                &format!(
+                    "checked out in {}; deleted after the worktree is removed",
+                    f.dir.join("wt-untracked").display()
+                ),
+            ],
+        ),
+    );
+
+    // The fallback's gone reading: the remote provably lacks the branch
+    // its tracking ref remembers, so it reads remote_gone with a real
+    // unpushed count - the delete-on-merge cleanup signal. Nothing is
+    // unpushed, so the verdict reviews instead of blocking.
+    expect(
+        &states,
+        "wt:untracked-gone@wt-untracked-gone",
+        (
+            Verdict::Review,
+            &[
+                "1 commit ahead of origin/main and not landed",
+                "removal keeps branch untracked-gone and its commits",
+            ],
+        ),
+        (
+            Verdict::Review,
+            &[
+                "requires `git branch -D`",
+                "not landed on origin/main",
+                &format!(
+                    "checked out in {}; deleted after the worktree is removed",
+                    f.dir.join("wt-untracked-gone").display()
+                ),
+            ],
+        ),
+    );
+
     expect(
         &states,
         "wt:tracks-release@wt-tracks-release",
@@ -669,6 +745,34 @@ fn the_fixture_table() {
     assert_eq!(v.landed, Evidence::Known(Landed::ContentMerged));
     let v = &states["wt:local@wt-local"].vector;
     assert_eq!(v.upstream_state, UpstreamState::NeverPushed);
+    let v = &states["wt:untracked@wt-untracked"].vector;
+    assert_eq!(
+        v.upstream_state,
+        UpstreamState::Untracked {
+            remote: "origin".to_owned(),
+            merge_ref: "refs/heads/untracked".to_owned()
+        }
+    );
+    assert_eq!(v.unpushed_commits, Evidence::Known(0));
+    let v = &states["wt:untracked-gone@wt-untracked-gone"].vector;
+    assert_eq!(
+        v.upstream_state,
+        UpstreamState::RemoteGone {
+            remote: "origin".to_owned(),
+            merge_ref: "refs/heads/untracked-gone".to_owned()
+        }
+    );
+    assert_eq!(v.unpushed_commits, Evidence::Known(0));
+    let v = &states["wt:gone-pruned@wt-gone-pruned"].vector;
+    assert!(matches!(v.upstream_state, UpstreamState::RemoteGone { .. }));
+    assert_eq!(v.unpushed_commits, Evidence::Known(1));
+    assert!(states["wt:untracked@wt-untracked"].remote_url.is_some());
+    assert!(states["wt:local@wt-local"].remote_url.is_none());
+    assert!(
+        states["wt:untracked-gone@wt-untracked-gone"]
+            .remote_url
+            .is_some()
+    );
     let v = &states["wt:tracks-release@wt-tracks-release"].vector;
     assert!(matches!(
         &v.upstream_state,
@@ -925,6 +1029,229 @@ fn a_remote_named_other_than_origin_resolves() {
         state.base.known().map(|b| b.label()).as_deref(),
         Some("upstream/main")
     );
+}
+
+#[test]
+fn an_unreachable_remote_falls_back_to_the_local_tracking_ref() {
+    // Pushed without `-u`, then the remote went away: the listing cannot
+    // answer, so the tracking ref the push wrote names the remote. A
+    // never-pushed branch beside it still reads never_pushed.
+    let f = FixtureRepo::new("origin");
+    f.branch_with_commits("feat", 1, false);
+    f.git(&f.main, &["push", "origin", "feat"]);
+    f.branch_with_commits("local", 1, false);
+    std::fs::remove_dir_all(&f.remote).expect("the remote goes away");
+
+    let repo = git::Repo::discover(f.main.as_path()).unwrap().unwrap();
+    let anchors = vector::anchors(&repo).unwrap();
+
+    let feat = anchors.iter().find(|a| a.branch() == Some("feat")).unwrap();
+    let state = vector::collect(&repo, feat, quiet());
+    assert_eq!(
+        state.vector.upstream_state,
+        UpstreamState::Untracked {
+            remote: "origin".to_owned(),
+            merge_ref: "refs/heads/feat".to_owned()
+        }
+    );
+
+    let local = anchors
+        .iter()
+        .find(|a| a.branch() == Some("local"))
+        .unwrap();
+    let state = vector::collect(&repo, local, quiet());
+    assert_eq!(state.vector.upstream_state, UpstreamState::NeverPushed);
+}
+
+#[test]
+fn an_untracked_remote_ref_without_a_local_one_cannot_count_unpushed() {
+    // The remote advertises the branch but no local tracking ref was kept:
+    // `untracked` holds on the advertised evidence alone, and the unpushed
+    // count honestly has nothing to diverge against.
+    let f = FixtureRepo::new("origin");
+    f.branch_with_commits("feat", 1, false);
+    f.git(&f.main, &["push", "origin", "feat"]);
+    f.git(&f.main, &["update-ref", "-d", "refs/remotes/origin/feat"]);
+
+    let repo = git::Repo::discover(f.main.as_path()).unwrap().unwrap();
+    let anchor = vector::anchors(&repo)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.branch() == Some("feat"))
+        .unwrap();
+    let state = vector::collect(&repo, &anchor, quiet());
+    assert_eq!(
+        state.vector.upstream_state,
+        UpstreamState::Untracked {
+            remote: "origin".to_owned(),
+            merge_ref: "refs/heads/feat".to_owned()
+        }
+    );
+    assert!(matches!(
+        state.vector.unpushed_commits,
+        Evidence::Unknown(_)
+    ));
+}
+
+#[test]
+fn the_untracked_fallback_fails_closed_on_ambiguous_remotes() {
+    // A branch pushed to each of two remotes without `-u`: both wrote a
+    // same-named tracking ref, nothing disambiguates - and a branch only
+    // one remote carries names that remote.
+    let f = FixtureRepo::new("origin");
+    let other = f.dir.join("other.git");
+    f.git(
+        f.main.as_path(),
+        &["init", "--bare", "-b", "main", other.to_str().unwrap()],
+    );
+    f.git(
+        f.main.as_path(),
+        &["remote", "add", "other", other.to_str().unwrap()],
+    );
+    f.branch_with_commits("feat", 1, false);
+    f.git(&f.main, &["push", "origin", "feat"]);
+    f.git(&f.main, &["push", "other", "feat"]);
+    f.branch_with_commits("elsewhere", 1, false);
+    f.git(&f.main, &["push", "other", "elsewhere"]);
+    // A branch no remote carries at all stays never_pushed.
+    f.branch_with_commits("local-only", 1, false);
+
+    let repo = git::Repo::discover(f.main.as_path()).unwrap().unwrap();
+    let anchors = vector::anchors(&repo).unwrap();
+
+    let feat = anchors.iter().find(|a| a.branch() == Some("feat")).unwrap();
+    let state = vector::collect(&repo, feat, quiet());
+    assert!(
+        matches!(state.vector.upstream_state, UpstreamState::Unknown(_)),
+        "{:?}",
+        state.vector.upstream_state
+    );
+
+    let elsewhere = anchors
+        .iter()
+        .find(|a| a.branch() == Some("elsewhere"))
+        .unwrap();
+    let state = vector::collect(&repo, elsewhere, quiet());
+    assert_eq!(
+        state.vector.upstream_state,
+        UpstreamState::Untracked {
+            remote: "other".to_owned(),
+            merge_ref: "refs/heads/elsewhere".to_owned()
+        }
+    );
+
+    let local = anchors
+        .iter()
+        .find(|a| a.branch() == Some("local-only"))
+        .unwrap();
+    let state = vector::collect(&repo, local, quiet());
+    assert_eq!(state.vector.upstream_state, UpstreamState::NeverPushed);
+}
+
+#[test]
+fn a_recorded_upstream_still_decides_remote_state_without_a_tracking_ref() {
+    // Pushed without `-u`, then deleted on the remote and the tracking
+    // ref pruned: only the persisted record remembers the remote ever
+    // carried the branch - and its say-so still decides remote_gone.
+    let f = FixtureRepo::new("origin");
+    f.branch_with_commits("feat", 1, false);
+    f.git(&f.main, &["push", "origin", "feat"]);
+    f.git(&f.remote, &["branch", "-D", "feat"]);
+    f.git(&f.main, &["update-ref", "-d", "refs/remotes/origin/feat"]);
+    // A recorded remote ref that is still advertised is the branch's
+    // counterpart: untracked, not never_pushed.
+    f.branch_with_commits("kept", 1, false);
+    f.git(&f.remote, &["branch", "feat-kept", "main"]);
+    // A record naming a remote that cannot be asked leaves `unknown`: the
+    // reading survives the pass instead of being overwritten.
+    f.branch_with_commits("elsewhere", 1, false);
+
+    let repo = git::Repo::discover(f.main.as_path()).unwrap().unwrap();
+    let priors = |anchor: &Anchor| match anchor.branch() {
+        Some("feat") => Some("untracked origin/feat".to_owned()),
+        Some("kept") => Some("untracked origin/feat-kept".to_owned()),
+        Some("elsewhere") => Some("untracked upstream/elsewhere".to_owned()),
+        Some("named") => Some("untracked second/named".to_owned()),
+        _ => None,
+    };
+    let upstream = |anchors: &[vector::AnchorWork], name: &str| {
+        anchors
+            .iter()
+            .find(|w| w.state.anchor.branch() == Some(name))
+            .unwrap_or_else(|| panic!("an anchor for {name}"))
+            .state
+            .vector
+            .upstream_state
+            .clone()
+    };
+    let collect = |priors: &dyn Fn(&Anchor) -> Option<String>| {
+        let local = vector::collect_local_repo(&repo, |_| quiet(), priors).unwrap();
+        let applied = vector::apply_remote(&repo, &local, |r, name| r.remote_listing(name));
+        let mut anchors = local.anchors;
+        for (work, applied) in anchors.iter_mut().zip(applied) {
+            work.apply(applied);
+        }
+        anchors
+    };
+    let anchors = collect(&priors);
+    assert_eq!(
+        upstream(&anchors, "feat"),
+        UpstreamState::RemoteGone {
+            remote: "origin".to_owned(),
+            merge_ref: "refs/heads/feat".to_owned()
+        }
+    );
+    assert_eq!(
+        upstream(&anchors, "kept"),
+        UpstreamState::Untracked {
+            remote: "origin".to_owned(),
+            merge_ref: "refs/heads/feat-kept".to_owned()
+        }
+    );
+    assert!(matches!(
+        upstream(&anchors, "elsewhere"),
+        UpstreamState::Unknown(_)
+    ));
+
+    // A second remote: the record names the one its local tracking refs
+    // cannot disambiguate, and the remote it names gets asked even though
+    // no local evidence points at it.
+    let remote_path = f.remote.display().to_string();
+    f.git(&f.main, &["remote", "add", "second", remote_path.as_str()]);
+    f.branch_with_commits("named", 1, false);
+    f.git(&f.main, &["push", "origin", "named"]);
+    f.git(&f.main, &["push", "second", "named"]);
+    let anchors = collect(&priors);
+    assert_eq!(
+        upstream(&anchors, "named"),
+        UpstreamState::Untracked {
+            remote: "second".to_owned(),
+            merge_ref: "refs/heads/named".to_owned()
+        }
+    );
+    assert_eq!(
+        upstream(&anchors, "feat"),
+        UpstreamState::RemoteGone {
+            remote: "origin".to_owned(),
+            merge_ref: "refs/heads/feat".to_owned()
+        }
+    );
+
+    // The lone remote unreachable, the tracking ref pruned, but the record
+    // remembering: `unknown` - the reading survives the pass.
+    f.git(&f.main, &["remote", "remove", "second"]);
+    let nowhere = f.dir.join("nonexistent").display().to_string();
+    f.git(&f.main, &["remote", "set-url", "origin", nowhere.as_str()]);
+    f.git(&f.main, &["update-ref", "-d", "refs/remotes/second/named"]);
+    let anchors = collect(&priors);
+    assert!(matches!(
+        upstream(&anchors, "feat"),
+        UpstreamState::Unknown(_)
+    ));
+    assert!(matches!(
+        upstream(&anchors, "elsewhere"),
+        UpstreamState::Unknown(_)
+    ));
 }
 
 #[test]
@@ -1344,7 +1671,7 @@ fn the_batched_read_agrees_with_the_per_branch_probes() {
     let repo = git::Repo::discover(f.main.as_path())
         .expect("discover")
         .expect("the clone is a repo");
-    let mut local = vector::collect_local_repo(&repo, |_| quiet()).expect("local");
+    let mut local = vector::collect_local_repo(&repo, |_| quiet(), |_| None).expect("local");
     let applied = vector::apply_remote(&repo, &local, |r, name| r.remote_listing(name));
     assert_eq!(applied.len(), local.anchors.len());
     /// A row's evidence dump plus its removal/deletion verdict pair.
@@ -1427,7 +1754,7 @@ fn a_locked_worktree_marks_its_anchor() {
     };
     assert!(locked);
     // The staged local read agrees: lock state is local evidence.
-    let local = vector::collect_local_repo(&repo, |_| quiet()).expect("local");
+    let local = vector::collect_local_repo(&repo, |_| quiet(), |_| None).expect("local");
     let work = local
         .anchors
         .iter()

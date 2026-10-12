@@ -130,8 +130,8 @@ is read from Git with `GIT_OPTIONAL_LOCKS=0`. Facts that cannot be proven are
 | `past_agent_sessions` | per-agent history for that path | "no live session" never means "nothing ever ran here" |
 | `dirty` | `git status --porcelain --untracked-files=all` | the primary removal blocker |
 | `commits_ahead_of_base` | `git rev-list --count <base>..HEAD` | zero plus no sessions means the worktree was never used |
-| `upstream_state` | `never_pushed` / `tracked` / `remote_gone` | proven by `ls-remote`; no fetch, no local mutation |
-| `unpushed_commits` | `git rev-list --count @{u}..HEAD`; vs the proven base when never pushed; commits no `refs/*` reaches when detached | the real data-loss risk on removal |
+| `upstream_state` | `never_pushed` / `untracked` / `tracked` / `remote_gone` | proven by `ls-remote`; `untracked` is the no-upstream fallback for a same-named remote ref; no fetch, no local mutation |
+| `unpushed_commits` | `git rev-list --count @{u}..HEAD`; vs `refs/remotes/<remote>/<branch>` when untracked; vs the proven base when never pushed or when remote-gone has no tracking ref left to count against; commits no `refs/*` reaches when detached | the real data-loss risk on removal |
 | `landed` | `no` / `ancestor-merged` / `content-merged` | ancestry first, then path-scoped tree comparison |
 | `last_git_activity` | the timestamps of real work entries in the worktree HEAD reflog, the branch reflog and the tip's committer date when it postdates the branch's creation | creation, checkout and clone bookkeeping never count as activity; the reflog file's mtime never counts either |
 

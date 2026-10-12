@@ -1355,6 +1355,7 @@ impl App {
         push_text(out, format!("local: {local}"), width);
         let remote = match w.upstream {
             Upstream::Tracked => format!("{} · tracked", opt(&w.upstream_detail)),
+            Upstream::Untracked => format!("{} · not tracked", opt(&w.upstream_detail)),
             Upstream::NeverPushed => "no remote".to_owned(),
             Upstream::RemoteGone => format!("{} · remote gone", opt(&w.upstream_detail)),
             Upstream::NotApplicable => "n/a".to_owned(),

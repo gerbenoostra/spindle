@@ -132,6 +132,10 @@ fn world() -> World {
     );
     repo.branch_with_commits("feat-merged", 1, true);
     repo.land("feat-merged", Landing::Merge);
+    // Pushed without `-u`: the remote carries the branch, no upstream is
+    // configured - the untracked fallback.
+    repo.branch_with_commits("feat-untracked", 1, false);
+    repo.git(repo.main.as_path(), &["push", "origin", "feat-untracked"]);
     repo.branch_with_commits("feat-squashed", 1, false);
     repo.land("feat-squashed", Landing::Squash);
     fs::write(worktree.join("uncommitted.txt"), "dirty").unwrap();
@@ -372,6 +376,11 @@ fn the_snapshot_holds_live_transcript_and_merged_conversations() {
     assert!(row("feat-login").dirty == Some(true));
     assert_eq!(row("feat-gone").upstream, Upstream::RemoteGone);
     assert_eq!(row("feat-unknown").upstream, Upstream::Unknown);
+    assert_eq!(row("feat-untracked").upstream, Upstream::Untracked);
+    assert_eq!(
+        row("feat-untracked").upstream_detail.as_deref(),
+        Some("origin/feat-untracked")
+    );
     assert_eq!(row("feat-merged").landed, Some(Landed::Ancestor));
     assert_eq!(row("feat-squashed").landed, Some(Landed::Content));
     assert!(snapshot.work.iter().any(|w| w.kind == WorkKind::Detached));
@@ -729,6 +738,7 @@ fn a_staged_pass_streams_inventory_local_git_remote_then_completes() {
     assert_eq!(login.upstream, Upstream::NeverPushed);
     let row = |name: &str| last.work.iter().find(|w| w.name == name).expect(name);
     assert_eq!(row("feat-gone").upstream, Upstream::RemoteGone);
+    assert_eq!(row("feat-untracked").upstream, Upstream::Untracked);
     assert_eq!(row("feat-merged").landed, Some(Landed::Ancestor));
     assert!(
         last.work

@@ -7,7 +7,7 @@
 //! environment and locale (see [`git_command`]). This module observes
 //! repositories; it never mutates them - no fetch, no prune, no config write.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -405,6 +405,10 @@ pub struct RefFacts {
     pub branches: HashMap<String, BranchFact>,
     /// Remote name -> the branch its `refs/remotes/<remote>/HEAD` targets. // coverage: off - the line's zero regions are unexecuted-instantiation edges
     pub remote_heads: HashMap<String, String>,
+    /// Remote name -> the branch names `refs/remotes/<remote>/<branch>`
+    /// proves it fetched or pushed: the evidence a `push` without `-u`
+    /// leaves behind. `<remote>/HEAD` symrefs are not branch evidence.
+    pub remote_refs: HashMap<String, HashSet<String>>,
 }
 
 /// What one `ls-remote --symref` proved about a remote.
@@ -1038,6 +1042,15 @@ fn parse_ref_facts(text: &str) -> RefFacts {
                 },
             );
         } else if let Some(rest) = refname.strip_prefix("refs/remotes/") {
+            if let Some((remote, name)) = rest.split_once('/')
+                && name != "HEAD"
+            {
+                facts
+                    .remote_refs
+                    .entry(remote.to_owned())
+                    .or_default()
+                    .insert(name.to_owned());
+            }
             // `%(symref)` is field six: non-empty only for the
             // `<remote>/HEAD` symbolic refs. `%(objectname)` after it is
             // branch-tip evidence the remotes arm does not read.
@@ -2210,6 +2223,13 @@ mod tests {
         assert_eq!(
             facts.remote_heads.get("origin").map(String::as_str),
             Some("main")
+        );
+        assert_eq!(
+            facts
+                .remote_refs
+                .get("origin")
+                .map(|names| names.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["main"])
         );
         assert!(!facts.branches.contains_key("origin/main"));
         assert!(!facts.branches.contains_key("v1"));
