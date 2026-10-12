@@ -976,7 +976,7 @@ pub struct ObservedRef {
 /// `repo`. A deleted ref closes the record (`ended_at`); a ref that
 /// reappears opens a fresh record with a new `id` and `parked: false` - a
 /// name is a label, not an identity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchRecord {
     /// Opaque stable identity of this incarnation.
     pub id: String,
@@ -1034,7 +1034,7 @@ pub struct BranchRecord {
 
 /// A path-anchored record: a detached worktree or a non-Git project space,
 /// keyed by its canonical path.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathRecord {
     /// The repository the path belongs to - a detached worktree's repo,
     /// a project space's own path - so a row outliving the directory
@@ -1059,7 +1059,7 @@ pub struct PathRecord {
 }
 
 /// The `work.json` payload: the authored Work state.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Work {
     /// Incarnation id -> the record, active or closed. Closed records are
     /// retained: they are the incarnation history a later pass numbers
@@ -3009,6 +3009,87 @@ mod tests {
         r
     }
 
+    /// Retry one write's documented busy verdict in the test only. The
+    /// production `Lock` is a bounded, non-fair waiter: `WouldBlock`
+    /// simply means the 2s poll expired before this writer's turn. A
+    /// writer that needs its write to land - which is what the
+    /// concurrency tests prove about *successful* writes, not lock
+    /// fairness - retries it; raising `LOCK_WAIT` to make the race vanish
+    /// would change the documented contract for every caller to fix one
+    /// test.
+    fn retry_busy_write<T>(
+        deadline: std::time::Instant,
+        write: &mut dyn FnMut() -> io::Result<T>,
+    ) -> T {
+        loop {
+            match write() {
+                Ok(v) => return v,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(e) => panic!("write: {e}"),
+            }
+        }
+    }
+
+    /// The helper retries `WouldBlock` to success, gives up past the
+    /// deadline, and never retries a non-busy error - each arm driven
+    /// deterministically by a mock append.
+    #[test]
+    fn retry_busy_write_retries_only_busy() {
+        let attempts = std::cell::Cell::new(0);
+        let mut append = || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"))
+            } else {
+                Ok(7_u64)
+            }
+        };
+        assert_eq!(
+            retry_busy_write(
+                std::time::Instant::now() + Duration::from_secs(30),
+                &mut append
+            ),
+            7
+        );
+        assert_eq!(attempts.get(), 2);
+
+        // Busy past the deadline gives up; a non-busy error is reported
+        // and never retried, however far the deadline sits. Each mock
+        // fails once then succeeds, so a wrongly-taken retry would return
+        // `Ok` - the panic assertion fails deterministically instead of
+        // passing on a hidden retry or hanging on an ignored deadline.
+        for (kind, wait) in [
+            (io::ErrorKind::WouldBlock, Duration::ZERO),
+            (io::ErrorKind::Other, Duration::from_secs(30)),
+        ] {
+            let attempts = std::cell::Cell::new(0);
+            let mut once = || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(io::Error::new(kind, "once"))
+                } else {
+                    Ok(7_u64)
+                }
+            };
+            let deadline = std::time::Instant::now() + wait;
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    retry_busy_write(deadline, &mut once)
+                }))
+                .is_err()
+            );
+            assert_eq!(attempts.get(), 1, "{kind:?} must not retry");
+            // The fallback succeeds if called again, without retrying
+            // through the helper.
+            assert_eq!(once().unwrap(), 7);
+        }
+    }
+
     #[test]
     fn concurrent_writers_get_unique_monotonic_sequences() {
         let temp = TempStore::new();
@@ -3019,9 +3100,13 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 (0..8)
                     .map(|_| {
-                        store
-                            .append(record("claude", &format!("s{i}"), "Stop", NormEvent::End))
-                            .expect("append")
+                        let mut append = || {
+                            store.append(record("claude", &format!("s{i}"), "Stop", NormEvent::End))
+                        };
+                        retry_busy_write(
+                            std::time::Instant::now() + Duration::from_secs(30),
+                            &mut append,
+                        )
                     })
                     .collect::<Vec<u64>>()
             }));
@@ -3030,6 +3115,9 @@ mod tests {
             .into_iter()
             .flat_map(|h| h.join().expect("writer joins"))
             .collect();
+        // 8 writers x 8 appends serialize into every sequence exactly
+        // once: the lock pins *that* successes interleave correctly, not
+        // that a given waiter wins inside LOCK_WAIT.
         seqs.sort_unstable();
         assert_eq!(seqs, (1..=64).collect::<Vec<_>>());
         let loaded = store.load();
@@ -3794,17 +3882,29 @@ mod tests {
         let a = std::thread::spawn({
             let store = Store::open(temp.0.clone());
             let key = key_a.clone();
-            move || store.acknowledge(&key, 5, None)
+            move || {
+                let mut ack = || store.acknowledge(&key, 5, None);
+                retry_busy_write(
+                    std::time::Instant::now() + Duration::from_secs(30),
+                    &mut ack,
+                )
+            }
         });
         let b = std::thread::spawn({
             let store = Store::open(temp.0.clone());
             let key = key_b.clone();
-            move || store.acknowledge(&key, 9, None)
+            move || {
+                let mut ack = || store.acknowledge(&key, 9, None);
+                retry_busy_write(
+                    std::time::Instant::now() + Duration::from_secs(30),
+                    &mut ack,
+                )
+            }
         });
         std::thread::sleep(Duration::from_millis(200));
         drop(held);
-        a.join().expect("ack a joins").expect("ack a");
-        b.join().expect("ack b joins").expect("ack b");
+        a.join().expect("ack a joins");
+        b.join().expect("ack b joins");
         let seen = store.load().seen;
         assert_eq!(seen[&key_a].seq, 5);
         assert_eq!(seen[&key_b].seq, 9);
@@ -3869,7 +3969,14 @@ mod tests {
         // sequence and the second read sees the first's compaction.
         let appender = std::thread::spawn({
             let store = Store::open(temp.0.clone());
-            move || store.append(record("claude", "appended", "Stop", NormEvent::End))
+            move || {
+                let mut append =
+                    || store.append(record("claude", "appended", "Stop", NormEvent::End));
+                retry_busy_write(
+                    std::time::Instant::now() + Duration::from_secs(30),
+                    &mut append,
+                )
+            }
         });
         let mut loaders = Vec::new();
         for _ in 0..2 {
@@ -3880,10 +3987,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(200));
         drop(held);
-        let seq = appender
-            .join()
-            .expect("append joins")
-            .expect("append commits");
+        let seq = appender.join().expect("append joins");
         assert_eq!(seq, (COMPACT_AFTER + 2) as u64);
         for loader in loaders {
             assert!(loader.join().expect("load joins") <= seq);
@@ -4517,15 +4621,18 @@ mod tests {
         let temp = TempStore::new();
         fs::create_dir_all(&temp.0).unwrap();
         let store = temp.store();
-        // Two repos syncing and two parked toggles racing: every write
-        // lands whole under the one lock.
+        // Four repos syncing and then four parked toggles racing: every
+        // write lands whole under the one lock.
         let mut handles = Vec::new();
         for i in 0..4 {
             let store = Store::open(temp.0.clone());
             handles.push(std::thread::spawn(move || {
-                store
-                    .sync_repo(&format!("/r{i}"), &[obs("main", i % 2 == 0)], 1_000)
-                    .expect("sync")
+                let mut sync =
+                    || store.sync_repo(&format!("/r{i}"), &[obs("main", i % 2 == 0)], 1_000);
+                retry_busy_write(
+                    std::time::Instant::now() + Duration::from_secs(30),
+                    &mut sync,
+                )
             }));
         }
         for h in handles {
@@ -4545,10 +4652,13 @@ mod tests {
         let mut handles = Vec::new();
         for id in ids {
             let store = Store::open(temp.0.clone());
+            let identity = WorkIdentity::Branch(id);
             handles.push(std::thread::spawn(move || {
-                store
-                    .toggle_parked(&WorkIdentity::Branch(id))
-                    .expect("toggle")
+                let mut toggle = || store.toggle_parked(&identity);
+                retry_busy_write(
+                    std::time::Instant::now() + Duration::from_secs(30),
+                    &mut toggle,
+                )
             }));
         }
         for h in handles {
