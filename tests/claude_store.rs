@@ -558,7 +558,7 @@ fn a_dead_pid_cannot_raise_a_transcript() {
 }
 
 #[test]
-fn a_clock_step_keeps_the_live_session_running() {
+fn a_start_gap_keeps_the_session_running_only_where_clocks_move_it() {
     if !tmux_or_skip() {
         return;
     }
@@ -566,7 +566,8 @@ fn a_clock_step_keeps_the_live_session_running() {
     // Linux derives `lstart` from the current boot time, so a wall-clock
     // step after the agent wrote `procStart` (an NTP correction on resume,
     // a VM clock resync) moves the observed start away from the claimed
-    // one. The live `claude` keeps running, as unproven evidence.
+    // one: the live `claude` keeps running, as unproven evidence. macOS
+    // stamps `lstart` at fork, so there the gap proves a recycled pid.
     let observed = process::parse_utc_ctime(&support::proc_start(world.live_pid))
         .expect("the live agent has a start time");
     session_file(
@@ -587,14 +588,20 @@ fn a_clock_step_keeps_the_live_session_running() {
         .find(|c| c.session_id == LIVE_ID)
         .unwrap();
     let attachment = live.attachment.as_ref().expect("the claim resolved");
-    assert_eq!(attachment.liveness, AttachmentLiveness::PidOnly);
-    assert!(live.running());
     let login = snapshot
         .work
         .iter()
         .find(|w| w.name == "feat-login")
         .expect("the worktree row");
-    assert_eq!(login.live_sessions, 1);
+    if cfg!(target_os = "linux") {
+        assert_eq!(attachment.liveness, AttachmentLiveness::PidOnly);
+        assert!(live.running());
+        assert_eq!(login.live_sessions, 1);
+    } else {
+        assert_eq!(attachment.liveness, AttachmentLiveness::Dead);
+        assert!(!live.running());
+        assert_eq!(login.live_sessions, 0);
+    }
 }
 
 #[test]

@@ -9,9 +9,10 @@
 //! is not used: deriving a start from it depends on when `ps` sampled, and
 //! a loaded machine's `ps -A` can take over a second. A process the
 //! platform cannot date is lower-authority evidence: the pid is alive, but
-//! reuse cannot be ruled out. So is one whose start disagrees while its
-//! executable is confirmed: Linux's `lstart` moves with every wall-clock
-//! step, so the gap cannot tell a stepped clock from a recycled pid. A pid
+//! reuse cannot be ruled out. On Linux, so is one whose start disagrees
+//! while its executable is confirmed: Linux's `lstart` moves with every
+//! wall-clock step, so the gap cannot tell a stepped clock from a recycled
+//! pid. A pid
 //! alone is never identity - lock files and session records outlive the
 //! processes they name, and a recycled pid would otherwise resurrect a
 //! dead session.
@@ -35,6 +36,12 @@ pub enum ProcessStart {
 
 /// The widest gap, in seconds, between two start times of one instance.
 const START_TOLERANCE_SECS: u64 = 1;
+
+/// Whether a wall-clock step moves the platform's reported `lstart`. Linux
+/// derives it from the current boot time, which a step shifts; macOS
+/// reports the time stamped at fork, which a step leaves alone - so there a
+/// start gap still proves a recycled pid.
+const LSTART_FOLLOWS_WALL_CLOCK: bool = cfg!(target_os = "linux");
 
 impl ProcessStart {
     /// Whether two start times name the same instance: both known and no
@@ -70,13 +77,13 @@ pub enum Liveness {
     /// when both sides carry a start time or an executable name, they agree.
     Instance,
     /// The pid is alive but the instance cannot be proven - a start time is
-    /// missing on a side that would need it, or the confirmed executable
-    /// started away from its claimed start. Lower-authority evidence:
+    /// missing on a side that would need it, or - on Linux - the confirmed
+    /// executable started away from its claimed start. Lower-authority evidence:
     /// enough to keep an attachment live, never enough to prove identity.
     PidOnly(String),
     /// The pid is gone or provably belongs to a different instance: dead,
-    /// a zombie, a different executable, or a mismatched start time with
-    /// no executable to confirm. The only verdict that retires live claims.
+    /// a zombie, a different executable, or a mismatched start time no
+    /// clock step can explain. The only verdict that retires live claims.
     Dead(String),
     /// Nothing could be checked - the process table itself failed to read.
     /// Neither life nor death is proven; nothing is reaped on this.
@@ -226,10 +233,20 @@ impl ProcessTable {
     /// it is given and the running basename provably differs, the pid was
     /// reused or the process exec'd elsewhere; either way not the claimed
     /// instance. A difference that could be the platform's `comm`
-    /// truncation is unproven rather than a mismatch. A confirmed
-    /// executable whose start disagrees is `PidOnly`, not `Dead`: a
-    /// wall-clock step moves Linux's `lstart` just as reuse would.
+    /// truncation is unproven rather than a mismatch. On Linux, a
+    /// confirmed executable whose start disagrees is `PidOnly`, not `Dead`.
     pub fn is_live(&self, claim: &ProcessInstance, expected_exe: Option<&str>) -> Liveness {
+        self.judge(claim, expected_exe, LSTART_FOLLOWS_WALL_CLOCK)
+    }
+
+    /// [`is_live`](Self::is_live) with the platform's `lstart` behavior
+    /// passed in, so both behaviors are tested on every platform.
+    fn judge(
+        &self,
+        claim: &ProcessInstance,
+        expected_exe: Option<&str>,
+        start_follows_clock: bool,
+    ) -> Liveness {
         let Some(row) = self.rows.get(&claim.pid) else {
             return Liveness::Dead(format!("pid {} has no process", claim.pid));
         };
@@ -256,7 +273,7 @@ impl ProcessTable {
             // resync) moves, while the claim keeps the start as it read
             // then. With the executable confirmed, a gap is as likely a
             // clock step as a recycled pid: the pid stays live, unproven.
-            Some(gap) if exe_confirmed => Liveness::PidOnly(format!(
+            Some(gap) if exe_confirmed && start_follows_clock => Liveness::PidOnly(format!(
                 "pid {} started {gap}s from its claimed start: a clock step or a recycled pid",
                 claim.pid
             )),
@@ -593,25 +610,29 @@ mod tests {
             pid_start: ProcessStart::At(1_700_000_000),
         };
         assert_eq!(table.is_live(&unseen, Some("other")), Liveness::Instance);
-        // A start gap on the confirmed executable is a clock step as much
-        // as a recycled pid: live, unproven. Without the executable
-        // confirmed - none expected or none observed - the gap is death.
+        // Where a clock step moves `lstart`, a start gap on the confirmed
+        // executable is a clock step as much as a recycled pid: live,
+        // unproven. Without the executable confirmed - none expected or
+        // none observed - or where `lstart` is stamped at fork, the gap is
+        // death.
         let stepped = ProcessInstance {
             pid: 11,
             pid_start: ProcessStart::At(1_700_000_000 + 600),
         };
-        let live = table.is_live(&stepped, Some("worker"));
+        let live = table.judge(&stepped, Some("worker"), true);
         assert!(
             matches!(live, Liveness::PidOnly(ref r) if r.contains("600s")),
             "{live:?}"
         ); // coverage: off - miss edge is the assert failing
-        let live = table.is_live(&stepped, None);
+        let live = table.judge(&stepped, Some("worker"), false);
+        assert!(matches!(live, Liveness::Dead(_))); // coverage: off - miss edge is the assert failing
+        let live = table.judge(&stepped, None, true);
         assert!(matches!(live, Liveness::Dead(_))); // coverage: off - miss edge is the assert failing
         let stepped_unseen = ProcessInstance {
             pid: 12,
             pid_start: ProcessStart::At(1_700_000_000 + 600),
         };
-        let live = table.is_live(&stepped_unseen, Some("worker"));
+        let live = table.judge(&stepped_unseen, Some("worker"), true);
         assert!(matches!(live, Liveness::Dead(_))); // coverage: off - miss edge is the assert failing
         // The tolerance's edge: one second apart is still the instance.
         let edge = ProcessInstance {
