@@ -53,11 +53,12 @@ notice that the macOS jobs did not run.
 
 `prek install` also installs a commit-msg hook, which rejects commit messages
 carrying agent attribution (a `Co-Authored-By:` line naming an agent or a
-bot, `Generated with`, `Made-with:`), and a pre-push hook: pushing a branch
-runs `just ci-gentle` against the commit pushed, which need not be `HEAD`. Pushing a
-tag, deleting a branch or pushing no new commits runs nothing. When one push
-updates several branches, prek checks only one of them, so push branches one at
-a time. `git push --no-verify` skips the hook.
+bot, `Generated with`, `Made-with:`, a Claude Code session link), and a
+pre-push hook: pushing a branch runs `just ci-gentle` against the commit
+pushed, which need not be `HEAD`. Pushing a tag, deleting a branch or pushing
+no new commits runs nothing. When one push updates several branches, prek
+checks only one of them, so push branches one at a time. `git push --no-verify`
+skips the hook.
 
 Unlike CI, which runs every job, a local run stops at the first failing job,
 and `just ci` skips the Linux jobs when a macOS job fails; run
