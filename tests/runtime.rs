@@ -321,7 +321,8 @@ fn claims_are_validated_by_start_time_and_executable() {
         ),
         Liveness::Instance
     );
-    // A pid reused by a process started at another time rejects.
+    // A pid reused by a process started at another time rejects when no
+    // executable confirms the claim.
     assert!(matches!(
         table.is_live(
             &ProcessInstance {
@@ -503,7 +504,7 @@ fn utc_and_platform_starts_agree_within_a_second() {
     };
     assert!(start.abs_diff(now) <= 2, "start {start} vs now {now}");
 
-    let ctime = epoch_to_utc_ctime(start);
+    let ctime = support::epoch_to_utc_ctime(start);
     assert_eq!(
         process::parse_utc_ctime(&ctime),
         Some(start),
@@ -511,37 +512,6 @@ fn utc_and_platform_starts_agree_within_a_second() {
     );
     let _ = child.kill();
     let _ = child.wait();
-}
-
-/// `epoch` rendered as the UTC ctime shape providers publish
-/// (`Tue Sep 22 16:18:53 2026`) - the exact inverse of the parser under
-/// test, so the round trip stands alone on any `date` flavor.
-fn epoch_to_utc_ctime(epoch: u64) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    let secs = epoch % 86_400;
-    let z = (epoch / 86_400) as i64 + 719_468;
-    // civil_from_days: the inverse of the parser's days_from_civil.
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{} {} {} {:02}:{:02}:{:02} {}",
-        WEEKDAYS[(z - 719_468 + 4).rem_euclid(7) as usize],
-        MONTHS[(month - 1) as usize],
-        day,
-        secs / 3_600,
-        (secs / 60) % 60,
-        secs % 60,
-        year
-    )
 }
 
 #[test]

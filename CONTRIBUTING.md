@@ -143,6 +143,12 @@ readers:
   run under `LC_ALL=C` and the POSIX `TZ=UTC0`, so `lstart` is the
   kernel's start time as a UTC ctime - the form provider records use -
   read without a timezone database and compared within one second.
+  Linux derives `lstart` from the current boot time, so a wall-clock step
+  (an NTP correction on resume, a VM clock resync) moves it: a gap on a
+  process whose executable the claim confirms is pid-only evidence, not
+  death, as it cannot tell a stepped clock from a recycled pid. macOS
+  stamps `lstart` at fork and a step leaves it alone, so there a gap stays
+  death.
   `etime` is not used: a start derived from elapsed time depends on when
   `ps` sampled, and a loaded machine's `ps -A` can take over a second.
   `comm` is not a full-fidelity basename: Linux caps it at 15 bytes and

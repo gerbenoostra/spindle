@@ -12,6 +12,7 @@ use std::path::Path;
 use std::process::Command;
 
 use agent_sessions::git;
+use agent_sessions::process;
 use agent_sessions::provider::SourceError;
 use agent_sessions::runtime::{PaneSource, Runtime};
 use agent_sessions::snapshot::{
@@ -554,6 +555,53 @@ fn a_dead_pid_cannot_raise_a_transcript() {
         .find(|r| r.id == login.repo)
         .expect("the repo row");
     assert_eq!(repo.live, 1);
+}
+
+#[test]
+fn a_start_gap_keeps_the_session_running_only_where_clocks_move_it() {
+    if !tmux_or_skip() {
+        return;
+    }
+    let world = world();
+    // Linux derives `lstart` from the current boot time, so a wall-clock
+    // step after the agent wrote `procStart` (an NTP correction on resume,
+    // a VM clock resync) moves the observed start away from the claimed
+    // one: the live `claude` keeps running, as unproven evidence. macOS
+    // stamps `lstart` at fork, so there the gap proves a recycled pid.
+    let observed = process::parse_utc_ctime(&support::proc_start(world.live_pid))
+        .expect("the live agent has a start time");
+    session_file(
+        &world.home,
+        world.live_pid,
+        LIVE_ID,
+        "busy",
+        &format!(
+            ",\"cwd\":\"{}\",\"procStart\":\"{}\"",
+            world.worktree.display(),
+            support::epoch_to_utc_ctime(observed - 600)
+        ),
+    );
+    let snapshot = collect(&world);
+    let live = snapshot
+        .conversations
+        .iter()
+        .find(|c| c.session_id == LIVE_ID)
+        .unwrap();
+    let attachment = live.attachment.as_ref().expect("the claim resolved");
+    let login = snapshot
+        .work
+        .iter()
+        .find(|w| w.name == "feat-login")
+        .expect("the worktree row");
+    if cfg!(target_os = "linux") {
+        assert_eq!(attachment.liveness, AttachmentLiveness::PidOnly);
+        assert!(live.running());
+        assert_eq!(login.live_sessions, 1);
+    } else {
+        assert_eq!(attachment.liveness, AttachmentLiveness::Dead);
+        assert!(!live.running());
+        assert_eq!(login.live_sessions, 0);
+    }
 }
 
 #[test]
