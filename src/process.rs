@@ -9,13 +9,10 @@
 //! is not used: deriving a start from it depends on when `ps` sampled, and
 //! a loaded machine's `ps -A` can take over a second. A process the
 //! platform cannot date is lower-authority evidence: the pid is alive, but
-//! reuse cannot be ruled out. On Linux, so is one whose start disagrees
-//! while its executable is confirmed: Linux's `lstart` moves with every
-//! wall-clock step, so the gap cannot tell a stepped clock from a recycled
-//! pid. A pid
-//! alone is never identity - lock files and session records outlive the
-//! processes they name, and a recycled pid would otherwise resurrect a
-//! dead session.
+//! reuse cannot be ruled out. So, on Linux, is a confirmed executable
+//! whose start disagrees. A pid alone is never identity - lock files and
+//! session records outlive the processes they name, and a recycled pid
+//! would otherwise resurrect a dead session.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -268,11 +265,9 @@ impl ProcessTable {
         };
         match claim.pid_start.gap(&row.start) {
             Some(gap) if gap <= START_TOLERANCE_SECS => Liveness::Instance,
-            // Linux derives `lstart` from the current boot time, which every
-            // wall-clock step (an NTP correction after resume, a VM clock
-            // resync) moves, while the claim keeps the start as it read
-            // then. With the executable confirmed, a gap is as likely a
-            // clock step as a recycled pid: the pid stays live, unproven.
+            // Where a wall-clock step moves `lstart` (an NTP correction after
+            // resume, a VM clock resync), a gap on the confirmed executable
+            // is as likely a clock step as a recycled pid: live, unproven.
             Some(gap) if exe_confirmed && start_follows_clock => Liveness::PidOnly(format!(
                 "pid {} started {gap}s from its claimed start: a clock step or a recycled pid",
                 claim.pid
