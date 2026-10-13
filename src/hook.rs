@@ -225,8 +225,9 @@ fn process_table() -> Option<ProcessTable> {
 /// A process that died without cleaning up leaves its file behind, so a
 /// resumed session can be named by several. One match is taken as is - a
 /// dead pid is the fold's to reject - but among several only a live one
-/// speaks, and `table` (a `ps` spawn) is read only then. No live match, or
-/// no table to tell, resolves nothing rather than a guess.
+/// speaks, a proven instance before pid-only evidence, and `table` (a `ps`
+/// spawn) is read only then. No live match, or no table to tell, resolves
+/// nothing rather than a guess.
 fn find_claude_process(
     root: &Path,
     session_id: &str,
@@ -268,16 +269,25 @@ fn find_claude_process(
         return found.pop();
     }
     let table = table()?;
-    found.into_iter().find(|&(pid, start)| {
+    let liveness = |&(pid, start): &(u32, Option<u64>)| {
         let claim = ProcessInstance {
             pid,
             pid_start: start.map_or(ProcessStart::Unavailable, ProcessStart::At),
         };
-        matches!(
-            table.is_live(&claim, Some(crate::claude::EXE)),
-            Liveness::Instance | Liveness::PidOnly(_)
-        )
-    })
+        table.is_live(&claim, Some(crate::claude::EXE))
+    };
+    // A proven instance outranks pid-only evidence: a stale file whose pid
+    // was recycled to another `claude` is live but unproven.
+    let proven = found
+        .iter()
+        .find(|record| liveness(record) == Liveness::Instance);
+    proven
+        .or_else(|| {
+            found
+                .iter()
+                .find(|record| matches!(liveness(record), Liveness::PidOnly(_)))
+        })
+        .copied()
 }
 
 #[cfg(test)]
@@ -485,6 +495,30 @@ mod tests {
         assert_eq!(
             find_claude_process(&dir, "s1", &table),
             Some((222, Some(start)))
+        );
+        // A proven instance outranks pid-only evidence, whichever the
+        // directory lists first: 111 runs `claude` too, but its record has
+        // no start to prove it. Pid-only evidence speaks only when nothing
+        // proves more.
+        fs::write(
+            sessions.join("111.json"),
+            "{\"sessionId\":\"s1\",\"pid\":111}",
+        )
+        .unwrap();
+        let both = || {
+            Some(ProcessTable::from_rows(vec![
+                row(111, start, "claude"),
+                row(222, start, "claude"),
+            ]))
+        };
+        assert_eq!(
+            find_claude_process(&dir, "s1", &both),
+            Some((222, Some(start)))
+        );
+        let unproven = || Some(ProcessTable::from_rows(vec![row(111, start, "claude")]));
+        assert_eq!(
+            find_claude_process(&dir, "s1", &unproven),
+            Some((111, None))
         );
         // A reused pid running something else is no match, and a table
         // that cannot be read resolves nothing rather than a guess.
