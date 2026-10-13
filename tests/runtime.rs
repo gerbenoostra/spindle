@@ -321,7 +321,8 @@ fn claims_are_validated_by_start_time_and_executable() {
         ),
         Liveness::Instance
     );
-    // A pid reused by a process started at another time rejects.
+    // A pid reused by a process started at another time rejects when no
+    // executable confirms the claim.
     assert!(matches!(
         table.is_live(
             &ProcessInstance {
