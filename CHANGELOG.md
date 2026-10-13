@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1](https://github.com/gerbenoostra/spindle/compare/v0.2.0...v0.2.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* keep a live agent running across a wall-clock step ([#25](https://github.com/gerbenoostra/spindle/issues/25)) ([5113ddd](https://github.com/gerbenoostra/spindle/commit/5113dddcc462e2a6828eb195bdaa8982a96cb76b))
+* render the collecting spinner in the default foreground ([#23](https://github.com/gerbenoostra/spindle/issues/23)) ([1a8344c](https://github.com/gerbenoostra/spindle/commit/1a8344c814cc0bcf19d0ec041873b58e81cbaf3b))
+
 ## [0.2.0](https://github.com/gerbenoostra/spindle/compare/v0.1.0...v0.2.0) (2026-10-12)
 
 
