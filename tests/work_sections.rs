@@ -1150,8 +1150,8 @@ fn a_recent_observation_never_passes_for_work_activity() {
                 name: (*name).to_owned(),
                 head: None,
                 creation: None,
-                renamed_from: None,
-                rewritten: false,
+                renamed: None,
+                rewritten: None,
                 commit: None,
                 activities: Vec::new(),
                 inputs: LifecycleInputs {

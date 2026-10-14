@@ -331,8 +331,12 @@ struct AnchorLocal {
     head_oid: Option<String>,
     /// The newest null-old creation the branch's own reflog proves.
     creation: Option<git::RefCreation>,
-    /// The short name a `Branch: renamed` reflog line moved this ref from.
-    renamed_from: Option<String>,
+    /// The `Branch: renamed` reflog line that moved this ref here:
+    /// source name and the line's own time.
+    renamed: Option<git::RenamedRef>,
+    /// When the branch's reflog last set its tip to the observed head -
+    /// the rewrite time the pass dates a proven non-FF move by.
+    tip_set_at: Option<SystemTime>,
 }
 
 /// One anchor with its local facts and current vector state.
@@ -367,10 +371,18 @@ impl AnchorWork {
         self.local.creation.as_ref()
     }
 
-    /// The short name a `Branch: renamed` reflog line moved this ref
-    /// from - the exact evidence that preserves identity across names.
-    pub fn renamed_from(&self) -> Option<&str> {
-        self.local.renamed_from.as_deref()
+    /// The `Branch: renamed` reflog line that moved this ref here -
+    /// source name and line time, the exact evidence that preserves
+    /// identity across names.
+    pub fn renamed(&self) -> Option<&git::RenamedRef> {
+        self.local.renamed.as_ref()
+    }
+
+    /// When the branch's reflog last set its tip to the head this pass
+    /// observed. `None` when no line proves it - a rewrite the missing
+    /// log cannot date.
+    pub fn tip_set_at(&self) -> Option<SystemTime> {
+        self.local.tip_set_at
     }
 
     /// Patch the remote-owned fields from a finished [`apply_remote`].
@@ -606,6 +618,11 @@ fn anchor_work(
     };
     let (reflog_entry, commit_activity) = git_activity(repo, &anchor, fact);
     let reflog_activity = reflog_entry.as_ref().map(|w| w.at);
+    // The same reflog read that proved creation and any rename also dates
+    // when the tip was last set to the observed head - no second read.
+    let tip_set_at = lifecycle
+        .as_ref()
+        .and_then(|l| head_oid.as_deref().and_then(|h| l.tip_set_at(h)));
     let local = AnchorLocal {
         // A branch with no configured upstream falls back to the remotes
         // a same-named remote-tracking ref proves - the local evidence a
@@ -648,7 +665,8 @@ fn anchor_work(
         commit_activity,
         head_oid,
         creation: lifecycle.as_ref().and_then(|l| l.creation.clone()),
-        renamed_from: lifecycle.and_then(|l| l.renamed_from),
+        renamed: lifecycle.as_ref().and_then(|l| l.renamed.clone()),
+        tip_set_at,
     };
     let state = WorkState {
         repo: repo.clone(),

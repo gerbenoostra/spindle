@@ -332,6 +332,9 @@ pub struct IncarnationRow {
     pub id: String,
     /// 1-based within `(repo, ref_name)`, oldest first.
     pub number: usize,
+    /// How many records for this `(repo, ref_name)` are retained; the
+    /// ordinal only shows when it exceeds 1.
+    pub lives: usize,
     pub repo: String,
     pub ref_name: String,
     pub first_observed_at: u64,
@@ -342,12 +345,51 @@ pub struct IncarnationRow {
     pub creation_at: Option<u64>,
     /// The tip the ref last proved, when it carried one.
     pub head: Option<String>,
+    /// The rename that moved this record to `ref_name`, when proven.
+    pub renamed: Option<RenamedRow>,
+    /// The latest proven non-fast-forward tip move, when proven.
+    pub rewritten: Option<RewrittenRow>,
     pub ended_at: Option<u64>,
+    /// How the record ended, from its closing lifecycle observation;
+    /// `None` while active or when that observation is not retained.
+    pub ended_by: Option<EndedBy>,
     /// The evidence that last established or separated this identity.
     pub continuity: store::ContinuityEvidence,
     /// `true` on retained earlier same-name history: it scopes and lists
     /// but never contributes to the current row.
     pub excluded: bool,
+}
+
+/// A record's persisted rename evidence in epoch seconds.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RenamedRow {
+    /// The short name the ref was renamed from.
+    pub from: String,
+    /// The rename line's reflog time, epoch seconds.
+    pub at: u64,
+}
+
+/// A record's persisted rewrite evidence in epoch seconds.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RewrittenRow {
+    /// When the rewritten tip was set (or the rewrite was observed),
+    /// epoch seconds.
+    pub at: u64,
+    /// Which clock `at` came from: `reflog` or `observed`.
+    pub dated: store::RewriteDating,
+}
+
+/// How a closed incarnation ended, as its closing lifecycle observation
+/// proves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndedBy {
+    /// The ref went absent - a `branch gone` observation.
+    Gone,
+    /// The ref never went absent: a boundary observation closed the
+    /// record while a new branch of the same name took over - in either
+    /// the legacy or the current reason spelling.
+    Replaced,
 }
 
 /// One persisted touch interval as the snapshot serializes it: the
@@ -361,6 +403,8 @@ pub struct TouchRow {
     pub ref_name: String,
     /// The incarnation's 1-based number within `(repo, ref_name)`.
     pub incarnation: usize,
+    /// How many records for this `(repo, ref_name)` are retained.
+    pub lives: usize,
     /// The ref's tip the placement observed; `None` when the evidence
     /// named the branch only.
     pub head: Option<String>,
@@ -591,6 +635,10 @@ pub struct RelatedRow {
     pub label: String,
     /// The evidence that proved it, for the view's provenance column.
     pub provenance: String,
+    /// The shared placement a `same incarnation` relation stands on -
+    /// its incarnation, name, number and retained-lives count. `None`
+    /// for every other relation.
+    pub touch: Option<RelatedTouch>,
     pub provider: Provider,
     pub session_id: String,
     /// First eight of the related session's id.
@@ -600,6 +648,20 @@ pub struct RelatedRow {
     pub attention: Attention,
     /// Its effective-state age basis, epoch seconds.
     pub state_since: Option<u64>,
+}
+
+/// The shared exact placement a `same incarnation` relation stands on:
+/// the structured form of what `provenance` spells out.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RelatedTouch {
+    /// The shared `BranchRecord.id`.
+    pub incarnation_id: String,
+    /// The incarnation's ref name.
+    pub ref_name: String,
+    /// Its 1-based number within `(repo, ref_name)`.
+    pub number: usize,
+    /// How many records for that `(repo, ref_name)` are retained.
+    pub lives: usize,
 }
 
 /// One retained latch event with its acknowledgement state.
@@ -1475,12 +1537,21 @@ impl Collector {
                             seen.insert(name.to_owned()).then(|| store::ObservedRef {
                                 name: name.to_owned(),
                                 head: w.ref_head().map(str::to_owned),
-                                rewritten: rewritten(&self.model.work, repo_id, name, w),
+                                rewritten: rewritten(
+                                    &self.model.work,
+                                    repo_id,
+                                    name,
+                                    w,
+                                    observed_ms,
+                                ),
                                 creation: w.ref_creation().map(|c| store::RefCreationEvidence {
                                     head: c.head.clone(),
                                     at_ms: store::epoch_ms(c.at),
                                 }),
-                                renamed_from: w.renamed_from().map(str::to_owned),
+                                renamed: w.renamed().map(|r| store::RenameEvidence {
+                                    from: r.from.clone(),
+                                    at_ms: store::epoch_ms(r.at),
+                                }),
                                 commit: observed_commit(&w.state, w.ref_head()),
                                 activities: pass_activities(&w.state, w.ref_head()),
                                 inputs: lifecycle_inputs(&w.state),
@@ -2332,8 +2403,9 @@ fn work_row(
             .filter(|r| r.repo == repo_id && &r.ref_name == name)
             .collect();
         sort_incarnations(&mut records);
+        let lives = records.len();
         for (number, record) in records.into_iter().enumerate() {
-            let row = incarnation_row(record, number + 1);
+            let row = incarnation_row(record, number + 1, lives);
             if record.ended_at.is_some() {
                 same_name_history.push(row);
             } else {
@@ -2686,21 +2758,41 @@ fn incarnation_at(
     covering.next().is_none().then(|| found.id.clone())
 }
 
-/// Whether the anchor's branch tip moved off the active record's last
-/// proven head without descending from it - one `merge-base
-/// --is-ancestor` only when the tip moved. A first sighting, an unproven
-/// tip or a comparison git could not answer (the old commit pruned) is
-/// not a proven rewrite.
-fn rewritten(authored: &store::Work, repo_id: &str, name: &str, w: &vector::AnchorWork) -> bool {
+/// The proven non-fast-forward tip move the anchor's branch made off
+/// the active record's last proven head - one `merge-base
+/// --is-ancestor` only when the tip moved. A first sighting, an
+/// unproven tip or a comparison git could not answer (the old commit
+/// pruned) is no proof and stays `None`. The time is the reflog line
+/// that set the observed tip; only a proven move the log cannot date
+/// falls back to this pass's scan time.
+fn rewritten(
+    authored: &store::Work,
+    repo_id: &str,
+    name: &str,
+    w: &vector::AnchorWork,
+    observed_ms: u64,
+) -> Option<store::RewriteEvidence> {
     let (Some(old), Some(new)) = (
         authored
             .branch(repo_id, name)
             .and_then(|r| r.head.as_deref()),
         w.ref_head(),
     ) else {
-        return false;
+        return None;
     };
-    old != new && w.state.repo.is_ancestor(old, new) == Evidence::Known(false)
+    if old == new || w.state.repo.is_ancestor(old, new) != Evidence::Known(false) {
+        return None;
+    }
+    Some(match w.tip_set_at() {
+        Some(at) => store::RewriteEvidence {
+            at_ms: store::epoch_ms(at),
+            dated: store::RewriteDating::Reflog,
+        },
+        None => store::RewriteEvidence {
+            at_ms: observed_ms,
+            dated: store::RewriteDating::Observed,
+        },
+    })
 }
 
 /// Incarnation order within a `(repo, ref_name)`: oldest first,
@@ -2714,10 +2806,22 @@ fn sort_incarnations(records: &mut [&store::BranchRecord]) {
     });
 }
 
-/// The `#N` numbers: every retained incarnation's 1-based rank within its
-/// `(repo, ref_name)`, ordered `(first_observed_at, id)` - the numbering a
-/// `#1`/`#2` label and a touch path share.
-fn incarnation_numbers(authored: &store::Work) -> HashMap<String, usize> {
+/// One incarnation's place within its `(repo, ref_name)`: the 1-based
+/// rank and the count of retained records - the pair a `feat (2nd)`
+/// label spells `2nd` and `lives` from.
+#[derive(Debug, Clone, Copy)]
+pub struct IncarnationPlace {
+    /// 1-based within `(repo, ref_name)`, oldest first.
+    pub number: usize,
+    /// How many records for the `(repo, ref_name)` are retained.
+    pub lives: usize,
+}
+
+/// Every retained incarnation's [`IncarnationPlace`] by `BranchRecord.id`:
+/// its 1-based rank within `(repo, ref_name)`, ordered
+/// `(first_observed_at, id)`, and the retained-lives count that decides
+/// whether an ordinal shows at all.
+fn incarnation_numbers(authored: &store::Work) -> HashMap<String, IncarnationPlace> {
     let mut by_name: HashMap<(&str, &str), Vec<&store::BranchRecord>> = HashMap::new();
     for record in authored.branches.values() {
         by_name
@@ -2727,20 +2831,81 @@ fn incarnation_numbers(authored: &store::Work) -> HashMap<String, usize> {
     }
     let mut numbers = HashMap::new();
     for records in by_name.values_mut() {
+        let lives = records.len();
         sort_incarnations(records);
         for (i, record) in records.iter().enumerate() {
-            numbers.insert(record.id.clone(), i + 1);
+            numbers.insert(
+                record.id.clone(),
+                IncarnationPlace {
+                    number: i + 1,
+                    lives,
+                },
+            );
         }
     }
     numbers
 }
 
+/// How the record's retained evidence says it ended: the Lifecycle
+/// observation exactly at `ended_at` is the closing one - `branch gone`
+/// is a deletion, a boundary reason in either spelling is a same-name
+/// replacement. `None` while active and `None` when the closing
+/// observation is not retained or names neither cause.
+fn ended_by(record: &store::BranchRecord) -> Option<EndedBy> {
+    let ended_at = record.ended_at?;
+    let reasons: Vec<&str> = record
+        .observations
+        .iter()
+        .filter(|o| o.source == store::ObservationSource::Lifecycle && o.observed_at_ms == ended_at)
+        .flat_map(|o| o.reasons.iter().map(String::as_str))
+        .collect();
+    if reasons.contains(&store::REASON_BRANCH_GONE) {
+        Some(EndedBy::Gone)
+    } else if reasons.contains(&store::REASON_INCARNATION_CHANGED)
+        || reasons.contains(&store::REASON_BRANCH_REPLACED)
+    {
+        Some(EndedBy::Replaced)
+    } else {
+        None
+    }
+}
+
+/// The compact label a branch name carries where space is tight:
+/// `feat` while one retained life makes the ordinal noise, `feat (2nd)`
+/// once several lives make it load-bearing. The one formatter both the
+/// JSON provenance text and the TUI's suffix style use, so the two can
+/// never drift.
+pub fn compact_ordinal_name(name: &str, number: usize, lives: usize) -> String {
+    if lives <= 1 {
+        return name.to_owned();
+    }
+    format!("{name} ({})", ordinal(number))
+}
+
+/// The English ordinal for a 1-based `n`: 1st, 2nd, 3rd, then `th` -
+/// except the teens, where 11th, 12th and 13th keep `th` despite ending
+/// in 1, 2 and 3.
+fn ordinal(n: usize) -> String {
+    let suffix = if (11..=13).contains(&(n % 100)) {
+        "th"
+    } else {
+        match n % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        }
+    };
+    format!("{n}{suffix}")
+}
+
 /// One persisted record as its serialized row, numbered within its
 /// `(repo, ref_name)` and marked excluded when closed.
-fn incarnation_row(record: &store::BranchRecord, number: usize) -> IncarnationRow {
+fn incarnation_row(record: &store::BranchRecord, number: usize, lives: usize) -> IncarnationRow {
     IncarnationRow {
         id: record.id.clone(),
         number,
+        lives,
         repo: record.repo.clone(),
         ref_name: record.ref_name.clone(),
         first_observed_at: record.first_observed_at / 1000,
@@ -2748,7 +2913,16 @@ fn incarnation_row(record: &store::BranchRecord, number: usize) -> IncarnationRo
         creation_head: record.creation_evidence.as_ref().map(|c| c.head.clone()),
         creation_at: record.creation_evidence.as_ref().map(|c| c.at_ms / 1000),
         head: record.head.clone(),
+        renamed: record.renamed.as_ref().map(|r| RenamedRow {
+            from: r.from.clone(),
+            at: r.at_ms / 1000,
+        }),
+        rewritten: record.rewritten.as_ref().map(|r| RewrittenRow {
+            at: r.at_ms / 1000,
+            dated: r.dated,
+        }),
         ended_at: record.ended_at.map(|ms| ms / 1000),
+        ended_by: ended_by(record),
         continuity: record.continuity_evidence,
         excluded: record.ended_at.is_some(),
     }
@@ -2760,14 +2934,22 @@ fn incarnation_row(record: &store::BranchRecord, number: usize) -> IncarnationRo
 fn touch_row(
     touch: &store::BranchTouch,
     authored: &store::Work,
-    numbers: &HashMap<String, usize>,
+    numbers: &HashMap<String, IncarnationPlace>,
 ) -> Option<TouchRow> {
     let record = authored.branches.get(&touch.branch)?;
+    let place = numbers
+        .get(&touch.branch)
+        .copied()
+        .unwrap_or(IncarnationPlace {
+            number: 0,
+            lives: 0,
+        }); // coverage: off - numbering covers every stored record
     Some(TouchRow {
         incarnation_id: touch.branch.clone(),
         repo: record.repo.clone(),
         ref_name: record.ref_name.clone(),
-        incarnation: numbers.get(&touch.branch).copied().unwrap_or(0), // coverage: off - numbering covers every stored record
+        incarnation: place.number,
+        lives: place.lives,
         head: touch.head.clone(),
         valid_from: touch.valid_from / 1000,
         valid_until: touch.valid_until.map(|ms| ms / 1000),
@@ -2867,10 +3049,12 @@ fn relate(conversations: &mut [ConversationRow], runtime: &Runtime) {
     let row = |strength: RelationStrength,
                label: &str,
                provenance: String,
+               touch: Option<RelatedTouch>,
                other: &ConversationRow| RelatedRow {
         strength,
         label: label.to_owned(),
         provenance,
+        touch,
         provider: other.provider,
         session_id: other.session_id.clone(),
         short_id: other.short_id.clone(),
@@ -2895,12 +3079,14 @@ fn relate(conversations: &mut [ConversationRow], runtime: &Runtime) {
                     RelationStrength::ProcessAncestry,
                     "ancestor",
                     "live process ancestry".to_owned(),
+                    None,
                     &conversations[b],
                 ));
                 related[b].push(row(
                     RelationStrength::ProcessAncestry,
                     "descendant",
                     "live process ancestry".to_owned(),
+                    None,
                     &conversations[a],
                 ));
             }
@@ -2914,7 +3100,16 @@ fn relate(conversations: &mut [ConversationRow], runtime: &Runtime) {
                     related[a].push(row(
                         RelationStrength::SameIncarnation,
                         "same incarnation",
-                        format!("touch {}#{}", t.ref_name, t.incarnation),
+                        format!(
+                            "touch {}",
+                            compact_ordinal_name(&t.ref_name, t.incarnation, t.lives)
+                        ),
+                        Some(RelatedTouch {
+                            incarnation_id: t.incarnation_id.clone(),
+                            ref_name: t.ref_name.clone(),
+                            number: t.incarnation,
+                            lives: t.lives,
+                        }),
                         &conversations[b],
                     ));
                 }
@@ -3013,7 +3208,13 @@ fn gone_rows(
         } else {
             "branch and worktree gone".to_owned()
         };
-        let number = numbers.get(&record.id).copied().unwrap_or(0); // coverage: off - numbering covers every stored record
+        let place = numbers
+            .get(&record.id)
+            .copied()
+            .unwrap_or(IncarnationPlace {
+                number: 0,
+                lives: 0,
+            }); // coverage: off - numbering covers every stored record
         rows.push(WorkRow {
             repo: record.repo.clone(),
             repo_name: display_name(Path::new(&record.repo)),
@@ -3022,7 +3223,7 @@ fn gone_rows(
             worktree: Some(path.clone()),
             branch: Some(record.ref_name.clone()),
             identity: Some(record.id.clone()),
-            incarnation: Some(incarnation_row(record, number)),
+            incarnation: Some(incarnation_row(record, place.number, place.lives)),
             // A gone row's recency is its retained source activity only:
             // `ended_at` and `last_observed_at` are detection times, so
             // a just-deleted old branch still reads old.
@@ -4040,6 +4241,8 @@ mod tests {
             head: None,
             creation_evidence: None,
             continuity_evidence: store::ContinuityEvidence::FirstObservation,
+            renamed: None,
+            rewritten: None,
             ended_at: ended_ms,
             parked: false,
             activities: Vec::new(),
@@ -4058,6 +4261,7 @@ mod tests {
             repo: "/r/.git".to_owned(),
             ref_name: "feat".to_owned(),
             incarnation: 1,
+            lives: 1,
             head: Some("aaaaaa".to_owned()),
             valid_from: 1_000,
             valid_until: None,
@@ -4094,9 +4298,70 @@ mod tests {
         work.branches
             .insert("i-old".to_owned(), branch_record("i-old", 500, None));
         let numbers = incarnation_numbers(&work);
-        assert_eq!(numbers["i-old"], 1);
-        assert_eq!(numbers["i-aa"], 2);
-        assert_eq!(numbers["i-zz"], 3);
+        assert_eq!(numbers["i-old"].number, 1);
+        assert_eq!(numbers["i-aa"].number, 2);
+        assert_eq!(numbers["i-zz"].number, 3);
+        assert!(numbers.values().all(|p| p.lives == 3));
+    }
+
+    /// A record closed at 2_000 by a Lifecycle observation carrying
+    /// `reason`.
+    fn closed_with_reason(reason: &str) -> store::BranchRecord {
+        let mut record = branch_record("i", 1_000, Some(2_000));
+        record.observations.push(store::ObservationEvent {
+            covered_by: None,
+            source: store::ObservationSource::Lifecycle,
+            observed_at_ms: 2_000,
+            reasons: vec![reason.to_owned()],
+        });
+        record
+    }
+
+    #[test]
+    fn ended_by_reads_the_closing_observation_in_either_spelling() {
+        assert_eq!(
+            ended_by(&closed_with_reason(store::REASON_BRANCH_GONE)),
+            Some(EndedBy::Gone)
+        );
+        // The current and the legacy boundary spellings both mean a
+        // same-name replacement - stored history is never rewritten.
+        assert_eq!(
+            ended_by(&closed_with_reason(store::REASON_BRANCH_REPLACED)),
+            Some(EndedBy::Replaced)
+        );
+        assert_eq!(
+            ended_by(&closed_with_reason(store::REASON_INCARNATION_CHANGED)),
+            Some(EndedBy::Replaced)
+        );
+        // A closed record whose closing observation is not retained -
+        // or a lifecycle observation at a different time - ends
+        // unexplained; an active record has no end at all.
+        assert_eq!(ended_by(&branch_record("i", 1_000, Some(2_000))), None);
+        let mut other = closed_with_reason(store::REASON_BRANCH_GONE);
+        other.observations[0].observed_at_ms = 1_500;
+        assert_eq!(ended_by(&other), None);
+        assert_eq!(ended_by(&branch_record("i", 1_000, None)), None);
+    }
+
+    #[test]
+    fn the_compact_ordinal_covers_the_english_edge_cases() {
+        // A sole retained life spells the bare name; several lives make
+        // the ordinal load-bearing.
+        assert_eq!(compact_ordinal_name("feat", 1, 1), "feat");
+        assert_eq!(compact_ordinal_name("feat", 2, 1), "feat");
+        assert_eq!(compact_ordinal_name("feat", 1, 2), "feat (1st)");
+        assert_eq!(compact_ordinal_name("feat", 2, 2), "feat (2nd)");
+        assert_eq!(compact_ordinal_name("feat", 3, 4), "feat (3rd)");
+        assert_eq!(compact_ordinal_name("feat", 4, 4), "feat (4th)");
+        // The teens keep `th` despite ending in 1, 2 and 3.
+        assert_eq!(compact_ordinal_name("feat", 11, 12), "feat (11th)");
+        assert_eq!(compact_ordinal_name("feat", 12, 12), "feat (12th)");
+        assert_eq!(compact_ordinal_name("feat", 13, 13), "feat (13th)");
+        assert_eq!(compact_ordinal_name("feat", 21, 21), "feat (21st)");
+        assert_eq!(compact_ordinal_name("feat", 22, 22), "feat (22nd)");
+        assert_eq!(compact_ordinal_name("feat", 23, 23), "feat (23rd)");
+        assert_eq!(compact_ordinal_name("feat", 111, 111), "feat (111th)");
+        assert_eq!(compact_ordinal_name("feat", 112, 112), "feat (112th)");
     }
 
     #[test]
@@ -6368,9 +6633,9 @@ mod tests {
                 &[store::ObservedRef {
                     name: "feat".to_owned(),
                     head: None,
-                    rewritten: false,
+                    rewritten: None,
                     creation: None,
-                    renamed_from: None,
+                    renamed: None,
                     commit: None,
                     activities: Vec::new(),
                     inputs: store::LifecycleInputs::default(),

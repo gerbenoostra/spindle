@@ -11,11 +11,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_sessions::runtime::Runtime;
-use agent_sessions::snapshot::{Collector, Snapshot, Upstream, WorkKind, WorkRow, to_json};
+use agent_sessions::snapshot::{
+    Collector, EndedBy, RelatedTouch, RenamedRow, RewrittenRow, SCHEMA_VERSION, Snapshot, Upstream,
+    WorkKind, WorkRow, to_json,
+};
 use agent_sessions::store::{
     ActivitySource, BranchRecord, Confidence, ContinuityEvidence, DatedTouch, LifecycleInputs,
-    ObservationSource, ObservedRef, RefCreationEvidence, SessionContext, SessionUpdate, Store,
-    TouchPlacement, TouchProvenance, UpdateIdentity, conversation_key,
+    ObservationSource, ObservedRef, RefCreationEvidence, RenameEvidence, RewriteDating,
+    RewriteEvidence, SessionContext, SessionUpdate, Store, TouchPlacement, TouchProvenance,
+    UpdateIdentity, conversation_key,
 };
 use agent_sessions::tui::{App, Key};
 use ratatui::Terminal;
@@ -79,7 +83,12 @@ fn git(repo: &FixtureRepo, args: &[&str]) {
 /// `git` with a pinned committer clock - the reflog's epoch is that
 /// clock, so branch creation dates are deterministic.
 fn git_dated(repo: &FixtureRepo, date: &str, args: &[&str]) {
-    let out = fixture::command(Some(repo.main.as_path()), args)
+    git_dated_at(repo.main.as_path(), date, args)
+}
+
+/// `git_dated` in any checkout of the fixture repo.
+fn git_dated_at(dir: &Path, date: &str, args: &[&str]) {
+    let out = fixture::command(Some(dir), args)
         .env("GIT_COMMITTER_DATE", date)
         .output()
         .expect("git runs");
@@ -268,8 +277,8 @@ fn obs(name: &str, head: Option<&str>, creation: Option<RefCreationEvidence>) ->
         name: name.to_owned(),
         head: head.map(str::to_owned),
         creation,
-        renamed_from: None,
-        rewritten: false,
+        renamed: None,
+        rewritten: None,
         commit: None,
         activities: Vec::new(),
         inputs: LifecycleInputs::default(),
@@ -284,7 +293,10 @@ fn obs_renamed(
     renamed_from: &str,
 ) -> ObservedRef {
     let mut o = obs(name, head, creation);
-    o.renamed_from = Some(renamed_from.to_owned());
+    o.renamed = Some(RenameEvidence {
+        from: renamed_from.to_owned(),
+        at_ms: 0,
+    });
     o
 }
 
@@ -643,11 +655,16 @@ fn the_json_carries_ids_numbers_intervals_and_evidence() {
         .find(|w| w["name"] == "feat")
         .expect("the feat row");
     assert_eq!(feat["incarnation"]["number"], 2);
+    assert_eq!(feat["incarnation"]["lives"], 2);
     assert_eq!(feat["incarnation"]["excluded"], false);
+    assert!(feat["incarnation"]["ended_by"].is_null());
     let history = &feat["same_name_history"][0];
     assert_eq!(history["number"], 1);
+    assert_eq!(history["lives"], 2);
     assert_eq!(history["excluded"], true);
     assert!(history["ended_at"].is_u64());
+    // The boundary close between passes reads `replaced`.
+    assert_eq!(history["ended_by"], "replaced");
     // The persisted touch serializes its full shape: incarnation id,
     // head, interval, provenance, confidence.
     let file: serde_json::Value = serde_json::from_str(
@@ -1999,4 +2016,344 @@ fn session_context_is_captured_per_record_across_paths_and_incarnations() {
             .as_deref(),
         Some("path prompt")
     );
+}
+
+#[test]
+fn a_rename_persists_its_source_with_the_reflog_lines_own_time() {
+    let world = world();
+    git(&world.repo, &["branch", "feat"]);
+    collect(&world);
+    let before = record(&world, "feat").unwrap();
+
+    // `git branch -m` stamps the rename line with the committer clock:
+    // pin it so the persisted time is exact.
+    git_dated(
+        &world.repo,
+        "@1600000000 +0000",
+        &["branch", "-m", "feat", "feat2"],
+    );
+    // Right after the rename, the newest line whose `new` is the tip is
+    // the rename line itself: `tip_set_at` returns its exact time.
+    let repo = agent_sessions::git::Repo::discover(&world.repo.main)
+        .expect("git works")
+        .expect("a repo");
+    let head = world.repo.git(&world.repo.main, &["rev-parse", "feat2"]);
+    assert_eq!(
+        repo.ref_lifecycle("feat2").tip_set_at(head.trim()),
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+    );
+    let snapshot = collect(&world);
+    let moved = record(&world, "feat2").expect("the renamed record");
+    assert_eq!(moved.id, before.id);
+    assert_eq!(moved.continuity_evidence, ContinuityEvidence::ProvenRename);
+    assert_eq!(
+        moved.renamed,
+        Some(RenameEvidence {
+            from: "feat".to_owned(),
+            at_ms: 1_600_000_000_000,
+        })
+    );
+    // The incarnation row carries the same evidence in epoch seconds.
+    let inc = work(&snapshot, "feat2")
+        .incarnation
+        .as_ref()
+        .expect("the active incarnation");
+    assert_eq!(
+        inc.renamed,
+        Some(RenamedRow {
+            from: "feat".to_owned(),
+            at: 1_600_000_000,
+        })
+    );
+    assert_eq!(inc.lives, 1);
+    // On the wire it is the same evidence in epoch seconds.
+    let json: serde_json::Value = serde_json::from_str(&to_json(&snapshot).unwrap()).unwrap();
+    let row = json["work"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == "feat2")
+        .expect("the feat2 row");
+    assert_eq!(
+        row["incarnation"]["renamed"],
+        serde_json::json!({"from": "feat", "at": 1_600_000_000})
+    );
+}
+
+#[test]
+fn a_rewrite_after_a_rename_keeps_the_label_and_dates_the_reflog_line() {
+    let world = world();
+    world.repo.branch_with_commits("feat", 2, false);
+    collect(&world);
+    git(&world.repo, &["branch", "-m", "feat", "feat2"]);
+    collect(&world);
+    let before = record(&world, "feat2").unwrap();
+    assert_eq!(before.continuity_evidence, ContinuityEvidence::ProvenRename);
+
+    // A reset then a commit on the renamed branch: the commit's reflog
+    // line is the newest entry setting the tip, so its pinned committer
+    // time dates the rewrite - `reflog` dating.
+    let wt = world.repo.add_worktree("feat2-wt", Some("feat2"));
+    world.repo.git(&wt, &["reset", "--hard", "HEAD~1"]);
+    git_dated_at(
+        &wt,
+        "@1700000000 +0000",
+        &["commit", "--allow-empty", "-qm", "rewrite"],
+    );
+    let snapshot = collect(&world);
+    let after = record(&world, "feat2").unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(
+        after.continuity_evidence,
+        ContinuityEvidence::ProvenRename,
+        "the rename label is terminal; the rewrite lives beside it"
+    );
+    assert_eq!(
+        after.rewritten,
+        Some(RewriteEvidence {
+            at_ms: 1_700_000_000_000,
+            dated: RewriteDating::Reflog,
+        })
+    );
+    // The row serializes the same evidence in seconds.
+    let inc = work(&snapshot, "feat2")
+        .incarnation
+        .as_ref()
+        .expect("the active incarnation");
+    assert_eq!(
+        inc.rewritten,
+        Some(RewrittenRow {
+            at: 1_700_000_000,
+            dated: RewriteDating::Reflog,
+        })
+    );
+    // On the wire: epoch seconds and the dating clock.
+    let json: serde_json::Value = serde_json::from_str(&to_json(&snapshot).unwrap()).unwrap();
+    let row = json["work"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == "feat2")
+        .expect("the feat2 row");
+    assert_eq!(
+        row["incarnation"]["rewritten"],
+        serde_json::json!({"at": 1_700_000_000, "dated": "reflog"})
+    );
+
+    // A fast-forward then leaves the stored rewrite untouched.
+    world.repo.commit(&wt, "more.txt", "y", "more");
+    collect(&world);
+    let later = record(&world, "feat2").unwrap();
+    assert_eq!(later.rewritten, after.rewritten);
+}
+
+#[test]
+fn a_rewrite_the_missing_reflog_cannot_date_is_dated_by_the_pass() {
+    let world = world();
+    world.repo.branch_with_commits("feat", 1, false);
+    collect(&world);
+    collect(&world);
+    let before = record(&world, "feat").unwrap();
+
+    // The branch log is gone and `update-ref` does not recreate it: no
+    // line can date the off-ancestry move, so the detecting pass's own
+    // time is the date - `observed` dating.
+    fs::remove_file(reflog(&world.repo, "feat")).unwrap();
+    world
+        .repo
+        .commit(&world.repo.main, "elsewhere.txt", "x", "elsewhere");
+    let tip = world.repo.git(&world.repo.main, &["rev-parse", "main"]);
+    // `update-ref` recreates a removed log on default Git, so the move
+    // runs with `core.logAllRefUpdates=false`: no line can date it.
+    git(
+        &world.repo,
+        &[
+            "-c",
+            "core.logAllRefUpdates=false",
+            "update-ref",
+            "refs/heads/feat",
+            tip.trim(),
+        ],
+    );
+    collect(&world);
+    let after = record(&world, "feat").unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.continuity_evidence, ContinuityEvidence::ForcePush);
+    let rewritten = after.rewritten.expect("the rewrite evidence");
+    assert_eq!(rewritten.dated, RewriteDating::Observed);
+    assert!(
+        rewritten.at_ms >= before.last_observed_at,
+        "the scan's own time, not a reflog line's"
+    );
+}
+
+#[test]
+fn a_second_life_numbers_touches_and_relations_with_the_compact_ordinal() {
+    let world = world();
+    git(&world.repo, &["branch", "feat"]);
+    collect(&world);
+    // Delete observed gone, then recreated: `feat` gains a second
+    // retained life, and the old record's close was a proven absence -
+    // `gone`.
+    git(&world.repo, &["branch", "-D", "feat"]);
+    collect(&world);
+    git_dated(&world.repo, "@1600000000 +0000", &["branch", "feat"]);
+    collect(&world);
+    let wt = world.repo.add_worktree("feat-wt", Some("feat"));
+    transcript(&world.home, CONV, &wt);
+    transcript(&world.home, OTHER, &wt);
+    transcript(&world.home, THIRD, &world.repo.main);
+    // Two conversations placed on the new life, one on main: the store
+    // records the placements exactly, however the transcripts date.
+    let inc2 = record(&world, "feat").expect("the new life").id;
+    let main = record(&world, "main").expect("main's record").id;
+    store(&world.home)
+        .sync_touches(
+            &[
+                placement(&conversation_key("claude", CONV), &inc2, "aaaa"),
+                placement(&conversation_key("claude", OTHER), &inc2, "aaaa"),
+                placement(&conversation_key("claude", THIRD), &main, "bbbb"),
+            ],
+            &[],
+            5_000,
+        )
+        .unwrap();
+    let snapshot = collect(&world);
+    let feat = work(&snapshot, "feat");
+    let inc = feat.incarnation.as_ref().expect("the active incarnation");
+    assert_eq!(inc.number, 2);
+    assert_eq!(inc.lives, 2);
+    assert_eq!(inc.ended_by, None, "the active record has no end");
+    let history = &feat.same_name_history[0];
+    assert_eq!(history.lives, 2);
+    assert_eq!(history.ended_by, Some(EndedBy::Gone));
+
+    // The persisted touch rows carry the lives count too.
+    let c = conversation(&snapshot, CONV);
+    let touch = c
+        .touches
+        .iter()
+        .find(|t| t.ref_name == "feat")
+        .unwrap_or_else(|| panic!("the feat touch: {:?}", c.touches));
+    assert_eq!(touch.incarnation, 2);
+    assert_eq!(touch.lives, 2);
+
+    // The same-branch relation carries the structured touch, and its
+    // provenance spells the compact ordinal: `feat (2nd)` at two lives.
+    let related = c
+        .related
+        .iter()
+        .find(|r| r.label == "same incarnation")
+        .expect("the same-branch relation");
+    assert_eq!(
+        related.touch,
+        Some(RelatedTouch {
+            incarnation_id: touch.incarnation_id.clone(),
+            ref_name: "feat".to_owned(),
+            number: 2,
+            lives: 2,
+        })
+    );
+    assert_eq!(related.provenance, "touch feat (2nd)");
+
+    // A sole life carries no ordinal: `main` reads `touch main`.
+    let third = conversation(&snapshot, THIRD);
+    let related = third
+        .related
+        .iter()
+        .find(|r| r.label == "same incarnation")
+        .expect("the same-branch relation");
+    assert_eq!(related.provenance, "touch main");
+    assert_eq!(related.touch.as_ref().unwrap().lives, 1);
+
+    // The serialization contract is additive: the snapshot stays at
+    // SCHEMA_VERSION and the stored file keeps its own unchanged schema.
+    let json: serde_json::Value = serde_json::from_str(&to_json(&snapshot).unwrap()).unwrap();
+    assert_eq!(json["schema_version"], serde_json::json!(SCHEMA_VERSION));
+    let row = json["work"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == "feat")
+        .expect("the feat row");
+    assert_eq!(row["incarnation"]["number"], 2);
+    assert_eq!(row["incarnation"]["lives"], 2);
+    let conv = json["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["session_id"] == CONV)
+        .expect("the conversation row");
+    let touch = conv["touches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["ref_name"] == "feat")
+        .expect("the feat touch");
+    assert_eq!(touch["incarnation"], 2);
+    assert_eq!(touch["lives"], 2);
+    let rel = conv["related"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["label"] == "same incarnation")
+        .expect("the same-branch relation");
+    assert_eq!(
+        rel["touch"],
+        serde_json::json!({
+            "incarnation_id": touch["incarnation_id"],
+            "ref_name": "feat",
+            "number": 2,
+            "lives": 2,
+        })
+    );
+    assert_eq!(rel["provenance"], "touch feat (2nd)");
+    let third = json["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["session_id"] == THIRD)
+        .expect("the main conversation row");
+    let rel = third["related"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["label"] == "same incarnation")
+        .expect("the same-branch relation");
+    assert_eq!(rel["provenance"], "touch main");
+    assert_eq!(rel["touch"]["lives"], 1);
+    let file: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(store_dir(&world.home).join("work.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(file["v"], 4, "work.json keeps its unchanged schema");
+}
+
+#[test]
+fn a_boundary_close_serializes_replaced_with_the_new_reason() {
+    let world = world();
+    // A creation pinned in the past so the between-passes recreate is a
+    // proven boundary, not a mere absence.
+    git_dated(&world.repo, "@1500000000 +0000", &["branch", "feat"]);
+    collect(&world);
+    let old = record(&world, "feat").unwrap();
+    git(&world.repo, &["branch", "-D", "feat"]);
+    git(&world.repo, &["branch", "feat"]);
+    let snapshot = collect(&world);
+
+    // The boundary close wrote the new reason - the ref was never
+    // absent - and the snapshot derives `replaced` from it. The legacy
+    // `branch incarnation changed` spelling derives the same.
+    let closed = &store(&world.home).load().work.branches[&old.id];
+    assert_eq!(
+        closed.observations.last().unwrap().reasons,
+        [agent_sessions::store::REASON_BRANCH_REPLACED.to_owned()]
+    );
+    let history = work(&snapshot, "feat")
+        .same_name_history
+        .iter()
+        .find(|h| h.id == old.id)
+        .expect("the earlier life");
+    assert_eq!(history.ended_by, Some(EndedBy::Replaced));
+    assert_eq!(history.lives, 2);
 }

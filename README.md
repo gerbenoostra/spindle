@@ -95,7 +95,7 @@ What it writes, all of it bounded:
 
 - Its own records under `$XDG_STATE_HOME/agent-sessions/` (default
   `~/.local/state/agent-sessions/`): the hook-event journal, seen-state,
-  parked flags, incarnation history, not-busy marks and reference dismissals.
+  parked flags, branch history, not-busy marks and reference dismissals.
 - User-confirmed cleanup commands only: `git worktree remove` and
   `git branch -d`/`-D`, each printed and re-checked immediately before it runs.
 - Hook entries invoking `agent-sessions hook` inside agent config files,
@@ -140,7 +140,11 @@ carry two timestamped histories: `activities` (when the work itself happened,
 as `occurred_at_ms`) and `observations` (when a collection pass learned
 something, as `observed_at_ms`), both Unix epoch milliseconds, plus
 `last_activity`, the newest source-backed occurrence in epoch seconds or
-`null`. Incarnation identity, conversation placements and the
+`null`. Incarnation rows carry `renamed` (`from` name and time) and
+`rewritten` (time and whether it was `reflog`- or `observed`-dated), plus
+`lives` (the retained same-name count, also on touch rows) and `ended_by`
+(`gone` or `replaced`); same-branch relations carry a structured `touch`
+field, all in epoch seconds. Incarnation identity, conversation placements and the
 activity/observation split are specified in
 [docs/architecture/work-lifecycle.md](docs/architecture/work-lifecycle.md).
 
