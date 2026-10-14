@@ -2155,9 +2155,8 @@ fn a_rewrite_the_missing_reflog_cannot_date_is_dated_by_the_pass() {
     collect(&world);
     let before = record(&world, "feat").unwrap();
 
-    // The branch log is gone and `update-ref` does not recreate it: no
-    // line can date the off-ancestry move, so the detecting pass's own
-    // time is the date - `observed` dating.
+    // The branch log is gone: no line can date the off-ancestry move, so
+    // the detecting pass's own time is the date - `observed` dating.
     fs::remove_file(reflog(&world.repo, "feat")).unwrap();
     world
         .repo
