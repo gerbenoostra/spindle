@@ -141,10 +141,10 @@ as `occurred_at_ms`) and `observations` (when a collection pass learned
 something, as `observed_at_ms`), both Unix epoch milliseconds, plus
 `last_activity`, the newest source-backed occurrence in epoch seconds or
 `null`. Incarnation rows carry `renamed` (`from` name and time) and
-`rewritten` (time and whether it was `reflog`- or `observed`-dated), plus
-`lives` (the retained same-name count, also on touch rows) and `ended_by`
-(`gone` or `replaced`); same-branch relations carry a structured `touch`
-field, all in epoch seconds. Incarnation identity, conversation placements and the
+`rewritten` (time and whether it was `reflog`- or `observed`-dated), both
+times in epoch seconds, plus `lives` (the retained same-name count, also on
+touch rows) and `ended_by` (`gone` or `replaced`); same-branch relations
+carry a structured `touch` field. Incarnation identity, conversation placements and the
 activity/observation split are specified in
 [docs/architecture/work-lifecycle.md](docs/architecture/work-lifecycle.md).
 
