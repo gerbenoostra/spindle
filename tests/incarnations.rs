@@ -1263,7 +1263,7 @@ fn the_global_scope_lists_each_conversation_once_with_its_touch_path() {
     transcript(&world.home, CONV, &wt);
     collect(&world);
     // A switch the conversation worked through gives it a
-    // two-incarnation path: feat#1 -> other#1.
+    // two-incarnation path: feat -> other.
     world.repo.git(&wt, &["checkout", "-b", "other"]);
     turn(&world.home, CONV, &wt);
     // A second conversation sits in the main checkout - one touch.
@@ -1277,8 +1277,9 @@ fn the_global_scope_lists_each_conversation_once_with_its_touch_path() {
     // One row per conversation, no matter how many incarnations it rode.
     assert_eq!(text.matches(&CONV[..8]).count(), 1, "{text}");
     assert_eq!(text.matches(&OTHER[..8]).count(), 1, "{text}");
-    // The single-touch conversation carries its full context instead.
-    assert!(text.contains("main"), "{text}");
+    // The single-touch conversation carries its full context instead:
+    // repo, branch and worktree, each named `main` here.
+    assert!(text.contains("main · main · main"), "{text}");
     // Selecting one incarnation drops the context line entirely.
     press(&mut app, &[Key::Char('2'), Key::Char('j')]);
     let text = render(&app, 200, 30);
@@ -1288,7 +1289,7 @@ fn the_global_scope_lists_each_conversation_once_with_its_touch_path() {
     press(&mut app, &[Key::Char('k')]);
     let text = render(&app, 55, 30);
     assert!(text.lines().all(|l| l.chars().count() <= 55));
-    assert!(text.contains("feat"), "{text}");
+    assert!(text.contains("feat → other"), "{text}");
 }
 
 #[test]
