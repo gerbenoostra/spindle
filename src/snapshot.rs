@@ -2885,7 +2885,7 @@ pub fn compact_ordinal_name(name: &str, number: usize, lives: usize) -> String {
 /// The English ordinal for a 1-based `n`: 1st, 2nd, 3rd, then `th` -
 /// except the teens, where 11th, 12th and 13th keep `th` despite ending
 /// in 1, 2 and 3.
-fn ordinal(n: usize) -> String {
+pub fn ordinal(n: usize) -> String {
     let suffix = if (11..=13).contains(&(n % 100)) {
         "th"
     } else {

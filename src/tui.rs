@@ -2159,25 +2159,21 @@ enum OrdinalStyle {
     History,
 }
 
-/// The English ordinal of life `number` among `lives` retained ones, as
-/// [`crate::snapshot::compact_ordinal_name`] spells it - `None` while a
-/// sole life makes the ordinal noise.
-fn ordinal_text(name: &str, number: usize, lives: usize) -> Option<String> {
-    crate::snapshot::compact_ordinal_name(name, number, lives)
-        .strip_prefix(name)
-        .and_then(|rest| rest.strip_prefix(" ("))
-        .and_then(|rest| rest.strip_suffix(')'))
-        .map(str::to_owned)
+/// The English ordinal of life `number` among `lives` retained ones -
+/// `None` while a sole life makes the ordinal noise, the same rule
+/// [`crate::snapshot::compact_ordinal_name`] applies.
+fn life_ordinal(number: usize, lives: usize) -> Option<String> {
+    (lives > 1).then(|| crate::snapshot::ordinal(number))
 }
 
 /// `name` with its life ordinal in `style`, or the bare name while only
 /// one life is retained - a sole life never carries a number. All styles
-/// spell the ordinal the way [`crate::snapshot::compact_ordinal_name`]
-/// does, so no second English-suffix algorithm exists.
+/// spell the ordinal with [`crate::snapshot::ordinal`], so no second
+/// English-suffix algorithm exists.
 fn ordinal_name(name: &str, number: usize, lives: usize, style: OrdinalStyle) -> String {
     match style {
         OrdinalStyle::Suffix => crate::snapshot::compact_ordinal_name(name, number, lives),
-        _ => match ordinal_text(name, number, lives) {
+        _ => match life_ordinal(number, lives) {
             Some(ordinal) if style == OrdinalStyle::Prefix => format!("{ordinal} {name}"),
             Some(ordinal) => format!("{name} ({ordinal} of {lives})"),
             None => name.to_owned(),
@@ -2836,7 +2832,7 @@ fn history_body(h: &IncarnationRow, now: u64, out: &mut Vec<Line<'static>>, widt
 /// the continuity decision in its wire spelling with a one-clause gloss.
 fn incarnation_body(i: &IncarnationRow, now: u64, out: &mut Vec<Line<'static>>, width: usize) {
     push_head(out, "branch identity record:".to_owned(), width);
-    let identity = match ordinal_text(&i.ref_name, i.number, i.lives) {
+    let identity = match life_ordinal(i.number, i.lives) {
         Some(ordinal) => format!("{ordinal} of {} lives of {}", i.lives, i.ref_name),
         None => i.ref_name.clone(),
     };
