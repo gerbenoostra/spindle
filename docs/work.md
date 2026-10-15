@@ -155,9 +155,11 @@ with ties ordered by their reason list.
 - An unproven boundary warns instead of listing earlier lives - because both
   lines would repeat the kept-separate fact, and the warning carries the one
   `- h` pointer, or drops it and says the earlier life is no longer kept.
-- Legacy stored reasons map to the new wording at render - because stored
-  history is never rewritten; not leaving "incarnation" on display until old
-  events age out.
+- A boundary close is recorded as `branch replaced by a new branch of the
+  same name`, and the older stored spelling `branch incarnation changed` maps
+  to it at render; `p` on a branch record that has since ended fails with
+  `no active branch <id>` - because stored history is never rewritten; not
+  leaving "incarnation" on display until old events age out.
 
 The architecture and failure semantics live in
 [work-lifecycle](architecture/work-lifecycle.md) and
