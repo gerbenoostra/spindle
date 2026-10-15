@@ -2764,17 +2764,24 @@ fn branch_summary(
     parts.extend(rewrite_phrase(i, now, false));
     push_text(out, format!("branch: {}", parts.join(" · ")), width);
     if i.continuity == store::ContinuityEvidence::Ambiguous {
-        let text = if earlier.is_empty() {
+        // Ranks count retained lives oldest first, so only a first rank
+        // proves the earlier branch was pruned. A gone row lists no
+        // earlier lives even when they are retained: `- h` points only
+        // at rows this view actually lists.
+        let mut text = if i.number > 1 {
             format!(
-                "! not proven to be an earlier {} (no longer kept); its activity is kept separate",
+                "! not proven to be the earlier {}; its activity is kept separate",
                 i.ref_name
             )
         } else {
             format!(
-                "! not proven to be the earlier {}; its activity is kept separate - h",
+                "! not proven to be an earlier {} (no longer kept); its activity is kept separate",
                 i.ref_name
             )
         };
+        if !earlier.is_empty() {
+            text.push_str(" - h");
+        }
         push_attention(out, text, width);
     } else if let Some(last) = earlier
         .iter()
@@ -5555,6 +5562,37 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("2nd") || l.contains("- h")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_unproven_boundary_on_a_gone_row_never_claims_the_earlier_life_is_gone() {
+        // A gone row lists no earlier lives, yet its record still ranks
+        // second of two retained ones: the warning must neither say the
+        // earlier branch is no longer kept nor point at an `h` row that
+        // is not there.
+        let mut i = incarnation("i111", "/repos/a/.git", "feat/login", 2);
+        i.lives = 2;
+        i.continuity = store::ContinuityEvidence::Ambiguous;
+        i.ended_at = Some(1_800_000_000 - 3600);
+        i.ended_by = Some(crate::snapshot::EndedBy::Gone);
+        let mut out = Vec::new();
+        branch_summary(&i, &[], 1_800_000_000, &mut out, 200);
+        let lines: Vec<String> = out
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "branch: 2nd feat/login · first seen 2h ago",
+                "! not proven to be the earlier feat/login; its activity is kept separate",
+            ],
         );
     }
 
