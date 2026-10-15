@@ -9,8 +9,9 @@ live between modules.
 
 - Work identity is scoped by the repository's canonical git common dir, not
   its checkout path. Branch names are reusable, so a name alone is not an
-  identity: an incarnation is one observed lifetime of a name, numbered `#N`
-  per `(repo, ref)`.
+  identity: an incarnation is one observed lifetime of a name, numbered
+  among the retained records per `(repo, ref)`; the TUI calls it a branch
+  life and shows the number as an ordinal only when several are retained.
 - Continuity is proven, not assumed: an exact rename or a force-push keeps
   the incarnation's id, while a detected recreation or a boundary that
   cannot be proven continuous starts a new one.
