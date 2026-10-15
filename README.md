@@ -17,11 +17,11 @@ needs you takes a glance instead of a window tour.
 > to end for Claude: `agent-sessions hook` records agent events, and rows
 > needing you sit under `Needs you` until you have seen them (see
 > [attention](docs/attention.md)). Work rows are sectioned by what they
-> need and carry their branch's observed incarnation (`#N`, with `h` for
-> excluded same-name history); `enter` jumps to a conversation's live pane
-> - or resumes a stopped one in place, in a project folder when it has no
-> checkout - and `o` opens a work row's pull or merge request (see
-> [work](docs/work.md)). Cleanup and hook registration still land
+> need and carry their branch's identity (an ordinal when the name has
+> several retained lives, with `h` for the earlier ones); `enter` jumps to a
+> conversation's live pane - or resumes a stopped one in place, in a
+> project folder when it has no checkout - and `o` opens a work row's pull or
+> merge request (see [work](docs/work.md)). Cleanup and hook registration still land
 > piecemeal, and any subcommand that has not shipped is a usage error.
 
 `agent-sessions` is the binary and the state directory; `spindle` is this

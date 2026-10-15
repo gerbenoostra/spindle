@@ -411,7 +411,7 @@ impl App {
                 Row::Work(w) => scope_of(w),
                 Row::History(_, h) => WorkScope::Incarnation {
                     id: h.id.clone(),
-                    label: format!("{}#{}", h.ref_name, h.number),
+                    label: ordinal_name(&h.ref_name, h.number, h.lives, OrdinalStyle::History),
                     excluded: true,
                 },
                 _ /* // coverage: off - work holds Work rows only */ => WorkScope::Space {
@@ -997,15 +997,15 @@ impl App {
                 dim_label: false,
             },
             Row::History(w, h) => RowCells {
-                // Excluded history: dim, no attention glyph, marked
-                // `excluded`, aged by when the incarnation ended.
+                // Earlier same-name life: dim, no attention glyph,
+                // marked `earlier`, aged by when that life ended.
                 glyph: "",
                 label: &work_label(
                     w,
                     list == List::Work && view.repo_scope.is_none(),
-                    Some(h.number),
+                    &ordinal_name(&h.ref_name, h.number, h.lives, OrdinalStyle::History),
                 ),
-                middle: "excluded",
+                middle: "earlier",
                 age: &age(self.now(), h.ended_at),
                 selected,
                 dim_label: true,
@@ -1081,10 +1081,13 @@ impl App {
             match self.detail_target(view) {
                 Some((List::Repos, Row::Repo(r))) => format!("[4] Evidence - {}", r.name),
                 Some((List::Work, Row::Work(w))) => {
-                    format!("[4] Evidence - {}", numbered_name(w))
+                    format!("[4] Evidence - {}", work_branch_name(w))
                 }
                 Some((List::Work, Row::History(_, h))) => {
-                    format!("[4] Evidence - {}#{}", h.ref_name, h.number)
+                    format!(
+                        "[4] Evidence - {}",
+                        ordinal_name(&h.ref_name, h.number, h.lives, OrdinalStyle::History)
+                    )
                 }
                 Some((List::Conversations, Row::Conversation(c))) => {
                     format!("[4] Evidence - {}", c.short_id)
@@ -1149,23 +1152,24 @@ impl App {
                 )),
             ),
             Some((List::Work, Row::Work(w))) => (
-                format!("[4] Work - {}", numbered_name(w)),
+                format!("[4] Work - {}", work_branch_name(w)),
                 Line::from(format!(
                     "{} {} - {} · {}",
                     work_glyph(w),
-                    numbered_name(w),
+                    work_branch_name(w),
                     w.kind.as_str().replace('_', " "),
                     age(self.now(), w.last_activity)
                 )),
             ),
             Some((List::Work, Row::History(_, h))) => (
-                format!("[4] Work - {}#{}", h.ref_name, h.number),
+                format!(
+                    "[4] Work - {}",
+                    ordinal_name(&h.ref_name, h.number, h.lives, OrdinalStyle::History)
+                ),
                 Line::from(format!(
-                    "  {}#{} - incarnation · excluded · observed {} · ended {}",
-                    h.ref_name,
-                    h.number,
-                    age(self.now(), Some(h.first_observed_at)),
-                    age(self.now(), h.ended_at)
+                    "  earlier {} · {}",
+                    ordinal_name(&h.ref_name, h.number, h.lives, OrdinalStyle::History),
+                    ended_label(h, self.now())
                 )),
             ),
             Some((List::Conversations, Row::Conversation(c))) => (
@@ -1198,9 +1202,7 @@ impl App {
         match self.detail_target(view) {
             Some((List::Repos, Row::Repo(r))) => self.repo_body(r, &mut out, width),
             Some((List::Work, Row::Work(w))) => self.work_body(w, &mut out, width),
-            Some((List::Work, Row::History(_, h))) => {
-                incarnation_body(h, self.now(), &mut out, width)
-            }
+            Some((List::Work, Row::History(_, h))) => history_body(h, self.now(), &mut out, width),
             Some((List::Conversations, Row::Conversation(c))) => {
                 self.conversation_body(c, &mut out, width)
             }
@@ -1220,7 +1222,7 @@ impl App {
             }
             Some((List::Work, Row::Work(w))) => match &w.incarnation {
                 Some(i) => incarnation_body(i, self.now(), &mut out, width),
-                None => push_text(&mut out, "no incarnation evidence".to_owned(), width),
+                None => push_text(&mut out, "no branch history recorded".to_owned(), width),
             },
             Some((List::Work, Row::History(_, h))) => {
                 incarnation_body(h, self.now(), &mut out, width)
@@ -1274,49 +1276,16 @@ impl App {
         );
     }
 
-    /// A Work row's fields - the incarnation's evidence, worktree, the
+    /// A Work row's fields - the branch identity block, worktree, the
     /// delivery readings against the proven base, upstream, forge, tmux,
-    /// activity, same-name history, and both independent cleanup
+    /// activity, and both independent cleanup
     /// verdicts with their blockers. A gone row leads with what vanished
     /// and everything still referencing it.
     fn work_body(&self, w: &WorkRow, out: &mut Vec<Line<'static>>, width: usize) {
         let now = self.now();
         push_text(out, format!("repo: {}", w.repo_name), width);
         if let Some(i) = &w.incarnation {
-            push_head(out, "incarnation:".to_owned(), width);
-            push_text(
-                out,
-                format!("  {}#{} · id {}", i.ref_name, i.number, i.id),
-                width,
-            );
-            let ended = i
-                .ended_at
-                .map_or_else(|| "open".to_owned(), |_| age(now, i.ended_at));
-            push_text(
-                out,
-                format!(
-                    "  observed {} - {} · ended {}",
-                    age(now, Some(i.first_observed_at)),
-                    age(now, Some(i.last_observed_at)),
-                    ended
-                ),
-                width,
-            );
-            push_text(
-                out,
-                format!(
-                    "  ref creation {} · tip {} · created {}",
-                    sha(&i.creation_head),
-                    sha(&i.head),
-                    age(now, i.creation_at)
-                ),
-                width,
-            );
-            push_text(
-                out,
-                format!("  continuity: {}", i.continuity.as_str()),
-                width,
-            );
+            branch_summary(i, &w.same_name_history, now, out, width);
         }
         if let Some(gone) = &w.gone {
             push_text(out, format!("gone: {gone}"), width);
@@ -1429,21 +1398,6 @@ impl App {
                 now.saturating_mul(1000),
             ) {
                 push_text(out, line, width);
-            }
-        }
-        if !w.same_name_history.is_empty() {
-            push_head(out, "same-name history:".to_owned(), width);
-            for h in &w.same_name_history {
-                push_text(
-                    out,
-                    format!(
-                        "  {}#{} · ended {}",
-                        h.ref_name,
-                        h.number,
-                        age(now, h.ended_at)
-                    ),
-                    width,
-                );
             }
         }
         push_head(out, format!("commits not on {}:", opt(&w.base)), width);
@@ -1575,7 +1529,7 @@ impl App {
             format!("forge: {}", forge.unwrap_or_else(|| "?".to_owned())),
             width,
         );
-        push_head(out, "branch incarnations touched:".to_owned(), width);
+        push_head(out, "branches touched:".to_owned(), width);
         if c.touches.is_empty() {
             push_text(out, "  none".to_owned(), width);
         }
@@ -1586,9 +1540,13 @@ impl App {
             push_text(
                 out,
                 format!(
-                    "  {}#{} · {} → {} · head {} · files ? · commits ? · created repo ? · {} · {}",
-                    t.ref_name,
-                    t.incarnation,
+                    "  {} · {} → {} · head {} · files ? · commits ? · created repo ? · {} · {}",
+                    ordinal_name(
+                        t.ref_name.as_str(),
+                        t.incarnation,
+                        t.lives,
+                        OrdinalStyle::Suffix
+                    ),
                     age(now, Some(t.valid_from)),
                     until,
                     sha(&t.head),
@@ -1611,7 +1569,7 @@ impl App {
                 RelationStrength::ProcessAncestry,
                 "  lineage - observed process ancestry:",
             ),
-            (RelationStrength::SameIncarnation, "  same incarnation:"),
+            (RelationStrength::SameIncarnation, "  same branch:"),
         ] {
             let mut group = c
                 .related
@@ -1623,15 +1581,33 @@ impl App {
             }
             push_head(out, header.to_owned(), width);
             for r in group {
+                // A same-branch relation spells its evidence from the
+                // structured touch alone - a missing one is an honest
+                // `?`, never the label or provenance text.
+                let relation = if r.strength == RelationStrength::SameIncarnation {
+                    match &r.touch {
+                        Some(t) => format!(
+                            "touch {}",
+                            ordinal_name(
+                                t.ref_name.as_str(),
+                                t.number,
+                                t.lives,
+                                OrdinalStyle::Suffix
+                            )
+                        ),
+                        None => "touch ?".to_owned(),
+                    }
+                } else {
+                    format!("{} · {}", r.label, r.provenance)
+                };
                 push_text(
                     out,
                     format!(
-                        "    {} {} {} - {} · {} · {}",
+                        "    {} {} {} - {} · {}",
                         r.attention.glyph(),
                         r.short_id,
                         r.title.as_deref().unwrap_or("?"),
-                        r.label,
-                        r.provenance,
+                        relation,
                         age(now, r.state_since)
                     ),
                     width,
@@ -1959,9 +1935,9 @@ impl App {
                     label, excluded, ..
                 }) => {
                     let state = if *excluded {
-                        "excluded history"
+                        "earlier branch"
                     } else {
-                        "current incarnation"
+                        "current branch"
                     };
                     format!("[3] Conversations  {label} · {state}")
                 }
@@ -2031,7 +2007,7 @@ fn scope_of(w: &WorkRow) -> WorkScope {
         (_, _, Some(branch)) => WorkScope::Incarnation {
             id: w.identity.clone().unwrap_or_default(),
             label: match w.incarnation.as_ref() {
-                Some(i) => format!("{}#{}", branch, i.number),
+                Some(i) => ordinal_name(branch, i.number, i.lives, OrdinalStyle::Suffix),
                 None => branch.clone(),
             },
             // A gone row's incarnation is closed: it scopes like history.
@@ -2055,7 +2031,7 @@ enum WorkScope {
     /// with a touch to exactly this id.
     Incarnation {
         id: String,
-        /// `<branch>#N` for the [3] title.
+        /// The branch's compact-ordinal name for the [3] title.
         label: String,
         /// Whether the row scopes to a retained earlier incarnation.
         excluded: bool,
@@ -2172,32 +2148,65 @@ fn work_glyph(w: &WorkRow) -> &'static str {
     w.attention.glyph()
 }
 
-/// The work row's label: `name#N ⌂worktree`, prefixed with the repo's
+/// Where a life's ordinal sits in its label: the detail's `branch:` line
+/// leads with it (`2nd feat/login`), compact labels trail it
+/// (`feat/login (2nd)`), and an earlier life's label counts the retained
+/// lives (`feat/login (1st of 2)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrdinalStyle {
+    Prefix,
+    Suffix,
+    History,
+}
+
+/// The English ordinal of life `number` among `lives` retained ones, as
+/// [`crate::snapshot::compact_ordinal_name`] spells it - `None` while a
+/// sole life makes the ordinal noise.
+fn ordinal_text(name: &str, number: usize, lives: usize) -> Option<String> {
+    crate::snapshot::compact_ordinal_name(name, number, lives)
+        .strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix(" ("))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .map(str::to_owned)
+}
+
+/// `name` with its life ordinal in `style`, or the bare name while only
+/// one life is retained - a sole life never carries a number. All styles
+/// spell the ordinal the way [`crate::snapshot::compact_ordinal_name`]
+/// does, so no second English-suffix algorithm exists.
+fn ordinal_name(name: &str, number: usize, lives: usize, style: OrdinalStyle) -> String {
+    match style {
+        OrdinalStyle::Suffix => crate::snapshot::compact_ordinal_name(name, number, lives),
+        _ => match ordinal_text(name, number, lives) {
+            Some(ordinal) if style == OrdinalStyle::Prefix => format!("{ordinal} {name}"),
+            Some(ordinal) => format!("{name} ({ordinal} of {lives})"),
+            None => name.to_owned(),
+        },
+    }
+}
+
+/// The row's branch name in compact-ordinal form: `feat/login (2nd)`, or
+/// the bare name where no incarnation numbers it.
+fn work_branch_name(w: &WorkRow) -> String {
+    match &w.incarnation {
+        Some(i) => ordinal_name(&w.name, i.number, i.lives, OrdinalStyle::Suffix),
+        None => w.name.clone(),
+    }
+}
+
+/// The work row's label: `name ⌂worktree`, prefixed with the repo's
 /// name under the global `all` scope; a project space's workspace is its
 /// name already, so it carries no suffix.
 fn work_name(w: &WorkRow, global: bool) -> String {
-    work_label(w, global, w.incarnation.as_ref().map(|i| i.number))
+    work_label(w, global, &work_branch_name(w))
 }
 
-/// The row's name with its `#N`: `feat#2`, or the bare name where no
-/// incarnation numbers it.
-fn numbered_name(w: &WorkRow) -> String {
-    match &w.incarnation {
-        Some(i) => format!("{}#{}", w.name, i.number),
-        None => w.name.clone(),
-    }
-}
-
-/// `work_name` with the incarnation number spelled out: `name` is the
-/// branch name plus its `#N` when a number is known.
-fn work_label(w: &WorkRow, global: bool, number: Option<usize>) -> String {
+/// `work_name` over a caller-spelled `name` - a work row's compact
+/// ordinal, a history row's `1st of 2` spelling.
+fn work_label(w: &WorkRow, global: bool, name: &str) -> String {
     if w.kind == WorkKind::ProjectSpace {
         return w.name.clone();
     }
-    let name = match number {
-        Some(n) => format!("{}#{}", w.name, n),
-        None => w.name.clone(),
-    };
     let wt = w
         .worktree
         .as_ref()
@@ -2212,10 +2221,11 @@ fn work_label(w: &WorkRow, global: bool, number: Option<usize>) -> String {
 }
 
 /// The conversation's dim second line under the global work scope:
-/// `a#N → b#M` when its ordered distinct touches name several in-scope
-/// incarnations, else the `repo · branch#N · worktree` context of the one
+/// `a → b` when its ordered distinct touches name several in-scope
+/// incarnations, else the `repo · branch · worktree` context of the one
 /// it carries - or its bare repo/worktree context when it touched none.
-/// `repo_scope` narrows "in scope" to touches in the selected repo.
+/// Each leg spells its branch in compact-ordinal form. `repo_scope`
+/// narrows "in scope" to touches in the selected repo.
 fn conversation_context(c: &ConversationRow, repo_scope: Option<&str>) -> Option<String> {
     let mut distinct: Vec<&crate::snapshot::TouchRow> = Vec::new();
     for t in &c.touches {
@@ -2236,10 +2246,11 @@ fn conversation_context(c: &ConversationRow, repo_scope: Option<&str>) -> Option
         .len()
         > 1;
     let label = |t: &crate::snapshot::TouchRow| {
+        let name = ordinal_name(&t.ref_name, t.incarnation, t.lives, OrdinalStyle::Suffix);
         if multi_repo {
-            format!("{}/{}#{}", repo_label(&t.repo), t.ref_name, t.incarnation)
+            format!("{}/{}", repo_label(&t.repo), name)
         } else {
-            format!("{}#{}", t.ref_name, t.incarnation)
+            name
         }
     };
     if distinct.len() > 1 {
@@ -2253,7 +2264,7 @@ fn conversation_context(c: &ConversationRow, repo_scope: Option<&str>) -> Option
     } else if let Some(t) = distinct.first() {
         let mut parts = vec![
             repo_label(&t.repo),
-            format!("{}#{}", t.ref_name, t.incarnation),
+            ordinal_name(&t.ref_name, t.incarnation, t.lives, OrdinalStyle::Suffix),
         ];
         if let Some(wt) = &c.worktree {
             parts.push(path_label(wt));
@@ -2551,7 +2562,10 @@ fn event_groups<E>(
             for event in events.iter().take(EVENT_DISPLAY_PER_SOURCE) {
                 let when = age_ms(now_ms, at(event));
                 for reason in reasons(event) {
-                    lines.push(format!("    {when} {}", escape_text(reason)));
+                    lines.push(format!(
+                        "    {when} {}",
+                        escape_text(display_reason(reason))
+                    ));
                 }
             }
             (newest, source, lines)
@@ -2620,7 +2634,10 @@ fn git_state_lines(events: &[store::ObservationEvent], now_ms: u64) -> Vec<Strin
     for event in sorted.iter().take(EVENT_DISPLAY_PER_SOURCE) {
         let when = age_ms(now_ms, event.observed_at_ms);
         for reason in &event.reasons {
-            lines.push(format!("    observed {when} {}", escape_text(reason)));
+            lines.push(format!(
+                "    observed {when} {}",
+                escape_text(display_reason(reason))
+            ));
         }
     }
     lines
@@ -2631,51 +2648,253 @@ fn age_ms(now_ms: u64, then_ms: u64) -> String {
     age(now_ms / 1000, Some(then_ms / 1000))
 }
 
-/// An incarnation's evidence block: the record's dates, creation
-/// evidence, tip and continuity decision - the same block a work row
-/// embeds and a history row's whole body.
-fn incarnation_body(i: &IncarnationRow, now: u64, out: &mut Vec<Line<'static>>, width: usize) {
-    push_head(out, "incarnation:".to_owned(), width);
-    push_text(
-        out,
-        format!("  {}#{} · id {}", i.ref_name, i.number, i.id),
-        width,
-    );
-    push_text(
-        out,
-        format!("  ref: {} · repo {}", i.ref_name, i.repo),
-        width,
-    );
-    let ended = i
-        .ended_at
-        .map_or_else(|| "open".to_owned(), |_| age(now, i.ended_at));
+/// An observation reason as the view spells it: the legacy
+/// boundary-close spelling maps to the current one at render - stored
+/// history is never rewritten.
+fn display_reason(reason: &str) -> &str {
+    if reason == store::REASON_INCARNATION_CHANGED {
+        store::REASON_BRANCH_REPLACED
+    } else {
+        reason
+    }
+}
+
+/// How a closed record ended, as a verb: `deleted` when the ref went
+/// absent, `replaced` when a boundary closed it under a live ref, and
+/// `ended` when the closing observation is not retained.
+fn end_verb(i: &IncarnationRow) -> &'static str {
+    match i.ended_by {
+        Some(crate::snapshot::EndedBy::Gone) => "deleted",
+        Some(crate::snapshot::EndedBy::Replaced) => "replaced",
+        None => "ended",
+    }
+}
+
+/// The `<verb> <age> ago` tail a header carries for a closed record, or
+/// the bare verb when no end time survived.
+fn ended_label(i: &IncarnationRow, now: u64) -> String {
+    match i.ended_at {
+        Some(at) => format!("{} {} ago", end_verb(i), age(now, Some(at))),
+        None => end_verb(i).to_owned(),
+    }
+}
+
+/// What a continuity decision spelled on the wire means, in one clause.
+fn continuity_gloss(continuity: store::ContinuityEvidence) -> &'static str {
+    match continuity {
+        store::ContinuityEvidence::FirstObservation => {
+            "first seen without earlier continuity evidence"
+        }
+        store::ContinuityEvidence::SameReflogCreation => "creation matched the reflog",
+        store::ContinuityEvidence::ProvenRename => "rename proved this is the same branch",
+        store::ContinuityEvidence::ForcePush => "tip moved off the earlier history",
+        store::ContinuityEvidence::Ambiguous => "continuity with the earlier branch was not proven",
+    }
+}
+
+/// A wrapped attention line into the detail body, `!`-styled.
+fn push_attention(out: &mut Vec<Line<'static>>, text: String, width: usize) {
+    for line in wrap_text(&text, width) {
+        out.push(Line::from(Span::styled(line, glyph_style("!"))));
+    }
+}
+
+/// The work detail's `branch:` block: one line naming the life in
+/// ordinal prefix form when the name has several retained lives, the
+/// proven rename, the proven creation or first sighting, and the latest
+/// rewrite - then the earlier-lives line, or the `!` warning that takes
+/// its place when continuity with the earlier branch is unproven.
+fn branch_summary(
+    i: &IncarnationRow,
+    earlier: &[IncarnationRow],
+    now: u64,
+    out: &mut Vec<Line<'static>>,
+    width: usize,
+) {
+    let mut parts: Vec<String> = Vec::new();
+    if i.lives > 1 {
+        parts.push(ordinal_name(
+            &i.ref_name,
+            i.number,
+            i.lives,
+            OrdinalStyle::Prefix,
+        ));
+    }
+    match &i.renamed {
+        Some(r) => parts.push(format!(
+            "renamed from {} {} ago",
+            r.from,
+            age(now, Some(r.at))
+        )),
+        None if i.continuity == store::ContinuityEvidence::ProvenRename => {
+            parts.push("renamed (earlier name not recorded)".to_owned())
+        }
+        None => {}
+    }
+    match (i.creation_at, &i.creation_head) {
+        (Some(at), Some(head)) => parts.push(format!(
+            "created {} ago from {}",
+            age(now, Some(at)),
+            sha(&Some(head.clone()))
+        )),
+        _ => parts.push(format!(
+            "first seen {} ago",
+            age(now, Some(i.first_observed_at))
+        )),
+    }
+    match &i.rewritten {
+        Some(r) => parts.push(match r.dated {
+            store::RewriteDating::Reflog => {
+                format!("history rewritten {} ago", age(now, Some(r.at)))
+            }
+            store::RewriteDating::Observed => {
+                format!("seen rewritten {} ago", age(now, Some(r.at)))
+            }
+        }),
+        None if i.continuity == store::ContinuityEvidence::ForcePush => {
+            parts.push("history rewritten".to_owned())
+        }
+        None => {}
+    }
+    push_text(out, format!("branch: {}", parts.join(" · ")), width);
+    if i.continuity == store::ContinuityEvidence::Ambiguous {
+        let text = if earlier.is_empty() {
+            format!(
+                "! not proven to be an earlier {} (no longer kept); its activity is kept separate",
+                i.ref_name
+            )
+        } else {
+            format!(
+                "! not proven to be the earlier {}; its activity is kept separate - h",
+                i.ref_name
+            )
+        };
+        push_attention(out, text, width);
+    } else if let Some(last) = earlier
+        .iter()
+        .max_by_key(|h| (h.ended_at, h.last_observed_at))
+    {
+        let text = if earlier.len() == 1 {
+            format!(
+                "1 earlier {} not counted here ({}) - h",
+                i.ref_name,
+                ended_label(last, now)
+            )
+        } else {
+            format!(
+                "{} earlier {} not counted here (last {}) - h",
+                earlier.len(),
+                i.ref_name,
+                ended_label(last, now)
+            )
+        };
+        push_text(out, text, width);
+    }
+}
+
+/// An earlier life's detail body: when it lived and the tip it last
+/// proved, plus the exclusion note - the end verb itself is in the
+/// header, stated once.
+fn history_body(h: &IncarnationRow, now: u64, out: &mut Vec<Line<'static>>, width: usize) {
     push_text(
         out,
         format!(
-            "  observed {} - {} · ended {}",
+            "lived {} ago - {} ago · last tip {}",
+            age(now, Some(h.first_observed_at)),
+            age(now, h.ended_at),
+            sha(&h.head)
+        ),
+        width,
+    );
+    push_text(
+        out,
+        "its conversations and activity are not counted on the current row".to_owned(),
+        width,
+    );
+}
+
+/// The `e` view's labeled raw record: id, the ordinal among retained
+/// lives, the seen range and how it ended, proven creation or first
+/// sighting, the last proven tip, the rename and rewrite evidence, and
+/// the continuity decision in its wire spelling with a one-clause gloss.
+fn incarnation_body(i: &IncarnationRow, now: u64, out: &mut Vec<Line<'static>>, width: usize) {
+    push_head(out, "branch identity record:".to_owned(), width);
+    let identity = match ordinal_text(&i.ref_name, i.number, i.lives) {
+        Some(ordinal) => format!("{ordinal} of {} lives of {}", i.lives, i.ref_name),
+        None => i.ref_name.clone(),
+    };
+    push_text(
+        out,
+        format!("  record id {} · {} in {}", i.id, identity, i.repo),
+        width,
+    );
+    let ended = match i.ended_at {
+        Some(at) => format!("{} {} ago", end_verb(i), age(now, Some(at))),
+        None => "still present".to_owned(),
+    };
+    push_text(
+        out,
+        format!(
+            "  seen by spindle {} ago - {} ago · ended: {}",
             age(now, Some(i.first_observed_at)),
             age(now, Some(i.last_observed_at)),
             ended
         ),
         width,
     );
+    let creation = match (i.creation_at, &i.creation_head) {
+        (Some(at), Some(head)) => format!(
+            "created at {} {} ago (from reflog)",
+            sha(&Some(head.clone())),
+            age(now, Some(at))
+        ),
+        _ => format!("first seen {} ago", age(now, Some(i.first_observed_at))),
+    };
+    push_text(
+        out,
+        format!("  {creation} · last proven tip {}", sha(&i.head)),
+        width,
+    );
+    let mut provenance: Vec<String> = Vec::new();
+    match &i.renamed {
+        Some(r) => provenance.push(format!(
+            "renamed from {} {} ago",
+            r.from,
+            age(now, Some(r.at))
+        )),
+        None if i.continuity == store::ContinuityEvidence::ProvenRename => {
+            provenance.push("renamed (earlier name not recorded)".to_owned())
+        }
+        None => {}
+    }
+    match &i.rewritten {
+        Some(r) => provenance.push(match r.dated {
+            store::RewriteDating::Reflog => {
+                format!("history rewritten {} ago (reflog)", age(now, Some(r.at)))
+            }
+            store::RewriteDating::Observed => {
+                format!("seen rewritten {} ago (observed)", age(now, Some(r.at)))
+            }
+        }),
+        None if i.continuity == store::ContinuityEvidence::ForcePush => {
+            provenance.push("history rewritten".to_owned())
+        }
+        None => {}
+    }
+    if !provenance.is_empty() {
+        push_text(out, format!("  {}", provenance.join(" · ")), width);
+    }
     push_text(
         out,
         format!(
-            "  ref creation {} · at {} · tip {}",
-            sha(&i.creation_head),
-            age(now, i.creation_at),
-            sha(&i.head)
+            "  continuity decision: {} - {}",
+            i.continuity.as_str(),
+            continuity_gloss(i.continuity)
         ),
         width,
     );
-    push_text(
-        out,
-        format!("  continuity: {}", i.continuity.as_str()),
-        width,
-    );
     if i.excluded {
-        push_text(out, "  excluded from the current row".to_owned(), width);
+        push_text(out, "  not counted on the current row".to_owned(), width);
     }
 }
 
@@ -4321,48 +4540,50 @@ mod tests {
             provenance: crate::store::TouchProvenance::Cwd,
             confidence: crate::store::Confidence::Exact,
         };
-        // One touch: `repo · branch#N · worktree`.
+        // One touch: `repo · branch · worktree`.
         let mut c = fixture().conversations[0].clone();
         assert_eq!(
             conversation_context(&c, None).as_deref(),
-            Some("a · feat/login#1 · a-login")
+            Some("a · feat/login · a-login")
         );
-        // A same-incarnation repeat - a head correction - collapses into
+        // A same-branch repeat - a head correction - collapses into
         // the one it corrects, never a second leg of the path.
         c.touches
             .push(touch("i111", "/repos/a/.git", "feat/login", 1));
         assert_eq!(
             conversation_context(&c, None).as_deref(),
-            Some("a · feat/login#1 · a-login")
+            Some("a · feat/login · a-login")
         );
-        // Two incarnations one repo: the ordered path `a#N → b#M`.
-        c.touches
-            .push(touch("i222", "/repos/a/.git", "feat/old", 2));
+        // Two lives of one repo: the ordered path `a → b`, each leg in
+        // compact-ordinal form where the name has several lives.
+        let mut leg = touch("i222", "/repos/a/.git", "feat/old", 2);
+        leg.lives = 3;
+        c.touches.push(leg);
         assert_eq!(
             conversation_context(&c, None).as_deref(),
-            Some("feat/login#1 → feat/old#2")
+            Some("feat/login → feat/old (2nd)")
         );
         // A path crossing repos qualifies each leg with its repo.
         c.touches.push(touch("i9", "/repos/b/.git", "b", 1));
         assert_eq!(
             conversation_context(&c, None).as_deref(),
-            Some("a/feat/login#1 → a/feat/old#2 → b/b#1")
+            Some("a/feat/login → a/feat/old (2nd) → b/b")
         );
         // A repo scope keeps only that repo's legs.
         assert_eq!(
             conversation_context(&c, Some("/repos/a/.git")).as_deref(),
-            Some("feat/login#1 → feat/old#2")
+            Some("feat/login → feat/old (2nd)")
         );
         assert_eq!(
             conversation_context(&c, Some("/repos/b/.git")).as_deref(),
-            Some("b · b#1 · a-login")
+            Some("b · b · a-login")
         );
         // A touch without a worktree resolves the same, shorter.
         let mut c = fixture().conversations[0].clone();
         c.worktree = None;
         assert_eq!(
             conversation_context(&c, None).as_deref(),
-            Some("a · feat/login#1")
+            Some("a · feat/login")
         );
         // No touch at all: the resolved identity is the context, with or
         // without a worktree.
@@ -4419,7 +4640,7 @@ mod tests {
         );
         let text = render_to(&app, 55, 22);
         assert!(text.contains("33cc0bbb"), "{text}");
-        assert!(text.contains("a · feat#1"), "{text}");
+        assert!(text.contains("a · feat"), "{text}");
     }
 
     #[test]
@@ -5049,8 +5270,8 @@ mod tests {
             worktree: None,
             ..fixture().work[1].clone()
         };
-        assert_eq!(work_name(&bare, false), "feat/old#1");
-        assert_eq!(work_name(&bare, true), "a/feat/old#1");
+        assert_eq!(work_name(&bare, false), "feat/old");
+        assert_eq!(work_name(&bare, true), "a/feat/old");
         // Key events map; unbound codes are None.
         use crossterm::event::KeyCode;
         assert_eq!(map_key(KeyCode::Tab), Some(Key::Tab));
@@ -5131,5 +5352,738 @@ mod tests {
         assert_eq!(ref_kind(ReferenceKind::TmuxSession), "session");
         assert_eq!(ref_kind(ReferenceKind::Process), "process");
         assert_eq!(ref_kind(ReferenceKind::AgentSession), "agent");
+    }
+
+    /// The detail body a work-list `cursor` selects, as plain text.
+    fn detail_body(app: &mut App, cursor: usize, width: usize) -> Vec<String> {
+        app.detail_list = List::Work;
+        app.cursor[list_index(List::Work)] = cursor;
+        let view = app.view();
+        app.detail_lines(&view, width)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// A closed earlier life of `feat/login` for history fixtures.
+    fn earlier_life(
+        number: usize,
+        lives: usize,
+        ended_by: Option<crate::snapshot::EndedBy>,
+    ) -> IncarnationRow {
+        let mut h = incarnation("i000", "/repos/a/.git", "feat/login", number);
+        h.lives = lives;
+        h.first_observed_at = 1_800_000_000 - 28 * 86400;
+        h.last_observed_at = 1_800_000_000 - 21 * 86400;
+        h.ended_at = Some(1_800_000_000 - 21 * 86400);
+        h.ended_by = ended_by;
+        h.head = Some("d4e5f6aa".to_owned());
+        h.excluded = true;
+        h
+    }
+
+    /// `w` as the second retained life of `feat/login` with one ended
+    /// earlier life, per `ended_by`.
+    fn two_lives(w: &mut WorkRow, ended_by: Option<crate::snapshot::EndedBy>) {
+        let i = w.incarnation.as_mut().unwrap();
+        i.number = 2;
+        i.lives = 2;
+        w.same_name_history = vec![earlier_life(1, 2, ended_by)];
+    }
+
+    #[test]
+    fn the_branch_block_states_a_plain_life_without_an_ordinal() {
+        // One retained life: no ordinal, no earlier line, one
+        // `branch:` line.
+        let mut snap = fixture();
+        let i = snap.work[0].incarnation.as_mut().unwrap();
+        i.creation_head = Some("a1b2c3d4e5f6".to_owned());
+        i.creation_at = Some(1_800_000_000 - 5 * 86400);
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 120);
+        assert!(
+            lines.contains(&"branch: created 5d ago from a1b2c3d".to_owned()),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("1st") || l.contains("earlier")),
+            "{lines:?}"
+        );
+        let text = render_to(&app, 200, 24);
+        assert!(text.contains("feat/login"), "{text}");
+        assert!(!text.contains("feat/login#"), "{text}");
+        assert!(!text.contains("(1st"), "{text}");
+    }
+
+    #[test]
+    fn the_branch_block_explains_a_reused_name_and_its_earlier_life() {
+        // A reused name: the ordinal prefix, the deleted earlier life
+        // with its `- h` pointer, and no separate same-name section.
+        let mut snap = fixture();
+        two_lives(&mut snap.work[0], Some(crate::snapshot::EndedBy::Gone));
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 120);
+        assert!(
+            lines.contains(&"branch: 2nd feat/login · first seen 2h ago".to_owned()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"1 earlier feat/login not counted here (deleted 21d ago) - h".to_owned()
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("same-name history")),
+            "{lines:?}"
+        );
+        // The gone row before recreation carries the same block.
+        let mut snap = fixture();
+        let gone = &mut snap.work[0];
+        let i = gone.incarnation.as_mut().unwrap();
+        i.lives = 1;
+        i.ended_at = Some(1_800_000_000 - 3600);
+        i.ended_by = Some(crate::snapshot::EndedBy::Gone);
+        gone.gone = Some("branch deleted".to_owned());
+        gone.references = vec![crate::snapshot::ReferenceRow {
+            kind: ReferenceKind::Pane,
+            label: "w:@1.%2".to_owned(),
+        }];
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 120);
+        let branch = lines.iter().position(|l| l.starts_with("branch:"));
+        let gone = lines.iter().position(|l| l.starts_with("gone:"));
+        assert!(
+            branch.is_some() && gone.is_some() && branch < gone,
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_boundary_close_reads_replaced_and_maps_the_legacy_reason() {
+        // A boundary close: the earlier life `replaced`, and a stored
+        // legacy reason renders in the new spelling.
+        let mut snap = fixture();
+        two_lives(&mut snap.work[0], Some(crate::snapshot::EndedBy::Replaced));
+        snap.work[0].observations = vec![store::ObservationEvent {
+            source: store::ObservationSource::Lifecycle,
+            observed_at_ms: (1_800_000_000 - 2 * 3600) * 1000,
+            reasons: vec![store::REASON_INCARNATION_CHANGED.to_owned()],
+            covered_by: None,
+        }];
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 120);
+        assert!(
+            lines.contains(
+                &"1 earlier feat/login not counted here (replaced 21d ago) - h".to_owned()
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("2h branch replaced by a new branch of the same name")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("incarnation changed")),
+            "{lines:?}"
+        );
+        // A pruned closing observation leaves only `ended`.
+        let mut snap = fixture();
+        two_lives(&mut snap.work[0], None);
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 120);
+        assert!(
+            lines.contains(&"1 earlier feat/login not counted here (ended 21d ago) - h".to_owned()),
+            "{lines:?}"
+        );
+        // Several earlier lives count and date by the latest ending.
+        let mut snap = fixture();
+        two_lives(&mut snap.work[0], Some(crate::snapshot::EndedBy::Gone));
+        let mut older = earlier_life(1, 3, Some(crate::snapshot::EndedBy::Replaced));
+        older.number = 1;
+        older.ended_at = Some(1_800_000_000 - 60 * 86400);
+        let w = &mut snap.work[0];
+        w.incarnation.as_mut().unwrap().number = 3;
+        w.incarnation.as_mut().unwrap().lives = 3;
+        w.same_name_history.insert(0, older);
+        for (n, h) in w.same_name_history.iter_mut().enumerate() {
+            h.lives = 3;
+            h.number = n + 1;
+        }
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 120);
+        assert!(
+            lines.contains(
+                &"2 earlier feat/login not counted here (last deleted 21d ago) - h".to_owned()
+            ),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_unproven_boundary_warns_instead_of_the_earlier_line() {
+        // An unprovable boundary: the `!` warning in place of the
+        // earlier-lives line.
+        let mut snap = fixture();
+        two_lives(&mut snap.work[0], Some(crate::snapshot::EndedBy::Replaced));
+        snap.work[0].incarnation.as_mut().unwrap().continuity =
+            store::ContinuityEvidence::Ambiguous;
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 120);
+        assert!(
+            lines.contains(
+                &"! not proven to be the earlier feat/login; its activity is kept separate - h"
+                    .to_owned()
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("not counted here")),
+            "{lines:?}"
+        );
+        // Once the earlier life is pruned: no retained life, so no
+        // ordinal and no `- h`.
+        let mut snap = fixture();
+        snap.work[0].incarnation.as_mut().unwrap().continuity =
+            store::ContinuityEvidence::Ambiguous;
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 120);
+        assert!(
+            lines.contains(&"branch: first seen 2h ago".to_owned()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"! not proven to be an earlier feat/login (no longer kept); its activity is kept separate"
+                    .to_owned()
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("2nd") || l.contains("- h")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn renames_and_rewrites_join_the_branch_line() {
+        // Rename, reflog-dated and observed-dated rewrites, and their
+        // composition.
+        let mut snap = fixture();
+        {
+            let i = snap.work[0].incarnation.as_mut().unwrap();
+            i.creation_head = Some("a1b2c3d4e5f6".to_owned());
+            i.creation_at = Some(1_800_000_000 - 5 * 86400);
+            i.renamed = Some(crate::snapshot::RenamedRow {
+                from: "feat/auth".to_owned(),
+                at: 1_800_000_000 - 2 * 86400,
+            });
+            i.rewritten = Some(crate::snapshot::RewrittenRow {
+                at: 1_800_000_000 - 2 * 3600,
+                dated: store::RewriteDating::Reflog,
+            });
+        }
+        two_lives(&mut snap.work[0], Some(crate::snapshot::EndedBy::Gone));
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 200);
+        assert!(
+            lines.contains(
+                &"branch: 2nd feat/login · renamed from feat/auth 2d ago · created 5d ago from a1b2c3d · history rewritten 2h ago"
+                    .to_owned()
+            ),
+            "{lines:?}"
+        );
+        // A rename alone: no ordinal on a sole life.
+        let mut snap = fixture();
+        let i = snap.work[0].incarnation.as_mut().unwrap();
+        i.creation_head = Some("a1b2c3d4e5f6".to_owned());
+        i.creation_at = Some(1_800_000_000 - 5 * 86400);
+        i.renamed = Some(crate::snapshot::RenamedRow {
+            from: "feat/auth".to_owned(),
+            at: 1_800_000_000 - 2 * 86400,
+        });
+        i.continuity = store::ContinuityEvidence::ProvenRename;
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 200);
+        assert!(
+            lines.contains(
+                &"branch: renamed from feat/auth 2d ago · created 5d ago from a1b2c3d".to_owned()
+            ),
+            "{lines:?}"
+        );
+        // An observed-dated rewrite hedges as `seen`.
+        let mut snap = fixture();
+        snap.work[0].incarnation.as_mut().unwrap().rewritten =
+            Some(crate::snapshot::RewrittenRow {
+                at: 1_800_000_000 - 3 * 3600,
+                dated: store::RewriteDating::Observed,
+            });
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 200);
+        assert!(
+            lines.contains(&"branch: first seen 2h ago · seen rewritten 3h ago".to_owned()),
+            "{lines:?}"
+        );
+        // A reflog-dated rewrite on a sole force-push-labelled life: no
+        // ordinal, the move carries its proven time.
+        let mut snap = fixture();
+        {
+            let i = snap.work[0].incarnation.as_mut().unwrap();
+            i.creation_head = Some("a1b2c3d4e5f6".to_owned());
+            i.creation_at = Some(1_800_000_000 - 5 * 86400);
+            i.rewritten = Some(crate::snapshot::RewrittenRow {
+                at: 1_800_000_000 - 2 * 3600,
+                dated: store::RewriteDating::Reflog,
+            });
+            i.continuity = store::ContinuityEvidence::ForcePush;
+        }
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 200);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("branch:"))
+                .collect::<Vec<_>>(),
+            vec![&"branch: created 5d ago from a1b2c3d · history rewritten 2h ago".to_owned()],
+            "{lines:?}"
+        );
+        // A rewrite composes with the unproven-boundary warning.
+        let mut snap = fixture();
+        two_lives(&mut snap.work[0], Some(crate::snapshot::EndedBy::Replaced));
+        {
+            let i = snap.work[0].incarnation.as_mut().unwrap();
+            i.continuity = store::ContinuityEvidence::Ambiguous;
+            i.creation_head = Some("a1b2c3d4e5f6".to_owned());
+            i.creation_at = Some(1_800_000_000 - 5 * 86400);
+            i.rewritten = Some(crate::snapshot::RewrittenRow {
+                at: 1_800_000_000 - 2 * 3600,
+                dated: store::RewriteDating::Reflog,
+            });
+        }
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 200);
+        assert!(
+            lines.contains(
+                &"branch: 2nd feat/login · created 5d ago from a1b2c3d · history rewritten 2h ago"
+                    .to_owned()
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"! not proven to be the earlier feat/login; its activity is kept separate - h"
+                    .to_owned()
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("not counted here")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_records_fall_back_to_honest_wording() {
+        // Legacy records: a proven rename without a recorded source
+        // name, a force-push-labelled rewrite without a time, and no
+        // proven creation.
+        let mut snap = fixture();
+        let i = snap.work[0].incarnation.as_mut().unwrap();
+        i.continuity = store::ContinuityEvidence::ProvenRename;
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 200);
+        assert!(
+            lines.contains(
+                &"branch: renamed (earlier name not recorded) · first seen 2h ago".to_owned()
+            ),
+            "{lines:?}"
+        );
+        let mut snap = fixture();
+        snap.work[0].incarnation.as_mut().unwrap().continuity =
+            store::ContinuityEvidence::ForcePush;
+        let mut app = App::new(snap);
+        let lines = detail_body(&mut app, 1, 200);
+        assert!(
+            lines.contains(&"branch: first seen 2h ago · history rewritten".to_owned()),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("history rewritten ")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_branch_line_wraps_within_the_pane_width() {
+        // At a narrow width every wrapped cell stays inside and the
+        // parts reassemble into the full line.
+        let mut i = incarnation("i111", "/repos/a/.git", "feat/login", 2);
+        i.lives = 2;
+        i.creation_head = Some("a1b2c3d4e5f6".to_owned());
+        i.creation_at = Some(1_800_000_000 - 5 * 86400);
+        i.renamed = Some(crate::snapshot::RenamedRow {
+            from: "feat/auth".to_owned(),
+            at: 1_800_000_000 - 2 * 86400,
+        });
+        i.rewritten = Some(crate::snapshot::RewrittenRow {
+            at: 1_800_000_000 - 2 * 3600,
+            dated: store::RewriteDating::Reflog,
+        });
+        let earlier = vec![earlier_life(1, 2, Some(crate::snapshot::EndedBy::Gone))];
+        let mut out = Vec::new();
+        branch_summary(&i, &earlier, 1_800_000_000, &mut out, 30);
+        let lines: Vec<String> = out
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(lines.len() > 2, "{lines:?}");
+        assert!(out.iter().all(|l| l.width() <= 30), "{lines:?}");
+        let branch_text = "branch: 2nd feat/login · renamed from feat/auth 2d ago · created 5d ago from a1b2c3d · history rewritten 2h ago";
+        let mut assembled = String::new();
+        let mut consumed = 0;
+        for line in &lines {
+            if assembled.len() < branch_text.len() {
+                assembled.push_str(line);
+                consumed += 1;
+            }
+        }
+        assert_eq!(assembled, branch_text, "{lines:?}");
+        assert_eq!(
+            lines[consumed..].concat(),
+            "1 earlier feat/login not counted here (deleted 21d ago) - h"
+        );
+    }
+
+    #[test]
+    fn a_history_row_names_the_earlier_life_and_its_end() {
+        // F: list row, title, header and body for an earlier life.
+        let mut snap = fixture();
+        two_lives(&mut snap.work[0], Some(crate::snapshot::EndedBy::Gone));
+        let mut app = App::new(snap);
+        app.history = true;
+        let text = render_to(&app, 120, 24);
+        assert!(text.contains("feat/login (1st of 2)"), "{text}");
+        assert!(text.contains("earlier"), "{text}");
+        assert!(!text.contains("excluded"), "{text}");
+        let lines = detail_body(&mut app, 2, 120);
+        assert!(
+            lines.contains(&"lived 28d ago - 21d ago · last tip d4e5f6a".to_owned()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"its conversations and activity are not counted on the current row".to_owned()
+            ),
+            "{lines:?}"
+        );
+        let (title, header) = {
+            app.detail_list = List::Work;
+            app.cursor[list_index(List::Work)] = 2;
+            let view = app.view();
+            app.detail_header(&view)
+        };
+        assert_eq!(title, "[4] Work - feat/login (1st of 2)");
+        let header: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(header, "  earlier feat/login (1st of 2) · deleted 21d ago");
+        // The scoped conversations title names the earlier branch.
+        let view = app.view();
+        match &view.work_scope {
+            Some(WorkScope::Incarnation {
+                label, excluded, ..
+            }) => {
+                assert_eq!(label, "feat/login (1st of 2)");
+                assert!(*excluded);
+            }
+            _ => panic!("a history row scopes to its branch life"), // coverage: off - cursor 2 always lands on the injected history row
+        }
+    }
+
+    #[test]
+    fn the_evidence_view_labels_the_branch_identity_record() {
+        // `e` on a work row: the labeled record with gloss.
+        let mut i = incarnation("i111", "/repos/a/.git", "feat/login", 2);
+        i.lives = 2;
+        i.creation_head = Some("a1b2c3d4e5f6".to_owned());
+        i.creation_at = Some(1_800_000_000 - 5 * 86400);
+        i.head = Some("d4e5f6aa".to_owned());
+        i.renamed = Some(crate::snapshot::RenamedRow {
+            from: "feat/auth".to_owned(),
+            at: 1_800_000_000 - 2 * 86400,
+        });
+        i.rewritten = Some(crate::snapshot::RewrittenRow {
+            at: 1_800_000_000 - 2 * 3600,
+            dated: store::RewriteDating::Reflog,
+        });
+        i.continuity = store::ContinuityEvidence::ProvenRename;
+        let mut out = Vec::new();
+        incarnation_body(&i, 1_800_000_000, &mut out, 200);
+        let lines: Vec<String> = out
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(lines[0], "branch identity record:");
+        assert_eq!(
+            lines[1],
+            "  record id i111 · 2nd of 2 lives of feat/login in /repos/a/.git"
+        );
+        assert_eq!(
+            lines[2],
+            "  seen by spindle 2h ago - 2m ago · ended: still present"
+        );
+        assert_eq!(
+            lines[3],
+            "  created at a1b2c3d 5d ago (from reflog) · last proven tip d4e5f6a"
+        );
+        assert_eq!(
+            lines[4],
+            "  renamed from feat/auth 2d ago · history rewritten 2h ago (reflog)"
+        );
+        assert_eq!(
+            lines[5],
+            "  continuity decision: proven_rename - rename proved this is the same branch"
+        );
+        // Every continuity gloss and end verb.
+        for (continuity, gloss) in [
+            (
+                store::ContinuityEvidence::FirstObservation,
+                "first_observation - first seen without earlier continuity evidence",
+            ),
+            (
+                store::ContinuityEvidence::SameReflogCreation,
+                "same_reflog_creation - creation matched the reflog",
+            ),
+            (
+                store::ContinuityEvidence::ProvenRename,
+                "proven_rename - rename proved this is the same branch",
+            ),
+            (
+                store::ContinuityEvidence::ForcePush,
+                "force_push - tip moved off the earlier history",
+            ),
+            (
+                store::ContinuityEvidence::Ambiguous,
+                "ambiguous - continuity with the earlier branch was not proven",
+            ),
+        ] {
+            let mut i = incarnation("i9", "/repos/a/.git", "feat", 1);
+            i.continuity = continuity;
+            let mut out = Vec::new();
+            incarnation_body(&i, 1_800_000_000, &mut out, 200);
+            let text: String = out
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                text.contains(&format!("continuity decision: {gloss}")),
+                "{text}"
+            );
+            // A sole life carries no ordinal in the record either.
+            assert!(
+                text.contains("record id i9 · feat in /repos/a/.git"),
+                "{text}"
+            );
+        }
+        for (ended_by, verb) in [
+            (
+                Some(crate::snapshot::EndedBy::Gone),
+                "ended: deleted 2h ago",
+            ),
+            (
+                Some(crate::snapshot::EndedBy::Replaced),
+                "ended: replaced 2h ago",
+            ),
+            (None, "ended: ended 2h ago"),
+        ] {
+            let mut i = incarnation("i9", "/repos/a/.git", "feat", 1);
+            i.ended_at = Some(1_800_000_000 - 7200);
+            i.ended_by = ended_by;
+            let mut out = Vec::new();
+            incarnation_body(&i, 1_800_000_000, &mut out, 200);
+            let text: String = out
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(verb), "{text}");
+        }
+        // No evidence at all: first-seen fallback and an excluded note.
+        let mut i = incarnation("i9", "/repos/a/.git", "feat", 1);
+        i.excluded = true;
+        let mut out = Vec::new();
+        incarnation_body(&i, 1_800_000_000, &mut out, 200);
+        let text: String = out
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("first seen 2h ago · last proven tip ?"),
+            "{text}"
+        );
+        assert!(text.contains("not counted on the current row"), "{text}");
+        // Observed-dated rewrite in the raw record.
+        let mut i = incarnation("i9", "/repos/a/.git", "feat", 1);
+        i.rewritten = Some(crate::snapshot::RewrittenRow {
+            at: 1_800_000_000 - 3600,
+            dated: store::RewriteDating::Observed,
+        });
+        let mut out = Vec::new();
+        incarnation_body(&i, 1_800_000_000, &mut out, 200);
+        let text: String = out
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("seen rewritten 60m ago (observed)"), "{text}");
+        // A closed record whose end time itself did not survive carries
+        // the bare verb.
+        let mut h = incarnation("i8", "/repos/a/.git", "feat", 1);
+        h.ended_by = Some(crate::snapshot::EndedBy::Gone);
+        assert_eq!(ended_label(&h, 1_800_000_000), "deleted");
+        h.ended_by = None;
+        assert_eq!(ended_label(&h, 1_800_000_000), "ended");
+    }
+
+    #[test]
+    fn a_conversation_spells_touched_lives_and_same_branch_evidence() {
+        // Touches across two lives carry ordinals, the same-branch
+        // relation renders its structured touch, and titles/scopes take
+        // the compact form.
+        let mut snap = fixture();
+        two_lives(&mut snap.work[0], Some(crate::snapshot::EndedBy::Gone));
+        let c = &mut snap.conversations[0];
+        let mut t1 = touch("i000", "/repos/a/.git", "feat/login");
+        t1.incarnation = 1;
+        t1.lives = 2;
+        t1.valid_until = Some(1_800_000_000 - 21 * 86400);
+        let mut t2 = touch("i111", "/repos/a/.git", "feat/login");
+        t2.incarnation = 2;
+        t2.lives = 2;
+        c.touches = vec![t1, t2];
+        c.related = vec![
+            crate::snapshot::RelatedRow {
+                strength: RelationStrength::SameIncarnation,
+                label: "legacy label".to_owned(),
+                provenance: "legacy provenance".to_owned(),
+                touch: Some(crate::snapshot::RelatedTouch {
+                    incarnation_id: "i111".to_owned(),
+                    ref_name: "feat/login".to_owned(),
+                    number: 2,
+                    lives: 2,
+                }),
+                provider: Provider::Claude,
+                session_id: "44dd0bbb-1111-2222-3333-444444444444".to_owned(),
+                short_id: "44dd0bbb".to_owned(),
+                title: Some("shared the branch".to_owned()),
+                attention: Attention::None,
+                state_since: Some(1_800_000_000 - 60),
+            },
+            crate::snapshot::RelatedRow {
+                strength: RelationStrength::SameIncarnation,
+                label: "legacy label".to_owned(),
+                provenance: "legacy provenance".to_owned(),
+                touch: None,
+                provider: Provider::Claude,
+                session_id: "55ee0bbb-1111-2222-3333-444444444444".to_owned(),
+                short_id: "55ee0bbb".to_owned(),
+                title: None,
+                attention: Attention::None,
+                state_since: None,
+            },
+        ];
+        let mut app = App::new(snap);
+        app.detail_list = List::Conversations;
+        app.cursor[list_index(List::Conversations)] = 1;
+        let view = app.view();
+        let lines: Vec<String> = app
+            .detail_lines(&view, 200)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let text = lines.join("\n");
+        assert!(text.contains("branches touched:"), "{text}");
+        assert!(text.contains("feat/login (1st)"), "{text}");
+        assert!(text.contains("feat/login (2nd)"), "{text}");
+        assert!(!text.contains("incarnations touched"), "{text}");
+        assert!(!text.contains("feat/login#"), "{text}");
+        assert!(text.contains("same branch:"), "{text}");
+        assert!(text.contains("touch feat/login (2nd)"), "{text}");
+        assert!(text.contains("touch ?"), "{text}");
+        assert!(!text.contains("legacy label"), "{text}");
+        assert!(!text.contains("legacy provenance"), "{text}");
+        // List label, detail title and scope all take the compact ordinal.
+        let text = render_to(&app, 120, 24);
+        assert_eq!(
+            work_name(&app.snapshot.work[0], true),
+            "a/feat/login (2nd) ⌂a-login"
+        );
+        assert!(
+            text.contains("[4] Conversation - update pane labels"),
+            "{text}"
+        );
+        app.detail_list = List::Work;
+        app.cursor[list_index(List::Work)] = 1;
+        let view = app.view();
+        let (title, _) = app.detail_header(&view);
+        assert_eq!(title, "[4] Work - feat/login (2nd)");
+        match &view.work_scope {
+            Some(WorkScope::Incarnation {
+                label, excluded, ..
+            }) => {
+                assert_eq!(label, "feat/login (2nd)");
+                assert!(!excluded);
+            }
+            _ => panic!("a branch row scopes to its incarnation"), // coverage: off - the work row always carries its incarnation
+        }
+        let title = app.panel_title(Pane::Conversations, &view);
+        assert_eq!(
+            title,
+            "[3] Conversations  feat/login (2nd) · current branch"
+        );
     }
 }

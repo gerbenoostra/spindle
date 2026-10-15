@@ -272,8 +272,8 @@ fn work_detail_shows_incarnation_delivery_upstream_forge_and_cleanup() {
     press(&mut app, &[Key::Char('2'), Key::Char('j')]);
     for width in [55, 200] {
         let text = render(&app, width, 40);
-        assert!(text.contains("incarnation:"), "{text}");
-        assert!(text.contains("feat/login#1"), "{text}");
+        assert!(text.contains("branch: created 2h ago"), "{text}");
+        assert!(!text.contains("feat/login#"), "{text}");
         assert!(text.contains("worktree:"), "{text}");
         assert!(text.contains("local:"), "{text}");
         assert!(text.contains("remote:"), "{text}");
@@ -896,10 +896,11 @@ fn conversation_detail_lists_touches_relations_and_last_prompts() {
     assert!(text.contains("lineage - provider declared:"), "{text}");
     assert!(text.contains("observed process ancestry"), "{text}");
     assert!(!text.contains("pane-creation"), "{text}");
-    assert!(text.contains("same incarnation:"), "{text}");
+    assert!(text.contains("same branch:"), "{text}");
+    assert!(text.contains("touch feat/login"), "{text}");
     assert!(
         at("lineage - provider declared:") < at("observed process ancestry")
-            && at("observed process ancestry") < at("same incarnation:"),
+            && at("observed process ancestry") < at("same branch:"),
         "{text}"
     );
     // Prompts are escaped and truncated to one line each.
@@ -1029,15 +1030,18 @@ fn evidence_on_work_shows_the_incarnation_continuity_verdict() {
     let text = render(&app, 200, 50);
     assert!(text.contains("[4] Evidence"), "{text}");
     assert!(text.contains("same_reflog_creation"), "{text}");
-    assert!(text.contains("ref creation aaa1111"), "{text}");
-    assert!(text.contains("tip ccc3333"), "{text}");
+    assert!(text.contains("created at aaa1111"), "{text}");
+    assert!(text.contains("last proven tip ccc3333"), "{text}");
     // A history row shows the same evidence block for its own record.
     let mut snapshot = fixture();
     let mut closed = incarnation("i000", "feat/login", 1);
     closed.ended_at = Some(NOW - 3600);
     closed.excluded = true;
+    closed.lives = 2;
     snapshot.work[0].same_name_history = vec![closed];
-    snapshot.work[0].incarnation.as_mut().unwrap().number = 2;
+    let active = snapshot.work[0].incarnation.as_mut().unwrap();
+    active.number = 2;
+    active.lives = 2;
     let mut app = App::new(snapshot);
     press(
         &mut app,
@@ -1051,19 +1055,22 @@ fn evidence_on_work_shows_the_incarnation_continuity_verdict() {
     // Walk [2] until the cursor lands on the history row itself.
     for _ in 0..8 {
         let text = render(&app, 200, 50);
-        if text.contains("[4] Work - feat/login#1") {
+        if text.contains("[4] Work - feat/login (1st of 2)") {
             break;
         }
         app.key(Key::Char('j'));
     }
     let text = render(&app, 200, 50);
-    assert!(text.contains("[4] Work - feat/login#1"), "{text}");
-    assert!(text.contains("excluded"), "{text}");
+    assert!(text.contains("[4] Work - feat/login (1st of 2)"), "{text}");
+    assert!(text.contains("earlier feat/login (1st of 2)"), "{text}");
     press(&mut app, &[Key::Char('e')]);
     let text = render(&app, 200, 50);
-    assert!(text.contains("[4] Evidence - feat/login#1"), "{text}");
-    assert!(text.contains("continuity:"), "{text}");
-    assert!(text.contains("excluded"), "{text}");
+    assert!(
+        text.contains("[4] Evidence - feat/login (1st of 2)"),
+        "{text}"
+    );
+    assert!(text.contains("continuity decision:"), "{text}");
+    assert!(text.contains("not counted on the current row"), "{text}");
 }
 
 #[test]
@@ -1341,7 +1348,7 @@ fn evidence_on_a_space_or_incarnationless_row_is_honest() {
     let mut app = App::new(snapshot);
     press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char('e')]);
     let text = render(&app, 200, 40);
-    assert!(text.contains("no incarnation evidence"), "{text}");
+    assert!(text.contains("no branch history recorded"), "{text}");
 }
 
 /// A journal record the fold rejected shows up in the emitted snapshot's

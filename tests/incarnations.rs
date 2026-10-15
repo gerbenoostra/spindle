@@ -1020,59 +1020,60 @@ fn the_history_rows_render_excluded_and_scope_their_own_conversations() {
     // is where the row and its history list.
     let mut app = App::new(snapshot);
     let text = render(&app, 200, 30);
-    assert!(!text.contains("excluded"), "{text}");
+    assert!(!text.contains("earlier"), "{text}");
     press(&mut app, &[Key::Char('1'), Key::Char('j')]);
     app.key(Key::Char('h'));
     let text = render(&app, 200, 30);
-    assert!(text.contains("feat#2"), "{text}");
-    assert!(text.contains("feat#1"), "{text}");
-    assert_eq!(text.matches("excluded").count(), 1, "{text}");
+    assert!(text.contains("feat (2nd)"), "{text}");
+    assert!(text.contains("feat (1st of 2)"), "{text}");
+    assert_eq!(text.matches("earlier").count(), 1, "{text}");
 
-    // The excluded row is selectable; [3] titles it as excluded history
-    // and scopes to exactly its touches - the two convs that rode feat#1.
+    // The earlier row is selectable; [3] titles it as an earlier branch
+    // and scopes to exactly its touches - the two convs that rode the
+    // first life.
     press(&mut app, &[Key::Char('2')]);
-    let text = until_conv_title(&mut app, "feat#1 · excluded history");
+    let text = until_conv_title(&mut app, "feat (1st of 2) · earlier branch");
     assert!(text.contains(&CONV[..8]), "{text}");
     assert!(text.contains(&THIRD[..8]), "{text}");
     assert!(!text.contains(&OTHER[..8]), "{text}");
     // The active row claims its own scope: current incarnation, nothing
     // bound - its historical namesakes stayed out.
-    let text = until_conv_title_back(&mut app, "feat#2 · current incarnation");
+    let text = until_conv_title_back(&mut app, "feat (2nd) · current branch");
     assert!(!text.contains(&CONV[..8]), "{text}");
 
     // `h` off while on the history row: the hidden id falls back to
     // `all` rather than retargeting whatever row now shares its index.
-    let _ = until_conv_title(&mut app, "feat#1 · excluded history");
+    let _ = until_conv_title(&mut app, "feat (1st of 2) · earlier branch");
     app.key(Key::Char('h'));
     let text = render(&app, 200, 30);
-    assert!(!text.contains("excluded"), "{text}");
-    assert!(!text.contains("feat#1 · excluded history"), "{text}");
+    assert!(!text.contains("earlier"), "{text}");
+    assert!(!text.contains("feat (1st of 2) · earlier branch"), "{text}");
     // `h` back on restores the row; an active selection keeps its
     // identity across the same toggle.
     app.key(Key::Char('h'));
     let text = render(&app, 200, 30);
-    assert!(text.contains("feat#1"), "{text}");
-    let _ = until_conv_title(&mut app, "feat#2 · current incarnation");
+    assert!(text.contains("feat (1st of 2)"), "{text}");
+    let _ = until_conv_title(&mut app, "feat (2nd) · current branch");
     app.key(Key::Char('h'));
     let text = render(&app, 200, 30);
-    assert!(!text.contains("excluded"), "{text}");
-    assert!(text.contains("feat#2 · current incarnation"), "{text}");
+    assert!(!text.contains("· earlier branch"), "{text}");
+    assert!(text.contains("feat (2nd) · current branch"), "{text}");
     app.key(Key::Char('h'));
 
-    // Back on the excluded row, a refresh keeps the selection on the
-    // incarnation id itself - the history row's identity is its record,
-    // not the name it shares with the active one.
-    let _ = until_conv_title(&mut app, "feat#1 · excluded history");
+    // Back on the earlier row, a refresh keeps the selection on the
+    // record id itself - the history row's identity is its record, not
+    // the name it shares with the active one.
+    let _ = until_conv_title(&mut app, "feat (1st of 2) · earlier branch");
     app.refresh(collect(&world));
     let text = render(&app, 200, 30);
-    assert!(text.contains("feat#1 · excluded history"), "{text}");
+    assert!(text.contains("feat (1st of 2) · earlier branch"), "{text}");
 
     // `space` and `p` on a history row are inert: nothing is written.
     let mut app = app.with_store(store(&world.home));
     let before = fs::read(store_dir(&world.home).join("work.json")).unwrap();
     press(&mut app, &[Key::Char(' '), Key::Char('p')]);
     let text = render(&app, 200, 30);
-    assert!(text.contains("excluded"), "{text}");
+    assert!(text.contains("earlier"), "{text}");
     assert_eq!(
         fs::read(store_dir(&world.home).join("work.json")).unwrap(),
         before
@@ -1272,12 +1273,12 @@ fn the_global_scope_lists_each_conversation_once_with_its_touch_path() {
     let snapshot = collect(&world);
     let mut app = App::new(snapshot);
     let text = render(&app, 200, 30);
-    assert!(text.contains("feat#1 → other#1"), "{text}");
+    assert!(text.contains("feat → other"), "{text}");
     // One row per conversation, no matter how many incarnations it rode.
     assert_eq!(text.matches(&CONV[..8]).count(), 1, "{text}");
     assert_eq!(text.matches(&OTHER[..8]).count(), 1, "{text}");
     // The single-touch conversation carries its full context instead.
-    assert!(text.contains("main#1"), "{text}");
+    assert!(text.contains("main"), "{text}");
     // Selecting one incarnation drops the context line entirely.
     press(&mut app, &[Key::Char('2'), Key::Char('j')]);
     let text = render(&app, 200, 30);
@@ -1287,7 +1288,7 @@ fn the_global_scope_lists_each_conversation_once_with_its_touch_path() {
     press(&mut app, &[Key::Char('k')]);
     let text = render(&app, 55, 30);
     assert!(text.lines().all(|l| l.chars().count() <= 55));
-    assert!(text.contains("feat#1"), "{text}");
+    assert!(text.contains("feat"), "{text}");
 }
 
 #[test]
