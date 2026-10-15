@@ -2692,6 +2692,46 @@ fn continuity_gloss(continuity: store::ContinuityEvidence) -> &'static str {
     }
 }
 
+/// The proven rename as `renamed from <old> <age> ago`, or the honest
+/// fallback for a rename-labelled record that predates the recorded name.
+fn rename_phrase(i: &IncarnationRow, now: u64) -> Option<String> {
+    match &i.renamed {
+        Some(r) => Some(format!(
+            "renamed from {} {} ago",
+            r.from,
+            age(now, Some(r.at))
+        )),
+        None if i.continuity == store::ContinuityEvidence::ProvenRename => {
+            Some("renamed (earlier name not recorded)".to_owned())
+        }
+        None => None,
+    }
+}
+
+/// The latest rewrite as `history rewritten <age> ago`, hedged to `seen
+/// rewritten` when only the detecting pass dated it, or the bare phrase
+/// for a force-push-labelled record that predates the recorded time.
+/// `tagged` appends the dating source for the raw record.
+fn rewrite_phrase(i: &IncarnationRow, now: u64, tagged: bool) -> Option<String> {
+    match &i.rewritten {
+        Some(r) => {
+            let (verb, source) = match r.dated {
+                store::RewriteDating::Reflog => ("history rewritten", "reflog"),
+                store::RewriteDating::Observed => ("seen rewritten", "observed"),
+            };
+            let mut phrase = format!("{verb} {} ago", age(now, Some(r.at)));
+            if tagged {
+                phrase.push_str(&format!(" ({source})"));
+            }
+            Some(phrase)
+        }
+        None if i.continuity == store::ContinuityEvidence::ForcePush => {
+            Some("history rewritten".to_owned())
+        }
+        None => None,
+    }
+}
+
 /// A wrapped attention line into the detail body, `!`-styled.
 fn push_attention(out: &mut Vec<Line<'static>>, text: String, width: usize) {
     for line in wrap_text(&text, width) {
@@ -2720,17 +2760,7 @@ fn branch_summary(
             OrdinalStyle::Prefix,
         ));
     }
-    match &i.renamed {
-        Some(r) => parts.push(format!(
-            "renamed from {} {} ago",
-            r.from,
-            age(now, Some(r.at))
-        )),
-        None if i.continuity == store::ContinuityEvidence::ProvenRename => {
-            parts.push("renamed (earlier name not recorded)".to_owned())
-        }
-        None => {}
-    }
+    parts.extend(rename_phrase(i, now));
     match (i.creation_at, &i.creation_head) {
         (Some(at), Some(head)) => parts.push(format!(
             "created {} ago from {}",
@@ -2742,20 +2772,7 @@ fn branch_summary(
             age(now, Some(i.first_observed_at))
         )),
     }
-    match &i.rewritten {
-        Some(r) => parts.push(match r.dated {
-            store::RewriteDating::Reflog => {
-                format!("history rewritten {} ago", age(now, Some(r.at)))
-            }
-            store::RewriteDating::Observed => {
-                format!("seen rewritten {} ago", age(now, Some(r.at)))
-            }
-        }),
-        None if i.continuity == store::ContinuityEvidence::ForcePush => {
-            parts.push("history rewritten".to_owned())
-        }
-        None => {}
-    }
+    parts.extend(rewrite_phrase(i, now, false));
     push_text(out, format!("branch: {}", parts.join(" · ")), width);
     if i.continuity == store::ContinuityEvidence::Ambiguous {
         let text = if earlier.is_empty() {
@@ -2829,7 +2846,7 @@ fn incarnation_body(i: &IncarnationRow, now: u64, out: &mut Vec<Line<'static>>, 
         width,
     );
     let ended = match i.ended_at {
-        Some(at) => format!("{} {} ago", end_verb(i), age(now, Some(at))),
+        Some(_) => ended_label(i, now),
         None => "still present".to_owned(),
     };
     push_text(
@@ -2855,32 +2872,10 @@ fn incarnation_body(i: &IncarnationRow, now: u64, out: &mut Vec<Line<'static>>, 
         format!("  {creation} · last proven tip {}", sha(&i.head)),
         width,
     );
-    let mut provenance: Vec<String> = Vec::new();
-    match &i.renamed {
-        Some(r) => provenance.push(format!(
-            "renamed from {} {} ago",
-            r.from,
-            age(now, Some(r.at))
-        )),
-        None if i.continuity == store::ContinuityEvidence::ProvenRename => {
-            provenance.push("renamed (earlier name not recorded)".to_owned())
-        }
-        None => {}
-    }
-    match &i.rewritten {
-        Some(r) => provenance.push(match r.dated {
-            store::RewriteDating::Reflog => {
-                format!("history rewritten {} ago (reflog)", age(now, Some(r.at)))
-            }
-            store::RewriteDating::Observed => {
-                format!("seen rewritten {} ago (observed)", age(now, Some(r.at)))
-            }
-        }),
-        None if i.continuity == store::ContinuityEvidence::ForcePush => {
-            provenance.push("history rewritten".to_owned())
-        }
-        None => {}
-    }
+    let provenance: Vec<String> = rename_phrase(i, now)
+        .into_iter()
+        .chain(rewrite_phrase(i, now, true))
+        .collect();
     if !provenance.is_empty() {
         push_text(out, format!("  {}", provenance.join(" · ")), width);
     }
