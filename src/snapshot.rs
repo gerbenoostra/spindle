@@ -2876,16 +2876,23 @@ fn ended_by(record: &store::BranchRecord) -> Option<EndedBy> {
 /// JSON provenance text and the TUI's suffix style use, so the two can
 /// never drift.
 pub fn compact_ordinal_name(name: &str, number: usize, lives: usize) -> String {
-    if lives <= 1 {
-        return name.to_owned();
+    match life_ordinal(number, lives) {
+        Some(ordinal) => format!("{name} ({ordinal})"),
+        None => name.to_owned(),
     }
-    format!("{name} ({})", ordinal(number))
+}
+
+/// The English ordinal of life `number` among `lives` retained ones -
+/// `None` while a sole life makes the ordinal noise. Every ordinal label,
+/// compact or not, decides on this one rule.
+pub(crate) fn life_ordinal(number: usize, lives: usize) -> Option<String> {
+    (lives > 1).then(|| ordinal(number))
 }
 
 /// The English ordinal for a 1-based `n`: 1st, 2nd, 3rd, then `th` -
 /// except the teens, where 11th, 12th and 13th keep `th` despite ending
 /// in 1, 2 and 3.
-pub fn ordinal(n: usize) -> String {
+fn ordinal(n: usize) -> String {
     let suffix = if (11..=13).contains(&(n % 100)) {
         "th"
     } else {
