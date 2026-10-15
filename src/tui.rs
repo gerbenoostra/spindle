@@ -1410,7 +1410,7 @@ impl App {
                         out,
                         format!(
                             "  {} {} · {} · {}",
-                            sha(&Some(c.sha.clone())),
+                            sha(Some(&c.sha)),
                             escape_text(&c.subject),
                             age(now, Some(c.at)),
                             c.conversation.as_deref().unwrap_or("?")
@@ -1549,7 +1549,7 @@ impl App {
                     ),
                     age(now, Some(t.valid_from)),
                     until,
-                    sha(&t.head),
+                    sha(t.head.as_deref()),
                     t.provenance.as_str(),
                     t.confidence.as_str()
                 ),
@@ -2420,9 +2420,8 @@ fn num(n: Option<u64>) -> String {
 }
 
 /// The head's first seven characters, or `?` where unrecorded.
-fn sha(head: &Option<String>) -> String {
-    head.as_ref()
-        .map(|h| h.chars().take(7).collect())
+fn sha(head: Option<&str>) -> String {
+    head.map(|h| h.chars().take(7).collect())
         .unwrap_or_else(|| "?".to_owned())
 }
 
@@ -2754,7 +2753,7 @@ fn branch_summary(
         (Some(at), Some(head)) => parts.push(format!(
             "created {} ago from {}",
             age(now, Some(at)),
-            sha(&Some(head.clone()))
+            sha(Some(head))
         )),
         _ => parts.push(format!(
             "first seen {} ago",
@@ -2815,7 +2814,7 @@ fn history_body(h: &IncarnationRow, now: u64, out: &mut Vec<Line<'static>>, widt
             "lived {} ago - {} ago · last tip {}",
             age(now, Some(h.first_observed_at)),
             age(now, h.ended_at),
-            sha(&h.head)
+            sha(h.head.as_deref())
         ),
         width,
     );
@@ -2858,14 +2857,14 @@ fn incarnation_body(i: &IncarnationRow, now: u64, out: &mut Vec<Line<'static>>, 
     let creation = match (i.creation_at, &i.creation_head) {
         (Some(at), Some(head)) => format!(
             "created at {} {} ago (from reflog)",
-            sha(&Some(head.clone())),
+            sha(Some(head)),
             age(now, Some(at))
         ),
         _ => format!("first seen {} ago", age(now, Some(i.first_observed_at))),
     };
     push_text(
         out,
-        format!("  {creation} · last proven tip {}", sha(&i.head)),
+        format!("  {creation} · last proven tip {}", sha(i.head.as_deref())),
         width,
     );
     let provenance: Vec<String> = rename_phrase(i, now)
