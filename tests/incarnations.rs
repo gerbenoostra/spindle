@@ -1,8 +1,9 @@
 //! Branch incarnations, touches and history end to end: a deleted and
-//! recreated ref is a new incarnation (`#N`), the ref's own reflog
-//! separates what polling could not see and fails closed on what it
-//! cannot order, touch intervals scope conversations to exactly one
-//! incarnation, and `h` reveals the excluded history - all on disposable
+//! recreated ref is a new incarnation (an ordinal once several lives are
+//! retained), the ref's own reflog separates what polling could not see
+//! and fails closed on what it cannot order, touch intervals scope
+//! conversations to exactly one incarnation, and `h` reveals the earlier
+//! lives - all on disposable
 //! fixtures: scratch git repositories, temp `$HOME`s, no live state.
 
 mod support;
@@ -2206,6 +2207,10 @@ fn a_second_life_numbers_touches_and_relations_with_the_compact_ordinal() {
     transcript(&world.home, THIRD, &world.repo.main);
     // Two conversations placed on the new life, one on main: the store
     // records the placements exactly, however the transcripts date.
+    // Placed directly rather than through transcript marks: a mark
+    // carries seconds precision, so one at a life boundary can cover
+    // both lives and placement fails closed, and the provider trail
+    // collapses consecutive marks on the same branch.
     let inc2 = record(&world, "feat").expect("the new life").id;
     let main = record(&world, "main").expect("main's record").id;
     store(&world.home)
