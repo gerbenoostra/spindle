@@ -54,8 +54,10 @@ line, where `<verb>` says what the closing observation proves: `deleted` when
 a pass observed the ref absent, `replaced` when a boundary was detected while
 the ref stayed present, `ended` when that observation is no longer retained.
 When continuity with the earlier same-name branch is unproven, a `!`
-warning takes that line's place and the earlier life stays separate; once the
-earlier life is no longer kept the warning drops `- h` and says so.
+warning takes that line's place and the earlier life stays separate. It
+points to `- h` only where the view lists earlier lives - a gone row lists
+none - and says the earlier life is no longer kept only when none is
+retained.
 
 A conversation can touch several branches over its life; it is shown once
 with its placements in the detail view.
@@ -154,7 +156,9 @@ with ties ordered by their reason list.
   store and architecture term; not displaying the wire spellings.
 - An unproven boundary warns instead of listing earlier lives - because both
   lines would repeat the kept-separate fact, and the warning carries the one
-  `- h` pointer, or drops it and says the earlier life is no longer kept.
+  `- h` pointer where earlier lives are listed; it says the earlier life is
+  no longer kept only when none is retained, never because a gone row
+  lists none.
 - A boundary close is recorded as `branch replaced by a new branch of the
   same name`, and the older stored spelling `branch incarnation changed` maps
   to it at render; `p` on a branch record that has since ended fails with
