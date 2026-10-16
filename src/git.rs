@@ -668,9 +668,10 @@ impl Repo {
     /// The incarnation evidence one branch's own reflog proves: the newest
     /// null-old entry names the head and moment this incarnation came to
     /// be, and the latest `Branch: renamed` line names the ref the log
-    /// moved from. A deleted ref's log is gone with it; a recreated ref's
-    /// log starts on a fresh null-old line, and a rename carries the whole
-    /// log - original creation line included - to the new name.
+    /// moved from and when. A deleted ref's log is gone with it; a
+    /// recreated ref's log starts on a fresh null-old line, and a rename
+    /// carries the whole log - original creation line included - to the
+    /// new name.
     pub fn ref_lifecycle(&self, branch: &str) -> RefLifecycle {
         let path = self.common_dir.join(format!("logs/refs/heads/{branch}"));
         let mut lifecycle = RefLifecycle::default();
@@ -690,8 +691,12 @@ impl Repo {
             if let Some((old, new)) = &entry.renamed
                 && new == branch
             {
-                lifecycle.renamed_from = Some(old.clone());
+                lifecycle.renamed = Some(RenamedRef {
+                    from: old.clone(),
+                    at: entry.at,
+                });
             }
+            lifecycle.tips.push((entry.head, entry.at));
         }
         lifecycle
     }
@@ -880,8 +885,34 @@ pub struct RefLifecycle {
     /// The newest null-old entry: the head and moment this incarnation
     /// came to be.
     pub creation: Option<RefCreation>,
-    /// The short name a `Branch: renamed` entry moved this log from.
-    pub renamed_from: Option<String>,
+    /// The newest `Branch: renamed` entry that moved this log to its
+    /// current name: the name it came from and the line's own time.
+    pub renamed: Option<RenamedRef>,
+    /// Every parsed entry's `(new, at)` in reflog order - what
+    /// [`Self::tip_set_at`] reads back to front.
+    tips: Vec<(String, SystemTime)>,
+}
+
+impl RefLifecycle {
+    /// When the log last set the tip to `head`: the newest entry in
+    /// reflog order whose `new` is the tip, never a max over timestamps -
+    /// reflog order is the history, a skewed committer clock is not.
+    pub fn tip_set_at(&self, head: &str) -> Option<SystemTime> {
+        self.tips
+            .iter()
+            .rev()
+            .find(|(new, _)| new == head)
+            .map(|(_, at)| *at)
+    }
+}
+
+/// A `Branch: renamed` reflog line as it applies to this ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenamedRef {
+    /// The short name the ref was renamed from.
+    pub from: String,
+    /// The committer-clock time stamped on the rename entry.
+    pub at: SystemTime,
 }
 
 /// A ref's creation as its reflog's newest null-old entry proves it.
@@ -2123,7 +2154,8 @@ mod tests {
         // No log at all is no evidence.
         let lifecycle = repo.ref_lifecycle("feat");
         assert!(lifecycle.creation.is_none());
-        assert!(lifecycle.renamed_from.is_none());
+        assert!(lifecycle.renamed.is_none());
+        assert_eq!(lifecycle.tip_set_at("aaaa"), None);
 
         fs::create_dir_all(temp.0.join("logs/refs/heads")).unwrap();
         // The newest null-old line is the incarnation's creation; the
@@ -2139,10 +2171,24 @@ mod tests {
         )
         .unwrap();
         let lifecycle = repo.ref_lifecycle("feat");
-        let creation = lifecycle.creation.expect("the creation line");
+        let creation = lifecycle.creation.as_ref().expect("the creation line");
         assert_eq!(creation.head, "aaaa");
         assert_eq!(creation.at, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
-        assert_eq!(lifecycle.renamed_from.as_deref(), Some("old"));
+        let renamed = lifecycle.renamed.as_ref().expect("the rename line");
+        assert_eq!(renamed.from, "old");
+        assert_eq!(renamed.at, UNIX_EPOCH + Duration::from_secs(1_700_000_200));
+        // `tip_set_at` answers the newest line whose `new` is the tip, in
+        // reflog order - `bbbb` was last set by the rename-away line at
+        // :300 - while a head no line ever set answers `None`.
+        assert_eq!(
+            lifecycle.tip_set_at("bbbb"),
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_300))
+        );
+        assert_eq!(
+            lifecycle.tip_set_at("aaaa"),
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        );
+        assert_eq!(lifecycle.tip_set_at("zzzz"), None);
 
         // A second null-old line - the shape a recreated ref's fresh log
         // shows - is the newest creation, not the first.
@@ -2152,8 +2198,8 @@ mod tests {
         )
         .unwrap();
         let lifecycle = repo.ref_lifecycle("feat");
-        assert_eq!(lifecycle.creation.unwrap().head, "cccc");
-        assert!(lifecycle.renamed_from.is_none());
+        assert_eq!(lifecycle.creation.as_ref().unwrap().head, "cccc");
+        assert!(lifecycle.renamed.is_none());
     }
 
     #[test]

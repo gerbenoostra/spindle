@@ -80,6 +80,7 @@ fn incarnation(id: &str, ref_name: &str, number: usize) -> IncarnationRow {
     IncarnationRow {
         id: id.to_owned(),
         number,
+        lives: 1,
         repo: "/repos/a/.git".to_owned(),
         ref_name: ref_name.to_owned(),
         first_observed_at: NOW - 7200,
@@ -87,7 +88,10 @@ fn incarnation(id: &str, ref_name: &str, number: usize) -> IncarnationRow {
         creation_head: Some("aaa1111bbb222".to_owned()),
         creation_at: Some(NOW - 7200),
         head: Some("ccc3333ddd444".to_owned()),
+        renamed: None,
+        rewritten: None,
         ended_at: None,
+        ended_by: None,
         continuity: ContinuityEvidence::SameReflogCreation,
         excluded: false,
     }
@@ -197,6 +201,7 @@ fn conversation(id: &str, title: Option<&str>) -> ConversationRow {
                 repo: "/repos/a/.git".to_owned(),
                 ref_name: "feat/login".to_owned(),
                 incarnation: 1,
+                lives: 1,
                 head: Some("aaa1111".to_owned()),
                 valid_from: NOW - 3600,
                 valid_until: Some(NOW - 1200),
@@ -208,6 +213,7 @@ fn conversation(id: &str, title: Option<&str>) -> ConversationRow {
                 repo: "/repos/a/.git".to_owned(),
                 ref_name: "feat/login".to_owned(),
                 incarnation: 1,
+                lives: 1,
                 head: Some("ccc3333".to_owned()),
                 valid_from: NOW - 900,
                 valid_until: None,
@@ -266,8 +272,8 @@ fn work_detail_shows_incarnation_delivery_upstream_forge_and_cleanup() {
     press(&mut app, &[Key::Char('2'), Key::Char('j')]);
     for width in [55, 200] {
         let text = render(&app, width, 40);
-        assert!(text.contains("incarnation:"), "{text}");
-        assert!(text.contains("feat/login#1"), "{text}");
+        assert!(text.contains("branch: created 2h ago"), "{text}");
+        assert!(!text.contains("feat/login#"), "{text}");
         assert!(text.contains("worktree:"), "{text}");
         assert!(text.contains("local:"), "{text}");
         assert!(text.contains("remote:"), "{text}");
@@ -826,6 +832,7 @@ fn conversation_detail_lists_touches_relations_and_last_prompts() {
             strength: RelationStrength::ProviderLineage,
             label: "child".to_owned(),
             provenance: "provider lineage record".to_owned(),
+            touch: None,
             provider: Provider::Claude,
             session_id: "child-1".to_owned(),
             short_id: "child001".to_owned(),
@@ -837,6 +844,7 @@ fn conversation_detail_lists_touches_relations_and_last_prompts() {
             strength: RelationStrength::ProcessAncestry,
             label: "ancestor".to_owned(),
             provenance: "live process ancestry".to_owned(),
+            touch: None,
             provider: Provider::Claude,
             session_id: "parent-1".to_owned(),
             short_id: "parent01".to_owned(),
@@ -847,7 +855,13 @@ fn conversation_detail_lists_touches_relations_and_last_prompts() {
         RelatedRow {
             strength: RelationStrength::SameIncarnation,
             label: "same incarnation".to_owned(),
-            provenance: "touch feat/login#1".to_owned(),
+            provenance: "touch feat/login".to_owned(),
+            touch: Some(agent_sessions::snapshot::RelatedTouch {
+                incarnation_id: "i111".to_owned(),
+                ref_name: "feat/login".to_owned(),
+                number: 1,
+                lives: 1,
+            }),
             provider: Provider::Claude,
             session_id: "sibling-1".to_owned(),
             short_id: "sibl001".to_owned(),
@@ -882,10 +896,11 @@ fn conversation_detail_lists_touches_relations_and_last_prompts() {
     assert!(text.contains("lineage - provider declared:"), "{text}");
     assert!(text.contains("observed process ancestry"), "{text}");
     assert!(!text.contains("pane-creation"), "{text}");
-    assert!(text.contains("same incarnation:"), "{text}");
+    assert!(text.contains("same branch:"), "{text}");
+    assert!(text.contains("touch feat/login"), "{text}");
     assert!(
         at("lineage - provider declared:") < at("observed process ancestry")
-            && at("observed process ancestry") < at("same incarnation:"),
+            && at("observed process ancestry") < at("same branch:"),
         "{text}"
     );
     // Prompts are escaped and truncated to one line each.
@@ -1015,15 +1030,18 @@ fn evidence_on_work_shows_the_incarnation_continuity_verdict() {
     let text = render(&app, 200, 50);
     assert!(text.contains("[4] Evidence"), "{text}");
     assert!(text.contains("same_reflog_creation"), "{text}");
-    assert!(text.contains("ref creation aaa1111"), "{text}");
-    assert!(text.contains("tip ccc3333"), "{text}");
+    assert!(text.contains("created at aaa1111"), "{text}");
+    assert!(text.contains("last proven tip ccc3333"), "{text}");
     // A history row shows the same evidence block for its own record.
     let mut snapshot = fixture();
     let mut closed = incarnation("i000", "feat/login", 1);
     closed.ended_at = Some(NOW - 3600);
     closed.excluded = true;
+    closed.lives = 2;
     snapshot.work[0].same_name_history = vec![closed];
-    snapshot.work[0].incarnation.as_mut().unwrap().number = 2;
+    let active = snapshot.work[0].incarnation.as_mut().unwrap();
+    active.number = 2;
+    active.lives = 2;
     let mut app = App::new(snapshot);
     press(
         &mut app,
@@ -1037,19 +1055,22 @@ fn evidence_on_work_shows_the_incarnation_continuity_verdict() {
     // Walk [2] until the cursor lands on the history row itself.
     for _ in 0..8 {
         let text = render(&app, 200, 50);
-        if text.contains("[4] Work - feat/login#1") {
+        if text.contains("[4] Work - feat/login (1st of 2)") {
             break;
         }
         app.key(Key::Char('j'));
     }
     let text = render(&app, 200, 50);
-    assert!(text.contains("[4] Work - feat/login#1"), "{text}");
-    assert!(text.contains("excluded"), "{text}");
+    assert!(text.contains("[4] Work - feat/login (1st of 2)"), "{text}");
+    assert!(text.contains("earlier feat/login (1st of 2)"), "{text}");
     press(&mut app, &[Key::Char('e')]);
     let text = render(&app, 200, 50);
-    assert!(text.contains("[4] Evidence - feat/login#1"), "{text}");
-    assert!(text.contains("continuity:"), "{text}");
-    assert!(text.contains("excluded"), "{text}");
+    assert!(
+        text.contains("[4] Evidence - feat/login (1st of 2)"),
+        "{text}"
+    );
+    assert!(text.contains("continuity decision:"), "{text}");
+    assert!(text.contains("not counted on the current row"), "{text}");
 }
 
 #[test]
@@ -1327,7 +1348,7 @@ fn evidence_on_a_space_or_incarnationless_row_is_honest() {
     let mut app = App::new(snapshot);
     press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char('e')]);
     let text = render(&app, 200, 40);
-    assert!(text.contains("no incarnation evidence"), "{text}");
+    assert!(text.contains("no branch history recorded"), "{text}");
 }
 
 /// A journal record the fold rejected shows up in the emitted snapshot's
@@ -1542,9 +1563,9 @@ fn a_unicode_control_prompt_renders_bounded_and_escaped() {
     let obs = |name: &str| agent_sessions::store::ObservedRef {
         name: name.to_owned(),
         head: None,
-        rewritten: false,
+        rewritten: None,
         creation: None,
-        renamed_from: None,
+        renamed: None,
         commit: None,
         activities: Vec::new(),
         inputs: agent_sessions::store::LifecycleInputs::default(),
