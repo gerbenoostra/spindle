@@ -5593,6 +5593,17 @@ mod tests {
                 "! not proven to be the earlier feat/login; its activity is kept separate",
             ],
         );
+        // A gone row can be the first of two lives while a later one is
+        // active elsewhere: the retained-lives count exceeds one, yet
+        // nothing earlier is kept - only the rank says so.
+        i.number = 1;
+        let mut out = Vec::new();
+        branch_summary(&i, &[], 1_800_000_000, &mut out, 200);
+        let warning: String = out[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            warning,
+            "! not proven to be an earlier feat/login (no longer kept); its activity is kept separate"
+        );
     }
 
     #[test]
