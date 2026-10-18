@@ -74,8 +74,24 @@ pub const AMBIENT_ENV_VARS: &[&str] = &[
     "GIT_CONFIG_COUNT",
 ];
 
+/// The `LC_ALL=C` diagnostics that mean a path belongs to no repository.
+/// Git rewords them across releases: a `.git` file pointing nowhere dies
+/// with `not a git repository: <dir>` up to 2.54 and with `gitfile does not
+/// point to a valid repository: <path>` from 2.56 on (`setup.c`,
+/// `read_gitfile_error_die`).
+const NO_REPOSITORY_MESSAGES: &[&str] = &[
+    "not a git repository",
+    "gitfile does not point to a valid repository",
+];
+
+/// Whether a failed discovery's stderr says the path is in no repository,
+/// in any spelling a supported Git release uses.
+fn names_no_repository(detail: &str) -> bool {
+    NO_REPOSITORY_MESSAGES.iter().any(|m| detail.contains(m))
+}
+
 /// `LC_ALL=C` keeps diagnostics in one language because
-/// `Repo::discover` recognizes "not a git repository" by message.
+/// `Repo::discover` recognizes a path in no repository by message.
 /// `GIT_TERMINAL_PROMPT=0` turns a remote that wants credentials into an
 /// error instead of a collector that hangs on a prompt nobody answers; the
 /// ssh transport gets the same treatment through `SSH_ASKPASS_REQUIRE` and
@@ -452,7 +468,7 @@ impl Repo {
                     .map_err(|e| Error::io("canonicalize", &common, e))?; // coverage: off - a reported common dir exists
                 Ok(Some(Repo { common_dir: common }))
             }
-            Err(e) if e.detail.contains("not a git repository") => Ok(None),
+            Err(e) if names_no_repository(&e.detail) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -2143,6 +2159,25 @@ mod tests {
             repo.reflog_times(Path::new("logs/MISSING")).newest_work,
             None
         );
+    }
+
+    #[test]
+    fn discovery_recognizes_every_releases_no_repository_spelling() {
+        // The fixture tests only see the installed Git's wording; this pins
+        // each release's spelling of a `.git` file pointing nowhere, so a
+        // host on either side of the 2.56 rewording classifies alike.
+        for detail in [
+            "fatal: not a git repository (or any of the parent directories): .git",
+            "fatal: not a git repository: /definitely/not/a/dir",
+            "fatal: not a git repository: (null)",
+            "fatal: gitfile does not point to a valid repository: /tmp/x/.git",
+        ] {
+            assert!(names_no_repository(detail), "{detail}");
+        }
+        // Any other failure stays an error the caller retains.
+        assert!(!names_no_repository(
+            "fatal: error opening '/tmp/x/.git': Permission denied"
+        ));
     }
 
     #[test]
