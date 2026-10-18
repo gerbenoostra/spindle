@@ -817,6 +817,44 @@ pub struct RefCreationEvidence {
     pub at_ms: u64,
 }
 
+/// A proven `Branch: renamed` reflog line as it applies to a record: the
+/// name the ref moved from and that line's own time, epoch milliseconds.
+/// Persisted independently of `continuity_evidence` - a later rewrite
+/// never erases where the record came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameEvidence {
+    /// The short name the ref was renamed from.
+    pub from: String,
+    /// The rename line's reflog time, epoch milliseconds.
+    pub at_ms: u64,
+}
+
+/// How a [`RewriteEvidence::at_ms`] was dated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteDating {
+    /// The reflog line whose `new` is the observed tip - when the tip was
+    /// set, which is when the rewritten history landed locally.
+    Reflog,
+    /// The detecting pass's own scan time: the branch reflog is gone, so
+    /// no line can date the move (the detail then hedges it as `seen`).
+    Observed,
+}
+
+/// A proven non-fast-forward tip move - a rebase, reset or amend such as
+/// a force-push publishes - with when the tip was set, epoch milliseconds,
+/// and how that time was dated. Persisted independently of
+/// `continuity_evidence`: `ProvenRename` and `Ambiguous` stay terminal for
+/// how the record began while this keeps tracking the latest rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewriteEvidence {
+    /// When the rewritten tip was set (or the rewrite was observed),
+    /// epoch milliseconds.
+    pub at_ms: u64,
+    /// Which clock `at_ms` came from.
+    pub dated: RewriteDating,
+}
+
 /// Which evidence last established - or separated - an incarnation's
 /// identity. `ProvenRename` and `Ambiguous` are terminal for the record:
 /// they say how it began under this name, and later confirmations do not
@@ -956,13 +994,14 @@ pub struct ObservedRef {
     /// The collector proved the tip moved off the record's last `head`
     /// without descending from it - a rewrite such as a rebase or reset
     /// that a force-push publishes. A fast-forward or an unprovable
-    /// comparison is `false`.
-    pub rewritten: bool,
+    /// comparison is `None`.
+    pub rewritten: Option<RewriteEvidence>,
     /// The newest null-old reflog entry's creation evidence.
     pub creation: Option<RefCreationEvidence>,
-    /// The short name a `Branch: renamed` reflog line moved this ref
-    /// from - the exact evidence that preserves identity across names.
-    pub renamed_from: Option<String>,
+    /// The `Branch: renamed` reflog line that moved this ref here -
+    /// source name and line time, the exact evidence that preserves
+    /// identity across names.
+    pub renamed: Option<RenameEvidence>,
     pub commit: Option<ObservedCommit>,
     /// The source-backed activity the pass can prove for this ref,
     /// deduplicated into the record's history - first collection may
@@ -1005,6 +1044,15 @@ pub struct BranchRecord {
     /// The evidence that last established or separated this identity.
     #[serde(default)]
     pub continuity_evidence: ContinuityEvidence,
+    /// The rename that moved this record to `ref_name`, with the reflog
+    /// line's own time - independent of the continuity label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed: Option<RenameEvidence>,
+    /// The latest proven non-fast-forward tip move, whenever proven and
+    /// however the continuity label reads - a fast-forward observation
+    /// leaves it untouched, never clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewritten: Option<RewriteEvidence>,
     /// When the ref was observed gone, epoch ms; `None` while active.
     #[serde(default)]
     pub ended_at: Option<u64>,
@@ -1139,6 +1187,18 @@ fn incarnation_id(repo: &str, ref_name: &str, at_ms: u64) -> String {
 /// as a touch references it - whichever outlives the other.
 const RETAIN_CLOSED_MS: u64 = 90 * 24 * 3600 * 1000;
 
+/// The Lifecycle observation reason an established ref's absence writes.
+pub const REASON_BRANCH_GONE: &str = "branch gone";
+/// The Lifecycle observation reason a detected same-name boundary close
+/// wrote before the wording moved off "incarnation". Stored history is
+/// never rewritten, so legacy records still carry it - renderers map it
+/// to [`REASON_BRANCH_REPLACED`].
+pub const REASON_INCARNATION_CHANGED: &str = "branch incarnation changed";
+/// The Lifecycle observation reason a detected same-name boundary close
+/// writes now: the ref never went absent, a new branch of the same name
+/// replaced the recorded one.
+pub const REASON_BRANCH_REPLACED: &str = "branch replaced by a new branch of the same name";
+
 /// Whether the observation proves the still-present ref is not the
 /// recorded incarnation, and how the new record labels the split: a
 /// creation strictly newer than the stored one is a proven recreate
@@ -1173,7 +1233,7 @@ fn creation_boundary(record: &BranchRecord, obs: &ObservedRef) -> Option<Continu
 fn continuity_of(record: &BranchRecord, obs: &ObservedRef) -> Option<ContinuityEvidence> {
     match record.continuity_evidence {
         ContinuityEvidence::ProvenRename | ContinuityEvidence::Ambiguous => None,
-        _ if obs.rewritten => Some(ContinuityEvidence::ForcePush),
+        _ if obs.rewritten.is_some() => Some(ContinuityEvidence::ForcePush),
         ContinuityEvidence::ForcePush => None,
         _ => record
             .creation_evidence
@@ -1206,6 +1266,8 @@ fn open_incarnation(
             head: obs.head.clone(),
             creation_evidence: obs.creation.clone(),
             continuity_evidence: continuity,
+            renamed: None,
+            rewritten: None,
             ended_at: None,
             parked: false,
             activities: Vec::new(),
@@ -2077,10 +2139,15 @@ impl Store {
         // history and all - moved with it, so id and `first_observed_at`
         // hold and only the label changes.
         for obs in refs {
-            let Some(old) = obs.renamed_from.as_deref().filter(|o| *o != obs.name) else {
+            let Some(old) = obs
+                .renamed
+                .as_ref()
+                .map(|r| r.from.clone())
+                .filter(|o| *o != obs.name)
+            else {
                 continue;
             };
-            let old_key = branch_key(repo, old);
+            let old_key = branch_key(repo, &old);
             let Some(id) = work.active_branches.get(&old_key).cloned() else {
                 continue;
             };
@@ -2089,7 +2156,7 @@ impl Store {
             // and the destination is not already a different active
             // incarnation. A recreated old name opens its own record; a
             // taken destination never loses its lookup.
-            if observed.contains(old)
+            if observed.contains(old.as_str())
                 || work
                     .active_branches
                     .get(&branch_key(repo, &obs.name))
@@ -2105,6 +2172,9 @@ impl Store {
             record.last_observed_at = observed_ms;
             absorb_evidence(record, obs, observed_ms);
             record.continuity_evidence = ContinuityEvidence::ProvenRename;
+            // The rename that moved the record persists with the reflog
+            // line's own time, independent of the continuity label.
+            record.renamed = obs.renamed.clone();
             if record.creation_evidence.is_none() {
                 record.creation_evidence = obs.creation.clone();
             }
@@ -2143,7 +2213,7 @@ impl Store {
                     covered_by: None,
                     source: ObservationSource::Lifecycle,
                     observed_at_ms: observed_ms,
-                    reasons: vec!["branch gone".to_owned()],
+                    reasons: vec![REASON_BRANCH_GONE.to_owned()],
                 },
             );
             last_seen(record);
@@ -2185,7 +2255,7 @@ impl Store {
                                 covered_by: None,
                                 source: ObservationSource::Lifecycle,
                                 observed_at_ms: observed_ms,
-                                reasons: vec!["branch incarnation changed".to_owned()],
+                                reasons: vec![REASON_BRANCH_REPLACED.to_owned()],
                             },
                         );
                         last_seen(record);
@@ -2213,6 +2283,15 @@ impl Store {
                         && record.continuity_evidence != continuity
                     {
                         record.continuity_evidence = continuity;
+                        changed = true;
+                    }
+                    // The latest proven rewrite persists whatever the
+                    // continuity label - `ProvenRename` and `Ambiguous`
+                    // are terminal for how the record began, not for
+                    // what its tip has done since. A fast-forward or an
+                    // unproven comparison leaves the stored time alone.
+                    if let Some(rewrite) = &obs.rewritten {
+                        record.rewritten = Some(rewrite.clone());
                         changed = true;
                     }
                     changed |= absorb_evidence(record, obs, observed_ms);
@@ -2481,10 +2560,7 @@ impl Store {
                     .get_mut(id)
                     .filter(|r| r.ended_at.is_none())
                     .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!("no active branch incarnation {id}"),
-                        )
+                        io::Error::new(io::ErrorKind::NotFound, format!("no active branch {id}"))
                     })?;
                 record.parked = !record.parked;
                 record.parked
@@ -4040,8 +4116,8 @@ mod tests {
             name: name.to_owned(),
             head: None,
             creation: None,
-            renamed_from: None,
-            rewritten: false,
+            renamed: None,
+            rewritten: None,
             commit: None,
             activities: Vec::new(),
             inputs: LifecycleInputs {
@@ -4163,7 +4239,7 @@ mod tests {
     }
 
     #[test]
-    fn a_creation_boundary_close_records_incarnation_changed_not_gone() {
+    fn a_creation_boundary_close_records_branch_replaced_not_gone() {
         let temp = TempStore::new();
         let store = temp.store();
         let repo = "/repo/.git";
@@ -4176,9 +4252,9 @@ mod tests {
         let mut o = obs("feat", false);
         o.creation = creation("aaaa", 500);
         store.sync_repo(repo, &[o], 1_000).unwrap();
-        // A different creation proven under a never-absent name is an
-        // incarnation boundary: the old record closes with `incarnation
-        // changed` - it was never gone - and the same-pass open is no
+        // A different creation proven under a never-absent name is a
+        // branch boundary: the old record closes with the replaced
+        // reason - it was never gone - and the same-pass open is no
         // `found`, since no absent interval preceded it.
         let mut o = obs("feat", false);
         o.creation = creation("bbbb", 800);
@@ -4192,7 +4268,7 @@ mod tests {
             .expect("the closed incarnation");
         assert_eq!(
             closed.observations.last().expect("the boundary").reasons,
-            ["branch incarnation changed".to_owned()]
+            [REASON_BRANCH_REPLACED.to_owned()]
         );
         let open = work.branch(repo, "feat").expect("the new incarnation");
         assert!(
@@ -4221,8 +4297,8 @@ mod tests {
                         name: "feat".to_owned(),
                         head: None,
                         creation: None,
-                        renamed_from: None,
-                        rewritten: false,
+                        renamed: None,
+                        rewritten: None,
                         commit: None,
                         activities: Vec::new(),
                         inputs: inputs.clone(),
@@ -4290,8 +4366,8 @@ mod tests {
                         name: "feat".to_owned(),
                         head: None,
                         creation: None,
-                        renamed_from: None,
-                        rewritten: false,
+                        renamed: None,
+                        rewritten: None,
                         commit: None,
                         activities: Vec::new(),
                         inputs: inputs.clone(),
@@ -4784,8 +4860,8 @@ mod tests {
             name: "feat".to_owned(),
             head: head.map(str::to_owned),
             creation: None,
-            renamed_from: None,
-            rewritten: false,
+            renamed: None,
+            rewritten: None,
             commit: head.map(|sha| ObservedCommit {
                 sha: sha.to_owned(),
                 subject: Some("landed subject".to_owned()),
@@ -5316,7 +5392,10 @@ mod tests {
         store.sync_repo(repo, &[o], 1_000).unwrap();
         let mut renamed = obs("feat2", false);
         renamed.head = Some("bbbbbbb1111111".to_owned());
-        renamed.renamed_from = Some("feat".to_owned());
+        renamed.renamed = Some(RenameEvidence {
+            from: "feat".to_owned(),
+            at_ms: 1_500,
+        });
         store.sync_repo(repo, &[renamed], 2_000).unwrap();
         let work = store.load().work;
         let record = work.branch(repo, "feat2").expect("the record");
@@ -5347,7 +5426,10 @@ mod tests {
         // lifecycle change dates this pass, not the next one to find
         // the moved record.
         let mut renamed = obs("feat2", true);
-        renamed.renamed_from = Some("feat".to_owned());
+        renamed.renamed = Some(RenameEvidence {
+            from: "feat".to_owned(),
+            at_ms: 1_500,
+        });
         store.sync_repo(repo, &[renamed], 2_000).unwrap();
         let work = store.load().work;
         let record = work.branch(repo, "feat2").expect("the record");
@@ -5361,6 +5443,167 @@ mod tests {
             }]
         );
         assert_eq!(record.inputs.dirty, Some(true));
+    }
+
+    #[test]
+    fn a_proven_rename_persists_its_source_and_the_lines_time() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        store.sync_repo(repo, &[obs("feat", false)], 1_000).unwrap();
+        let mut renamed = obs("feat2", false);
+        renamed.renamed = Some(RenameEvidence {
+            from: "feat".to_owned(),
+            at_ms: 1_500,
+        });
+        store.sync_repo(repo, &[renamed], 2_000).unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat2").expect("the record");
+        assert_eq!(
+            record.renamed,
+            Some(RenameEvidence {
+                from: "feat".to_owned(),
+                at_ms: 1_500,
+            })
+        );
+    }
+
+    /// A confirmed-same pass carrying rewrite evidence: the record's tip
+    /// moved off its last proven head without descending from it.
+    fn rewritten_obs(name: &str, at_ms: u64) -> ObservedRef {
+        let mut o = obs(name, false);
+        o.head = Some("cccccccc0000".to_owned());
+        o.rewritten = Some(RewriteEvidence {
+            at_ms,
+            dated: RewriteDating::Reflog,
+        });
+        o
+    }
+
+    #[test]
+    fn a_rewrite_after_a_rename_keeps_proven_rename_and_persists() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        store.sync_repo(repo, &[obs("feat", false)], 1_000).unwrap();
+        let mut renamed = obs("feat2", false);
+        renamed.renamed = Some(RenameEvidence {
+            from: "feat".to_owned(),
+            at_ms: 1_500,
+        });
+        store.sync_repo(repo, &[renamed], 2_000).unwrap();
+        // `proven_rename` is terminal for how the record began; the
+        // rewrite still lands beside it.
+        store
+            .sync_repo(repo, &[rewritten_obs("feat2", 3_000)], 3_000)
+            .unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat2").expect("the record");
+        assert_eq!(record.continuity_evidence, ContinuityEvidence::ProvenRename);
+        assert_eq!(
+            record.rewritten,
+            Some(RewriteEvidence {
+                at_ms: 3_000,
+                dated: RewriteDating::Reflog,
+            })
+        );
+    }
+
+    #[test]
+    fn a_rewrite_after_an_ambiguous_boundary_keeps_ambiguous_and_persists() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        let mut first = obs("feat", false);
+        first.creation = Some(RefCreationEvidence {
+            head: "aaaa".to_owned(),
+            at_ms: 500,
+        });
+        store.sync_repo(repo, &[first], 1_000).unwrap();
+        // A creation the record cannot order - different but not newer -
+        // is a boundary without a proven side: `ambiguous`.
+        let mut next = obs("feat", false);
+        next.creation = Some(RefCreationEvidence {
+            head: "bbbb".to_owned(),
+            at_ms: 500,
+        });
+        store.sync_repo(repo, &[next], 2_000).unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("the record");
+        assert_eq!(record.continuity_evidence, ContinuityEvidence::Ambiguous);
+        let mut o = rewritten_obs("feat", 3_000);
+        o.creation = record.creation_evidence.clone();
+        store.sync_repo(repo, &[o], 3_000).unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("the record");
+        assert_eq!(record.continuity_evidence, ContinuityEvidence::Ambiguous);
+        assert_eq!(
+            record.rewritten,
+            Some(RewriteEvidence {
+                at_ms: 3_000,
+                dated: RewriteDating::Reflog,
+            })
+        );
+    }
+
+    #[test]
+    fn a_second_rewrite_replaces_the_time_a_fast_forward_keeps_it() {
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        store.sync_repo(repo, &[obs("feat", false)], 1_000).unwrap();
+        store
+            .sync_repo(repo, &[rewritten_obs("feat", 2_000)], 2_000)
+            .unwrap();
+        store
+            .sync_repo(repo, &[rewritten_obs("feat", 3_000)], 3_000)
+            .unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("the record");
+        assert_eq!(
+            record.rewritten,
+            Some(RewriteEvidence {
+                at_ms: 3_000,
+                dated: RewriteDating::Reflog,
+            }),
+            "the latest proven rewrite wins"
+        );
+        // A pass with no proven rewrite - fast-forward or unproven -
+        // leaves the stored evidence untouched, never clears it.
+        store.sync_repo(repo, &[obs("feat", false)], 4_000).unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("the record");
+        assert_eq!(
+            record.rewritten,
+            Some(RewriteEvidence {
+                at_ms: 3_000,
+                dated: RewriteDating::Reflog,
+            })
+        );
+    }
+
+    #[test]
+    fn a_record_without_rename_or_rewrite_evidence_round_trips() {
+        // A record written before the fields existed deserializes to
+        // `None`, and `skip_serializing_if` keeps them out of the file:
+        // legacy bytes in, legacy bytes out, no schema bump.
+        let temp = TempStore::new();
+        let store = temp.store();
+        let repo = "/repo/.git";
+        store.sync_repo(repo, &[obs("feat", false)], 1_000).unwrap();
+        let work = store.load().work;
+        let record = work.branch(repo, "feat").expect("the record").clone();
+        let mut value = serde_json::to_value(&record).unwrap();
+        let object = value.as_object_mut().unwrap();
+        assert!(object.remove("renamed").is_none());
+        assert!(object.remove("rewritten").is_none());
+        let legacy: BranchRecord = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(legacy, record);
+        assert_eq!(legacy.renamed, None);
+        assert_eq!(legacy.rewritten, None);
+        let value = serde_json::to_value(&legacy).unwrap();
+        assert!(!value.as_object().unwrap().contains_key("renamed"));
+        assert!(!value.as_object().unwrap().contains_key("rewritten"));
     }
 
     #[test]

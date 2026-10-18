@@ -74,8 +74,24 @@ pub const AMBIENT_ENV_VARS: &[&str] = &[
     "GIT_CONFIG_COUNT",
 ];
 
+/// The `LC_ALL=C` diagnostics that mean a path belongs to no repository.
+/// Git rewords them across releases: a `.git` file pointing nowhere dies
+/// with `not a git repository: <dir>` up to 2.54 and with `gitfile does not
+/// point to a valid repository: <path>` from 2.56 on (`setup.c`,
+/// `read_gitfile_error_die`).
+const NO_REPOSITORY_MESSAGES: &[&str] = &[
+    "not a git repository",
+    "gitfile does not point to a valid repository",
+];
+
+/// Whether a failed discovery's stderr says the path is in no repository,
+/// in any spelling a supported Git release uses.
+fn names_no_repository(detail: &str) -> bool {
+    NO_REPOSITORY_MESSAGES.iter().any(|m| detail.contains(m))
+}
+
 /// `LC_ALL=C` keeps diagnostics in one language because
-/// `Repo::discover` recognizes "not a git repository" by message.
+/// `Repo::discover` recognizes a path in no repository by message.
 /// `GIT_TERMINAL_PROMPT=0` turns a remote that wants credentials into an
 /// error instead of a collector that hangs on a prompt nobody answers; the
 /// ssh transport gets the same treatment through `SSH_ASKPASS_REQUIRE` and
@@ -452,7 +468,7 @@ impl Repo {
                     .map_err(|e| Error::io("canonicalize", &common, e))?; // coverage: off - a reported common dir exists
                 Ok(Some(Repo { common_dir: common }))
             }
-            Err(e) if e.detail.contains("not a git repository") => Ok(None),
+            Err(e) if names_no_repository(&e.detail) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -668,9 +684,10 @@ impl Repo {
     /// The incarnation evidence one branch's own reflog proves: the newest
     /// null-old entry names the head and moment this incarnation came to
     /// be, and the latest `Branch: renamed` line names the ref the log
-    /// moved from. A deleted ref's log is gone with it; a recreated ref's
-    /// log starts on a fresh null-old line, and a rename carries the whole
-    /// log - original creation line included - to the new name.
+    /// moved from and when. A deleted ref's log is gone with it; a
+    /// recreated ref's log starts on a fresh null-old line, and a rename
+    /// carries the whole log - original creation line included - to the
+    /// new name.
     pub fn ref_lifecycle(&self, branch: &str) -> RefLifecycle {
         let path = self.common_dir.join(format!("logs/refs/heads/{branch}"));
         let mut lifecycle = RefLifecycle::default();
@@ -690,8 +707,12 @@ impl Repo {
             if let Some((old, new)) = &entry.renamed
                 && new == branch
             {
-                lifecycle.renamed_from = Some(old.clone());
+                lifecycle.renamed = Some(RenamedRef {
+                    from: old.clone(),
+                    at: entry.at,
+                });
             }
+            lifecycle.tips.push((entry.head, entry.at));
         }
         lifecycle
     }
@@ -880,8 +901,34 @@ pub struct RefLifecycle {
     /// The newest null-old entry: the head and moment this incarnation
     /// came to be.
     pub creation: Option<RefCreation>,
-    /// The short name a `Branch: renamed` entry moved this log from.
-    pub renamed_from: Option<String>,
+    /// The newest `Branch: renamed` entry that moved this log to its
+    /// current name: the name it came from and the line's own time.
+    pub renamed: Option<RenamedRef>,
+    /// Every parsed entry's `(new, at)` in reflog order - what
+    /// [`Self::tip_set_at`] reads back to front.
+    tips: Vec<(String, SystemTime)>,
+}
+
+impl RefLifecycle {
+    /// When the log last set the tip to `head`: the newest entry in
+    /// reflog order whose `new` is the tip, never a max over timestamps -
+    /// reflog order is the history, a skewed committer clock is not.
+    pub fn tip_set_at(&self, head: &str) -> Option<SystemTime> {
+        self.tips
+            .iter()
+            .rev()
+            .find(|(new, _)| new == head)
+            .map(|(_, at)| *at)
+    }
+}
+
+/// A `Branch: renamed` reflog line as it applies to this ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenamedRef {
+    /// The short name the ref was renamed from.
+    pub from: String,
+    /// The committer-clock time stamped on the rename entry.
+    pub at: SystemTime,
 }
 
 /// A ref's creation as its reflog's newest null-old entry proves it.
@@ -2115,6 +2162,25 @@ mod tests {
     }
 
     #[test]
+    fn discovery_recognizes_every_releases_no_repository_spelling() {
+        // The fixture tests only see the installed Git's wording; this pins
+        // each release's spelling of a `.git` file pointing nowhere, so a
+        // host on either side of the 2.56 rewording classifies alike.
+        for detail in [
+            "fatal: not a git repository (or any of the parent directories): .git",
+            "fatal: not a git repository: /definitely/not/a/dir",
+            "fatal: not a git repository: (null)",
+            "fatal: gitfile does not point to a valid repository: /tmp/x/.git",
+        ] {
+            assert!(names_no_repository(detail), "{detail}");
+        }
+        // Any other failure stays an error the caller retains.
+        assert!(!names_no_repository(
+            "fatal: error opening '/tmp/x/.git': Permission denied"
+        ));
+    }
+
+    #[test]
     fn ref_lifecycle_reads_creation_head_and_rename() {
         let temp = Temp::new();
         let repo = Repo {
@@ -2123,7 +2189,8 @@ mod tests {
         // No log at all is no evidence.
         let lifecycle = repo.ref_lifecycle("feat");
         assert!(lifecycle.creation.is_none());
-        assert!(lifecycle.renamed_from.is_none());
+        assert!(lifecycle.renamed.is_none());
+        assert_eq!(lifecycle.tip_set_at("aaaa"), None);
 
         fs::create_dir_all(temp.0.join("logs/refs/heads")).unwrap();
         // The newest null-old line is the incarnation's creation; the
@@ -2139,10 +2206,24 @@ mod tests {
         )
         .unwrap();
         let lifecycle = repo.ref_lifecycle("feat");
-        let creation = lifecycle.creation.expect("the creation line");
+        let creation = lifecycle.creation.as_ref().expect("the creation line");
         assert_eq!(creation.head, "aaaa");
         assert_eq!(creation.at, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
-        assert_eq!(lifecycle.renamed_from.as_deref(), Some("old"));
+        let renamed = lifecycle.renamed.as_ref().expect("the rename line");
+        assert_eq!(renamed.from, "old");
+        assert_eq!(renamed.at, UNIX_EPOCH + Duration::from_secs(1_700_000_200));
+        // `tip_set_at` answers the newest line whose `new` is the tip, in
+        // reflog order - `bbbb` was last set by the rename-away line at
+        // :300 - while a head no line ever set answers `None`.
+        assert_eq!(
+            lifecycle.tip_set_at("bbbb"),
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_300))
+        );
+        assert_eq!(
+            lifecycle.tip_set_at("aaaa"),
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        );
+        assert_eq!(lifecycle.tip_set_at("zzzz"), None);
 
         // A second null-old line - the shape a recreated ref's fresh log
         // shows - is the newest creation, not the first.
@@ -2152,8 +2233,8 @@ mod tests {
         )
         .unwrap();
         let lifecycle = repo.ref_lifecycle("feat");
-        assert_eq!(lifecycle.creation.unwrap().head, "cccc");
-        assert!(lifecycle.renamed_from.is_none());
+        assert_eq!(lifecycle.creation.as_ref().unwrap().head, "cccc");
+        assert!(lifecycle.renamed.is_none());
     }
 
     #[test]

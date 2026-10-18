@@ -32,13 +32,32 @@ tool can only show what the recorded sources prove.
 `p` parks a row. Parking suppresses only `Forgotten` placement - a parked row
 is your local note to leave it alone, not a claim that the work completed.
 
-## Incarnations and history
+## Branch lives and history
 
-Branch names are reusable. A `feat-x #2` label means the collector has
-observed that name before: `#N` numbers the current incarnation's lifetime of
-the branch, not a count of your work on it. `h` opens the same-name history -
-earlier incarnations, retained for audit and excluded from the current row's
-counts and recency.
+Branch names are reusable. When a name has several retained lives the current
+one carries an English ordinal: `feat-x (2nd)` in compact labels, `2nd feat-x`
+leading the detail's `branch:` line, `feat-x (1st of 2)` on an earlier life's
+row. The ordinal numbers the retained lives of the branch, not a count of
+your work on it. A sole life shows no number, and the count drops when a
+closed life is pruned. `h` shows the earlier lives - retained for audit and
+never counted on the current row's counts or recency.
+
+The `branch:` line states what the record proves about this life, in plain
+words: `created <age> ago from <sha>` when the reflog proved the creation
+(`first seen <age> ago` when it did not), `renamed from <old> <age> ago` for a
+proven rename (`renamed (earlier name not recorded)` on a legacy record), and
+`history rewritten <age> ago` for a proven non-fast-forward tip move - `seen
+rewritten <age> ago` when only the detecting pass could date it, and a bare
+`history rewritten` when a legacy record carries no time. Earlier
+lives fold into one `N earlier <name> not counted here (<verb> <age> ago) - h`
+line, where `<verb>` says what the closing observation proves: `deleted` when
+a pass observed the ref absent, `replaced` when a boundary was detected while
+the ref stayed present, `ended` when that observation is no longer retained.
+When continuity with the earlier same-name branch is unproven, a `!`
+warning takes that line's place and the earlier life stays separate. It
+points to `- h` only where the view lists earlier lives - a gone row lists
+none - and says the earlier life is no longer kept only when none is
+retained.
 
 A conversation can touch several branches over its life; it is shown once
 with its placements in the detail view.
@@ -47,7 +66,11 @@ with its placements in the detail view.
 
 The `[4]` detail pane follows the focused row. `e` shows the evidence behind
 a claim - which source won and what was outranked, `?` where nothing proved
-it. The full vocabulary is in [attention](attention.md).
+it. On a branch row it renders the raw `branch identity record:`: the record
+id and its ordinal among retained lives, the seen range and how it ended,
+proven creation and last tip, rename and rewrite evidence, and the continuity
+decision in its stored spelling with a one-line gloss. The full vocabulary is
+in [attention](attention.md).
 
 Under **Activity**, each conversation the row's record has observed gets one
 row - `last activity` at its newest source-backed occurrence - rather than one
@@ -113,6 +136,34 @@ with ties ordered by their reason list.
 - Rejected transcript paths are neither retained nor exposed - because they
   provide no actionable evidence and add noise; not hiding them only in the
   evidence pane (that leaves unused data in the JSON contract).
+- Rewrites say "history rewritten", never "force-push" - because detection
+  proves a local non-fast-forward move; not claiming a push the collector
+  never sees.
+- Ordinals count retained lives and appear only above one - because a `1st`
+  on every branch is the noise `#N` was; not stable lifetime counters (they
+  need persisted counters for little gain).
+- The ordinal leads the `branch:` line but trails compact labels, and an
+  earlier life's label counts the retained lives (`1st of 2`) - because a
+  suffix keeps names aligned in lists while the summary line reads the number
+  first, and the of-N form states what the number ranges over.
+- An end verb follows the closing observation - `deleted` for an observed
+  absence, `replaced` for a boundary detected while the ref stayed present,
+  `ended` when the closing observation is not retained; not `deleted` for
+  every close, which a boundary never proved.
+- Earlier lives fold into the `branch:` block - because a separate same-name
+  history section repeats the same fact; not keeping both.
+- The TUI says "branch", "earlier" and "same branch" - "incarnation" stays a
+  store and architecture term; not displaying the wire spellings.
+- An unproven boundary warns instead of listing earlier lives - because both
+  lines would repeat the kept-separate fact, and the warning carries the one
+  `- h` pointer where earlier lives are listed; it says the earlier life is
+  no longer kept only when none is retained, never because a gone row
+  lists none.
+- A boundary close is recorded as `branch replaced by a new branch of the
+  same name`, and the older stored spelling `branch incarnation changed` maps
+  to it at render; `p` on a branch record that has since ended fails with
+  `no active branch <id>` - because stored history is never rewritten; not
+  leaving "incarnation" on display until old events age out.
 
 The architecture and failure semantics live in
 [work-lifecycle](architecture/work-lifecycle.md) and

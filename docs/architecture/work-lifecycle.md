@@ -9,11 +9,16 @@ live between modules.
 
 - Work identity is scoped by the repository's canonical git common dir, not
   its checkout path. Branch names are reusable, so a name alone is not an
-  identity: an incarnation is one observed lifetime of a name, numbered `#N`
-  per `(repo, ref)`.
+  identity: an incarnation is one observed lifetime of a name, numbered
+  among the retained records per `(repo, ref)`; the TUI calls it a branch
+  life and shows the number as an ordinal only when several are retained.
 - Continuity is proven, not assumed: an exact rename or a force-push keeps
   the incarnation's id, while a detected recreation or a boundary that
   cannot be proven continuous starts a new one.
+- Rename and rewrite evidence are persisted independently of the
+  continuity label: `proven_rename` and `ambiguous` are terminal for how a
+  record began, but `renamed` and `rewritten` keep recording what the ref
+  has done since, and neither is derived from the label.
 - A detached checkout and a non-git project space are keyed by canonical
   path. Runtime pane identity never defines a work row.
 - A conversation's placement is exact only: the live process's cwd, or a
@@ -144,6 +149,38 @@ rather than "noticed 30 days ago".
   unchanged - because resetting it discards incarnation and parking
   history; not versioning an additive change (legacy records can default
   absent fields).
+- Rename and rewrite evidence persist as independent `renamed` and
+  `rewritten` fields on the branch record - because the continuity label
+  is terminal for `proven_rename`/`ambiguous`, hides rewrites and carries
+  no name or time; not deriving them from `continuity_evidence` (the enum
+  cannot hold both facts). Both serialize only when set, so the change is
+  additive under `WORK_SCHEMA`.
+- A rewrite is dated by the reflog line that set the observed tip, else by
+  the detecting pass's time - because source-dated events are preferred
+  and a missing branch reflog must not lose the fact; not scan time only
+  (it misdates by the poll gap) nor reflog only (a logless move proves
+  nothing about when). The `dated` field records which clock answered.
+- Incarnation and touch rows carry the retained-lives count, and ordinals
+  appear only above one - because `1st` on every branch is the noise `#1`
+  was; not stable lifetime counters (they need persisted counters for
+  little gain). Numbers count retained lives, so pruning renumbers.
+- Same-branch relations carry a structured `touch` field and provenance
+  text from a shared compact-ordinal formatter - because the TUI renders
+  the group from structure, not free text; not rendering the provenance
+  string (the UI would depend on formatting and keep the `same
+  incarnation` spelling). The relation's wire `label` value is unchanged.
+- New store text says `branch`, with the legacy reason kept as a constant
+  beside its replacement - because stored history is never rewritten and
+  old records still carry the old spelling; not rewording new reasons
+  only (old ones would show `incarnation` until they age out) nor
+  rewriting stored text. The parking error reads `no active branch {id}`.
+- A record's end verb derives from its closing lifecycle observation -
+  `gone` from `branch gone`, `replaced` from a boundary reason in either
+  spelling - because a boundary close proves no deletion and the closing
+  observation already records the cause; not always `deleted` (a boundary
+  proves no absence) nor a persisted cause field (it duplicates the
+  observation). A record whose closing observation is gone ends
+  unexplained.
 - Linux pane matching recognizes the kernel's trailing ` (deleted)`
   annotation only when both the reported literal path and recorded root
   are proven absent - because deleted-cwd panes still retain gone work;
