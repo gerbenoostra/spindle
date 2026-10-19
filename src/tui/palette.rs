@@ -1,5 +1,5 @@
-//! The palette: the only production code that names a `Color` or a
-//! `Modifier`. Everything the dashboard renders carries a `Role`; the
+//! The palette: the only production code that builds a `Style` or names
+//! a `Color` or a `Modifier`. Everything the dashboard renders carries a `Role`; the
 //! table below is the whole mapping from role to style. Hues are the
 //! normal ANSI 1-6 plus `DarkGray` for borders and separators only -
 //! never ANSI 7 and never a bright variant.

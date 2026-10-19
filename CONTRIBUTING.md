@@ -118,8 +118,8 @@ filter excludes it by name).
 - **Subcommands ship with their behaviour.** An argument the binary cannot act
   on is a usage error, not a stub.
 - **A span takes a role, never a colour.** `src/tui/palette.rs` is the only
-  production code that names a `Color` or `Modifier`;
-  `tests/source_invariants.rs` enforces it.
+  production code that builds a `Style` or names a `Color` or `Modifier`,
+  `Stylize` shorthand included; `tests/source_invariants.rs` enforces it.
 
 ## The read boundary
 
