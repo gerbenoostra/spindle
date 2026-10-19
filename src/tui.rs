@@ -857,9 +857,9 @@ impl App {
             .title(self.panel_title(pane, view))
             .borders(Borders::ALL)
             .border_style(if self.focus == pane {
-                Role::Focus.style()
+                Role::Focus
             } else {
-                Role::Border.style()
+                Role::Border
             });
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -1101,11 +1101,7 @@ impl App {
         let block = Block::default()
             .title(title_line(&title, focused))
             .borders(Borders::ALL)
-            .border_style(if focused {
-                Role::Focus.style()
-            } else {
-                Role::Border.style()
-            });
+            .border_style(if focused { Role::Focus } else { Role::Border });
         let inner = block.inner(area);
         f.render_widget(block, area);
         let [head, body] =
@@ -1178,7 +1174,7 @@ impl App {
                 Line::from(vec![
                     Span::styled(
                         format!("{} ", conversation_glyph(c)),
-                        attention_glyph_role(c.attention).style(),
+                        attention_glyph_role(c.attention),
                     ),
                     Span::raw(format!(
                         "{} {} - {}, {}",
@@ -1801,13 +1797,13 @@ impl App {
     fn footer(&self, f: &mut Frame<'_>, area: Rect) {
         let line = if self.collector_dead {
             let mut spans = vec![
-                Span::styled("collector stopped - last snapshot", Role::Text.style()),
-                Span::styled(" | ", Role::Separator.style()),
+                Span::styled("collector stopped - last snapshot", Role::Text),
+                Span::styled(" | ", Role::Separator),
             ];
             spans.extend(hint_spans(DEAD_HINTS));
             Line::from(spans)
         } else if let Some(notice) = &self.notice {
-            Line::from(Span::styled(notice.clone(), Role::Text.style()))
+            Line::from(Span::styled(notice.clone(), Role::Text))
         } else {
             let spinner = self.spinner(area.width);
             let (prefix, hints) = if self.editing.is_some() {
@@ -1820,8 +1816,8 @@ impl App {
             // The spinner leads so it reads as live activity; the hints
             // behind it carry their roles.
             let mut spans = vec![
-                Span::styled(spinner, Role::Text.style()),
-                Span::styled(prefix, Role::Text.style()),
+                Span::styled(spinner, Role::Text),
+                Span::styled(prefix, Role::Text),
             ];
             spans.extend(hint_spans(hints));
             Line::from(spans)
@@ -1857,7 +1853,7 @@ impl App {
                         List::Work => "[2] Work - what needs attention, follow-up or cleanup",
                         List::Conversations => "[3] Conversations - what needs me right now",
                     },
-                    Role::Text.style(),
+                    Role::Text,
                 )),
                 Line::from(""),
                 help_line(match list {
@@ -1869,14 +1865,14 @@ impl App {
             None => vec![
                 Line::from(Span::styled(
                     "[4] Detail - follows the focused list",
-                    Role::Text.style(),
+                    Role::Text,
                 )),
                 Line::from(""),
                 help_line(DETAIL_HELP),
             ],
         };
         let mut lines = vec![
-            Line::from(Span::styled("keys", Role::Strong.style())),
+            Line::from(Span::styled("keys", Role::Strong)),
             help_line(SHARED_HELP), // coverage: off - the unexecuted instantiation's region edge
             Line::from(""),
         ]; // coverage: off - the unexecuted instantiation's region edge
@@ -1894,8 +1890,8 @@ impl App {
             Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Role::Border.style())
-                    .title(Span::styled("help", Role::Strong.style())),
+                    .border_style(Role::Border)
+                    .title(Span::styled("help", Role::Strong)),
             ),
             popup,
         ); // coverage: off - the unexecuted instantiation's region edge
@@ -1950,8 +1946,8 @@ impl App {
             Role::Strong
         };
         Line::from(vec![
-            Span::styled(name, role.style()),
-            Span::styled(suffix, Role::Text.style()),
+            Span::styled(name, role),
+            Span::styled(suffix, Role::Text),
         ])
     }
 }
@@ -2279,11 +2275,11 @@ fn hint_spans(hints: &[Hint]) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (i, &(key, desc)) in hints.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" | ", Role::Separator.style()));
+            spans.push(Span::styled(" | ", Role::Separator));
         }
-        spans.push(Span::styled(key, Role::Key.style()));
+        spans.push(Span::styled(key, Role::Key));
         if !desc.is_empty() {
-            spans.push(Span::styled(format!(" {desc}"), Role::Text.style()));
+            spans.push(Span::styled(format!(" {desc}"), Role::Text));
         }
     }
     spans
@@ -2295,10 +2291,10 @@ fn help_line(hints: &[Hint]) -> Line<'static> {
     let mut spans = Vec::new();
     for (i, &(key, desc)) in hints.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("   ", Role::Text.style()));
+            spans.push(Span::styled("   ", Role::Text));
         }
-        spans.push(Span::styled(key, Role::Key.style()));
-        spans.push(Span::styled(format!(" {desc}"), Role::Text.style()));
+        spans.push(Span::styled(key, Role::Key));
+        spans.push(Span::styled(format!(" {desc}"), Role::Text));
     }
     Line::from(spans)
 }
@@ -2309,10 +2305,10 @@ fn title_line(title: &str, focused: bool) -> Line<'static> {
     let role = if focused { Role::Focus } else { Role::Strong };
     match title.split_once(" - ") {
         Some((name, rest)) => Line::from(vec![
-            Span::styled(name.to_owned(), role.style()),
-            Span::styled(format!(" - {rest}"), Role::Text.style()),
+            Span::styled(name.to_owned(), role),
+            Span::styled(format!(" - {rest}"), Role::Text),
         ]),
-        None => Line::from(Span::styled(title.to_owned(), role.style())),
+        None => Line::from(Span::styled(title.to_owned(), role)),
     }
 }
 
@@ -2506,7 +2502,7 @@ fn section_header(section: crate::snapshot::WorkSection) -> Line<'static> {
         crate::snapshot::WorkSection::NeedsYou => Role::NeedsYou,
         _ => Role::Strong,
     };
-    Line::from(Span::styled(section.title().to_owned(), role.style()))
+    Line::from(Span::styled(section.title().to_owned(), role))
 }
 
 /// A conversation row's glyph is its attention: `!`/`✗`/`✓`/`●`/`?`/blank.
@@ -2567,7 +2563,7 @@ fn push_text(out: &mut Vec<Line<'static>>, text: String, width: usize) {
 /// A wrapped section header into the detail body, `Strong`.
 fn push_head(out: &mut Vec<Line<'static>>, text: String, width: usize) {
     for line in wrap_text(&text, width) {
-        out.push(Line::from(Span::styled(line, Role::Strong.style())));
+        out.push(Line::from(Span::styled(line, Role::Strong)));
     }
 }
 
@@ -2908,7 +2904,7 @@ fn rewrite_phrase(i: &IncarnationRow, now: u64, tagged: bool) -> Option<String> 
 /// A wrapped attention line into the detail body, `Wait`-styled.
 fn push_attention(out: &mut Vec<Line<'static>>, text: String, width: usize) {
     for line in wrap_text(&text, width) {
-        out.push(Line::from(Span::styled(line, Role::Wait.style())));
+        out.push(Line::from(Span::styled(line, Role::Wait)));
     }
 }
 

@@ -68,8 +68,10 @@ pub enum Role {
 impl Role {
     /// The role's style - the only place a `Role` becomes a `Color`.
     /// Each style starts from `Style::reset()` so a span never inherits
-    /// the base cell's colour or modifiers.
-    pub fn style(self) -> Style {
+    /// the base cell's colour or modifiers. Private: renderers pass the
+    /// `Role` itself (`From<Role> for Style`), so no `Style` value reaches
+    /// them to chain `.bold()` or `.fg(..)` onto.
+    fn style(self) -> Style {
         match self {
             Role::Text => Style::reset(),
             Role::Strong => Style::reset().add_modifier(Modifier::BOLD),
@@ -86,6 +88,12 @@ impl Role {
             Role::Border | Role::Separator => Style::reset().fg(Color::DarkGray),
             Role::Focus => Style::reset().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         }
+    }
+}
+
+impl From<Role> for Style {
+    fn from(role: Role) -> Style {
+        role.style()
     }
 }
 
