@@ -2119,60 +2119,54 @@ fn glyph_width(glyph: &str) -> usize {
     glyph.chars().count().max(1)
 }
 
-/// A footer or help hint: the key and what it does. An empty
-/// `desc` is the compact form's dropped description.
-struct Hint {
-    key: &'static str,
-    desc: &'static str,
-}
-
-#[rustfmt::skip]
-const fn h(key: &'static str, desc: &'static str) -> Hint { Hint { key, desc } } // coverage: off - const-evaluated in the statics below, never called at runtime
+/// A footer or help hint: `(key, desc)`, the key and what it does. An
+/// empty `desc` is the compact form's dropped description.
+type Hint = (&'static str, &'static str);
 
 /// The wide footer's hint lists, one per focused view - every key keeps
 /// its description.
 const WIDE_REPOS: &[Hint] = &[
-    h("1-4", "focus"),
-    h("tab", "next"),
-    h("j/k", "move"),
-    h("e", "evidence"),
-    h("/", "filter"),
-    h("?", "keys"),
-    h("q", "quit"),
+    ("1-4", "focus"),
+    ("tab", "next"),
+    ("j/k", "move"),
+    ("e", "evidence"),
+    ("/", "filter"),
+    ("?", "keys"),
+    ("q", "quit"),
 ];
 const WIDE_WORK: &[Hint] = &[
-    h("1-4", "focus"),
-    h("tab", "next"),
-    h("j/k", "move"),
-    h("enter", "jump"),
-    h("o", "open"),
-    h("e", "evidence"),
-    h("/", "filter"),
-    h("space", "ack"),
-    h("p", "park"),
-    h("h", "history"),
-    h("?", "keys"),
-    h("q", "quit"),
+    ("1-4", "focus"),
+    ("tab", "next"),
+    ("j/k", "move"),
+    ("enter", "jump"),
+    ("o", "open"),
+    ("e", "evidence"),
+    ("/", "filter"),
+    ("space", "ack"),
+    ("p", "park"),
+    ("h", "history"),
+    ("?", "keys"),
+    ("q", "quit"),
 ];
 const WIDE_CONVERSATIONS: &[Hint] = &[
-    h("1-4", "focus"),
-    h("tab", "next"),
-    h("j/k", "move"),
-    h("enter", "jump"),
-    h("e", "evidence"),
-    h("/", "filter"),
-    h("space", "ack"),
-    h("?", "keys"),
-    h("q", "quit"),
+    ("1-4", "focus"),
+    ("tab", "next"),
+    ("j/k", "move"),
+    ("enter", "jump"),
+    ("e", "evidence"),
+    ("/", "filter"),
+    ("space", "ack"),
+    ("?", "keys"),
+    ("q", "quit"),
 ];
 const WIDE_DETAIL: &[Hint] = &[
-    h("1-4", "focus"),
-    h("tab", "next"),
-    h("j/k", "scroll"),
-    h("e", "evidence"),
-    h("esc", "close"),
-    h("?", "keys"),
-    h("q", "quit"),
+    ("1-4", "focus"),
+    ("tab", "next"),
+    ("j/k", "scroll"),
+    ("e", "evidence"),
+    ("esc", "close"),
+    ("?", "keys"),
+    ("q", "quit"),
 ];
 
 /// The focused view's footer hints, wide form.
@@ -2188,44 +2182,44 @@ fn wide_hints(list: Option<List>) -> &'static [Hint] {
 /// The compact footer's hint lists: bare keys, the few descriptions kept
 /// where the narrow footer keeps them today.
 const COMPACT_WORK: &[Hint] = &[
-    h("1-4", ""),
-    h("tab", ""),
-    h("j/k", ""),
-    h("⏎", ""),
-    h("o", ""),
-    h("e", ""),
-    h("p", ""),
-    h("h", ""),
-    h("/", ""),
-    h("?", ""),
-    h("q", "quit"),
+    ("1-4", ""),
+    ("tab", ""),
+    ("j/k", ""),
+    ("⏎", ""),
+    ("o", ""),
+    ("e", ""),
+    ("p", ""),
+    ("h", ""),
+    ("/", ""),
+    ("?", ""),
+    ("q", "quit"),
 ];
 const COMPACT_CONVERSATIONS: &[Hint] = &[
-    h("1-4", ""),
-    h("tab", ""),
-    h("j/k", ""),
-    h("⏎", ""),
-    h("e", ""),
-    h("/", "filter"),
-    h("?", ""),
-    h("q", "quit"),
+    ("1-4", ""),
+    ("tab", ""),
+    ("j/k", ""),
+    ("⏎", ""),
+    ("e", ""),
+    ("/", "filter"),
+    ("?", ""),
+    ("q", "quit"),
 ];
 const COMPACT_LIST: &[Hint] = &[
-    h("1-4", ""),
-    h("tab", ""),
-    h("j/k", ""),
-    h("e", ""),
-    h("/", "filter"),
-    h("?", ""),
-    h("q", "quit"),
+    ("1-4", ""),
+    ("tab", ""),
+    ("j/k", ""),
+    ("e", ""),
+    ("/", "filter"),
+    ("?", ""),
+    ("q", "quit"),
 ];
 const COMPACT_DETAIL: &[Hint] = &[
-    h("1-4", ""),
-    h("tab", ""),
-    h("j/k", "scroll"),
-    h("e", ""),
-    h("?", ""),
-    h("q", "quit"),
+    ("1-4", ""),
+    ("tab", ""),
+    ("j/k", "scroll"),
+    ("e", ""),
+    ("?", ""),
+    ("q", "quit"),
 ];
 
 /// The focused view's footer hints, compact form.
@@ -2239,57 +2233,57 @@ fn compact_hints(list: Option<List>) -> &'static [Hint] {
 }
 
 /// The open filter-edit line's hints.
-const FILTER_HINTS: &[Hint] = &[h("enter", "apply"), h("esc", "cancel")];
+const FILTER_HINTS: &[Hint] = &[("enter", "apply"), ("esc", "cancel")];
 
 /// The dead collector's hint, after its `Text` status.
-const DEAD_HINTS: &[Hint] = &[h("q", "quit")];
+const DEAD_HINTS: &[Hint] = &[("q", "quit")];
 
 /// The help overlay's shared top row.
 const SHARED_HELP: &[Hint] = &[
-    h("1-4", "focus"),
-    h("tab", "next"),
-    h("q", "quit"),
-    h("?", "close"),
-    h("esc", "close"),
+    ("1-4", "focus"),
+    ("tab", "next"),
+    ("q", "quit"),
+    ("?", "close"),
+    ("esc", "close"),
 ];
 
 /// The help overlay's per-pane key rows.
 const REPOS_HELP: &[Hint] = &[
-    h("j/k", "move"),
-    h("/", "filter"),
-    h("e", "evidence"),
-    h("space", "ack/mark"),
+    ("j/k", "move"),
+    ("/", "filter"),
+    ("e", "evidence"),
+    ("space", "ack/mark"),
 ];
 const WORK_HELP: &[Hint] = &[
-    h("j/k", "move"),
-    h("/", "filter"),
-    h("e", "evidence"),
-    h("space", "ack/mark"),
-    h("p", "park"),
-    h("h", "history"),
-    h("enter", "jump"),
-    h("o", "open"),
+    ("j/k", "move"),
+    ("/", "filter"),
+    ("e", "evidence"),
+    ("space", "ack/mark"),
+    ("p", "park"),
+    ("h", "history"),
+    ("enter", "jump"),
+    ("o", "open"),
 ];
 const CONVERSATIONS_HELP: &[Hint] = &[
-    h("j/k", "move"),
-    h("/", "filter"),
-    h("e", "evidence"),
-    h("space", "ack/mark"),
-    h("enter", "jump"),
+    ("j/k", "move"),
+    ("/", "filter"),
+    ("e", "evidence"),
+    ("space", "ack/mark"),
+    ("enter", "jump"),
 ];
-const DETAIL_HELP: &[Hint] = &[h("j/k", "scroll"), h("e", "evidence"), h("esc", "close")];
+const DETAIL_HELP: &[Hint] = &[("j/k", "scroll"), ("e", "evidence"), ("esc", "close")];
 
 /// `hints` as footer spans: each key a `Key`, its ` desc` `Text`, the
 /// ` | ` between hints a `Separator` - the exact text the footer writes.
 fn hint_spans(hints: &[Hint]) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    for (i, hint) in hints.iter().enumerate() {
+    for (i, &(key, desc)) in hints.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" | ", Role::Separator.style()));
         }
-        spans.push(Span::styled(hint.key, Role::Key.style()));
-        if !hint.desc.is_empty() {
-            spans.push(Span::styled(format!(" {}", hint.desc), Role::Text.style()));
+        spans.push(Span::styled(key, Role::Key.style()));
+        if !desc.is_empty() {
+            spans.push(Span::styled(format!(" {desc}"), Role::Text.style()));
         }
     }
     spans
@@ -2299,12 +2293,12 @@ fn hint_spans(hints: &[Hint]) -> Vec<Span<'static>> {
 /// apart, the exact layout the overlay writes.
 fn help_line(hints: &[Hint]) -> Line<'static> {
     let mut spans = Vec::new();
-    for (i, hint) in hints.iter().enumerate() {
+    for (i, &(key, desc)) in hints.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("   ", Role::Text.style()));
         }
-        spans.push(Span::styled(hint.key, Role::Key.style()));
-        spans.push(Span::styled(format!(" {}", hint.desc), Role::Text.style()));
+        spans.push(Span::styled(key, Role::Key.style()));
+        spans.push(Span::styled(format!(" {desc}"), Role::Text.style()));
     }
     Line::from(spans)
 }
