@@ -134,8 +134,9 @@ pub struct Seg {
 }
 
 /// A line under construction: an ordered run of `Seg`s. `push` adds
-/// `Content`, `push_layout` adds `Layout` - only `render_row` calls the
-/// latter, so kind is never inferred from text or position.
+/// `Content`, `push_layout` adds `Layout` - only the cursor-item renderers
+/// (a list row and its context line) call the latter, so kind is never
+/// inferred from text or position.
 #[derive(Debug, Default)]
 pub struct Segs(Vec<Seg>);
 
@@ -150,7 +151,7 @@ impl Segs {
     }
 
     /// A `Layout` segment - row glyph slot, inter-field padding, the gap
-    /// before the age.
+    /// before the age, a context line's indent.
     pub fn push_layout(&mut self, role: Role, text: impl Into<String>) {
         self.0.push(Seg {
             role,

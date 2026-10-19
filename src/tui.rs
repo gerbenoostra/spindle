@@ -899,11 +899,15 @@ impl App {
                 && view.work_scope.is_none()
                 && let Some(context) = conversation_context(c, view.repo_scope.as_deref())
             {
+                // The indent is `Layout`, so the unfocused underline
+                // starts under the context text; it is split off after
+                // `fit` so the line's text is unchanged.
+                let line = fit(&format!("    {context}"), inner.width as usize);
+                let indent = line.bytes().take(4).take_while(|b| *b == b' ').count();
+                let (indent, text) = line.split_at(indent);
                 let mut segs = Segs::default();
-                segs.push(
-                    Role::Text,
-                    fit(&format!("    {context}"), inner.width as usize),
-                );
+                segs.push_layout(Role::Text, indent);
+                segs.push(Role::Text, text);
                 display.push(to_line(&segs, item, inner.width as usize));
             }
             // Scroll is computed against the selected item's FINAL
@@ -1052,8 +1056,7 @@ impl App {
             .saturating_sub(glyph_w + cell_width(&label) + middle_w + age_w + 2)
             .max(1);
         // The glyph slot, the padding and the gap before the age are
-        // `Layout`: spacing the cursor's underline must not touch. Only
-        // this function calls `push_layout`.
+        // `Layout`: spacing the cursor's underline must not touch.
         let mut segs = Segs::default();
         segs.push_layout(
             glyph_role(cells.glyph),
@@ -6416,11 +6419,17 @@ mod tests {
         for x in 1..79 {
             assert!(!buffer[(x, y)].modifier.contains(Modifier::REVERSED));
         }
-        // The context line underlines as one Content segment.
+        // The context line underlines its text, not its Layout indent.
         let cy = y + 1;
         assert_eq!(list_text_at(&buffer, cy, "a · feat/login"), Some(5));
         let end = 4 + "a · feat/login · a-login".chars().count() as u16 + 1;
-        for x in 1..end {
+        for x in 1..5 {
+            assert!(
+                !buffer[(x, cy)].modifier.contains(Modifier::UNDERLINED),
+                "indent x{x}"
+            );
+        }
+        for x in 5..end {
             assert!(
                 buffer[(x, cy)].modifier.contains(Modifier::UNDERLINED),
                 "context x{x}"
