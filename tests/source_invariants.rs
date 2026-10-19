@@ -251,9 +251,11 @@ fn only_the_palette_names_a_style() {
 
 /// The style names `code` holds. Besides the `Style`, `Color` and
 /// `Modifier` paths, an import from `ratatui::style` - braced, aliased or
-/// through `prelude` - is what brings in `Stylize` shorthand (`.cyan()`,
-/// `.bold()`), which names no type at the call site. Each needle must
-/// start a word, so `OrdinalStyle::` is not `Style::`.
+/// through ratatui's `prelude` - is what brings in `Stylize` shorthand
+/// (`.cyan()`, `.bold()`), which names no type at the call site. Each
+/// needle must start a word, so `OrdinalStyle::` is not `Style::`; a
+/// `prelude::` counts only within a statement that names `ratatui`, so
+/// `std::io::prelude` passes.
 fn style_names(code: &str) -> Vec<&'static str> {
     const NEEDLES: [&str; 6] = [
         "Style::",
@@ -267,10 +269,13 @@ fn style_names(code: &str) -> Vec<&'static str> {
         .into_iter()
         .filter(|needle| {
             code.match_indices(needle).any(|(at, _)| {
-                !code[..at]
+                let before = &code[..at];
+                let starts_word = !before
                     .chars()
                     .next_back()
-                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                let statement = &before[before.rfind(';').map_or(0, |end| end + 1)..];
+                starts_word && (*needle != "prelude::" || statement.contains("ratatui"))
             })
         })
         .collect()
@@ -286,6 +291,8 @@ fn the_style_guard_sees_every_way_to_name_a_style() {
         ("use ratatui::style::Color as C;", vec!["style::"]),
         ("use ratatui::{style::Color, text::Line};", vec!["style::"]),
         ("use ratatui::prelude::*;", vec!["prelude::"]),
+        ("use ratatui::{prelude::*, Frame};", vec!["prelude::"]),
+        ("use ratatui::text::Line;\nuse std::io::prelude::*;", vec![]),
         ("OrdinalStyle::Suffix", vec![]),
         ("Role::Focus.style()", vec![]),
         ("Block::default().border_style(s)", vec![]),
