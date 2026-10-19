@@ -35,10 +35,30 @@ lines remain yellow, but values carry no identity hues.
 
 ## Decisions
 
-- D1: hue means state or identity; bold carries hierarchy, ANSI 8 is chrome only.
-- D2: normal ANSI 1-6 hues; red-bold for `error`/`blocked` words.
-- D3: light themes are best effort, no contrast target.
-- D4: focus stays cyan.
-- D5: one reverse-video cursor bar in the focused list; unfocused lists underline the cursor item's text.
-- D6: spans take a role; only `src/tui/palette.rs` names a colour.
-- D9: earlier-life rows render plain - default foreground, no bold, no glyph.
+- A hue means state (waiting, error, done, working) or identity (references,
+  identifiers), and bold carries hierarchy - because a hue that only
+  decorates teaches nothing; not a neutral gray ladder (labels, summaries and
+  ages flatten into one weight), not lazygit's roles (status hues double as
+  type hues).
+- Hues are the normal ANSI 1-6, with bold red for `error`/`blocked` words -
+  because, compared side by side, they read better on Catppuccin and degrade
+  less on light themes; not the bright 9-14 set, which wins on Kanagawa and
+  Tango. Accepted: red, and on Tango blue and magenta, stay below 4.5:1
+  contrast.
+- ANSI 8 is for borders and separators only - because it falls below 4.5:1
+  on common dark themes, and ANSI 7 is near-invisible on light ones.
+- Light themes are best effort: nothing is invisible - because both hue sets
+  mostly fail contrast on a light background; not a light-theme contrast
+  target.
+- Focus stays cyan - because green already means done; not lazygit's green
+  focus border.
+- One cursor bar, in the focused list only; other lists underline their
+  cursor item - because a bar in every list reads as three cursors, and the
+  unfocused cursor still sets the next pane's scope; not bold (labels that
+  are already bold barely change), not an invisible unfocused cursor.
+- A span takes a role, never a colour, and only `src/tui/palette.rs` builds
+  a style - because the next palette change then audits one file; not
+  inline styles, not a configurable theme.
+- Earlier-life rows render plain - default foreground, no bold, no glyph -
+  because an earlier life must not look as current as the live one; not the
+  live rows' accents.
