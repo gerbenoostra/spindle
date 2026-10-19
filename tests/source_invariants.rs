@@ -223,6 +223,34 @@ fn action_code_spawns_no_shell_topology_or_urls() {
     }
 }
 
+/// Style names the render path must not hold outside the palette: a span
+/// takes a `Role`, and only `src/tui/palette.rs` may turn a role into a
+/// `Color` or `Modifier` - the next style change audits one file, not
+/// twenty.
+#[test]
+fn only_the_palette_names_a_color_or_modifier() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let palette = src.join("tui/palette.rs");
+    assert!(
+        palette.is_file(),
+        "src/tui/palette.rs must exist - it is the one file allowed to name styles"
+    );
+    for path in rust_sources(&src) {
+        if path == palette {
+            continue;
+        }
+        let text = fs::read_to_string(&path).expect("a source file this crate owns");
+        let production = production_part(&text, &path);
+        for style in ["Color::", "Modifier::"] {
+            assert!(
+                !production.contains(style),
+                "{}: names {style} outside src/tui/palette.rs; take a Role instead",
+                path.display()
+            );
+        }
+    }
+}
+
 /// The text of `file` up to its unit-test module, after asserting the
 /// `#[cfg(test)]` convention that makes that cut safe.
 fn production_part<'a>(text: &'a str, path: &Path) -> &'a str {

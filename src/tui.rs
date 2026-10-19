@@ -9,7 +9,7 @@
 //!
 //! The render path reads only the snapshot: collectors do all subprocess and
 //! file work behind it, so a bursty filesystem or a slow remote can never
-//! stall a redraw. Every cell the evidence could not fill renders a dim `?`.
+//! stall a redraw. Every cell the evidence could not fill renders a plain `?`.
 
 use std::io;
 use std::path::Path;
@@ -19,7 +19,6 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyEventKind};
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
@@ -37,6 +36,9 @@ use crate::snapshot::{
 use crate::store::{self, Store};
 use crate::text::escape_text;
 use crate::tmux::{self, PaneRef};
+
+mod palette;
+use palette::{Cursor, Role, Segs, attention_glyph_role, glyph_role, to_line};
 
 /// The four panes, in `Tab` order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,15 +202,13 @@ enum Row<'a> {
 }
 
 /// The cells one row renders: attention glyph, label, the right-aligned
-/// middle field and the right-edge age. `selected` inverts, `dim_label` is
-/// for an unknown title.
+/// middle field and the right-edge age. Cursor styling is not the row's
+/// business - `to_line` applies it from the `Cursor` the caller passes.
 struct RowCells<'a> {
     glyph: &'a str,
     label: &'a str,
     middle: &'a str,
     age: &'a str,
-    selected: bool,
-    dim_label: bool,
 }
 
 impl App {
@@ -857,9 +857,9 @@ impl App {
             .title(self.panel_title(pane, view))
             .borders(Borders::ALL)
             .border_style(if self.focus == pane {
-                Style::default().fg(Color::Cyan)
+                Role::Focus.style()
             } else {
-                Style::default()
+                Role::Border.style()
             });
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -870,8 +870,16 @@ impl App {
         // list is the only one with sections yet).
         let cursor = self.cursor[list_index(list)];
         let visible = inner.height as usize;
+        // The list pane's focus decides which cursor mark a selected line
+        // gets: the focused list's bar, an unfocused list's underline -
+        // even while the detail pane is focused, every list is unfocused.
+        let row_cursor = |selected: bool| match (selected, self.focus == pane) {
+            (true, true) => Cursor::Focused,
+            (true, false) => Cursor::Unfocused,
+            (false, _) => Cursor::None,
+        };
         let mut display: Vec<Line<'_>> = Vec::new();
-        display.push(self.all_row(list, rows, view, inner.width, cursor == 0));
+        display.push(self.all_row(list, rows, view, inner.width, row_cursor(cursor == 0)));
         let mut cursor_line = 0usize;
         let mut last_section = None;
         for (i, row) in rows.iter().enumerate() {
@@ -881,8 +889,9 @@ impl App {
                 display.push(section_header(w.section));
                 last_section = Some(w.section);
             }
-            display.push(self.row(list, row, view, inner.width, cursor == i + 1));
-            // The global work scope gives each conversation a dim context
+            let item = row_cursor(cursor == i + 1);
+            display.push(self.row(list, row, view, inner.width, item));
+            // The global work scope gives each conversation a context
             // line - part of the same cursor item, never a row of its
             // own; it disappears once a scope is selected.
             if let Row::Conversation(c) = row
@@ -890,10 +899,12 @@ impl App {
                 && view.work_scope.is_none()
                 && let Some(context) = conversation_context(c, view.repo_scope.as_deref())
             {
-                display.push(Line::from(Span::styled(
+                let mut segs = Segs::default();
+                segs.push(
+                    Role::Text,
                     fit(&format!("    {context}"), inner.width as usize),
-                    Style::default().fg(Color::DarkGray),
-                )));
+                );
+                display.push(to_line(&segs, item, inner.width as usize));
             }
             // Scroll is computed against the selected item's FINAL
             // display line - its optional context line included - so a
@@ -907,13 +918,15 @@ impl App {
         if list == List::Work
             && let Some((safe, review)) = view.cleanup
         {
-            display.push(Line::from(Span::styled(
+            let mut segs = Segs::default();
+            segs.push(
+                Role::Text,
                 fit(
                     &format!("Cleanup {safe} safe · {review} review"),
                     inner.width as usize,
                 ),
-                Style::default().fg(Color::DarkGray),
-            )));
+            );
+            display.push(to_line(&segs, Cursor::None, inner.width as usize));
         }
         let scroll = cursor_line.saturating_sub(visible.saturating_sub(1));
         let lines: Vec<Line<'_>> = display.into_iter().skip(scroll).take(visible).collect();
@@ -927,7 +940,7 @@ impl App {
         rows: &[Row<'_>],
         view: &View<'_>,
         width: u16,
-        selected: bool,
+        cursor: Cursor,
     ) -> Line<'static> {
         // Only [1]'s `all` row carries a glyph: the attention rolled up
         // over every repo in view.
@@ -962,9 +975,8 @@ impl App {
                 label: "all",
                 middle: &counts,
                 age: "",
-                selected,
-                dim_label: false,
             },
+            cursor,
         )
     }
 
@@ -975,7 +987,7 @@ impl App {
         row: &Row<'_>,
         view: &View<'_>,
         width: u16,
-        selected: bool,
+        cursor: Cursor,
     ) -> Line<'static> {
         let cells = match row {
             Row::Repo(r) => RowCells {
@@ -983,8 +995,6 @@ impl App {
                 label: &r.name,
                 middle: &repo_counts(r),
                 age: &age(self.now(), r.last_activity),
-                selected,
-                dim_label: false,
             },
             Row::Work(w) => RowCells {
                 glyph: work_glyph(w),
@@ -993,12 +1003,11 @@ impl App {
                 label: &work_name(w, list == List::Work && view.repo_scope.is_none()),
                 middle: &w.summary,
                 age: &age(self.now(), w.last_activity),
-                selected,
-                dim_label: false,
             },
             Row::History(w, h) => RowCells {
-                // Earlier same-name life: dim, no attention glyph,
-                // marked `earlier`, aged by when that life ended.
+                // Earlier same-name life: plain text, no attention
+                // glyph, marked `earlier`, aged by when that life
+                // ended.
                 glyph: "",
                 label: &work_label(
                     w,
@@ -1007,39 +1016,24 @@ impl App {
                 ),
                 middle: "earlier",
                 age: &age(self.now(), h.ended_at),
-                selected,
-                dim_label: true,
             },
             Row::Conversation(c) => RowCells {
                 glyph: conversation_glyph(c),
                 label: &format!("{} {}", c.short_id, c.title.as_deref().unwrap_or("?")),
                 middle: &conversation_middle(c),
                 age: &age(self.now(), c.state_since),
-                selected,
-                dim_label: c.title.is_none(),
             },
         };
-        self.render_row(width, &cells)
+        self.render_row(width, &cells, cursor)
     }
 
     /// A row assembled from fixed cells: glyph, label, right-aligned middle
     /// field and right-edge age. Width tiers, not clipping: a narrow pane
     /// gets glyph and label, a medium one adds the age and the compact
     /// summary. Nothing scrolls horizontally; the label is what shrinks.
-    fn render_row(&self, width: u16, cells: &RowCells<'_>) -> Line<'static> {
+    fn render_row(&self, width: u16, cells: &RowCells<'_>, cursor: Cursor) -> Line<'static> {
         let width = width as usize;
         let glyph_w = glyph_width(cells.glyph);
-        let base = if cells.selected {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        let label_style = if cells.dim_label {
-            base.fg(Color::DarkGray)
-        } else {
-            base
-        };
-        let dim = base.fg(Color::DarkGray);
         // narrow: glyph + label. medium adds the age and the compact
         // summary - which is capped so it never starves the label below a
         // readable minimum.
@@ -1057,17 +1051,20 @@ impl App {
         let pad = width
             .saturating_sub(glyph_w + cell_width(&label) + middle_w + age_w + 2)
             .max(1);
-        Line::from(vec![
-            Span::styled(
-                format!("{:>glyph_w$} ", cells.glyph),
-                glyph_style(cells.glyph).patch(base),
-            ),
-            Span::styled(label, label_style),
-            Span::styled(" ".repeat(pad), base),
-            Span::styled(middle.to_owned(), dim),
-            Span::styled(" ".to_owned(), base),
-            Span::styled(age.to_owned(), dim),
-        ])
+        // The glyph slot, the padding and the gap before the age are
+        // `Layout`: spacing the cursor's underline must not touch. Only
+        // this function calls `push_layout`.
+        let mut segs = Segs::default();
+        segs.push_layout(
+            glyph_role(cells.glyph),
+            format!("{:>glyph_w$} ", cells.glyph),
+        );
+        segs.push(Role::Text, label);
+        segs.push_layout(Role::Text, " ".repeat(pad));
+        segs.push(Role::Text, middle);
+        segs.push_layout(Role::Text, " ");
+        segs.push(Role::Text, age);
+        to_line(&segs, cursor, width)
     }
 
     /// The detail pane: a pinned `glyph target - what · state age`
@@ -1097,13 +1094,14 @@ impl App {
         } else {
             title
         };
+        let focused = self.focus == Pane::Detail;
         let block = Block::default()
-            .title(title)
+            .title(title_line(&title, focused))
             .borders(Borders::ALL)
-            .border_style(if self.focus == Pane::Detail {
-                Style::default().fg(Color::Cyan)
+            .border_style(if focused {
+                Role::Focus.style()
             } else {
-                Style::default()
+                Role::Border.style()
             });
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -1177,7 +1175,7 @@ impl App {
                 Line::from(vec![
                     Span::styled(
                         format!("{} ", conversation_glyph(c)),
-                        glyph_style(conversation_glyph(c)),
+                        attention_glyph_role(c.attention).style(),
                     ),
                     Span::raw(format!(
                         "{} {} - {}, {}",
@@ -1188,10 +1186,7 @@ impl App {
                     )),
                 ]),
             ),
-            _ => (
-                "[4] Detail".to_owned(),
-                Line::from(Span::styled("all", Style::default().fg(Color::DarkGray))),
-            ),
+            _ => ("[4] Detail".to_owned(), Line::from("all")),
         }
     }
 
@@ -1801,45 +1796,32 @@ impl App {
     /// While the snapshot is incomplete a spinner leads - collection is in
     /// flight - and a dead collector replaces the line entirely.
     fn footer(&self, f: &mut Frame<'_>, area: Rect) {
-        let dim = Style::default().fg(Color::DarkGray);
         let line = if self.collector_dead {
-            Line::from(Span::styled(
-                "collector stopped - last snapshot | q quit",
-                dim,
-            ))
+            let mut spans = vec![
+                Span::styled("collector stopped - last snapshot", Role::Text.style()),
+                Span::styled(" | ", Role::Separator.style()),
+            ];
+            spans.extend(hint_spans(DEAD_HINTS));
+            Line::from(spans)
         } else if let Some(notice) = &self.notice {
-            Line::from(Span::styled(notice.clone(), dim))
+            Line::from(Span::styled(notice.clone(), Role::Text.style()))
         } else {
             let spinner = self.spinner(area.width);
-            let hints = if self.editing.is_some() {
-                "filter: enter apply | esc cancel".to_owned()
+            let (prefix, hints) = if self.editing.is_some() {
+                ("filter: ", FILTER_HINTS)
             } else if area.width < 60 {
-                match self.focused_list() {
-                    Some(List::Work) => {
-                        "1-4 | tab | j/k | ⏎ | o | e | p | h | / | ? | q quit".to_owned()
-                    }
-                    Some(List::Conversations) => {
-                        "1-4 | tab | j/k | ⏎ | e | / filter | ? | q quit".to_owned()
-                    }
-                    Some(_) => "1-4 | tab | j/k | e | / filter | ? | q quit".to_owned(),
-                    None => "1-4 | tab | j/k scroll | e | ? | q quit".to_owned(),
-                }
+                ("", compact_hints(self.focused_list()))
             } else {
-                let hints = match self.focused_list() {
-                    Some(List::Repos) => "1-4 focus | tab next | j/k move | e evidence | / filter",
-                    Some(List::Work) => {
-                        "1-4 focus | tab next | j/k move | enter jump | o open | e evidence | / filter | space ack | p park | h history"
-                    }
-                    Some(_) => {
-                        "1-4 focus | tab next | j/k move | enter jump | e evidence | / filter | space ack"
-                    }
-                    None => "1-4 focus | tab next | j/k scroll | e evidence | esc close",
-                };
-                format!("{hints} | ? keys | q quit")
+                ("", wide_hints(self.focused_list()))
             };
-            // The spinner leads in the default foreground so it reads as live
-            // activity; the hints behind it stay dim.
-            Line::from(vec![Span::raw(spinner), Span::styled(hints, dim)])
+            // The spinner leads so it reads as live activity; the hints
+            // behind it carry their roles.
+            let mut spans = vec![
+                Span::styled(spinner, Role::Text.style()),
+                Span::styled(prefix, Role::Text.style()),
+            ];
+            spans.extend(hint_spans(hints));
+            Line::from(spans)
         };
         f.render_widget(Paragraph::new(line), area);
     }
@@ -1866,31 +1848,33 @@ impl App {
     fn help_overlay(&self, f: &mut Frame<'_>, area: Rect) {
         let rows: Vec<Line<'static>> = match self.focused_list() {
             Some(list) => vec![
-                Line::from(match list {
-                    List::Repos => "[1] Repos - which project needs me",
-                    List::Work => "[2] Work - what needs attention, follow-up or cleanup",
-                    List::Conversations => "[3] Conversations - what needs me right now",
-                }),
+                Line::from(Span::styled(
+                    match list {
+                        List::Repos => "[1] Repos - which project needs me",
+                        List::Work => "[2] Work - what needs attention, follow-up or cleanup",
+                        List::Conversations => "[3] Conversations - what needs me right now",
+                    },
+                    Role::Text.style(),
+                )),
                 Line::from(""),
-                Line::from(match list {
-                    List::Work => {
-                        "j/k move   / filter   e evidence   space ack/mark   p park   h history   enter jump   o open"
-                    }
-                    List::Conversations => {
-                        "j/k move   / filter   e evidence   space ack/mark   enter jump"
-                    }
-                    _ => "j/k move   / filter   e evidence   space ack/mark",
+                help_line(match list {
+                    List::Work => WORK_HELP,
+                    List::Conversations => CONVERSATIONS_HELP,
+                    _ => REPOS_HELP,
                 }),
             ],
             None => vec![
-                Line::from("[4] Detail - follows the focused list"),
+                Line::from(Span::styled(
+                    "[4] Detail - follows the focused list",
+                    Role::Text.style(),
+                )),
                 Line::from(""),
-                Line::from("j/k scroll   e evidence   esc close"),
+                help_line(DETAIL_HELP),
             ],
         };
         let mut lines = vec![
-            Line::from("keys"),
-            Line::from("1-4 focus   tab next   q quit   ? close   esc close"), // coverage: off - the unexecuted instantiation's region edge
+            Line::from(Span::styled("keys", Role::Strong.style())),
+            help_line(SHARED_HELP), // coverage: off - the unexecuted instantiation's region edge
             Line::from(""),
         ]; // coverage: off - the unexecuted instantiation's region edge
         lines.extend(rows);
@@ -1904,50 +1888,68 @@ impl App {
         };
         f.render_widget(Clear, popup);
         f.render_widget(
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("help")),
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Role::Border.style())
+                    .title(Span::styled("help", Role::Strong.style())),
+            ),
             popup,
         ); // coverage: off - the unexecuted instantiation's region edge
     } // coverage: off - same
     // coverage: off - the instantiation edge lands on this line
-    /// The panel title: `[N] Name` plus the scope suffix the cursor above set.
-    fn panel_title(&self, pane: Pane, view: &View<'_>) -> String {
-        // coverage: off - the Pane::Detail arm never runs: the detail pane renders its own header
-        match pane {
-            Pane::Repos => "[1] Repos".to_owned(),
-            Pane::Work => match &view.repo_scope {
-                None => "[2] Work  all · by next action".to_owned(),
-                Some(repo) => {
-                    let name = self
-                        .snapshot
-                        .repos
-                        .iter()
-                        .find(|r| &r.id == repo)
-                        .map(|r| r.name.clone())
-                        .unwrap_or_else(|| repo.clone()); // coverage: off - the scope's id always names a repo row
-                    format!("[2] Work  {name} · by next action")
-                }
-            },
-            Pane::Conversations => match &view.work_scope {
-                Some(WorkScope::Worktree { root, .. }) => {
-                    format!("[3] Conversations  {}", root.display())
-                }
-                Some(WorkScope::Incarnation {
-                    label, excluded, ..
-                }) => {
-                    let state = if *excluded {
-                        "earlier branch"
-                    } else {
-                        "current branch"
-                    };
-                    format!("[3] Conversations  {label} · {state}")
-                }
-                Some(WorkScope::Space { path, .. }) => {
-                    format!("[3] Conversations  {}", path.display())
-                }
-                None => "[3] Conversations  all · by attention".to_owned(),
-            },
-            Pane::Detail => self.detail_header(view).0, // coverage: off - the detail pane renders its own header, never asks the title
-        }
+    /// The panel title: `[N] Name` in the pane's focus role, plus the
+    /// scope suffix the cursor above set in plain `Text` either way.
+    fn panel_title(&self, pane: Pane, view: &View<'_>) -> Line<'static> {
+        let (name, suffix) = match pane {
+            Pane::Repos => ("[1] Repos".to_owned(), String::new()),
+            Pane::Work => (
+                "[2] Work".to_owned(),
+                match &view.repo_scope {
+                    None => "  all · by next action".to_owned(),
+                    Some(repo) => {
+                        let name = self
+                            .snapshot
+                            .repos
+                            .iter()
+                            .find(|r| &r.id == repo)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_else(|| repo.clone()); // coverage: off - the scope's id always names a repo row
+                        format!("  {name} · by next action")
+                    }
+                },
+            ),
+            Pane::Conversations => (
+                "[3] Conversations".to_owned(),
+                match &view.work_scope {
+                    Some(WorkScope::Worktree { root, .. }) => {
+                        format!("  {}", root.display())
+                    }
+                    Some(WorkScope::Incarnation {
+                        label, excluded, ..
+                    }) => {
+                        let state = if *excluded {
+                            "earlier branch"
+                        } else {
+                            "current branch"
+                        };
+                        format!("  {label} · {state}")
+                    }
+                    Some(WorkScope::Space { path, .. }) => format!("  {}", path.display()),
+                    None => "  all · by attention".to_owned(),
+                },
+            ),
+            Pane::Detail => return title_line(&self.detail_header(view).0, self.focus == pane), // coverage: off - the detail pane renders its own header, never asks panel_title
+        };
+        let role = if self.focus == pane {
+            Role::Focus
+        } else {
+            Role::Strong
+        };
+        Line::from(vec![
+            Span::styled(name, role.style()),
+            Span::styled(suffix, Role::Text.style()),
+        ])
     }
 }
 
@@ -2114,16 +2116,206 @@ fn glyph_width(glyph: &str) -> usize {
     glyph.chars().count().max(1)
 }
 
-/// The leading glyph's colour: attention is `!`/`✗`/`✓`/`●`, unknown is a
-/// dim `?`, and an empty slot takes no colour.
-fn glyph_style(glyph: &str) -> Style {
-    match glyph {
-        "!" => Style::default().fg(Color::LightYellow),
-        "✗" => Style::default().fg(Color::LightRed),
-        "✓" => Style::default().fg(Color::LightGreen),
-        "●" => Style::default().fg(Color::LightBlue),
-        "?" => Style::default().fg(Color::DarkGray),
-        _ => Style::default(),
+/// A footer or help hint: the key and what it does. An empty
+/// `desc` is the compact form's dropped description.
+struct Hint {
+    key: &'static str,
+    desc: &'static str,
+}
+
+#[rustfmt::skip]
+const fn h(key: &'static str, desc: &'static str) -> Hint { Hint { key, desc } } // coverage: off - const-evaluated in the statics below, never called at runtime
+
+/// The wide footer's hint lists, one per focused view - every key keeps
+/// its description.
+const WIDE_REPOS: &[Hint] = &[
+    h("1-4", "focus"),
+    h("tab", "next"),
+    h("j/k", "move"),
+    h("e", "evidence"),
+    h("/", "filter"),
+    h("?", "keys"),
+    h("q", "quit"),
+];
+const WIDE_WORK: &[Hint] = &[
+    h("1-4", "focus"),
+    h("tab", "next"),
+    h("j/k", "move"),
+    h("enter", "jump"),
+    h("o", "open"),
+    h("e", "evidence"),
+    h("/", "filter"),
+    h("space", "ack"),
+    h("p", "park"),
+    h("h", "history"),
+    h("?", "keys"),
+    h("q", "quit"),
+];
+const WIDE_CONVERSATIONS: &[Hint] = &[
+    h("1-4", "focus"),
+    h("tab", "next"),
+    h("j/k", "move"),
+    h("enter", "jump"),
+    h("e", "evidence"),
+    h("/", "filter"),
+    h("space", "ack"),
+    h("?", "keys"),
+    h("q", "quit"),
+];
+const WIDE_DETAIL: &[Hint] = &[
+    h("1-4", "focus"),
+    h("tab", "next"),
+    h("j/k", "scroll"),
+    h("e", "evidence"),
+    h("esc", "close"),
+    h("?", "keys"),
+    h("q", "quit"),
+];
+
+/// The focused view's footer hints, wide form.
+fn wide_hints(list: Option<List>) -> &'static [Hint] {
+    match list {
+        Some(List::Repos) => WIDE_REPOS,
+        Some(List::Work) => WIDE_WORK,
+        Some(List::Conversations) => WIDE_CONVERSATIONS,
+        None => WIDE_DETAIL,
+    }
+}
+
+/// The compact footer's hint lists: bare keys, the few descriptions kept
+/// where the narrow footer keeps them today.
+const COMPACT_WORK: &[Hint] = &[
+    h("1-4", ""),
+    h("tab", ""),
+    h("j/k", ""),
+    h("⏎", ""),
+    h("o", ""),
+    h("e", ""),
+    h("p", ""),
+    h("h", ""),
+    h("/", ""),
+    h("?", ""),
+    h("q", "quit"),
+];
+const COMPACT_CONVERSATIONS: &[Hint] = &[
+    h("1-4", ""),
+    h("tab", ""),
+    h("j/k", ""),
+    h("⏎", ""),
+    h("e", ""),
+    h("/", "filter"),
+    h("?", ""),
+    h("q", "quit"),
+];
+const COMPACT_LIST: &[Hint] = &[
+    h("1-4", ""),
+    h("tab", ""),
+    h("j/k", ""),
+    h("e", ""),
+    h("/", "filter"),
+    h("?", ""),
+    h("q", "quit"),
+];
+const COMPACT_DETAIL: &[Hint] = &[
+    h("1-4", ""),
+    h("tab", ""),
+    h("j/k", "scroll"),
+    h("e", ""),
+    h("?", ""),
+    h("q", "quit"),
+];
+
+/// The focused view's footer hints, compact form.
+fn compact_hints(list: Option<List>) -> &'static [Hint] {
+    match list {
+        Some(List::Work) => COMPACT_WORK,
+        Some(List::Conversations) => COMPACT_CONVERSATIONS,
+        Some(_) => COMPACT_LIST,
+        None => COMPACT_DETAIL,
+    }
+}
+
+/// The open filter-edit line's hints.
+const FILTER_HINTS: &[Hint] = &[h("enter", "apply"), h("esc", "cancel")];
+
+/// The dead collector's hint, after its `Text` status.
+const DEAD_HINTS: &[Hint] = &[h("q", "quit")];
+
+/// The help overlay's shared top row.
+const SHARED_HELP: &[Hint] = &[
+    h("1-4", "focus"),
+    h("tab", "next"),
+    h("q", "quit"),
+    h("?", "close"),
+    h("esc", "close"),
+];
+
+/// The help overlay's per-pane key rows.
+const REPOS_HELP: &[Hint] = &[
+    h("j/k", "move"),
+    h("/", "filter"),
+    h("e", "evidence"),
+    h("space", "ack/mark"),
+];
+const WORK_HELP: &[Hint] = &[
+    h("j/k", "move"),
+    h("/", "filter"),
+    h("e", "evidence"),
+    h("space", "ack/mark"),
+    h("p", "park"),
+    h("h", "history"),
+    h("enter", "jump"),
+    h("o", "open"),
+];
+const CONVERSATIONS_HELP: &[Hint] = &[
+    h("j/k", "move"),
+    h("/", "filter"),
+    h("e", "evidence"),
+    h("space", "ack/mark"),
+    h("enter", "jump"),
+];
+const DETAIL_HELP: &[Hint] = &[h("j/k", "scroll"), h("e", "evidence"), h("esc", "close")];
+
+/// `hints` as footer spans: each key a `Key`, its ` desc` `Text`, the
+/// ` | ` between hints a `Separator` - the exact text the footer writes.
+fn hint_spans(hints: &[Hint]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, hint) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" | ", Role::Separator.style()));
+        }
+        spans.push(Span::styled(hint.key, Role::Key.style()));
+        if !hint.desc.is_empty() {
+            spans.push(Span::styled(format!(" {}", hint.desc), Role::Text.style()));
+        }
+    }
+    spans
+}
+
+/// `hints` on one help-overlay line: `key desc` pairs three spaces
+/// apart, the exact layout the overlay writes.
+fn help_line(hints: &[Hint]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, hint) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("   ", Role::Text.style()));
+        }
+        spans.push(Span::styled(hint.key, Role::Key.style()));
+        spans.push(Span::styled(format!(" {}", hint.desc), Role::Text.style()));
+    }
+    Line::from(spans)
+}
+
+/// The detail pane's title as a line: `[4] What` takes the focus role,
+/// the ` - target` suffix stays `Text`.
+fn title_line(title: &str, focused: bool) -> Line<'static> {
+    let role = if focused { Role::Focus } else { Role::Strong };
+    match title.split_once(" - ") {
+        Some((name, rest)) => Line::from(vec![
+            Span::styled(name.to_owned(), role.style()),
+            Span::styled(format!(" - {rest}"), Role::Text.style()),
+        ]),
+        None => Line::from(Span::styled(title.to_owned(), role.style())),
     }
 }
 
@@ -2209,7 +2401,7 @@ fn work_label(w: &WorkRow, global: bool, name: &str) -> String {
     }
 }
 
-/// The conversation's dim second line under the global work scope:
+/// The conversation's context line under the global work scope:
 /// `a → b` when its ordered distinct touches name several in-scope
 /// incarnations, else the `repo · branch · worktree` context of the one
 /// it carries - or its bare repo/worktree context when it touched none.
@@ -2310,15 +2502,14 @@ fn conversation_middle(c: &ConversationRow) -> String {
     }
 }
 
-/// A `[2]` section header line: the section's name, dimmed, unselectable
-/// in spirit - the cursor counts rows, not headers.
+/// A `[2]` section header line: the section's name in its header role,
+/// unselectable in spirit - the cursor counts rows, not headers.
 fn section_header(section: crate::snapshot::WorkSection) -> Line<'static> {
-    Line::from(Span::styled(
-        section.title().to_owned(),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    ))
+    let role = match section {
+        crate::snapshot::WorkSection::NeedsYou => Role::NeedsYou,
+        _ => Role::Strong,
+    };
+    Line::from(Span::styled(section.title().to_owned(), role.style()))
 }
 
 /// A conversation row's glyph is its attention: `!`/`✗`/`✓`/`●`/`?`/blank.
@@ -2376,13 +2567,10 @@ fn push_text(out: &mut Vec<Line<'static>>, text: String, width: usize) {
     }
 }
 
-/// A wrapped section header into the detail body, dimmed.
+/// A wrapped section header into the detail body, `Strong`.
 fn push_head(out: &mut Vec<Line<'static>>, text: String, width: usize) {
     for line in wrap_text(&text, width) {
-        out.push(Line::from(Span::styled(
-            line,
-            Style::default().fg(Color::DarkGray),
-        )));
+        out.push(Line::from(Span::styled(line, Role::Strong.style())));
     }
 }
 
@@ -2720,10 +2908,10 @@ fn rewrite_phrase(i: &IncarnationRow, now: u64, tagged: bool) -> Option<String> 
     }
 }
 
-/// A wrapped attention line into the detail body, `!`-styled.
+/// A wrapped attention line into the detail body, `Wait`-styled.
 fn push_attention(out: &mut Vec<Line<'static>>, text: String, width: usize) {
     for line in wrap_text(&text, width) {
-        out.push(Line::from(Span::styled(line, glyph_style("!"))));
+        out.push(Line::from(Span::styled(line, Role::Wait.style())));
     }
 }
 
@@ -3312,6 +3500,7 @@ mod tests {
         SCHEMA_VERSION, Upstream, WorkRow,
     };
     use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
     use std::path::PathBuf;
 
     /// The incarnation row a fixture work row carries, `number` within
@@ -3815,9 +4004,8 @@ mod tests {
                     label: "ペインのラベルを更新する長いタイトル",
                     middle: "日本語 · 要約",
                     age: "2m",
-                    selected: false,
-                    dim_label: false,
                 },
+                Cursor::None,
             );
             assert!(line.width() <= width as usize, "{line:?}");
         }
@@ -4654,7 +4842,7 @@ mod tests {
     }
 
     #[test]
-    fn every_unfilled_cell_is_a_dim_question_mark() {
+    fn every_unfilled_cell_is_a_plain_question_mark() {
         let app = App::new(fixture());
         let text = render_to(&app, 55, 24);
         // The transcript-only row has no title, state or age - it renders `?`
@@ -4989,12 +5177,12 @@ mod tests {
         assert!(bottom_line(&wide).contains("collecting"), "{wide:?}");
 
         // The glyph keeps the default foreground so it reads as live
-        // activity; the hints behind it stay dim.
+        // activity; the hint behind it is a `Key`.
         let mut terminal = Terminal::new(TestBackend::new(55, 10)).unwrap();
         terminal.draw(|f| app.render(f)).unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 9)].fg, Color::Reset);
-        assert_eq!(buffer[(2, 9)].fg, Color::DarkGray);
+        assert_eq!(buffer[(2, 9)].fg, Color::Cyan);
     }
 
     #[test]
@@ -5242,10 +5430,10 @@ mod tests {
         dead.attention = Attention::Waiting;
         dead.state = ConversationState::Waiting;
         assert_eq!(conversation_middle(&dead), "claude");
-        // Glyph colours by meaning; the empty glyph colours nothing.
-        assert_eq!(glyph_style("✗").fg, Some(Color::LightRed));
-        assert_eq!(glyph_style("✓").fg, Some(Color::LightGreen));
-        assert_eq!(glyph_style("?").fg, Some(Color::DarkGray));
+        // Glyph roles by meaning; the empty glyph stays plain.
+        assert_eq!(glyph_role("✗"), Role::Error);
+        assert_eq!(glyph_role("✓"), Role::Done);
+        assert_eq!(glyph_role("?"), Role::Text);
         // A repo whose work rows carry no attention shows no glyph.
         let dead = RepoRow {
             attention: Attention::None,
@@ -6113,9 +6301,488 @@ mod tests {
             _ => panic!("a branch row scopes to its incarnation"), // coverage: off - the work row always carries its incarnation
         }
         let title = app.panel_title(Pane::Conversations, &view);
-        assert_eq!(
-            title,
-            "[3] Conversations  feat/login (2nd) · current branch"
+        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "[3] Conversations  feat/login (2nd) · current branch");
+    }
+
+    /// Render `app` at `w`×`h` and return the cell buffer for style
+    /// assertions.
+    fn buffer_of(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The cell column where `text` starts on row `y` of `buffer`, or
+    /// `None` when the row does not show it.
+    fn text_at(buffer: &ratatui::buffer::Buffer, y: u16, text: &str) -> Option<u16> {
+        let width = buffer.area.width;
+        let line: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+        line.find(text).map(|at| line[..at].chars().count() as u16)
+    }
+
+    /// `text_at` over the left column's cells only (x < 80 at 200
+    /// columns): the detail pane echoes row fields, so searches for a
+    /// row's own text must not see it.
+    fn list_text_at(buffer: &ratatui::buffer::Buffer, y: u16, text: &str) -> Option<u16> {
+        let line: String = (0..79u16).map(|x| buffer[(x, y)].symbol()).collect();
+        line.find(text).map(|at| line[..at].chars().count() as u16)
+    }
+
+    /// The row of the left-column line containing `text`.
+    fn list_row(buffer: &ratatui::buffer::Buffer, text: &str) -> u16 {
+        (0..buffer.area.height)
+            .find(|y| list_text_at(buffer, *y, text).is_some())
+            .unwrap_or_else(|| panic!("a list row shows {text:?}")) // coverage: off - failure path
+    }
+
+    #[test]
+    fn the_focused_cursor_row_is_one_reverse_bar() {
+        // [2] focused with `feat/login` selected: every inner cell of
+        // that row is reversed - the glyph included - and no cell carries
+        // a colour of its own.
+        let mut app = App::new(fixture());
+        press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+        let buffer = buffer_of(&app, 200, 24);
+        // [1] is 5 rows tall; [2]'s inner starts at y6: `all`, `Needs
+        // you`, then the row.
+        let y = 8u16;
+        assert_eq!(buffer[(1, y)].symbol(), "!");
+        for x in 1..79 {
+            let cell = &buffer[(x, y)];
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "x{x}: {cell:?} is not reversed"
+            );
+            assert_eq!(cell.fg, Color::Reset, "x{x}: {cell:?}");
+            assert_eq!(cell.bg, Color::Reset, "x{x}: {cell:?}");
+        }
+        // The line is padded to the inner width: the row's last cell is
+        // the reversed age `m`, and the border beyond stays unreversed.
+        assert_eq!(buffer[(78, y)].symbol(), "m");
+        assert!(!buffer[(79, y)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn the_focused_conversations_context_line_reverses_too() {
+        // [3] focused under the global scope: the selected conversation's
+        // context line is part of the cursor item and reverses with it.
+        let mut app = App::new(fixture());
+        press(&mut app, &[Key::Char('3'), Key::Char('j')]);
+        let buffer = buffer_of(&app, 200, 24);
+        let row = list_row(&buffer, "8f423bbb");
+        let context = row + 1;
+        assert_eq!(list_text_at(&buffer, context, "a · feat/login"), Some(5));
+        for y in [row, context] {
+            for x in 1..79 {
+                let cell = &buffer[(x, y)];
+                assert!(
+                    cell.modifier.contains(Modifier::REVERSED),
+                    "({x},{y}): {cell:?} is not reversed"
+                );
+                assert_eq!(cell.fg, Color::Reset, "({x},{y}): {cell:?}");
+                assert_eq!(cell.bg, Color::Reset, "({x},{y}): {cell:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_unfocused_cursor_row_underlines_content_only() {
+        // [3] keeps a selected conversation while [1] takes the focus:
+        // its label, middle, age and context line are underlined, its
+        // hues kept; the glyph, padding and gap are not, and nothing is
+        // reversed.
+        let mut app = App::new(fixture());
+        press(&mut app, &[Key::Char('3'), Key::Char('j'), Key::Char('1')]);
+        let buffer = buffer_of(&app, 200, 24);
+        let y = list_row(&buffer, "8f423bbb");
+        let underlined = |x: u16| buffer[(x, y)].modifier.contains(Modifier::UNDERLINED);
+        // `!` at x1 is Layout: it keeps `Wait` yellow without underline.
+        assert_eq!(buffer[(1, y)].symbol(), "!");
+        assert_eq!(buffer[(1, y)].fg, Color::Yellow);
+        assert!(!underlined(1));
+        // The label is underlined; the padding between label and middle
+        // is not; the gap before the age is not; the age is.
+        assert!(underlined(4), "label cell");
+        let label_end = list_text_at(&buffer, y, "update pane labels").unwrap() + 18;
+        assert!(!underlined(label_end + 1), "pad cell");
+        let middle = list_text_at(&buffer, y, "claude").unwrap();
+        assert!(underlined(middle), "middle cell");
+        assert!(underlined(middle + 5), "middle cell");
+        let age = list_text_at(&buffer, y, "2m").unwrap();
+        assert!(!underlined(age - 1), "gap cell");
+        assert!(underlined(age + 1), "age cell");
+        for x in 1..79 {
+            assert!(!buffer[(x, y)].modifier.contains(Modifier::REVERSED));
+        }
+        // The context line underlines as one Content segment.
+        let cy = y + 1;
+        assert_eq!(list_text_at(&buffer, cy, "a · feat/login"), Some(5));
+        let end = 4 + "a · feat/login · a-login".chars().count() as u16 + 1;
+        for x in 1..end {
+            assert!(
+                buffer[(x, cy)].modifier.contains(Modifier::UNDERLINED),
+                "context x{x}"
+            );
+        }
+        assert!(!buffer[(end, cy)].modifier.contains(Modifier::UNDERLINED));
+        // With [1] focused, the other lists' selected rows underline:
+        // [2]'s `all` row here, and - with focus moved to [2] - [1]'s
+        // `all` row too.
+        // Both [1]'s and [2]'s `all` rows read `3 open · 0 clean`; [1]'s
+        // is focused, so the underlined one is the second match.
+        let wy = (0..24)
+            .filter(|y| list_text_at(&buffer, *y, "3 open").is_some())
+            .nth(1)
+            .expect("the [2] all row");
+        let wx = list_text_at(&buffer, wy, "3 open").unwrap();
+        assert!(buffer[(wx, wy)].modifier.contains(Modifier::UNDERLINED));
+        let mut swap = App::new(fixture());
+        press(&mut swap, &[Key::Char('2')]);
+        let buffer2 = buffer_of(&swap, 200, 24);
+        // Both `all` rows read `3 open · 0 clean`; the first match is
+        // [1]'s, unfocused under a [2] focus.
+        let ry = (0..24)
+            .find(|y| list_text_at(&buffer2, *y, "3 open · 0 clean").is_some())
+            .expect("the [1] all row");
+        let rx = list_text_at(&buffer2, ry, "3 open · 0 clean").unwrap();
+        assert!(buffer2[(rx, ry)].modifier.contains(Modifier::UNDERLINED));
+        // A selected [2] data row under focus elsewhere: label, middle,
+        // age underlined; glyph and gaps not.
+        let mut app2 = App::new(fixture());
+        press(&mut app2, &[Key::Char('2'), Key::Char('j'), Key::Char('1')]);
+        let buffer = buffer_of(&app2, 200, 24);
+        let y = list_row(&buffer, "a/feat/login");
+        assert!(!buffer[(1, y)].modifier.contains(Modifier::UNDERLINED));
+        assert!(buffer[(4, y)].modifier.contains(Modifier::UNDERLINED));
+        let middle = list_text_at(&buffer, y, "waiting: permission prompt").unwrap();
+        assert!(buffer[(middle, y)].modifier.contains(Modifier::UNDERLINED));
+        let age = list_text_at(&buffer, y, "2m").unwrap();
+        assert!(!buffer[(age - 1, y)].modifier.contains(Modifier::UNDERLINED));
+        assert!(buffer[(age, y)].modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn focusing_detail_marks_every_list_unfocused() {
+        // [4] focused: the [2] selection carries the unfocused underline,
+        // and no list row is reversed anywhere.
+        let mut app = App::new(fixture());
+        press(&mut app, &[Key::Char('2'), Key::Char('j'), Key::Char('4')]);
+        let buffer = buffer_of(&app, 200, 24);
+        let y = list_row(&buffer, "a/feat/login");
+        assert!(buffer[(4, y)].modifier.contains(Modifier::UNDERLINED));
+        assert!(!buffer[(1, y)].modifier.contains(Modifier::REVERSED));
+        // Moving focus back restores the bar.
+        press(&mut app, &[Key::Char('2')]);
+        let buffer = buffer_of(&app, 200, 24);
+        assert!(buffer[(4, y)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn chrome_takes_its_roles() {
+        // [1] focused: cyan-bold border and title; the other borders and
+        // titles take their unfocused roles, and [2]'s scope suffix is
+        // plain text.
+        let app = App::new(fixture());
+        let buffer = buffer_of(&app, 200, 24);
+        assert_eq!(buffer[(0, 0)].fg, Color::Cyan);
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(1, 0)].symbol(), "[");
+        assert_eq!(buffer[(1, 0)].fg, Color::Cyan);
+        // [2]'s border is the muted one; its `[2] Work` title is `Strong`
+        // and the `  all · by next action` suffix is `Text`. Role styles
+        // reset the base, so neither cell keeps the border's `DarkGray`.
+        assert_eq!(buffer[(0, 5)].fg, Color::DarkGray);
+        let title_x = text_at(&buffer, 5, "[2] Work").unwrap();
+        let title = &buffer[(title_x, 5)];
+        assert_eq!(title.fg, Color::Reset);
+        assert!(title.modifier.contains(Modifier::BOLD));
+        let suffix_x = text_at(&buffer, 5, "all · by next action").unwrap();
+        let suffix = &buffer[(suffix_x, 5)];
+        assert_eq!(suffix.fg, Color::Reset);
+        assert!(!suffix.modifier.contains(Modifier::BOLD));
+        // Focused [2]: the title goes cyan bold, the suffix stays `Text` -
+        // it must not inherit the border's cyan or the title's bold.
+        let mut focused = App::new(fixture());
+        press(&mut focused, &[Key::Char('2')]);
+        let buffer = buffer_of(&focused, 200, 24);
+        let title_x = text_at(&buffer, 5, "[2] Work").unwrap();
+        let title = &buffer[(title_x, 5)];
+        assert_eq!(title.fg, Color::Cyan);
+        assert!(title.modifier.contains(Modifier::BOLD));
+        let suffix_x = text_at(&buffer, 5, "all · by next action").unwrap();
+        let suffix = &buffer[(suffix_x, 5)];
+        assert_eq!(suffix.fg, Color::Reset);
+        assert!(!suffix.modifier.contains(Modifier::BOLD));
+        // [3]'s scoped title behaves the same: name `Focus`, suffix `Text`.
+        let mut scoped = App::new(fixture());
+        press(
+            &mut scoped,
+            &[Key::Char('2'), Key::Char('j'), Key::Char('3')],
         );
+        let buffer = buffer_of(&scoped, 200, 24);
+        let ty = (0..24)
+            .find(|y| text_at(&buffer, *y, "[3] Conversations").is_some())
+            .expect("the [3] border row");
+        let title_x = text_at(&buffer, ty, "[3] Conversations").unwrap();
+        let title = &buffer[(title_x, ty)];
+        assert_eq!(title.fg, Color::Cyan);
+        assert!(title.modifier.contains(Modifier::BOLD));
+        let suffix_x = text_at(&buffer, ty, "feat/login").unwrap();
+        let suffix = &buffer[(suffix_x, ty)];
+        assert_eq!(suffix.fg, Color::Reset);
+        assert!(!suffix.modifier.contains(Modifier::BOLD));
+        // [4]'s title splits the same way: `[4] Work` styled, ` - target`
+        // plain.
+        let mut detail = App::new(fixture());
+        press(&mut detail, &[Key::Char('4')]);
+        let buffer = buffer_of(&detail, 200, 24);
+        let name_x = text_at(&buffer, 0, "[4] Detail").unwrap();
+        assert_eq!(buffer[(name_x, 0)].fg, Color::Cyan);
+        assert!(buffer[(name_x, 0)].modifier.contains(Modifier::BOLD));
+        // The `Needs you` header is its own role; another section header
+        // is `Strong`.
+        let needs_x = text_at(&buffer, 7, "Needs you").unwrap();
+        let needs = &buffer[(needs_x, 7)];
+        assert_eq!(needs.fg, Color::Yellow);
+        assert!(needs.modifier.contains(Modifier::BOLD));
+        let follow = (0..24)
+            .find(|y| text_at(&buffer, *y, "Follow up").is_some())
+            .expect("the Follow up header");
+        let fx = text_at(&buffer, follow, "Follow up").unwrap();
+        let header = &buffer[(fx, follow)];
+        assert_eq!(header.fg, Color::Reset);
+        assert!(header.modifier.contains(Modifier::BOLD));
+        // Footer: key `Key`, description `Text`, `|` `Separator` - wide
+        // and compact.
+        let y = 23;
+        assert_eq!(buffer[(0, y)].symbol(), "1");
+        assert_eq!(buffer[(0, y)].fg, Color::Cyan);
+        assert_eq!(buffer[(3, y)].symbol(), " ");
+        let desc_x = text_at(&buffer, y, "focus").unwrap();
+        assert_eq!(buffer[(desc_x, y)].fg, Color::Reset);
+        let bar_x = text_at(&buffer, y, "|").unwrap();
+        assert_eq!(buffer[(bar_x, y)].fg, Color::DarkGray);
+        let compact = buffer_of(&app, 55, 24);
+        let cy = 23;
+        assert_eq!(compact[(0, cy)].fg, Color::Cyan);
+        let bar = text_at(&compact, cy, "|").unwrap();
+        assert_eq!(compact[(bar, cy)].fg, Color::DarkGray);
+        let quit = text_at(&compact, cy, "q quit").unwrap();
+        assert_eq!(compact[(quit, cy)].fg, Color::Cyan);
+        assert_eq!(compact[(quit + 1, cy)].fg, Color::Reset);
+    }
+
+    #[test]
+    fn the_footer_and_help_keep_their_exact_text() {
+        // Every focused view at both widths, the filter editor and the
+        // dead collector write the same footer characters as before.
+        for (key, wide, compact) in [
+            (
+                Key::Char('1'),
+                "1-4 focus | tab next | j/k move | e evidence | / filter | ? keys | q quit",
+                "1-4 | tab | j/k | e | / filter | ? | q quit",
+            ),
+            (
+                Key::Char('2'),
+                "1-4 focus | tab next | j/k move | enter jump | o open | e evidence | / filter | space ack | p park | h history | ? keys | q quit",
+                "1-4 | tab | j/k | ⏎ | o | e | p | h | / | ? | q quit",
+            ),
+            (
+                Key::Char('3'),
+                "1-4 focus | tab next | j/k move | enter jump | e evidence | / filter | space ack | ? keys | q quit",
+                "1-4 | tab | j/k | ⏎ | e | / filter | ? | q quit",
+            ),
+            (
+                Key::Char('4'),
+                "1-4 focus | tab next | j/k scroll | e evidence | esc close | ? keys | q quit",
+                "1-4 | tab | j/k scroll | e | ? | q quit",
+            ),
+        ] {
+            let mut app = App::new(fixture());
+            press(&mut app, &[key]);
+            let footer = render_to(&app, 200, 24);
+            let footer = bottom_line(&footer);
+            assert!(footer.starts_with(wide), "{key:?}: {footer}");
+            let footer = render_to(&app, 55, 24);
+            let footer = bottom_line(&footer);
+            assert!(footer.starts_with(compact), "{key:?}: {footer}");
+        }
+        // The filter-edit line and the dead collector, verbatim.
+        let mut app = App::new(fixture());
+        press(&mut app, &[Key::Char('/')]);
+        let rendered = render_to(&app, 200, 24);
+        assert_eq!(
+            bottom_line(&rendered).trim_end(),
+            "filter: enter apply | esc cancel"
+        );
+        let mut app = App::new(fixture());
+        app.collector_stopped();
+        let rendered = render_to(&app, 80, 24);
+        assert_eq!(
+            bottom_line(&rendered).trim_end(),
+            "collector stopped - last snapshot | q quit"
+        );
+        // ...and its cells carry roles: status `Text`, `|` `Separator`,
+        // `q` `Key`.
+        let buffer = buffer_of(&app, 80, 24);
+        let dy = 23;
+        assert_eq!(buffer[(0, dy)].fg, Color::Reset);
+        let bar = text_at(&buffer, dy, "|").unwrap();
+        assert_eq!(buffer[(bar, dy)].fg, Color::DarkGray);
+        let key = text_at(&buffer, dy, "q quit").unwrap();
+        assert_eq!(buffer[(key, dy)].fg, Color::Cyan);
+        assert_eq!(buffer[(key + 1, dy)].fg, Color::Reset);
+        // Help rows for every pane, verbatim triple-spaced.
+        for (key, row) in [
+            (
+                Key::Char('1'),
+                "j/k move   / filter   e evidence   space ack/mark",
+            ),
+            (
+                Key::Char('2'),
+                "j/k move   / filter   e evidence   space ack/mark   p park   h history   enter jump   o open",
+            ),
+            (
+                Key::Char('3'),
+                "j/k move   / filter   e evidence   space ack/mark   enter jump",
+            ),
+            (Key::Char('4'), "j/k scroll   e evidence   esc close"),
+        ] {
+            let mut app = App::new(fixture());
+            press(&mut app, &[key, Key::Char('?')]);
+            let text = render_to(&app, 200, 24);
+            // The 60-column popup clips the longest rows; assert each
+            // row's exact built text on its `Line`, and the rendered
+            // start on the buffer.
+            assert!(text.contains(&row[..row.len().min(55)]), "{key:?}: {text}");
+            assert!(text.contains("1-4 focus   tab next   q quit   ? close   esc close"));
+        }
+        // The full text of every help row, data-side, is exact.
+        for (hints, row) in [
+            (
+                SHARED_HELP,
+                "1-4 focus   tab next   q quit   ? close   esc close",
+            ),
+            (
+                REPOS_HELP,
+                "j/k move   / filter   e evidence   space ack/mark",
+            ),
+            (
+                WORK_HELP,
+                "j/k move   / filter   e evidence   space ack/mark   p park   h history   enter jump   o open",
+            ),
+            (
+                CONVERSATIONS_HELP,
+                "j/k move   / filter   e evidence   space ack/mark   enter jump",
+            ),
+            (DETAIL_HELP, "j/k scroll   e evidence   esc close"),
+        ] {
+            let text: String = help_line(hints)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(text, row);
+        }
+    }
+
+    #[test]
+    fn rows_and_chrome_leave_ansi8_to_borders_and_separators() {
+        // Summaries and ages render `Reset`, never `DarkGray`: [2]'s
+        // waiting row at 200 columns.
+        let mut app = App::new(fixture());
+        press(&mut app, &[Key::Char('2'), Key::Char('j')]);
+        let buffer = buffer_of(&app, 200, 24);
+        let y = 8u16;
+        let middle = list_text_at(&buffer, y, "waiting: permission prompt").unwrap();
+        let age = list_text_at(&buffer, y, "2m").unwrap();
+        assert_eq!(buffer[(middle, y)].fg, Color::Reset);
+        assert_eq!(buffer[(age, y)].fg, Color::Reset);
+        // The focused row reverses, so assert the same cells unfocused.
+        press(&mut app, &[Key::Char('1')]);
+        let buffer = buffer_of(&app, 200, 24);
+        assert_eq!(buffer[(middle, y)].fg, Color::Reset);
+        assert_eq!(buffer[(age, y)].fg, Color::Reset);
+        // A history row: `Text` label, not bold, no glyph.
+        let mut snap = fixture();
+        two_lives(&mut snap.work[0], Some(crate::snapshot::EndedBy::Gone));
+        let mut app = App::new(snap);
+        press(&mut app, &[Key::Char('h'), Key::Char('2')]);
+        let buffer = buffer_of(&app, 200, 24);
+        let y = list_row(&buffer, "earlier");
+        assert_eq!(buffer[(1, y)].symbol(), " ");
+        assert_eq!(buffer[(1, y)].fg, Color::Reset);
+        let label = list_text_at(&buffer, y, "a/feat/login (1st of 2)").unwrap();
+        let cell = &buffer[(label, y)];
+        assert_eq!(cell.fg, Color::Reset);
+        assert!(!cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn the_help_overlay_and_detail_chrome_take_their_roles() {
+        // Help: `Key` keys, `Border` border, `Strong` title.
+        let mut app = App::new(fixture());
+        press(&mut app, &[Key::Char('?')]);
+        let buffer = buffer_of(&app, 200, 24);
+        let top = (0..24)
+            .find(|y| text_at(&buffer, *y, "help").is_some())
+            .expect("the help border row");
+        let border_x = (0..200u16)
+            .find(|x| buffer[(*x, top)].symbol() == "┌")
+            .expect("the popup corner");
+        assert_eq!(buffer[(border_x, top)].fg, Color::DarkGray);
+        let title_x = text_at(&buffer, top, "help").unwrap();
+        let title = &buffer[(title_x, top)];
+        assert_eq!(title.fg, Color::Reset);
+        assert!(title.modifier.contains(Modifier::BOLD));
+        let key_y = (top..24)
+            .find(|y| text_at(&buffer, *y, "j/k move").is_some())
+            .expect("a key row");
+        let key_x = text_at(&buffer, key_y, "j/k").unwrap();
+        assert_eq!(buffer[(key_x, key_y)].fg, Color::Cyan);
+        let desc_x = text_at(&buffer, key_y, "move").unwrap();
+        assert_eq!(buffer[(desc_x, key_y)].fg, Color::Reset);
+        // The detail border follows focus: `Focus` under `4`, `Border`
+        // otherwise.
+        let mut app = App::new(fixture());
+        let buffer = buffer_of(&app, 200, 24);
+        assert_eq!(buffer[(80, 0)].fg, Color::DarkGray);
+        press(&mut app, &[Key::Char('4')]);
+        let buffer = buffer_of(&app, 200, 24);
+        let border = &buffer[(80, 0)];
+        assert_eq!(border.fg, Color::Cyan);
+        assert!(border.modifier.contains(Modifier::BOLD));
+        // A detail attention line is `Wait`.
+        let mut snap = fixture();
+        two_lives(&mut snap.work[0], Some(crate::snapshot::EndedBy::Replaced));
+        snap.work[0].incarnation.as_mut().unwrap().continuity =
+            crate::store::ContinuityEvidence::Ambiguous;
+        let mut app = App::new(snap);
+        app.detail_list = List::Work;
+        app.cursor[list_index(List::Work)] = 1;
+        let view = app.view();
+        let lines = app.detail_lines(&view, 120);
+        let line = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .starts_with("! not proven")
+            })
+            .expect("the attention line");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Yellow));
+        // `push_head` headings are `Strong`: reset fg, bold.
+        let mut out = Vec::new();
+        push_head(&mut out, "heading".to_owned(), 80);
+        let head = &out[0].spans[0];
+        assert_eq!(head.style.fg, Some(Color::Reset));
+        assert!(head.style.add_modifier.contains(Modifier::BOLD));
+        let mut out = Vec::new();
+        push_text(&mut out, "plain".to_owned(), 80);
+        assert_eq!(out[0].spans[0].style.fg, None);
     }
 }
