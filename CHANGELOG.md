@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0](https://github.com/gerbenoostra/spindle/compare/v0.2.0...v0.3.0) (2026-10-19)
+
+
+### Features
+
+* explain branch identity in plain words ([#34](https://github.com/gerbenoostra/spindle/issues/34)) ([48de723](https://github.com/gerbenoostra/spindle/commit/48de723f11642f9e7b5f4a0c4e510304914c4b78))
+
+
+### Bug Fixes
+
+* keep a live agent running across a wall-clock step ([#25](https://github.com/gerbenoostra/spindle/issues/25)) ([5113ddd](https://github.com/gerbenoostra/spindle/commit/5113dddcc462e2a6828eb195bdaa8982a96cb76b))
+* render the collecting spinner in the default foreground ([#23](https://github.com/gerbenoostra/spindle/issues/23)) ([1a8344c](https://github.com/gerbenoostra/spindle/commit/1a8344c814cc0bcf19d0ec041873b58e81cbaf3b))
+
 ## [0.2.0](https://github.com/gerbenoostra/spindle/compare/v0.1.0...v0.2.0) (2026-10-12)
 
 
