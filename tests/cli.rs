@@ -7,6 +7,7 @@ mod support;
 
 use std::process::Command;
 
+use support::fixture::FixtureRepo;
 use support::tempdir::TempDir;
 use support::{BIN, stderr_of};
 
@@ -165,6 +166,20 @@ fn a_bare_invocation_without_a_terminal_is_an_operational_error() {
 #[test]
 fn list_json_prints_the_complete_snapshot() {
     let home = TempDir::new("cli");
+    // A real work row: a scratch repo's unpushed branch checked out in a
+    // worktree a transcript roots at, so `summary` carries the computed
+    // string rather than an empty fixture's.
+    let repo = FixtureRepo::new("origin");
+    repo.branch_with_commits("feat-cli", 3, false);
+    let worktree = repo.add_worktree("cli-wt", Some("feat-cli"));
+    let id = "aa11bb22-3333-4444-5555-666677778888";
+    let projects = home.join(".claude/projects/t");
+    std::fs::create_dir_all(&projects).expect("mkdir");
+    std::fs::write(
+        projects.join(format!("{id}.jsonl")),
+        support::claude_turn(id, &worktree, "the task"),
+    )
+    .expect("transcript writes");
     // No CLAUDE_CONFIG_DIR here: the default `$HOME/.claude` resolves.
     let out = Command::new(BIN)
         .args(["list", "--json"])
@@ -186,6 +201,21 @@ fn list_json_prints_the_complete_snapshot() {
     assert!(json["observed_at"].as_u64().unwrap_or(0) > 0);
     assert!(json["repos"].is_array() && json["work"].is_array());
     assert!(json["conversations"].is_array() && json["errors"].is_array());
+    // The work row's summary is a plain string - no parts key. The
+    // fixture also surfaces the clone's `main` worktree, and the rows'
+    // order is the runtime's; name the row instead.
+    let work = json["work"].as_array().expect("work is an array");
+    let row = work
+        .iter()
+        .find(|r| r["branch"] == "feat-cli")
+        .unwrap_or_else(|| panic!("the feat-cli row: {work:?}"));
+    assert_eq!(row["summary"], "unpushed 3 · no remote ↑3", "{row}");
+    for row in work {
+        assert!(row["summary"].is_string(), "{row}");
+        for key in ["reason", "facts", "parts"] {
+            assert!(row.get(key).is_none(), "{key} in {row}");
+        }
+    }
     assert!(stderr_of(&out).is_empty(), "{out:?}");
 }
 

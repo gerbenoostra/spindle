@@ -310,7 +310,7 @@ fn work_row(name: &str, forge: WorkItem, url: Option<&str>) -> WorkRow {
         worktree_removal: None,
         branch_deletion: None,
         section: WorkSection::FollowUp,
-        summary: String::new(),
+        summary: Default::default(),
     }
 }
 

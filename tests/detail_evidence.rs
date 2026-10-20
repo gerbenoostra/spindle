@@ -148,7 +148,7 @@ fn work() -> WorkRow {
             reasons: vec!["would need git branch -D".to_owned()],
         }),
         section: WorkSection::NeedsYou,
-        summary: "waiting: permission prompt · ↑3 ~dirty PR #191".to_owned(),
+        summary: "waiting: permission prompt · ↑3 ~dirty PR #191".into(),
     }
 }
 

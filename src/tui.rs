@@ -38,7 +38,7 @@ use crate::text::escape_text;
 use crate::tmux::{self, PaneRef};
 
 mod palette;
-use palette::{Cursor, Role, Segs, attention_glyph_role, glyph_role, to_line};
+use palette::{Cursor, Role, Segs, attention_glyph_role, attention_word_role, glyph_role, to_line};
 
 /// The four panes, in `Tab` order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,8 +206,8 @@ enum Row<'a> {
 /// business - `to_line` applies it from the `Cursor` the caller passes.
 struct RowCells<'a> {
     glyph: &'a str,
-    label: &'a str,
-    middle: &'a str,
+    label: Segs,
+    middle: Segs,
     age: &'a str,
 }
 
@@ -362,7 +362,7 @@ impl App {
             .filter(|w| repo_scope.as_deref().is_none_or(|s| w.repo == *s))
             .filter(|w| {
                 self.filter(List::Work).allows(
-                    [w.repo_name.as_str(), w.name.as_str(), w.summary.as_str()],
+                    [w.repo_name.as_str(), w.name.as_str(), &w.summary],
                     w.last_activity,
                     now,
                     &mut lower,
@@ -972,12 +972,14 @@ impl App {
                 format!("{live} live · {} shown", rows.len())
             }
         };
+        let mut label = Segs::default();
+        label.push(Role::Text, "all");
         self.render_row(
             width,
             &RowCells {
                 glyph,
-                label: "all",
-                middle: &counts,
+                label,
+                middle: count_segs(&counts),
                 age: "",
             },
             cursor,
@@ -994,37 +996,51 @@ impl App {
         cursor: Cursor,
     ) -> Line<'static> {
         let cells = match row {
-            Row::Repo(r) => RowCells {
-                glyph: repo_glyph(r),
-                label: &r.name,
-                middle: &repo_counts(r),
-                age: &age(self.now(), r.last_activity),
-            },
+            Row::Repo(r) => {
+                let mut label = Segs::default();
+                label.push(Role::Strong, r.name.clone());
+                RowCells {
+                    glyph: repo_glyph(r),
+                    label,
+                    middle: count_segs(&repo_counts(r)),
+                    age: &age(self.now(), r.last_activity),
+                }
+            }
             Row::Work(w) => RowCells {
                 glyph: work_glyph(w),
                 // Under `all` the label carries the repo; scoped, it is
                 // the branch alone.
-                label: &work_name(w, list == List::Work && view.repo_scope.is_none()),
-                middle: &w.summary,
+                label: work_name(w, list == List::Work && view.repo_scope.is_none()),
+                middle: summary_segs(&w.summary),
                 age: &age(self.now(), w.last_activity),
             },
-            Row::History(w, h) => RowCells {
+            Row::History(w, h) => {
                 // Earlier same-name life: plain text, no attention
                 // glyph, marked `earlier`, aged by when that life
                 // ended.
-                glyph: "",
-                label: &work_label(
-                    w,
-                    list == List::Work && view.repo_scope.is_none(),
-                    &ordinal_name(&h.ref_name, h.number, h.lives, OrdinalStyle::History),
-                ),
-                middle: "earlier",
-                age: &age(self.now(), h.ended_at),
-            },
+                let mut label = Segs::default();
+                label.push(
+                    Role::Text,
+                    work_label(
+                        w,
+                        list == List::Work && view.repo_scope.is_none(),
+                        &ordinal_name(&h.ref_name, h.number, h.lives, OrdinalStyle::History),
+                    )
+                    .text(),
+                );
+                let mut middle = Segs::default();
+                middle.push(Role::Text, "earlier");
+                RowCells {
+                    glyph: "",
+                    label,
+                    middle,
+                    age: &age(self.now(), h.ended_at),
+                }
+            }
             Row::Conversation(c) => RowCells {
                 glyph: conversation_glyph(c),
-                label: &format!("{} {}", c.short_id, c.title.as_deref().unwrap_or("?")),
-                middle: &conversation_middle(c),
+                label: conversation_label(c),
+                middle: conversation_middle(c),
                 age: &age(self.now(), c.state_since),
             },
         };
@@ -1045,15 +1061,15 @@ impl App {
         let age = if show_fields { cells.age } else { "" };
         let age_w = cell_width(age);
         let middle = if show_fields {
-            fit(cells.middle, width.saturating_sub(glyph_w + age_w + 12))
+            palette::fit(&cells.middle, width.saturating_sub(glyph_w + age_w + 12))
         } else {
-            String::new()
+            Segs::default()
         };
-        let middle_w = cell_width(&middle);
+        let middle_w = cell_width(&middle.text());
         let label_w = width.saturating_sub(glyph_w + middle_w + age_w + 4);
-        let label = fit(cells.label, label_w);
+        let label = palette::fit(&cells.label, label_w);
         let pad = width
-            .saturating_sub(glyph_w + cell_width(&label) + middle_w + age_w + 2)
+            .saturating_sub(glyph_w + cell_width(&label.text()) + middle_w + age_w + 2)
             .max(1);
         // The glyph slot, the padding and the gap before the age are
         // `Layout`: spacing the cursor's underline must not touch.
@@ -1062,9 +1078,9 @@ impl App {
             glyph_role(cells.glyph),
             format!("{:>glyph_w$} ", cells.glyph),
         );
-        segs.push(Role::Text, label);
+        segs.append(label);
         segs.push_layout(Role::Text, " ".repeat(pad));
-        segs.push(Role::Text, middle);
+        segs.append(middle);
         segs.push_layout(Role::Text, " ");
         segs.push(Role::Text, age);
         to_line(&segs, cursor, width)
@@ -2371,26 +2387,92 @@ fn work_branch_name(w: &WorkRow) -> String {
 /// The work row's label: `name ⌂worktree`, prefixed with the repo's
 /// name under the global `all` scope; a project space's workspace is its
 /// name already, so it carries no suffix.
-fn work_name(w: &WorkRow, global: bool) -> String {
+fn work_name(w: &WorkRow, global: bool) -> Segs {
     work_label(w, global, &work_branch_name(w))
 }
 
 /// `work_name` over a caller-spelled `name` - a work row's compact
-/// ordinal, a history row's `1st of 2` spelling.
-fn work_label(w: &WorkRow, global: bool, name: &str) -> String {
+/// ordinal, a history row's `1st of 2` spelling. The repo is `Strong`,
+/// its `/` a `Separator`, the branch `Ref`, the ` ⌂worktree` suffix and
+/// a project space's bare name `Text`/`Strong`.
+fn work_label(w: &WorkRow, global: bool, name: &str) -> Segs {
+    let mut segs = Segs::default();
     if w.kind == WorkKind::ProjectSpace {
-        return w.name.clone();
+        segs.push(Role::Strong, w.name.clone());
+        return segs;
     }
-    let wt = w
-        .worktree
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|n| format!(" ⌂{}", n.to_string_lossy()))
-        .unwrap_or_default();
     if global {
-        format!("{}/{}{}", w.repo_name, name, wt)
-    } else {
-        format!("{}{}", name, wt)
+        segs.push(Role::Strong, w.repo_name.clone());
+        segs.push(Role::Separator, "/");
+    }
+    segs.push(Role::Ref, name.to_owned());
+    if let Some(wt) = w.worktree.as_ref().and_then(|p| p.file_name()) {
+        segs.push(Role::Text, format!(" ⌂{}", wt.to_string_lossy()));
+    }
+    segs
+}
+
+/// The conversation row's label: the short id `Id`, then the title as
+/// `Text` - `?` when absent.
+fn conversation_label(c: &ConversationRow) -> Segs {
+    let mut segs = Segs::default();
+    segs.push(Role::Id, c.short_id.clone());
+    segs.push(
+        Role::Text,
+        format!(" {}", c.title.as_deref().unwrap_or("?")),
+    );
+    segs
+}
+
+/// `N open · M clean`-style counts: `Text` parts joined by `Separator`
+/// ` · `.
+fn count_segs(counts: &str) -> Segs {
+    let mut segs = Segs::default();
+    for (i, part) in counts.split(" · ").enumerate() {
+        if i > 0 {
+            segs.push(Role::Separator, " · ");
+        }
+        segs.push(Role::Text, part.to_owned());
+    }
+    segs
+}
+
+/// A work row's `Summary` as middle segments: parts in their kind's
+/// role, reason ` · ` joiners `Separator`, fact spaces `Text`.
+fn summary_segs(summary: &crate::snapshot::Summary) -> Segs {
+    let mut segs = Segs::default();
+    for (i, part) in summary.reason().iter().enumerate() {
+        if i > 0 {
+            segs.push(Role::Separator, " · ");
+        }
+        segs.push(part_role(part.kind), part.text.clone());
+    }
+    if !summary.facts().is_empty() {
+        segs.push(Role::Separator, " · ");
+        for (i, part) in summary.facts().iter().enumerate() {
+            if i > 0 {
+                segs.push(Role::Text, " ");
+            }
+            segs.push(part_role(part.kind), part.text.clone());
+        }
+    }
+    if summary.parked() {
+        segs.push(Role::Separator, " · ");
+        segs.push(Role::Text, "parked");
+    }
+    segs
+}
+
+/// The `Role` a summary part renders in: a `Status` phrase takes its
+/// attention's word hue, verdicts `Ok`/`Bad`, the forge label `Id`,
+/// everything else `Text`.
+fn part_role(kind: crate::snapshot::PartKind) -> Role {
+    match kind {
+        crate::snapshot::PartKind::Plain => Role::Text,
+        crate::snapshot::PartKind::Status(a) => attention_word_role(a),
+        crate::snapshot::PartKind::Ok => Role::Ok,
+        crate::snapshot::PartKind::Bad => Role::Bad,
+        crate::snapshot::PartKind::Forge => Role::Id,
     }
 }
 
@@ -2486,13 +2568,16 @@ fn path_label(path: &Path) -> String {
 /// beside a retained latch when the agent has gone back to grinding -
 /// the retained `error`/`done` asks for you while the state field says
 /// the turn runs.
-fn conversation_middle(c: &ConversationRow) -> String {
-    match c.attention {
-        Attention::Error | Attention::CompletedUnseen if c.state == ConversationState::Busy => {
-            format!("{} · working", c.provider.as_str())
-        }
-        _ => c.provider.as_str().to_owned(),
+fn conversation_middle(c: &ConversationRow) -> Segs {
+    let mut segs = Segs::default();
+    segs.push(Role::Text, c.provider.as_str());
+    if matches!(c.attention, Attention::Error | Attention::CompletedUnseen)
+        && c.state == ConversationState::Busy
+    {
+        segs.push(Role::Separator, " · ");
+        segs.push(Role::Working, "working");
     }
+    segs
 }
 
 /// A `[2]` section header line: the section's name in its header role,
@@ -3489,8 +3574,8 @@ mod tests {
     use crate::runtime::EvidenceSource;
     use crate::runtime::{PaneSource, Provider};
     use crate::snapshot::{
-        AttachmentLiveness, AttachmentRow, EvidenceRow, Landed, RepoCounts, RepoRow,
-        SCHEMA_VERSION, Upstream, WorkRow,
+        AttachmentLiveness, AttachmentRow, EvidenceRow, Landed, PartKind, RepoCounts, RepoRow,
+        SCHEMA_VERSION, Summary, SummaryPart, Upstream, WorkRow,
     };
     use ratatui::backend::TestBackend;
     use ratatui::style::{Color, Modifier};
@@ -3622,7 +3707,7 @@ mod tests {
                         reasons: vec!["3 unpushed commits".to_owned()],
                     }),
                     section: crate::snapshot::WorkSection::NeedsYou,
-                    summary: "waiting: permission prompt · ↑3 ~dirty PR #191".to_owned(),
+                    summary: "waiting: permission prompt · ↑3 ~dirty PR #191".into(),
                 },
                 WorkRow {
                     repo: "/repos/a/.git".to_owned(),
@@ -3670,7 +3755,7 @@ mod tests {
                         reasons: vec!["7 unpushed commits".to_owned()],
                     }),
                     section: crate::snapshot::WorkSection::FollowUp,
-                    summary: "unpushed 7 · no wt no remote ↑7".to_owned(),
+                    summary: "unpushed 7 · no wt no remote ↑7".into(),
                 },
                 WorkRow {
                     repo: "/spaces/notes".to_owned(),
@@ -3712,7 +3797,7 @@ mod tests {
                     worktree_removal: None,
                     branch_deletion: None,
                     section: crate::snapshot::WorkSection::FollowUp,
-                    summary: "idle project · no git".to_owned(),
+                    summary: "idle project · no git".into(),
                 },
             ],
             conversations: vec![
@@ -3858,6 +3943,13 @@ mod tests {
         out
     } // coverage: off - the unexecuted instantiation's exit edge
     // coverage: off - the instantiation edge lands on this line
+    /// `text` as one `Text` segment - a test row's unstyled cell.
+    fn text_segs(text: &str) -> Segs {
+        let mut segs = Segs::default();
+        segs.push(Role::Text, text);
+        segs
+    }
+
     /// Feed `keys` into `app` - a scripted session, not a terminal.
     fn press(app: &mut App, keys: &[Key]) {
         // coverage: off - same
@@ -3955,7 +4047,7 @@ mod tests {
         }
         for w in &mut snapshot.work {
             w.worktree = Some(path.clone());
-            w.summary = long.clone();
+            w.summary = long.clone().into();
             w.gone = Some(long.clone());
             w.references = vec![crate::snapshot::ReferenceRow {
                 kind: ReferenceKind::Pane,
@@ -3994,8 +4086,8 @@ mod tests {
                 width,
                 &RowCells {
                     glyph: "!",
-                    label: "ペインのラベルを更新する長いタイトル",
-                    middle: "日本語 · 要約",
+                    label: text_segs("ペインのラベルを更新する長いタイトル"),
+                    middle: text_segs("日本語 · 要約"),
                     age: "2m",
                 },
                 Cursor::None,
@@ -4073,7 +4165,7 @@ mod tests {
         snapshot.conversations[0].attention_detail = Some("StopFailure".to_owned());
         snapshot.conversations[0].state = ConversationState::Busy;
         snapshot.work[0].attention = Attention::Error;
-        snapshot.work[0].summary = "error: StopFailure · working · ↑3 ~dirty".to_owned();
+        snapshot.work[0].summary = "error: StopFailure · working · ↑3 ~dirty".into();
         let app = App::new(snapshot);
         for width in [55u16, 200] {
             let text = render_to(&app, width, 24);
@@ -4089,7 +4181,7 @@ mod tests {
         snapshot.conversations[0].attention_detail = None;
         snapshot.conversations[0].state = ConversationState::Idle;
         snapshot.work[0].attention = Attention::CompletedUnseen;
-        snapshot.work[0].summary = "done · ↑3 ~dirty".to_owned();
+        snapshot.work[0].summary = "done · ↑3 ~dirty".into();
         let app = App::new(snapshot);
         let text = render_to(&app, 55, 24);
         assert!(text.contains("✓ a/feat/lo"), "{text}");
@@ -4101,7 +4193,7 @@ mod tests {
         snapshot.conversations[0].state = ConversationState::Busy;
         snapshot.work[0].attention = Attention::Working;
         snapshot.work[0].section = crate::snapshot::WorkSection::Active;
-        snapshot.work[0].summary = "working · ↑3 ~dirty".to_owned();
+        snapshot.work[0].summary = "working · ↑3 ~dirty".into();
         let mut app = App::new(snapshot);
         let text = render_to(&app, 200, 24);
         assert!(text.contains("Active"), "{text}");
@@ -5419,10 +5511,10 @@ mod tests {
         assert_eq!(detail_state(&dead), "error · dead");
         // The middle field says `working` beside a retained latch.
         dead.state = ConversationState::Busy;
-        assert_eq!(conversation_middle(&dead), "claude · working");
+        assert_eq!(conversation_middle(&dead).text(), "claude · working");
         dead.attention = Attention::Waiting;
         dead.state = ConversationState::Waiting;
-        assert_eq!(conversation_middle(&dead), "claude");
+        assert_eq!(conversation_middle(&dead).text(), "claude");
         // Glyph roles by meaning; the empty glyph stays plain.
         assert_eq!(glyph_role("✗"), Role::Error);
         assert_eq!(glyph_role("✓"), Role::Done);
@@ -5441,8 +5533,8 @@ mod tests {
             worktree: None,
             ..fixture().work[1].clone()
         };
-        assert_eq!(work_name(&bare, false), "feat/old");
-        assert_eq!(work_name(&bare, true), "a/feat/old");
+        assert_eq!(work_name(&bare, false).text(), "feat/old");
+        assert_eq!(work_name(&bare, true).text(), "a/feat/old");
         // Key events map; unbound codes are None.
         use crossterm::event::KeyCode;
         assert_eq!(map_key(KeyCode::Tab), Some(Key::Tab));
@@ -6272,7 +6364,7 @@ mod tests {
         // List label, detail title and scope all take the compact ordinal.
         let text = render_to(&app, 120, 24);
         assert_eq!(
-            work_name(&app.snapshot.work[0], true),
+            work_name(&app.snapshot.work[0], true).text(),
             "a/feat/login (2nd) ⌂a-login"
         );
         assert!(
@@ -6455,11 +6547,263 @@ mod tests {
         let y = list_row(&buffer, "a/feat/login");
         assert!(!buffer[(1, y)].modifier.contains(Modifier::UNDERLINED));
         assert!(buffer[(4, y)].modifier.contains(Modifier::UNDERLINED));
+        // The hues survive the underline: repo bold, `/` gray, branch cyan.
+        assert_eq!(buffer[(3, y)].fg, Color::Reset);
+        assert!(buffer[(3, y)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(4, y)].fg, Color::DarkGray);
+        assert_eq!(buffer[(5, y)].fg, Color::Cyan);
         let middle = list_text_at(&buffer, y, "waiting: permission prompt").unwrap();
         assert!(buffer[(middle, y)].modifier.contains(Modifier::UNDERLINED));
         let age = list_text_at(&buffer, y, "2m").unwrap();
         assert!(!buffer[(age - 1, y)].modifier.contains(Modifier::UNDERLINED));
         assert!(buffer[(age, y)].modifier.contains(Modifier::UNDERLINED));
+    }
+
+    /// One summary part with `kind`.
+    fn part(kind: PartKind, text: &str) -> SummaryPart {
+        SummaryPart {
+            kind,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn row_cells_take_their_identity_and_summary_hues() {
+        // Identity and summary hues: repo bold, `/` DarkGray, branch
+        // cyan, worktree suffix
+        // plain, `PR #191` magenta, ` · ` separators DarkGray, the rest
+        // and the age plain.
+        let mut snapshot = fixture();
+        snapshot.work[0].attention = Attention::None;
+        snapshot.work[0].section = crate::snapshot::WorkSection::FollowUp;
+        snapshot.work[0].summary = Summary::new(
+            vec!["unpushed 3".into()],
+            vec!["↑3".into(), part(PartKind::Forge, "PR #191")],
+            false,
+        );
+        let buffer = buffer_of(&App::new(snapshot), 200, 24);
+        let y = list_row(&buffer, "a/feat/login");
+        let plain = |x: u16| {
+            let cell = &buffer[(x, y)];
+            cell.fg == Color::Reset && cell.modifier.is_empty()
+        };
+        let at = |text: &str| list_text_at(&buffer, y, text).unwrap();
+        let x = at("a/feat/login");
+        assert!(
+            buffer[(x, y)].modifier.contains(Modifier::BOLD),
+            "repo bold"
+        );
+        assert_eq!(buffer[(x, y)].fg, Color::Reset);
+        assert_eq!(buffer[(x + 1, y)].fg, Color::DarkGray, "the /");
+        assert_eq!(buffer[(x + 2, y)].fg, Color::Cyan, "branch");
+        assert!(plain(at("⌂a-login")), "worktree suffix");
+        assert!(plain(at("unpushed 3")), "reason");
+        assert_eq!(buffer[(at(" · "), y)].fg, Color::DarkGray, "the joiner");
+        assert!(plain(at("↑3")), "fact");
+        assert_eq!(buffer[(at("PR #191"), y)].fg, Color::Magenta, "forge label");
+        assert!(plain(at("2m")), "age");
+
+        // A repo row's label is bold, its counts plain with a DarkGray
+        // separator.
+        let ry = list_row(&buffer, "2 open · 0 clean");
+        let rx = list_text_at(&buffer, ry, "a").unwrap();
+        assert!(buffer[(rx, ry)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(rx, ry)].fg, Color::Reset);
+        assert_eq!(
+            buffer[(list_text_at(&buffer, ry, "·").unwrap(), ry)].fg,
+            Color::DarkGray
+        );
+        // A non-git repo's middle is plain too.
+        let ny = list_row(&buffer, "no git");
+        let nx = list_text_at(&buffer, ny, "no git").unwrap();
+        assert_eq!(buffer[(nx, ny)].fg, Color::Reset);
+        assert!(buffer[(nx, ny)].modifier.is_empty());
+
+        // A conversation label is the id magenta, the title plain.
+        let cy = list_row(&buffer, "8f423bbb");
+        let cx = list_text_at(&buffer, cy, "8f423bbb").unwrap();
+        assert_eq!(buffer[(cx, cy)].fg, Color::Magenta);
+        let tx = list_text_at(&buffer, cy, "update pane labels").unwrap();
+        assert_eq!(buffer[(tx, cy)].fg, Color::Reset);
+        assert!(buffer[(tx, cy)].modifier.is_empty());
+        // Its middle: provider plain; a retained error over a busy state
+        // adds a DarkGray joiner and a blue `working`.
+        let mut snapshot = fixture();
+        snapshot.conversations[0].attention = Attention::Error;
+        snapshot.conversations[0].state = ConversationState::Busy;
+        let buffer = buffer_of(&App::new(snapshot), 200, 24);
+        let cy = list_row(&buffer, "8f423bbb");
+        let cx = list_text_at(&buffer, cy, "claude").unwrap();
+        assert_eq!(buffer[(cx, cy)].fg, Color::Reset);
+        let mx = list_text_at(&buffer, cy, "·").unwrap();
+        assert_eq!(buffer[(mx, cy)].fg, Color::DarkGray);
+        let wx = list_text_at(&buffer, cy, "working").unwrap();
+        assert_eq!(buffer[(wx, cy)].fg, Color::Blue);
+
+        // `Bad` facts go bold red, `Ok` green, on a row of their own.
+        let mut snapshot = fixture();
+        snapshot.work[1].summary = Summary::new(
+            vec![part(PartKind::Bad, "blocked: uncommitted changes")],
+            vec![
+                part(PartKind::Bad, "remote gone"),
+                part(PartKind::Ok, "checks ok"),
+            ],
+            false,
+        );
+        let buffer = buffer_of(&App::new(snapshot), 200, 24);
+        let by = list_row(&buffer, "feat/old");
+        let bx = list_text_at(&buffer, by, "blocked: uncommitted changes").unwrap();
+        assert_eq!(buffer[(bx, by)].fg, Color::Red);
+        assert!(buffer[(bx, by)].modifier.contains(Modifier::BOLD));
+        let gx = list_text_at(&buffer, by, "remote gone").unwrap();
+        assert_eq!(buffer[(gx, by)].fg, Color::Red);
+        assert!(buffer[(gx, by)].modifier.contains(Modifier::BOLD));
+        let ox = list_text_at(&buffer, by, "checks ok").unwrap();
+        assert_eq!(buffer[(ox, by)].fg, Color::Green);
+        assert!(!buffer[(ox, by)].modifier.contains(Modifier::BOLD));
+
+        // A history row is all `Text`: label, `earlier` and age.
+        let mut snapshot = fixture();
+        two_lives(&mut snapshot.work[0], Some(crate::snapshot::EndedBy::Gone));
+        let mut app = App::new(snapshot);
+        app.history = true;
+        let buffer = buffer_of(&app, 200, 24);
+        let hy = list_row(&buffer, "earlier");
+        let hx = list_text_at(&buffer, hy, "feat/login (1st of 2)").unwrap();
+        for x in hx..hx + 21 {
+            assert_eq!(buffer[(x, hy)].fg, Color::Reset, "x{x}");
+            assert!(buffer[(x, hy)].modifier.is_empty(), "x{x}");
+        }
+        let ex = list_text_at(&buffer, hy, "earlier").unwrap();
+        assert_eq!(buffer[(ex, hy)].fg, Color::Reset);
+    }
+
+    #[test]
+    fn state_words_take_their_glyph_hue() {
+        // Each state word takes its glyph's hue; `error` is bold red
+        // while the `✗` stays plain red.
+        let case = |attention: Attention, state: ConversationState, detail: Option<&str>| {
+            let mut snapshot = fixture();
+            snapshot.conversations[0].attention = attention;
+            snapshot.conversations[0].attention_detail = detail.map(str::to_owned);
+            snapshot.conversations[0].state = state;
+            snapshot.work[0].attention = attention;
+            let mut reason = vec![part(
+                PartKind::Status(attention),
+                &match detail {
+                    Some(d) => format!("{}: {d}", attention.label()),
+                    None => attention.label().to_owned(),
+                },
+            )];
+            if attention != Attention::Working && state == ConversationState::Busy {
+                reason.push(part(PartKind::Status(Attention::Working), "working"));
+            }
+            snapshot.work[0].summary =
+                Summary::new(reason, vec!["↑3".into(), "~dirty".into()], false);
+            buffer_of(&App::new(snapshot), 200, 24)
+        };
+
+        // waiting: yellow word and glyph.
+        let buffer = case(
+            Attention::Waiting,
+            ConversationState::Waiting,
+            Some("permission prompt"),
+        );
+        let y = list_row(&buffer, "a/feat/login");
+        let x = list_text_at(&buffer, y, "waiting: permission prompt").unwrap();
+        assert_eq!(buffer[(1, y)].symbol(), "!");
+        assert_eq!(buffer[(1, y)].fg, Color::Yellow);
+        assert_eq!(buffer[(x, y)].fg, Color::Yellow);
+        assert!(buffer[(x, y)].modifier.is_empty());
+
+        // error: the word bold red, the glyph red unbold, the appended
+        // `working` blue.
+        let buffer = case(
+            Attention::Error,
+            ConversationState::Busy,
+            Some("StopFailure"),
+        );
+        let y = list_row(&buffer, "a/feat/login");
+        assert_eq!(buffer[(1, y)].symbol(), "✗");
+        assert_eq!(buffer[(1, y)].fg, Color::Red);
+        assert!(!buffer[(1, y)].modifier.contains(Modifier::BOLD));
+        let x = list_text_at(&buffer, y, "error: StopFailure").unwrap();
+        assert_eq!(buffer[(x, y)].fg, Color::Red);
+        assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+        let wx = list_text_at(&buffer, y, "working").unwrap();
+        assert_eq!(buffer[(wx, y)].fg, Color::Blue);
+
+        // done and working: green and blue.
+        for (attention, state, word, fg) in [
+            (
+                Attention::CompletedUnseen,
+                ConversationState::Idle,
+                "done",
+                Color::Green,
+            ),
+            (
+                Attention::Working,
+                ConversationState::Busy,
+                "working",
+                Color::Blue,
+            ),
+        ] {
+            let buffer = case(attention, state, None);
+            let y = list_row(&buffer, "a/feat/login");
+            let x = list_text_at(&buffer, y, word).unwrap();
+            assert_eq!(buffer[(x, y)].fg, fg, "{word}");
+            assert_eq!(buffer[(1, y)].fg, fg, "{word} glyph");
+        }
+    }
+
+    #[test]
+    fn a_truncated_label_and_middle_keep_their_roles() {
+        // The cut lands on the same cell the string `fit` lands on;
+        // the ellipsis ends in the surviving segment's role and every
+        // surviving cell keeps its own.
+        let app = App::new(fixture());
+        let mut label = Segs::default();
+        label.push(Role::Strong, "a");
+        label.push(Role::Separator, "/");
+        label.push(Role::Ref, "feat/login");
+        label.push(Role::Text, " ⌂a-login");
+        let mut middle = Segs::default();
+        middle.push(Role::Wait, "waiting: permission prompt");
+        middle.push(Role::Separator, " · ");
+        middle.push(Role::Text, "↑3 ~dirty");
+        // 40 cells: glyph 2 + age 2 leave a 24-cell middle and an
+        // 8-cell label - both cut.
+        let line = app.render_row(
+            40,
+            &RowCells {
+                glyph: "!",
+                label,
+                middle,
+                age: "2m",
+            },
+            Cursor::None,
+        );
+        assert_eq!(line.width(), 40);
+        let spans: Vec<(&str, Option<Color>)> = line
+            .spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style.fg))
+            .collect();
+        // `a/feat/` + `…`: the separator and branch survived whole and
+        // partial, the ellipsis ends the branch's `Ref` cyan.
+        assert!(spans.contains(&("a", Some(Color::Reset))), "{spans:?}");
+        assert!(spans.contains(&("/", Some(Color::DarkGray))), "{spans:?}");
+        assert!(spans.contains(&("feat/", Some(Color::Cyan))), "{spans:?}");
+        assert!(spans.contains(&("…", Some(Color::Cyan))), "{spans:?}");
+        // `waiting: permission prom` + `…`: the ellipsis ends the
+        // waiting phrase's `Wait` yellow.
+        assert!(
+            spans.contains(&("waiting: permission prom", Some(Color::Yellow))),
+            "{spans:?}"
+        );
+        assert!(spans.contains(&("…", Some(Color::Yellow))), "{spans:?}");
+        // The tail cells are plain: pad, gap and age.
+        assert!(spans.contains(&("2m", Some(Color::Reset))), "{spans:?}");
     }
 
     #[test]

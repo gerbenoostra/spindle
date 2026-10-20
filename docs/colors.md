@@ -12,8 +12,8 @@ default-foreground text.
 | red | error - `✗`, and bold red for `error`/`blocked` words, `checks failed` and `remote gone` |
 | green | done or good - `✓`, `done`, `checks ok`, upstream `tracked`, forge `open`, verdict `safe` |
 | blue | working - `●`, `working` |
-| cyan | references and keys - the focused pane's border and title (bold cyan), footer and help keys; branch names once identity hues land |
-| magenta | identifiers - conversation ids, commit hashes, PR/MR labels once identity hues land |
+| cyan | references and keys - branch names, the focused pane's border and title (bold cyan), footer and help keys |
+| magenta | identifiers - conversation ids and PR/MR labels in the lists (detail identifiers stay plain for now) |
 | dim gray | chrome only - unfocused borders and the separators between fields (`·`, `/`, `|`) |
 
 All hues are the terminal's normal ANSI colours (1-6), plus ANSI 8 for
@@ -29,9 +29,12 @@ pane's inner width. In the lists that are not focused, the cursor item's
 text is underlined instead and keeps its hues, so the row that set the
 panel's scope stays findable.
 
-Identity hues are not applied yet: labels, summaries and detail values
-render in the default foreground. In `[4]`, headings are bold and attention
-lines remain yellow, but values carry no identity hues.
+In the lists these all apply: repo names are bold, branches cyan,
+conversation ids and PR/MR labels magenta, state words take their glyph's
+hue, and a summary's verdicts (`checks ok`, `blocked`, `remote gone`) go
+green or bold red. In `[4]`, headings are bold and attention lines remain
+yellow, but detail values still render plain - the identity hues land
+there with the detail-pane work.
 
 ## Decisions
 
@@ -62,3 +65,8 @@ lines remain yellow, but values carry no identity hues.
 - Earlier-life rows render plain - default foreground, no bold, no glyph -
   because an earlier life must not look as current as the live one; not the
   live rows' accents.
+- A work summary is a typed structure - reason parts, fact parts, the
+  parked flag - whose flat text is computed once from those parts at
+  construction - because the renderer hues the parts and `list --json`
+  keeps emitting the same string; not re-parsing a flattened display
+  string into pieces.

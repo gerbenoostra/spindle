@@ -16,7 +16,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::attention::Attention;
 
@@ -38,20 +38,13 @@ pub enum Role {
     /// `●` and `working`: busy, nothing above pending.
     Working,
     /// `checks ok`, upstream `tracked`, forge `open`, verdict `safe`.
-    /// Segmented middles and detail values arrive with the upcoming
-    /// identity-hue work; nothing names `Ok` yet.
-    #[allow(dead_code)] // consumed by the upcoming summary segmentation
     Ok,
     /// `error`/`blocked` words, `checks failed`, `remote gone` - the
-    /// word role of `Attention::Error`, consumed by `attention_word_role`
-    /// once state words render through it.
-    #[allow(dead_code)] // consumed by the upcoming summary segmentation
+    /// word role of `Attention::Error`.
     Bad,
     /// Branch names, bases, upstreams.
-    #[allow(dead_code)] // consumed by the upcoming identity-hue labelling
     Ref,
     /// Conversation ids, commit hashes, PR/MR labels.
-    #[allow(dead_code)] // consumed by the upcoming identity-hue labelling
     Id,
     /// The `Needs you` section header.
     NeedsYou,
@@ -116,7 +109,6 @@ pub fn attention_glyph_role(attention: Attention) -> Role {
 
 /// The role a state word takes: its glyph's hue, except `error`, which
 /// is bold red.
-#[allow(dead_code)] // consumed by the upcoming detail state-word colouring
 pub fn attention_word_role(attention: Attention) -> Role {
     match attention {
         Attention::Error => Role::Bad,
@@ -145,7 +137,7 @@ pub struct Seg {
 /// `Content`, `push_layout` adds `Layout` - only the cursor-item renderers
 /// (a list row and its context line) call the latter, so kind is never
 /// inferred from text or position.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Segs(Vec<Seg>);
 
 impl Segs {
@@ -168,13 +160,73 @@ impl Segs {
         });
     }
 
+    /// Append every segment of `other`, roles and kinds preserved.
+    pub fn append(&mut self, mut other: Segs) {
+        self.0.append(&mut other.0);
+    }
+
     /// The concatenated text: width math and filters measure this.
-    /// `render_row` still measures the cell strings directly; the width
-    /// contract moves onto segments with the segmented middles work.
-    #[allow(dead_code)] // consumed by the upcoming segmented middles
     pub fn text(&self) -> String {
         self.0.iter().map(|s| s.text.as_str()).collect()
     }
+}
+
+/// `segs` clipped to `w` cells, cutting the segment sequence at the same
+/// cell `crate::tui`'s string `fit` cuts the concatenated text: a
+/// character joins only while `used + width` fits the `w - 1` budget, the
+/// cut lands mid-segment or on its boundary identically, and the `…`
+/// takes the role and kind of the segment it ends - or of the first
+/// non-empty segment when no character survives.
+pub fn fit(segs: &Segs, w: usize) -> Segs {
+    if UnicodeWidthStr::width(segs.text().as_str()) <= w {
+        return segs.clone();
+    }
+    let mut out = Segs::default();
+    if w == 0 {
+        return out;
+    }
+    let mut used = 0usize;
+    let mut last: Option<(Role, SegKind)> = None;
+    'cut: for seg in &segs.0 {
+        let mut text = String::new();
+        let mut overflow = false;
+        for c in seg.text.chars() {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + cw > w - 1 {
+                overflow = true;
+                break;
+            }
+            used += cw;
+            text.push(c);
+        }
+        if !text.is_empty() {
+            last = Some((seg.role, seg.kind));
+        }
+        if !text.is_empty() || seg.text.is_empty() {
+            out.0.push(Seg {
+                role: seg.role,
+                text,
+                kind: seg.kind,
+            });
+        }
+        if overflow {
+            break 'cut;
+        }
+    }
+    let (role, kind) = last
+        .or_else(|| {
+            segs.0
+                .iter()
+                .find(|s| !s.text.is_empty())
+                .map(|s| (s.role, s.kind))
+        })
+        .unwrap_or((Role::Text, SegKind::Content));
+    out.0.push(Seg {
+        role,
+        text: "…".to_owned(),
+        kind,
+    });
+    out
 }
 
 /// Where the line sits relative to the focused list's cursor.
@@ -348,6 +400,86 @@ mod tests {
         assert_eq!(segs.text(), "ab  cd");
         let kinds: Vec<SegKind> = segs.0.iter().map(|s| s.kind).collect();
         assert_eq!(kinds, [SegKind::Content, SegKind::Layout, SegKind::Content]);
+    }
+
+    #[test]
+    fn fit_cuts_segments_at_the_same_cell_as_string_fit() {
+        // For every width the segmented cut equals the string cut of the
+        // concatenated text - plain, wide and combining characters alike.
+        for text in [
+            "repo/feat/login ⌂wt",
+            "ペインのラベルを更新する長いタイトル",
+            "a\u{0301}b · ↑3 x",
+        ] {
+            let mut one = Segs::default();
+            one.push(Role::Text, text);
+            let mut split = Segs::default();
+            let cut = text.len() / 3;
+            split.push(Role::Strong, &text[..cut]);
+            split.push(Role::Separator, &text[cut..cut * 2]);
+            split.push(Role::Ref, &text[cut * 2..]);
+            for w in 0..=text.len() + 2 {
+                assert_eq!(
+                    fit(&one, w).text(),
+                    crate::tui::fit(text, w),
+                    "{text:?} at {w}"
+                );
+                assert_eq!(
+                    fit(&split, w).text(),
+                    crate::tui::fit(text, w),
+                    "split {text:?} at {w}"
+                );
+            }
+        }
+        // Zero width: nothing survives and there is no ellipsis.
+        assert_eq!(fit(&one_more(""), 0).text(), "");
+    }
+
+    fn one_more(text: &str) -> Segs {
+        let mut segs = Segs::default();
+        segs.push(Role::Text, text);
+        segs
+    }
+
+    #[test]
+    fn fit_ellipsis_takes_the_role_of_the_segment_it_ends() {
+        let segs = || {
+            let mut segs = Segs::default();
+            segs.push(Role::Strong, "repo");
+            segs.push(Role::Separator, "/");
+            segs.push(Role::Ref, "feat/login");
+            segs
+        };
+        // Whole text fits: nothing cut, no ellipsis.
+        let whole = fit(&segs(), 20);
+        assert_eq!(whole.text(), "repo/feat/login");
+        assert_eq!(whole.0.len(), 3);
+        // Inside the branch: the ellipsis is `Ref`.
+        let f = fit(&segs(), 8);
+        assert_eq!(f.text(), "repo/fe…");
+        let last = f.0.last().unwrap();
+        assert_eq!(last.role, Role::Ref);
+        assert_eq!(last.kind, SegKind::Content);
+        // Exactly on a segment boundary (`repo/` survived whole): the
+        // ellipsis is `Separator`.
+        let f = fit(&segs(), 6);
+        assert_eq!(f.text(), "repo/…");
+        assert_eq!(f.0.last().unwrap().role, Role::Separator);
+        // Nothing survives a one-cell cut: the first non-empty segment's
+        // role - `Strong`, not the `Layout` gap's.
+        let mut layout_first = Segs::default();
+        layout_first.push_layout(Role::Wait, "");
+        layout_first.append(segs());
+        let f = fit(&layout_first, 1);
+        assert_eq!(f.text(), "…");
+        assert_eq!(f.0.last().unwrap().role, Role::Strong);
+        // Kind survives the cut: a truncated `Layout` tail ends in a
+        // `Layout` ellipsis.
+        let mut layout = Segs::default();
+        layout.push_layout(Role::Text, "   pad");
+        let f = fit(&layout, 4);
+        assert_eq!(f.text(), "   …");
+        assert_eq!(f.0.last().unwrap().kind, SegKind::Layout);
     }
 
     #[test]

@@ -516,7 +516,155 @@ pub struct WorkRow {
     pub section: WorkSection,
     /// The section reason followed by the compact evidence tail (`↑3`,
     /// `~dirty`, `no remote`, `no wt`, `merged`, a PR/MR label).
-    pub summary: String,
+    pub summary: Summary,
+}
+
+/// What one piece of a work row's summary is - which is all the renderer
+/// needs to hue it: plain text, a state word carrying its attention's
+/// hue, a green or red verdict, or the forge label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartKind {
+    /// Everything unlisted.
+    Plain,
+    /// A state word or phrase (`error: StopFailure`, `working`): the
+    /// renderer takes the `Attention`'s word hue.
+    Status(Attention),
+    /// `checks ok`.
+    Ok,
+    /// `blocked...`, `checks failed`, `remote gone`.
+    Bad,
+    /// The `PR #191`/`MR !7` label.
+    Forge,
+}
+
+/// One part of a work row's summary: its text and what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryPart {
+    pub kind: PartKind,
+    pub text: String,
+}
+
+impl From<&str> for SummaryPart {
+    fn from(text: &str) -> SummaryPart {
+        SummaryPart {
+            kind: PartKind::Plain,
+            text: text.to_owned(),
+        }
+    }
+}
+
+impl From<String> for SummaryPart {
+    fn from(text: String) -> SummaryPart {
+        SummaryPart {
+            kind: PartKind::Plain,
+            text,
+        }
+    }
+}
+
+/// A work row's summary: the typed parts the TUI hues plus the flattened
+/// text, computed once in the constructor so the JSON string, the `/`
+/// filter and every string assertion read it unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Summary {
+    reason: Vec<SummaryPart>,
+    facts: Vec<SummaryPart>,
+    parked: bool,
+    text: String,
+}
+
+impl Summary {
+    /// The text is `reason` joined with ` · `, then `facts` joined with
+    /// a space when non-empty, then `parked`, the groups joined with
+    /// ` · ` - computed here and never set separately.
+    pub fn new(reason: Vec<SummaryPart>, facts: Vec<SummaryPart>, parked: bool) -> Summary {
+        let mut groups = vec![
+            reason
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" · "),
+        ];
+        if !facts.is_empty() {
+            groups.push(
+                facts
+                    .iter()
+                    .map(|p| p.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+        if parked {
+            groups.push("parked".to_owned());
+        }
+        Summary {
+            reason,
+            facts,
+            parked,
+            text: groups.join(" · "),
+        }
+    }
+
+    /// The reason parts, ` · `-joined in the text.
+    pub fn reason(&self) -> &[SummaryPart] {
+        &self.reason
+    }
+
+    /// The evidence-tail parts, space-joined in the text.
+    pub fn facts(&self) -> &[SummaryPart] {
+        &self.facts
+    }
+
+    /// Whether the summary ends in `parked`.
+    pub fn parked(&self) -> bool {
+        self.parked
+    }
+}
+
+impl From<&str> for Summary {
+    /// A bare string reads as one `Plain` reason part.
+    fn from(text: &str) -> Summary {
+        Summary::new(vec![text.into()], Vec::new(), false)
+    }
+}
+
+impl From<String> for Summary {
+    fn from(text: String) -> Summary {
+        Summary::new(vec![text.into()], Vec::new(), false)
+    }
+}
+
+impl Serialize for Summary {
+    /// The JSON form is the flattened text: `list --json` is unchanged.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text)
+    }
+}
+
+impl std::ops::Deref for Summary {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for Summary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl PartialEq<&str> for Summary {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for Summary {
+    fn eq(&self, other: &String) -> bool {
+        self.text == *other
+    }
 }
 
 /// One conversation the work record's cursor proves: its full
@@ -2473,7 +2621,7 @@ fn work_row(
         worktree_removal: Some(removal),
         branch_deletion: Some(deletion),
         section: WorkSection::FollowUp,
-        summary: String::new(),
+        summary: Summary::default(),
     }
 }
 
@@ -3236,7 +3384,7 @@ fn gone_rows(
             // a just-deleted old branch still reads old.
             last_activity: store::newest_activity(&record.activities).map(|ms| ms / 1000),
             gone: Some(gone.clone()),
-            summary: format!("{gone} · {}", reference_summary(&refs)),
+            summary: gone_summary(&gone, &refs),
             references: refs,
             activities: record.activities.clone(),
             observations: record.observations.clone(),
@@ -3272,7 +3420,7 @@ fn gone_rows(
             repo: repo.to_owned(),
             repo_name: display_name(Path::new(repo)),
             gone: Some(gone.to_owned()),
-            summary: format!("{gone} · {}", reference_summary(&refs)),
+            summary: gone_summary(gone, &refs),
             references: refs,
             activities: record.activities.clone(),
             observations: record.observations.clone(),
@@ -3374,7 +3522,7 @@ fn inside_resolved(cwd: &Path, root: &Path) -> bool {
 }
 
 /// The reference counts a gone row's summary names.
-fn reference_summary(refs: &[ReferenceRow]) -> String {
+fn reference_summary(refs: &[ReferenceRow]) -> Vec<SummaryPart> {
     [
         (ReferenceKind::Pane, "pane"),
         (ReferenceKind::Window, "window"),
@@ -3385,10 +3533,17 @@ fn reference_summary(refs: &[ReferenceRow]) -> String {
     .into_iter()
     .filter_map(|(kind, word)| {
         let n = refs.iter().filter(|r| r.kind == kind).count();
-        (n > 0).then(|| format!("{n} {word}{}", if n == 1 { "" } else { "s" }))
+        (n > 0).then(|| format!("{n} {word}{}", if n == 1 { "" } else { "s" }).into())
     })
-    .collect::<Vec<_>>()
-    .join(" · ")
+    .collect()
+}
+
+/// A gone row's summary: the gone word, then each reference count - all
+/// `Plain`, no facts.
+fn gone_summary(gone: &str, refs: &[ReferenceRow]) -> Summary {
+    let mut reason = vec![gone.into()];
+    reason.extend(reference_summary(refs));
+    Summary::new(reason, Vec::new(), false)
 }
 
 /// Whether the conversation is bound to the work row: an open exact
@@ -3463,7 +3618,7 @@ fn section_reason(
     bound: &[&ConversationRow],
     forgotten_after: Duration,
     now: u64,
-) -> (WorkSection, String) {
+) -> (WorkSection, Vec<SummaryPart>) {
     match row.attention {
         Attention::Waiting | Attention::Error | Attention::CompletedUnseen => {
             return (WorkSection::NeedsYou, attention_reason(row, bound));
@@ -3492,7 +3647,7 @@ fn section_reason(
         && quiet_beyond
     {
         let age = age_at(now, row.last_activity.unwrap_or(now));
-        return (WorkSection::Forgotten, format!("idle {age}"));
+        return (WorkSection::Forgotten, vec![format!("idle {age}").into()]);
     }
     if let Some(pair) = cleanup_section(row) {
         return pair;
@@ -3500,8 +3655,8 @@ fn section_reason(
     match row.kind {
         // A non-actionable space is never forgotten or cleaned: it either
         // holds a resumable conversation or it is simply there.
-        WorkKind::ProjectSpace => (WorkSection::FollowUp, "idle project".to_owned()),
-        _ => (WorkSection::FollowUp, "open".to_owned()),
+        WorkKind::ProjectSpace => (WorkSection::FollowUp, vec!["idle project".into()]),
+        _ => (WorkSection::FollowUp, vec!["open".into()]),
     }
 }
 
@@ -3509,11 +3664,11 @@ fn section_reason(
 /// tree, unpushed commits, a resumable idle conversation when `pick_up`
 /// says the work is still unfinished and recent, or a blocked cleanup
 /// verdict. Unknown forge state triggers nothing by itself.
-fn follow_up(row: &WorkRow, bound: &[&ConversationRow], pick_up: bool) -> Option<String> {
+fn follow_up(row: &WorkRow, bound: &[&ConversationRow], pick_up: bool) -> Option<Vec<SummaryPart>> {
     if row.forge == WorkItem::Open {
         match row.pipeline {
-            Pipeline::Failed => return Some("checks failed".to_owned()),
-            Pipeline::Busy => return Some("checks pending".to_owned()),
+            Pipeline::Failed => return Some(vec![bad("checks failed")]),
+            Pipeline::Busy => return Some(vec!["checks pending".into()]),
             Pipeline::Succeeded | Pipeline::Unknown => {}
         }
     }
@@ -3524,26 +3679,26 @@ fn follow_up(row: &WorkRow, bound: &[&ConversationRow], pick_up: bool) -> Option
     // Landed work whose cleanup is blocked names both facts - its
     // remaining dirt is part of why it is blocked, not a separate ask.
     if blocked.is_some() && matches!(row.landed, Some(Landed::Ancestor | Landed::Content)) {
-        return Some("merged · blocked".to_owned());
+        return Some(vec!["merged".into(), bad("blocked")]);
     }
     if row.dirty == Some(true) {
-        return Some("dirty".to_owned());
+        return Some(vec!["dirty".into()]);
     }
     if let Some(n) = row.unpushed.filter(|n| *n > 0) {
-        return Some(format!("unpushed {n}"));
+        return Some(vec![format!("unpushed {n}").into()]);
     }
     if pick_up
         && bound
             .iter()
             .any(|c| !c.running() && !c.resume_argv.is_empty())
     {
-        return Some("resumable idle".to_owned());
+        return Some(vec!["resumable idle".into()]);
     }
     if let Some(blocked) = blocked {
         // A blocked row that is not landed names its first concrete
         // blocker and is never a cleanup candidate.
         let first = blocked.reasons.first().map(String::as_str).unwrap_or("?");
-        return Some(format!("blocked: {first}"));
+        return Some(vec![bad(format!("blocked: {first}"))]);
     }
     None
 }
@@ -3552,7 +3707,7 @@ fn follow_up(row: &WorkRow, bound: &[&ConversationRow], pick_up: bool) -> Option
 /// to clean` and names what goes; an applicable `Review` is `Cleanup
 /// review` and names its first reason. Blocked actions never land here -
 /// they are FollowUp.
-fn cleanup_section(row: &WorkRow) -> Option<(WorkSection, String)> {
+fn cleanup_section(row: &WorkRow) -> Option<(WorkSection, Vec<SummaryPart>)> {
     let removal = row.worktree_removal.as_ref();
     let deletion = row.branch_deletion.as_ref();
     let applicable: Vec<&verdict::ActionVerdict> = [removal, deletion]
@@ -3576,11 +3731,14 @@ fn cleanup_section(row: &WorkRow) -> Option<(WorkSection, String)> {
             (false, true) => "branch only",
             (false, false) => "?", // coverage: off - `applicable` was proven non-empty above
         };
-        return Some((WorkSection::ReadyToClean, what.to_owned()));
+        return Some((WorkSection::ReadyToClean, vec![what.into()]));
     }
     if let Some(review) = applicable.iter().find(|a| a.verdict == Verdict::Review) {
         let first = review.reasons.first().map(String::as_str).unwrap_or("?");
-        return Some((WorkSection::CleanupReview, format!("review: {first}")));
+        return Some((
+            WorkSection::CleanupReview,
+            vec![format!("review: {first}").into()],
+        ));
     } // coverage: off - the find-miss edge: `Blocked` verdicts exit at `FollowUp`, so a `Review` is always found
     None // coverage: off - the same edge
 }
@@ -3588,47 +3746,59 @@ fn cleanup_section(row: &WorkRow) -> Option<(WorkSection, String)> {
 /// The attention sections' reason: `waiting: permission prompt`,
 /// `error: StopFailure`, `done` - with `working` beside a retained latch
 /// while the agent grinds on.
-fn attention_reason(row: &WorkRow, bound: &[&ConversationRow]) -> String {
+fn attention_reason(row: &WorkRow, bound: &[&ConversationRow]) -> Vec<SummaryPart> {
     let mut parts = Vec::new();
     let detail = bound
         .iter()
         .find(|c| c.attention == row.attention)
         .and_then(|c| c.attention_detail.as_deref());
-    parts.push(match detail {
-        Some(d) => format!("{}: {d}", row.attention.label()),
-        None => row.attention.label().to_owned(),
+    parts.push(SummaryPart {
+        kind: PartKind::Status(row.attention),
+        text: match detail {
+            Some(d) => format!("{}: {d}", row.attention.label()),
+            None => row.attention.label().to_owned(),
+        },
     });
     if row.attention != Attention::Working
         && bound.iter().any(|c| c.state == ConversationState::Busy)
     {
-        parts.push("working".to_owned());
+        parts.push(SummaryPart {
+            kind: PartKind::Status(Attention::Working),
+            text: "working".to_owned(),
+        });
     }
-    parts.join(" · ")
+    parts
+}
+
+/// A `Bad` summary part.
+fn bad(text: impl Into<String>) -> SummaryPart {
+    SummaryPart {
+        kind: PartKind::Bad,
+        text: text.into(),
+    }
 }
 
 /// The row's final summary: the section reason, then the compact evidence
 /// tail with any phrase the reason already made dropped, then `parked`.
-fn summarize(row: &WorkRow, reason: String) -> String {
-    let mut parts = vec![reason.clone()];
-    let reason_norm = normalized(&reason);
-    let facts: Vec<String> = work_facts(row)
+fn summarize(row: &WorkRow, reason: Vec<SummaryPart>) -> Summary {
+    let reason_text = reason
+        .iter()
+        .map(|p| p.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let reason_norm = normalized(&reason_text);
+    let facts: Vec<SummaryPart> = work_facts(row)
         .into_iter()
         .filter(|f| {
             // Only a pure-word fact can duplicate the reason (`~dirty`
             // beside `dirty`); `?`/`↑?` normalize to nothing and counts
             // like `↑2` may disagree with the reason's own count - both
             // always stay.
-            let f = normalized(f);
+            let f = normalized(&f.text);
             f.is_empty() || f.bytes().any(|b| b.is_ascii_digit()) || !reason_norm.contains(&f)
         })
         .collect();
-    if !facts.is_empty() {
-        parts.push(facts.join(" "));
-    }
-    if row.parked {
-        parts.push("parked".to_owned());
-    }
-    parts.join(" · ")
+    Summary::new(reason, facts, row.parked)
 }
 
 /// `a` contains `b` as a phrase, compared on lowercase alphanumerics only,
@@ -3644,39 +3814,45 @@ fn normalized(s: &str) -> String {
 /// The compact evidence tail: `no wt`, `no remote`/`remote gone`/`?`,
 /// `↑n`, `~dirty`, `merged`, the PR/MR label and the pipeline read-out.
 /// A project space says `no git` and nothing else.
-fn work_facts(row: &WorkRow) -> Vec<String> {
+fn work_facts(row: &WorkRow) -> Vec<SummaryPart> {
     if row.kind == WorkKind::ProjectSpace {
-        return vec!["no git".to_owned()];
+        return vec!["no git".into()];
     }
-    let mut parts = Vec::new();
+    let mut parts: Vec<SummaryPart> = Vec::new();
     if row.worktree.is_none() {
-        parts.push("no wt".to_owned());
+        parts.push("no wt".into());
     }
     match row.upstream {
-        Upstream::NeverPushed => parts.push("no remote".to_owned()),
-        Upstream::RemoteGone => parts.push("remote gone".to_owned()),
-        Upstream::Unknown => parts.push("?".to_owned()),
+        Upstream::NeverPushed => parts.push("no remote".into()),
+        Upstream::RemoteGone => parts.push(bad("remote gone")),
+        Upstream::Unknown => parts.push("?".into()),
         Upstream::Tracked | Upstream::Untracked | Upstream::NotApplicable => {}
     }
     match row.commits_ahead {
-        Some(n) if n > 0 => parts.push(format!("↑{n}")),
-        None => parts.push("↑?".to_owned()),
+        Some(n) if n > 0 => parts.push(format!("↑{n}").into()),
+        None => parts.push("↑?".into()),
         _ => {}
     }
     if row.dirty == Some(true) {
-        parts.push("~dirty".to_owned());
+        parts.push("~dirty".into());
     }
     if matches!(row.landed, Some(Landed::Ancestor | Landed::Content)) {
-        parts.push("merged".to_owned());
+        parts.push("merged".into());
     }
     if let Some(label) = &row.forge_label {
-        parts.push(label.clone());
+        parts.push(SummaryPart {
+            kind: PartKind::Forge,
+            text: label.clone(),
+        });
     }
     if row.forge == WorkItem::Open {
         match row.pipeline {
-            Pipeline::Failed => parts.push("checks failed".to_owned()),
-            Pipeline::Busy => parts.push("checks pending".to_owned()),
-            Pipeline::Succeeded => parts.push("checks ok".to_owned()),
+            Pipeline::Failed => parts.push(bad("checks failed")),
+            Pipeline::Busy => parts.push("checks pending".into()),
+            Pipeline::Succeeded => parts.push(SummaryPart {
+                kind: PartKind::Ok,
+                text: "checks ok".to_owned(),
+            }),
             Pipeline::Unknown => {}
         }
     }
@@ -3764,7 +3940,7 @@ fn space_row(repo_id: &str, path: &Path) -> WorkRow {
         worktree_removal: None,
         branch_deletion: None,
         section: WorkSection::FollowUp,
-        summary: String::new(),
+        summary: Summary::default(),
     }
 }
 
@@ -4818,7 +4994,13 @@ mod tests {
             f(&mut row);
             row
         };
-        let facts = |row: &WorkRow| work_facts(row).join(" ");
+        let facts = |row: &WorkRow| {
+            work_facts(row)
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
 
         assert_eq!(facts(&row(&|_| {})), "");
 
@@ -4867,7 +5049,11 @@ mod tests {
 
         // A project space says `no git` and nothing else.
         assert_eq!(
-            work_facts(&space_row("s", Path::new("/s"))).join(" "),
+            work_facts(&space_row("s", Path::new("/s")))
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
             "no git"
         );
 
@@ -4876,16 +5062,219 @@ mod tests {
             r.dirty = Some(true);
             r.commits_ahead = Some(3);
         });
-        r.summary = summarize(&r, "dirty".to_owned());
+        r.summary = summarize(&r, vec!["dirty".into()]);
         assert_eq!(r.summary, "dirty · ↑3");
-        r.summary = summarize(&r, "merged · blocked".to_owned());
+        r.summary = summarize(&r, vec!["merged · blocked".into()]);
         assert_eq!(r.summary, "merged · blocked · ↑3 ~dirty");
         r.landed = Some(Landed::Ancestor);
-        r.summary = summarize(&r, "merged · blocked".to_owned());
+        r.summary = summarize(&r, vec!["merged · blocked".into()]);
         assert_eq!(r.summary, "merged · blocked · ↑3 ~dirty");
         r.parked = true;
-        r.summary = summarize(&r, "merged · blocked".to_owned());
+        r.summary = summarize(&r, vec!["merged · blocked".into()]);
         assert_eq!(r.summary, "merged · blocked · ↑3 ~dirty · parked");
+    }
+
+    #[test]
+    fn every_summary_path_lands_its_part_kinds() {
+        // The kinds each reason and fact carry; the flattened text these
+        // rows produce is pinned everywhere else and stays identical.
+        let kinds = |parts: &[SummaryPart]| parts.iter().map(|p| p.kind).collect::<Vec<_>>();
+        let now = 2_000_000_000;
+        let threshold = Duration::from_secs(14 * 24 * 3600);
+        let conv = |attention: Attention, state: ConversationState, detail: Option<&str>| {
+            let mut c = conversation_row(
+                &conversation(None, None),
+                None,
+                derived(Exec::Unknown, attention),
+                Some("/r/.git".to_owned()),
+                None,
+                Some("feat".to_owned()),
+                EvidenceIn::default(),
+            );
+            c.state = state;
+            c.attention_detail = detail.map(str::to_owned);
+            c.touches = vec![open_touch("/r")];
+            c
+        };
+        let fresh = || WorkRow {
+            repo: "/r/.git".to_owned(),
+            kind: WorkKind::Branch,
+            worktree: None,
+            branch: Some("feat".to_owned()),
+            ..space_row("r", Path::new("/r"))
+        };
+
+        // Attention reasons: one `Status` part per phrase, the appended
+        // `working` carrying `Working`.
+        let mut row = fresh();
+        classify_work(
+            &mut row,
+            &[conv(
+                Attention::Waiting,
+                ConversationState::Waiting,
+                Some("permission prompt"),
+            )],
+            threshold,
+            now,
+        );
+        assert_eq!(
+            kinds(row.summary.reason()),
+            [PartKind::Status(Attention::Waiting)]
+        );
+        assert_eq!(row.summary.reason()[0].text, "waiting: permission prompt");
+
+        let mut row = fresh();
+        classify_work(
+            &mut row,
+            &[conv(
+                Attention::Error,
+                ConversationState::Busy,
+                Some("StopFailure"),
+            )],
+            threshold,
+            now,
+        );
+        assert_eq!(
+            kinds(row.summary.reason()),
+            [
+                PartKind::Status(Attention::Error),
+                PartKind::Status(Attention::Working)
+            ]
+        );
+        assert_eq!(row.summary.reason()[0].text, "error: StopFailure");
+        assert_eq!(row.summary.reason()[1].text, "working");
+
+        for (attention, state, label) in [
+            (Attention::CompletedUnseen, ConversationState::Idle, "done"),
+            (Attention::Working, ConversationState::Busy, "working"),
+        ] {
+            let mut row = fresh();
+            classify_work(&mut row, &[conv(attention, state, None)], threshold, now);
+            assert_eq!(kinds(row.summary.reason()), [PartKind::Status(attention)]);
+            assert_eq!(row.summary.reason()[0].text, label);
+        }
+
+        // `merged · blocked` splits into `Plain` + `Bad`; a bare blocker
+        // names its reason `Bad`.
+        let blocked = || crate::verdict::ActionVerdict {
+            verdict: Verdict::Blocked,
+            reasons: vec!["uncommitted changes".to_owned()],
+        };
+        let mut row = fresh();
+        row.landed = Some(Landed::Ancestor);
+        row.worktree_removal = Some(blocked());
+        classify_work(&mut row, &[], threshold, now);
+        assert_eq!(
+            kinds(row.summary.reason()),
+            [PartKind::Plain, PartKind::Bad]
+        );
+        assert_eq!(row.summary, "merged · blocked · no wt ↑?");
+
+        let mut row = fresh();
+        row.worktree_removal = Some(blocked());
+        classify_work(&mut row, &[], threshold, now);
+        assert_eq!(kinds(row.summary.reason()), [PartKind::Bad]);
+        assert_eq!(row.summary, "blocked: uncommitted changes · no wt ↑?");
+
+        // `checks failed` is a `Bad` reason.
+        let mut row = fresh();
+        row.forge = WorkItem::Open;
+        row.pipeline = Pipeline::Failed;
+        classify_work(&mut row, &[], threshold, now);
+        assert_eq!(kinds(row.summary.reason()), [PartKind::Bad]);
+        assert_eq!(row.summary.reason()[0].text, "checks failed");
+
+        // Facts: `checks ok` `Ok`, `remote gone` `Bad`, the forge label
+        // `Forge`, the rest `Plain`.
+        let mut row = row.clone();
+        row.pipeline = Pipeline::Succeeded;
+        row.forge_label = Some("PR #191".to_owned());
+        row.upstream = Upstream::RemoteGone;
+        row.dirty = Some(true);
+        let summary = summarize(&row, vec!["dirty".into()]);
+        assert_eq!(
+            kinds(summary.facts()),
+            [
+                PartKind::Plain,
+                PartKind::Bad,
+                PartKind::Plain,
+                PartKind::Forge,
+                PartKind::Ok
+            ]
+        );
+        assert_eq!(summary.facts()[1].text, "remote gone");
+        assert_eq!(summary.facts()[3].text, "PR #191");
+        assert_eq!(summary.facts()[4].text, "checks ok");
+
+        // Dedupe on the joined reason text: a pure-word fact the reason
+        // names drops; digits and normalizing-to-empty survive.
+        let summary = summarize(&row, vec!["remote gone".into()]);
+        assert!(!summary.facts().iter().any(|p| p.text == "remote gone"));
+        assert!(summary.facts().iter().any(|p| p.text == "↑?"));
+        row.upstream = Upstream::Unknown;
+        let summary = summarize(&row, vec!["open".into()]);
+        assert!(summary.facts().iter().any(|p| p.text == "?"));
+        // A multi-part reason dedupes on its joined text too.
+        row.landed = Some(Landed::Ancestor);
+        let summary = summarize(&row, vec!["merged".into(), "blocked".into()]);
+        assert!(summary.facts().iter().any(|p| p.text == "~dirty"));
+        assert!(!summary.facts().iter().any(|p| p.text == "merged"));
+
+        // `parked` lands as the flag, not a part.
+        row.parked = true;
+        let summary = summarize(&row, vec!["open".into()]);
+        assert!(summary.parked());
+        assert!(summary.ends_with("· parked"));
+
+        // A gone row: `Plain` gone word and `Plain` counts, no facts.
+        let gone = gone_summary(
+            "project folder gone",
+            &[ReferenceRow {
+                kind: ReferenceKind::Process,
+                label: "x".to_owned(),
+            }],
+        );
+        assert_eq!(kinds(gone.reason()), [PartKind::Plain, PartKind::Plain]);
+        assert!(gone.facts().is_empty());
+        assert_eq!(gone, "project folder gone · 1 process");
+    }
+
+    #[test]
+    fn a_summary_serializes_and_reads_as_its_text() {
+        // The JSON form is the flattened string; there is no parts key.
+        let row = WorkRow {
+            kind: WorkKind::Branch,
+            worktree: Some(PathBuf::from("/w")),
+            branch: Some("b".to_owned()),
+            dirty: Some(false),
+            commits_ahead: Some(0),
+            unpushed: Some(0),
+            upstream: Upstream::Tracked,
+            landed: Some(Landed::No),
+            ..space_row("r", Path::new("/r"))
+        };
+        let summary = summarize(&row, vec!["merged · blocked".into()]);
+        assert_eq!(
+            serde_json::to_value(&summary).unwrap(),
+            serde_json::Value::from("merged · blocked")
+        );
+        // `From` spells one `Plain` reason part; `Default` is empty.
+        let s: Summary = "unpushed 3 · ↑3 PR #191".into();
+        assert_eq!(&*s, "unpushed 3 · ↑3 PR #191");
+        assert_eq!(s.reason().len(), 1);
+        assert_eq!(s.reason()[0].kind, PartKind::Plain);
+        assert_eq!(s, "unpushed 3 · ↑3 PR #191".to_owned());
+        assert_eq!(format!("{s}"), "unpushed 3 · ↑3 PR #191");
+        assert_eq!(&*Summary::default(), "");
+        assert_eq!(Summary::default(), "");
+        // A `From` summary whose `Plain` reason contains ` · ` composes
+        // like today's bare-string reason did.
+        let parts = Summary::new(
+            vec!["merged".into(), "blocked".into()],
+            vec!["~dirty".into()],
+            true,
+        );
+        assert_eq!(parts, "merged · blocked · ~dirty · parked");
     }
 
     #[test]
@@ -6036,7 +6425,7 @@ mod tests {
     fn a_gone_row_keeps_its_own_placement_in_classification() {
         let mut row = space_row("/r", Path::new("/r"));
         row.gone = Some("project folder gone".to_owned());
-        row.summary = "project folder gone · 1 process".to_owned();
+        row.summary = "project folder gone · 1 process".into();
         let summary = row.summary.clone();
         classify_work(&mut row, &[], Duration::from_secs(1), 2_000_000_000);
         assert_eq!(row.summary, summary);
