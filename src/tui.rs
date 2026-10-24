@@ -961,15 +961,18 @@ impl App {
                 glyph = crate::attention::rollup(repos.iter().map(|r| &r.attention)).glyph();
                 let open: usize = repos.iter().map(|r| r.open).sum();
                 let clean: usize = repos.iter().map(|r| r.clean).sum();
-                format!("{open} open · {clean} clean")
+                vec![format!("{open} open"), format!("{clean} clean")]
             }
-            List::Work => format!("{} open · {} clean", view.work_open, view.work_clean),
+            List::Work => vec![
+                format!("{} open", view.work_open),
+                format!("{} clean", view.work_clean),
+            ],
             List::Conversations => {
                 let live = rows
                     .iter()
                     .filter(|r| matches!(r, Row::Conversation(c) if c.running()))
                     .count();
-                format!("{live} live · {} shown", rows.len())
+                vec![format!("{live} live"), format!("{} shown", rows.len())]
             }
         };
         let mut label = Segs::default();
@@ -2333,12 +2336,15 @@ fn repo_glyph(repo: &RepoRow) -> &'static str {
     repo.attention.glyph()
 }
 
-/// `N open · M clean` for repos with Git evidence, `no git` otherwise.
-fn repo_counts(repo: &RepoRow) -> String {
+/// `N open`, `M clean` for repos with Git evidence, `no git` otherwise.
+fn repo_counts(repo: &RepoRow) -> Vec<String> {
     if repo.git {
-        format!("{} open · {} clean", repo.open, repo.clean)
+        vec![
+            format!("{} open", repo.open),
+            format!("{} clean", repo.clean),
+        ]
     } else {
-        "no git".to_owned()
+        vec!["no git".to_owned()]
     }
 }
 
@@ -2426,13 +2432,13 @@ fn conversation_label(c: &ConversationRow) -> Segs {
 
 /// `N open · M clean`-style counts: `Text` parts joined by `Separator`
 /// ` · `.
-fn count_segs(counts: &str) -> Segs {
+fn count_segs(counts: &[String]) -> Segs {
     let mut segs = Segs::default();
-    for (i, part) in counts.split(" · ").enumerate() {
+    for (i, part) in counts.iter().enumerate() {
         if i > 0 {
             segs.push(Role::Separator, " · ");
         }
-        segs.push(Role::Text, part.to_owned());
+        segs.push(Role::Text, part.clone());
     }
     segs
 }
