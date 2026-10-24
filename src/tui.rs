@@ -30,8 +30,8 @@ use crate::config;
 use crate::forge::{Pipeline, WorkItem};
 use crate::snapshot::{
     AttachmentLiveness, AttachmentRow, ConversationRow, ConversationState, ConversationSummary,
-    IncarnationRow, ReferenceKind, RelationStrength, RepoRow, Snapshot, Upstream, WorkKind,
-    WorkRow, WorkSection, to_json,
+    IncarnationRow, ReferenceKind, RelationStrength, RepoRow, Snapshot, SummaryPiece, Upstream,
+    WorkKind, WorkRow, WorkSection, to_json,
 };
 use crate::store::{self, Store};
 use crate::text::escape_text;
@@ -2437,28 +2437,18 @@ fn count_segs(counts: &str) -> Segs {
     segs
 }
 
-/// A work row's `Summary` as middle segments: parts in their kind's
-/// role, reason ` · ` joiners `Separator`, fact spaces `Text`.
+/// A work row's `Summary` as middle segments, piece by piece so the
+/// middle reads exactly as the summary's text: parts in their kind's
+/// role, ` · ` joiners `Separator`, fact spaces and `parked` `Text`.
 fn summary_segs(summary: &crate::snapshot::Summary) -> Segs {
     let mut segs = Segs::default();
-    for (i, part) in summary.reason().iter().enumerate() {
-        if i > 0 {
-            segs.push(Role::Separator, " · ");
-        }
-        segs.push(part_role(part.kind), part.text.clone());
-    }
-    if !summary.facts().is_empty() {
-        segs.push(Role::Separator, " · ");
-        for (i, part) in summary.facts().iter().enumerate() {
-            if i > 0 {
-                segs.push(Role::Text, " ");
-            }
-            segs.push(part_role(part.kind), part.text.clone());
-        }
-    }
-    if summary.parked() {
-        segs.push(Role::Separator, " · ");
-        segs.push(Role::Text, "parked");
+    for piece in summary.pieces() {
+        let role = match piece {
+            SummaryPiece::Part(part) => part_role(part.kind),
+            SummaryPiece::Separator => Role::Separator,
+            SummaryPiece::Space | SummaryPiece::Parked => Role::Text,
+        };
+        segs.push(role, piece.text());
     }
     segs
 }
@@ -6804,6 +6794,44 @@ mod tests {
         assert!(spans.contains(&("…", Some(Color::Yellow))), "{spans:?}");
         // The tail cells are plain: pad, gap and age.
         assert!(spans.contains(&("2m", Some(Color::Reset))), "{spans:?}");
+    }
+
+    #[test]
+    fn a_summary_middle_reads_as_its_text() {
+        // The middle walks the summary's own pieces: every shape renders
+        // the exact text the filter and `list --json` read, joiners in
+        // their roles.
+        for summary in [
+            Summary::default(),
+            "idle project · no git".into(),
+            Summary::new(
+                vec![
+                    part(PartKind::Status(Attention::Error), "error: StopFailure"),
+                    part(PartKind::Status(Attention::Working), "working"),
+                ],
+                vec![
+                    "↑3".into(),
+                    "~dirty".into(),
+                    part(PartKind::Forge, "PR #191"),
+                ],
+                true,
+            ),
+            Summary::new(vec!["merged".into()], Vec::new(), true),
+        ] {
+            let segs = summary_segs(&summary);
+            assert_eq!(segs.text(), &*summary);
+            let line = to_line(&segs, Cursor::None, 0);
+            for span in &line.spans {
+                let want = match span.content.as_ref() {
+                    " · " => Some(Color::DarkGray),
+                    "PR #191" => Some(Color::Magenta),
+                    "error: StopFailure" => Some(Color::Red),
+                    "working" => Some(Color::Blue),
+                    _ => Some(Color::Reset),
+                };
+                assert_eq!(span.style.fg, want, "{:?} in {summary}", span.content);
+            }
+        }
     }
 
     #[test]

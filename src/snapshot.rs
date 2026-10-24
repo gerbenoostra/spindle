@@ -574,35 +574,25 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// The text is `reason` joined with ` · `, then `facts` joined with
-    /// a space when non-empty, then `parked`, the groups joined with
-    /// ` · ` - computed here and never set separately.
+    /// The text is the concatenation of `pieces` - computed here and
+    /// never set separately.
     pub fn new(reason: Vec<SummaryPart>, facts: Vec<SummaryPart>, parked: bool) -> Summary {
-        let mut groups = vec![
-            reason
-                .iter()
-                .map(|p| p.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" · "),
-        ];
-        if !facts.is_empty() {
-            groups.push(
-                facts
-                    .iter()
-                    .map(|p| p.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
-        }
-        if parked {
-            groups.push("parked".to_owned());
-        }
+        let text = pieces(&reason, &facts, parked)
+            .iter()
+            .map(SummaryPiece::text)
+            .collect();
         Summary {
             reason,
             facts,
             parked,
-            text: groups.join(" · "),
+            text,
         }
+    }
+
+    /// The text in order, parts and joiners alike: what the renderer
+    /// walks, so a rendered summary reads exactly as its text.
+    pub fn pieces(&self) -> Vec<SummaryPiece<'_>> {
+        pieces(&self.reason, &self.facts, self.parked)
     }
 
     /// The reason parts, ` · `-joined in the text.
@@ -619,6 +609,59 @@ impl Summary {
     pub fn parked(&self) -> bool {
         self.parked
     }
+}
+
+/// One piece of a summary's text: a part, or what joins them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryPiece<'a> {
+    Part(&'a SummaryPart),
+    /// ` · ` between reason parts and between the groups.
+    Separator,
+    /// The space between facts.
+    Space,
+    /// The trailing `parked`.
+    Parked,
+}
+
+impl SummaryPiece<'_> {
+    pub fn text(&self) -> &str {
+        match self {
+            SummaryPiece::Part(p) => &p.text,
+            SummaryPiece::Separator => " · ",
+            SummaryPiece::Space => " ",
+            SummaryPiece::Parked => "parked",
+        }
+    }
+}
+
+/// `reason` joined with ` · `, then `facts` joined with a space when
+/// non-empty, then `parked`, the groups joined with ` · `.
+fn pieces<'a>(
+    reason: &'a [SummaryPart],
+    facts: &'a [SummaryPart],
+    parked: bool,
+) -> Vec<SummaryPiece<'a>> {
+    let mut out = Vec::new();
+    for (i, part) in reason.iter().enumerate() {
+        if i > 0 {
+            out.push(SummaryPiece::Separator);
+        }
+        out.push(SummaryPiece::Part(part));
+    }
+    if !facts.is_empty() {
+        out.push(SummaryPiece::Separator);
+        for (i, part) in facts.iter().enumerate() {
+            if i > 0 {
+                out.push(SummaryPiece::Space);
+            }
+            out.push(SummaryPiece::Part(part));
+        }
+    }
+    if parked {
+        out.push(SummaryPiece::Separator);
+        out.push(SummaryPiece::Parked);
+    }
+    out
 }
 
 impl From<&str> for Summary {
