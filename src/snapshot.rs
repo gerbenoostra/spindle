@@ -5310,8 +5310,8 @@ mod tests {
         assert_eq!(format!("{s}"), "unpushed 3 · ↑3 PR #191");
         assert_eq!(&*Summary::default(), "");
         assert_eq!(Summary::default(), "");
-        // A `From` summary whose `Plain` reason contains ` · ` composes
-        // like today's bare-string reason did.
+        // Separate reason parts join with ` · ` exactly as one bare
+        // reason string spelling the same text did.
         let parts = Summary::new(
             vec!["merged".into(), "blocked".into()],
             vec!["~dirty".into()],
