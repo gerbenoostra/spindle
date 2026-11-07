@@ -29,6 +29,8 @@ pane's inner width. In the lists that are not focused, the cursor item's
 text is underlined instead and keeps its hues, so the row that set the
 panel's scope stays findable.
 
+## Where hues apply
+
 In the lists these all apply: repo names are bold, branches cyan,
 conversation ids and PR/MR labels magenta, state words take their glyph's
 hue, and a summary's verdicts (`checks ok`, `blocked`, `remote gone`) go
