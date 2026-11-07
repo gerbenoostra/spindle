@@ -241,9 +241,10 @@ pub enum Cursor {
 }
 
 /// `segs` as a `Line` of `width` cells - the sole site of cursor
-/// styling. `Focused` strips every span's own style, reverses the whole
-/// line and pads it to `width`, because `Paragraph` styles only the
-/// cells a line covers. `Unfocused` underlines `Content` segments over
+/// styling. `Focused` strips every span's own style - reverse video swaps
+/// each cell's own fg and bg, so a hued span would read as a hued block
+/// inside the bar - then reverses the whole line and pads it to `width`,
+/// because `Paragraph` styles only the cells a line covers. `Unfocused` underlines `Content` segments over
 /// their roles; `Layout` segments keep theirs. `None` is roles alone.
 /// `Focused` and `None` ignore the kind.
 pub fn to_line(segs: &Segs, cursor: Cursor, width: usize) -> Line<'static> {
