@@ -71,4 +71,6 @@ there with the detail-pane work.
   parked flag - whose flat text is computed once from those parts at
   construction - because the renderer hues the parts and `list --json`
   keeps emitting the same string; not re-parsing a flattened display
-  string into pieces.
+  string into pieces (it breaks silently when wording changes), not
+  serializing the parts (it widens the JSON contract for a rendering
+  concern).
