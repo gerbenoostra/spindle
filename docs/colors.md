@@ -10,7 +10,7 @@ default-foreground text.
 | --- | --- |
 | yellow | waiting - a row blocked on you (`!`, `waiting`, the `Needs you` section header, detail attention lines) |
 | red | error - `✗`, and bold red for `error`/`blocked` words, `checks failed` and `remote gone` |
-| green | done or good - `✓`, `done`, `checks ok`, upstream `tracked`, forge `open`, verdict `safe` |
+| green | done or good - `✓`, `done`, `checks ok` |
 | blue | working - `●`, `working` |
 | cyan | references and keys - branch names, the focused pane's border and title (bold cyan), footer and help keys |
 | magenta | identifiers - conversation ids and PR/MR labels in the lists (detail identifiers stay plain for now) |
