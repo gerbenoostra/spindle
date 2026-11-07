@@ -595,17 +595,17 @@ impl Summary {
         pieces(&self.reason, &self.facts, self.parked)
     }
 
-    /// The reason parts, ` · `-joined in the text.
+    /// The section reason's parts.
     pub fn reason(&self) -> &[SummaryPart] {
         &self.reason
     }
 
-    /// The evidence-tail parts, space-joined in the text.
+    /// The evidence tail's parts.
     pub fn facts(&self) -> &[SummaryPart] {
         &self.facts
     }
 
-    /// Whether the summary ends in `parked`.
+    /// Whether the work is parked.
     pub fn parked(&self) -> bool {
         self.parked
     }
