@@ -16,6 +16,8 @@ agent hooks feed it.
 | `?` | unknown | a live process with no applicable evidence, or seen-state that cannot be read |
 | blank | none | nothing pending |
 
+Each glyph's hue is in [the colour table](colors.md).
+
 A conversation can show a retained `✗` or `✓` while it is busy again. The row
 then reads `error · working` or `done · working`, so the unseen event is not
 hidden by the new turn. A `✗` or `✓` also survives the process exiting: an

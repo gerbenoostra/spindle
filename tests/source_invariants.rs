@@ -223,6 +223,84 @@ fn action_code_spawns_no_shell_topology_or_urls() {
     }
 }
 
+/// Style names the render path must not hold outside the palette: a span
+/// takes a `Role`, and only `src/tui/palette.rs` may build a `Style` or
+/// turn a role into a `Color` or `Modifier` - the next style change
+/// audits one file, not twenty.
+#[test]
+fn only_the_palette_names_a_style() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let palette = src.join("tui/palette.rs");
+    assert!(
+        palette.is_file(),
+        "src/tui/palette.rs must exist - it is the one file allowed to name styles"
+    );
+    for path in rust_sources(&src) {
+        if path == palette {
+            continue;
+        }
+        let text = fs::read_to_string(&path).expect("a source file this crate owns");
+        let named = style_names(production_part(&text, &path));
+        assert!(
+            named.is_empty(),
+            "{}: names {named:?} outside src/tui/palette.rs; take a Role instead",
+            path.display()
+        );
+    }
+}
+
+/// The style names `code` holds. Besides the `Style`, `Color` and
+/// `Modifier` paths, an import from `ratatui::style` - braced, aliased or
+/// through ratatui's `prelude` - is what brings in `Stylize` shorthand
+/// (`.cyan()`, `.bold()`), which names no type at the call site. Each
+/// needle must start a word, so `OrdinalStyle::` is not `Style::`; a
+/// `prelude::` counts only within a statement that names `ratatui`, so
+/// `std::io::prelude` passes.
+fn style_names(code: &str) -> Vec<&'static str> {
+    const NEEDLES: [&str; 6] = [
+        "Style::",
+        "Color::",
+        "Modifier::",
+        "Stylize",
+        "style::",
+        "prelude::",
+    ];
+    NEEDLES
+        .into_iter()
+        .filter(|needle| {
+            code.match_indices(needle).any(|(at, _)| {
+                let before = &code[..at];
+                let starts_word = !before
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                let statement = &before[before.rfind(';').map_or(0, |end| end + 1)..];
+                starts_word && (*needle != "prelude::" || statement.contains("ratatui"))
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn the_style_guard_sees_every_way_to_name_a_style() {
+    for (code, named) in [
+        ("Style::default()", vec!["Style::"]),
+        ("Style::reset().fg(Color::Red)", vec!["Style::", "Color::"]),
+        ("x.add_modifier(Modifier::BOLD)", vec!["Modifier::"]),
+        ("use ratatui::style::Stylize;", vec!["Stylize", "style::"]),
+        ("use ratatui::style::Color as C;", vec!["style::"]),
+        ("use ratatui::{style::Color, text::Line};", vec!["style::"]),
+        ("use ratatui::prelude::*;", vec!["prelude::"]),
+        ("use ratatui::{prelude::*, Frame};", vec!["prelude::"]),
+        ("use ratatui::text::Line;\nuse std::io::prelude::*;", vec![]),
+        ("OrdinalStyle::Suffix", vec![]),
+        ("Role::Focus.style()", vec![]),
+        ("Block::default().border_style(s)", vec![]),
+    ] {
+        assert_eq!(style_names(code), named, "{code}");
+    }
+}
+
 /// The text of `file` up to its unit-test module, after asserting the
 /// `#[cfg(test)]` convention that makes that cut safe.
 fn production_part<'a>(text: &'a str, path: &Path) -> &'a str {

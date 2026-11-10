@@ -108,7 +108,7 @@ filter excludes it by name).
   `set-option`, no `git config` write, no window rename, no edit to an agent's
   own session files or transcripts. `tests/source_invariants.rs` scans for
   this; add your surface's assertion there when you add one.
-- **`Unknown` is a value, not a default.** A dim `?` beats a confident lie:
+- **`Unknown` is a value, not a default.** A plain `?` beats a confident lie:
   absent evidence renders `Unknown`, never a guessed state.
 - **`(pid, pid_start)`, never a bare PID.** Providers leave stale locks behind;
   a pid is only evidence while its process instance is provably alive.
@@ -117,6 +117,9 @@ filter excludes it by name).
   against live state, a live agent, or the user's real tmux server.
 - **Subcommands ship with their behaviour.** An argument the binary cannot act
   on is a usage error, not a stub.
+- **A span takes a role, never a colour.** `src/tui/palette.rs` is the only
+  production code that builds a `Style` or names a `Color` or `Modifier`,
+  `Stylize` shorthand included; `tests/source_invariants.rs` enforces it.
 
 ## The read boundary
 
